@@ -64,6 +64,7 @@ pub fn run_clean_helper(job_dir: &Path) -> Result<()> {
 fn remove_job_tree(job_dir: &Path) {
     if job_dir.exists()
         && let Err(err) = std::fs::remove_dir_all(job_dir)
+        && err.kind() != std::io::ErrorKind::PermissionDenied
     {
         eprintln!(
             "cite helper: could not fully remove {}: {err}",

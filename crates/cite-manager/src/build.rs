@@ -150,6 +150,22 @@ pub fn prune_command(pm: &str, rendering: Rendering, prune: Option<bool>) -> Opt
     }
 }
 
+/// `node x.js` / `bun x.js` need the script; any other program runs from `node_modules/.bin`, so its arguments are not paths.
+fn start_target_problem(site_src: &Path, argv: &[String]) -> Option<String> {
+    let program = argv.first()?;
+    match program.as_str() {
+        "node" | "bun" => {
+            let script = argv.get(1)?;
+            (!site_src.join(script).exists()).then(|| format!("SSR start target missing: {script}"))
+        }
+        name => (!site_src.join("node_modules/.bin").join(name).exists()).then(|| {
+            format!(
+                "SSR start binary missing: node_modules/.bin/{name} (is it a devDependency removed by the production prune? set CITE_PRUNE=false or use a node start command)"
+            )
+        }),
+    }
+}
+
 pub fn load_build_env(cfg: &ManagerConfig) -> Result<HashMap<String, String>> {
     Ok(cfg.build_env.resolve()?.into_iter().collect())
 }
@@ -373,12 +389,8 @@ async fn build_in_job(
                 "SSR release requires a start command; set CITE_START_COMMAND",
             ));
         }
-        if let Some(target) = det.start_argv.get(1)
-            && !site_src.join(target).exists()
-        {
-            return Err(BuildFailure::permanent(format!(
-                "SSR start target missing: {target}"
-            )));
+        if let Some(problem) = start_target_problem(&site_src, &det.start_argv) {
+            return Err(BuildFailure::permanent(problem));
         }
         site_src
     };
@@ -2006,5 +2018,20 @@ mod tests {
         assert!(!old.exists(), "oldest cache file must be pruned");
         assert!(new.exists(), "newer cache file stays under the cap");
         assert!(super::dir_size(cache).unwrap() <= 100);
+    }
+
+    #[test]
+    fn start_target_check_treats_only_node_and_bun_arguments_as_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path();
+        let argv = |parts: &[&str]| parts.iter().map(|p| p.to_string()).collect::<Vec<_>>();
+        assert!(super::start_target_problem(src, &argv(&["node", "server.js"])).is_some());
+        std::fs::write(src.join("server.js"), "").unwrap();
+        assert!(super::start_target_problem(src, &argv(&["node", "server.js"])).is_none());
+        let missing = super::start_target_problem(src, &argv(&["next", "start"])).unwrap();
+        assert!(missing.contains("node_modules/.bin/next"), "{missing}");
+        std::fs::create_dir_all(src.join("node_modules/.bin")).unwrap();
+        std::fs::write(src.join("node_modules/.bin/next"), "").unwrap();
+        assert!(super::start_target_problem(src, &argv(&["next", "start"])).is_none());
     }
 }

@@ -12,7 +12,7 @@ Compose-level settings live in `.env` (copy `.env.example`). `.env` is gitignore
 | `CITE_GITHUB_TOKEN` | — | **required**, PAT with `contents:read`; passed to the manager only |
 | `CITE_BRANCH` | `main` | |
 | `CITE_POLL_INTERVAL` | `5m` | `1m`…`1d`, or `off` |
-| `CITE_VERSION` | `0.1.0` | Image tag shared by manager + executor |
+| `CITE_VERSION` | `0.1.1` | Image tag shared by manager + executor |
 | `CITE_NODE` | `22` | `22` or `24` — selects image pair |
 | `CITE_PORT` | `8080` | Host published port (container always `:8080`) |
 | `CITE_BIND` | `0.0.0.0` | Host bind address |
@@ -92,7 +92,7 @@ Builds run with a cleared environment plus these variables, so `CITE_GITHUB_TOKE
 ```yaml
 services:
   executor:
-    image: ghcr.io/seggys116/cite-executor-static:${CITE_VERSION:-0.1.0}
+    image: ghcr.io/seggys116/cite-executor-static:${CITE_VERSION:-0.1.1}
 ```
 
 Use `cite-executor-bun` for Bun sites. Both images set `CITE_RUNTIME` themselves.

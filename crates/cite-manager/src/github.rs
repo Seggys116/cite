@@ -416,11 +416,37 @@ impl RateHints {
 }
 
 fn token_expiry_from_headers(headers: &HeaderMap) -> Option<String> {
-    // GitHub fine-grained tokens may expose expiry via github-authentication-token-expiration
-    headers
-        .get("github-authentication-token-expiration")
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string)
+    let raw = headers
+        .get("github-authentication-token-expiration")?
+        .to_str()
+        .ok()?;
+    let normalized = normalize_expiry(raw);
+    if normalized.is_none() {
+        info!(
+            expires_at = raw,
+            "unrecognised GitHub token expiry format; ignoring"
+        );
+    }
+    normalized
+}
+
+/// GitHub sends `2026-12-29 13:04:33 UTC` (or a `+0000`-style offset), which state files store as RFC 3339.
+fn normalize_expiry(raw: &str) -> Option<String> {
+    use time::format_description::well_known::Rfc3339;
+    let raw = raw.trim();
+    if let Ok(at) = time::OffsetDateTime::parse(raw, &Rfc3339) {
+        return at.format(&Rfc3339).ok();
+    }
+    let with_offset = match raw.strip_suffix(" UTC") {
+        Some(rest) => format!("{rest} +0000"),
+        None => raw.to_string(),
+    };
+    let format = time::format_description::parse_borrowed::<2>(
+        "[year]-[month]-[day] [hour]:[minute]:[second] [offset_hour sign:mandatory][offset_minute]",
+    )
+    .ok()?;
+    let at = time::OffsetDateTime::parse(&with_offset, &format).ok()?;
+    at.to_offset(time::UtcOffset::UTC).format(&Rfc3339).ok()
 }
 
 fn warn_if_token_expiring(expires_at: &str) {
@@ -672,6 +698,33 @@ mod tests {
         assert!(
             text.contains("certificate") || text.contains("unknownissuer"),
             "{err}"
+        );
+    }
+
+    #[test]
+    fn github_expiry_header_is_stored_as_rfc3339() {
+        assert_eq!(
+            normalize_expiry("2026-12-29 13:04:33 UTC").as_deref(),
+            Some("2026-12-29T13:04:33Z")
+        );
+        assert_eq!(
+            normalize_expiry("2026-12-29 13:04:33 -0700").as_deref(),
+            Some("2026-12-29T20:04:33Z")
+        );
+        assert_eq!(
+            normalize_expiry("2026-12-29T13:04:33Z").as_deref(),
+            Some("2026-12-29T13:04:33Z")
+        );
+        assert_eq!(normalize_expiry("next tuesday"), None);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "github-authentication-token-expiration",
+            HeaderValue::from_static("2026-12-29 13:04:33 UTC"),
+        );
+        let stored = token_expiry_from_headers(&headers).unwrap();
+        assert!(
+            time::OffsetDateTime::parse(&stored, &time::format_description::well_known::Rfc3339)
+                .is_ok()
         );
     }
 }
