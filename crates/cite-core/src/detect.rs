@@ -62,9 +62,15 @@ pub fn detect_site(repo_dir: &Path) -> Result<Detection> {
     let has = |name: &str| deps.iter().any(|dep| dep == name);
 
     if has("next") {
+        let configs = [
+            "next.config.js",
+            "next.config.mjs",
+            "next.config.ts",
+            "next.config.cjs",
+        ];
         let export = config_contains(
             repo_dir,
-            &["next.config.js", "next.config.mjs", "next.config.ts"],
+            &configs,
             &["output: 'export'", "output: \"export\""],
         );
         if export {
@@ -72,11 +78,20 @@ pub fn detect_site(repo_dir: &Path) -> Result<Detection> {
                 static_detection("next", "out", None, 0.9).with_pm(repo_dir, &pm, node_major)
             );
         }
-        let mut det = ssr(
-            "next",
-            "npm run build && mkdir -p .next/standalone/.next && cp -R .next/static .next/standalone/.next/static && (cp -R public .next/standalone/public || true)",
-            vec!["node".into(), ".next/standalone/server.js".into()],
+        let standalone = config_contains(
+            repo_dir,
+            &configs,
+            &["output: 'standalone'", "output: \"standalone\""],
         );
+        let mut det = if standalone {
+            ssr(
+                "next",
+                "npm run build && mkdir -p .next/standalone/.next && cp -R .next/static .next/standalone/.next/static && (cp -R public .next/standalone/public || true)",
+                vec!["node".into(), ".next/standalone/server.js".into()],
+            )
+        } else {
+            ssr("next", "", vec!["next".into(), "start".into()])
+        };
         det.install_command = install_command(&pm, repo_dir);
         det.build_command = build_with_pm(&pm, &det.build_command);
         det.package_manager = pm;
@@ -408,7 +423,22 @@ mod tests {
         let det = detect_site(next.path()).unwrap();
         assert_eq!(det.framework, "next");
         assert_eq!(det.rendering, Rendering::Ssr);
+        assert_eq!(det.start_argv, vec!["next", "start"]);
+        assert_eq!(det.build_command, "npm run build");
+
+        let standalone = site(&[
+            (
+                "package.json",
+                r#"{"dependencies":{"next":"15.0.0"},"scripts":{"build":"next build"}}"#,
+            ),
+            (
+                "next.config.ts",
+                "const nextConfig = { output: 'standalone' };\nexport default nextConfig;\n",
+            ),
+        ]);
+        let det = detect_site(standalone.path()).unwrap();
         assert_eq!(det.start_argv, vec!["node", ".next/standalone/server.js"]);
+        assert!(det.build_command.contains(".next/standalone"));
 
         let astro = site(&[(
             "package.json",
