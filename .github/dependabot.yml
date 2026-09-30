@@ -1,0 +1,110 @@
+version: 2
+
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "chore(deps)"
+    cooldown:
+      default-days: 3
+    groups:
+      rust-minor-patch:
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: cargo
+    directory: "/fuzz"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "chore(deps)"
+    cooldown:
+      default-days: 3
+    groups:
+      rust-minor-patch:
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "chore(deps)"
+    cooldown:
+      default-days: 3
+    groups:
+      github-actions-minor-patch:
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: docker
+    directory: "/images/manager"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "chore(deps)"
+    cooldown:
+      default-days: 3
+    groups:
+      docker-minor-patch:
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: docker
+    directory: "/images/executor-node"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "chore(deps)"
+    cooldown:
+      default-days: 3
+    groups:
+      docker-minor-patch:
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: docker
+    directory: "/images/executor-bun"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "chore(deps)"
+    cooldown:
+      default-days: 3
+    groups:
+      docker-minor-patch:
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: docker
+    directory: "/images/executor-static"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "chore(deps)"
+    cooldown:
+      default-days: 3
+    groups:
+      docker-minor-patch:
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: docker
+    directory: "/images/mock-github"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "chore(deps)"
+    cooldown:
+      default-days: 3
+    groups:
+      docker-minor-patch:
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: docker-compose
+    directory: "/"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "chore(deps)"
+    cooldown:
+      default-days: 3
+    groups:
+      docker-compose-minor-patch:
+        update-types: ["minor", "patch"]

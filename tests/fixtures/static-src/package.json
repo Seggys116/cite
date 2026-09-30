@@ -1,0 +1,10 @@
+{
+  "name": "static-src",
+  "private": true,
+  "scripts": {
+    "build": "node build.js"
+  },
+  "dependencies": {
+    "vite": "^6.0.0"
+  }
+}

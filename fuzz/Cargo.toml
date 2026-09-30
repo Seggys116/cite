@@ -1,0 +1,93 @@
+[package]
+name = "cite-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+license = "MIT"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+cite-core = { path = "../crates/cite-core" }
+
+# Separate workspace so cargo-fuzz is not part of the main workspace.
+[workspace]
+
+[[bin]]
+name = "extract_tar"
+path = "fuzz_targets/extract_tar.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "start_command"
+path = "fuzz_targets/start_command.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "release_json"
+path = "fuzz_targets/release_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "desired_json"
+path = "fuzz_targets/desired_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "status_json"
+path = "fuzz_targets/status_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "redact_line"
+path = "fuzz_targets/redact_line.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "duration_parser"
+path = "fuzz_targets/duration_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "request_path"
+path = "fuzz_targets/request_path.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pack_tree"
+path = "fuzz_targets/pack_tree.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "detect_package"
+path = "fuzz_targets/detect_package.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "host_header"
+path = "fuzz_targets/host_header.rs"
+test = false
+doc = false
+bench = false

@@ -1,0 +1,27 @@
+name: cite-e2e
+
+services:
+  init:
+    image: cite-manager:dev
+  manager:
+    image: cite-manager:dev
+    environment:
+      CITE_GITHUB_API_URL: http://mock-github:8080
+      CITE_POLL_INTERVAL: "${CITE_POLL_INTERVAL:-off}"
+      CITE_INSTALL_COMMAND: "true"
+      CITE_BUILD_COMMAND: "node build.js"
+      CITE_HEALTH_TIMEOUT: 5s
+      CITE_HEALTH_CONSECUTIVE: "1"
+      CITE_FAULT_HOLD_BEFORE_ACTIVATE_MS: ${CITE_FAULT_HOLD_BEFORE_ACTIVATE_MS:-0}
+      CITE_FAULT_HOLD_DURING_ATOMIC_MS: ${CITE_FAULT_HOLD_DURING_ATOMIC_MS:-0}
+  executor:
+    image: cite-executor-node:e2e
+  mock-github:
+    image: cite-mock-github:dev
+    environment:
+      CITE_MOCK_TARBALL_DELAY_MS: ${CITE_MOCK_TARBALL_DELAY_MS:-0}
+
+volumes:
+  cite_data:
+    name: cite-e2e_cite_data
+    external: true

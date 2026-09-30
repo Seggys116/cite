@@ -1,0 +1,9 @@
+.git
+target
+**/target
+*.profraw
+.env
+build.env
+runtime.env
+fuzz/artifacts
+*.log

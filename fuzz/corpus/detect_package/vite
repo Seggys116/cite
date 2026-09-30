@@ -1,0 +1,1 @@
+{"name":"site","dependencies":{"vite":"5.0.0"},"scripts":{"build":"vite build"}}

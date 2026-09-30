@@ -1,0 +1,5 @@
+services:
+  manager:
+    environment:
+      CITE_RENDERING: static
+      CITE_OUTPUT_DIR: dist

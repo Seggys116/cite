@@ -1,0 +1,8 @@
+services:
+  executor:
+    networks: !override
+      - egress
+
+networks:
+  egress:
+    driver: bridge

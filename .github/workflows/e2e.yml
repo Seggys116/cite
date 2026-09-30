@@ -1,0 +1,40 @@
+name: e2e
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: |
+          docker build -f images/manager/Dockerfile -t cite-manager:dev .
+          docker build -f images/mock-github/Dockerfile -t cite-mock-github:dev .
+          docker build -f images/executor-node/Dockerfile -t cite-executor-node:e2e .
+      - run: ./scripts/e2e-first-deploy.sh
+      - run: ./scripts/e2e-fault.sh
+      - if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-logs
+          path: target/e2e-*
+          if-no-files-found: ignore
+      - if: always()
+        run: |
+          docker rm -f cite-e2e-layout >/dev/null 2>&1 || true
+          docker compose -p cite-e2e -f docker-compose.dev.yml -f docker-compose.e2e.yml -f docker-compose.e2e-static.yml --profile mock down -v --remove-orphans || true
+          docker volume rm -f cite-e2e_cite_data || true

@@ -1,0 +1,198 @@
+# Production stack: pulls published images. Needs Docker Engine 26+ and Compose 2.26+.
+
+name: cite
+
+services:
+  init:
+    image: ghcr.io/seggys116/cite-manager:${CITE_VERSION:-0.1.0}-node${CITE_NODE:-22}
+    restart: "no"
+    user: "0:0"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - FOWNER
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        mkdir -p /data/releases/blue /data/releases/green /data/control /data/status /data/state &&
+        chown 0:0 /data/releases /data/releases/blue /data/releases/green /data/control /data/state &&
+        chown 65532:65532 /data/status &&
+        chmod 0755 /data/releases /data/control /data/status && chmod 0750 /data/state
+    volumes:
+      - type: volume
+        source: cite_data
+        target: /data
+    network_mode: none
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  manager:
+    image: ghcr.io/seggys116/cite-manager:${CITE_VERSION:-0.1.0}-node${CITE_NODE:-22}
+    restart: unless-stopped
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    init: true
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETUID
+      - SETGID
+      - DAC_READ_SEARCH
+    tmpfs:
+      - /tmp:size=256m,mode=0755
+      - /run/cite:size=16m,mode=0750
+    environment:
+      CITE_REPO: ${CITE_REPO:?set CITE_REPO in .env}
+      CITE_BRANCH: ${CITE_BRANCH:-main}
+      CITE_POLL_INTERVAL: ${CITE_POLL_INTERVAL:-5m}
+      CITE_NODE: ${CITE_NODE:-22}
+      CITE_GITHUB_TOKEN: ${CITE_GITHUB_TOKEN:?set CITE_GITHUB_TOKEN in .env}
+      CITE_DATA_DIR: /var/lib/cite
+      CITE_RELEASES_DIR: /var/lib/cite/releases
+      CITE_CONTROL_DIR: /var/lib/cite/control
+      CITE_STATUS_DIR: /var/lib/cite/status
+      CITE_STATE_DIR: /var/lib/cite/state
+      CITE_WORK_DIR: /var/lib/cite/work
+      CITE_CACHE_DIR: /var/lib/cite/cache
+      CITE_SOCKET: /run/cite/manager.sock
+      RUST_LOG: ${RUST_LOG:-info}
+    env_file:
+      - path: build.env
+        required: false
+    volumes:
+      - type: volume
+        source: cite_data
+        target: /var/lib/cite/releases
+        volume:
+          subpath: releases
+      - type: volume
+        source: cite_data
+        target: /var/lib/cite/control
+        volume:
+          subpath: control
+      - type: volume
+        source: cite_data
+        target: /var/lib/cite/status
+        read_only: true
+        volume:
+          subpath: status
+      - type: volume
+        source: cite_data
+        target: /var/lib/cite/state
+        volume:
+          subpath: state
+      - type: volume
+        source: cite_work
+        target: /var/lib/cite/work
+      - type: volume
+        source: cite_cache
+        target: /var/lib/cite/cache
+    networks:
+      - manager_net
+    mem_limit: ${CITE_MANAGER_MEM:-2g}
+    cpus: ${CITE_MANAGER_CPUS:-2.0}
+    pids_limit: ${CITE_MANAGER_PIDS:-2048}
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "cite-manager", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  executor:
+    image: ghcr.io/seggys116/cite-executor-node:${CITE_VERSION:-0.1.0}-node${CITE_NODE:-22}
+    restart: unless-stopped
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    init: true
+    user: "65532:65532"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp:size=64m,mode=1777,noexec,nosuid,nodev
+    environment:
+      CITE_LISTEN: 0.0.0.0:8080
+      CITE_NODE_BIN: /nodejs/bin/node
+      CITE_NODE: ${CITE_NODE:-22}
+      CITE_DATA_DIR: /var/lib/cite
+      CITE_RELEASES_DIR: /var/lib/cite/releases
+      CITE_CONTROL_DIR: /var/lib/cite/control
+      CITE_STATUS_DIR: /var/lib/cite/status
+      RUST_LOG: ${RUST_LOG:-info}
+    env_file:
+      - path: runtime.env
+        required: false
+    ports:
+      - target: 8080
+        published: ${CITE_PORT:-8080}
+        host_ip: ${CITE_BIND:-0.0.0.0}
+        protocol: tcp
+    volumes:
+      - type: volume
+        source: cite_data
+        target: /var/lib/cite/releases
+        read_only: true
+        volume:
+          subpath: releases
+      - type: volume
+        source: cite_data
+        target: /var/lib/cite/control
+        read_only: true
+        volume:
+          subpath: control
+      - type: volume
+        source: cite_data
+        target: /var/lib/cite/status
+        volume:
+          subpath: status
+    # no_egress has masquerade off, so the executor cannot reach the internet.
+    networks:
+      - no_egress
+    mem_limit: ${CITE_EXECUTOR_MEM:-512m}
+    cpus: ${CITE_EXECUTOR_CPUS:-1.0}
+    pids_limit: ${CITE_EXECUTOR_PIDS:-256}
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "/cite-executor", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  cite_data:
+  cite_work:
+  cite_cache:
+
+networks:
+  manager_net:
+    driver: bridge
+  no_egress:
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.enable_ip_masquerade: "false"

@@ -1,0 +1,36 @@
+[package]
+name = "cite-manager"
+description = "Cite manager: poll, build, and promote one site"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "cite-manager"
+path = "src/main.rs"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[dependencies]
+cite-core = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+clap = { workspace = true }
+rustix = { workspace = true }
+nix = { version = "0.29", default-features = false, features = ["ptrace"] }
+sha2 = { workspace = true }
+time = { workspace = true }
+flate2 = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true }
+cite-mock-github = { workspace = true }
+cite-executor = { workspace = true }

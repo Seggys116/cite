@@ -1,0 +1,7 @@
+services:
+  manager:
+    environment:
+      CITE_RENDERING: ssr
+      CITE_START_COMMAND: node server.js
+      CITE_PRUNE: "false"
+      CITE_HEALTH_TIMEOUT: 3s

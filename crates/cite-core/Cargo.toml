@@ -1,0 +1,31 @@
+[package]
+name = "cite-core"
+description = "Shared schemas, safe archive IO, and config for Cite"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+toml = { workspace = true }
+tar = { workspace = true }
+flate2 = { workspace = true }
+cap-std = { workspace = true }
+rustix = { workspace = true }
+sha2 = { workspace = true }
+subtle = { workspace = true }
+time = { workspace = true }
+ulid = { workspace = true }
+regex = { workspace = true }
+ipnet = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+tempfile = { workspace = true }

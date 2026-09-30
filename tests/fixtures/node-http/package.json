@@ -1,0 +1,8 @@
+{
+  "name": "node-http",
+  "private": true,
+  "scripts": {
+    "start": "node server.js",
+    "build": "node -e \"process.exit(0)\""
+  }
+}

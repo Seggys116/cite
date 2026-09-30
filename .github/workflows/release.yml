@@ -1,0 +1,179 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE_PREFIX: ghcr.io/${{ github.repository_owner }}
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: check
+        run: |
+          cargo_version="$(awk -F'"' '/^version = /{print $2; exit}' Cargo.toml)"
+          if [[ "${GITHUB_REF_NAME#v}" != "$cargo_version" ]]; then
+            echo "tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${cargo_version}" >&2
+            exit 1
+          fi
+          echo "version=${cargo_version}" >> "$GITHUB_OUTPUT"
+
+  binaries:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          rustup target add "${{ matrix.target }}"
+      - run: cargo build --locked --release --target "${{ matrix.target }}" -p cite-manager -p cite-executor
+      - run: |
+          mkdir -p dist
+          archive="cite-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz"
+          tar -C "target/${{ matrix.target }}/release" -czf "dist/${archive}" cite-manager cite-executor
+          (cd dist && sha256sum "${archive}" > "${archive}.sha256")
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: binaries-${{ matrix.target }}
+          path: dist/*
+
+  github-release:
+    needs: binaries
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: binaries-*
+          merge-multiple: true
+          path: dist
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          files: dist/*
+          generate_release_notes: true
+
+  images:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        variant:
+          - { key: manager-node22, name: cite-manager, dockerfile: images/manager/Dockerfile, node: "22", args: "NODE_MAJOR=22" }
+          - { key: manager-node24, name: cite-manager, dockerfile: images/manager/Dockerfile, node: "24", args: "NODE_MAJOR=24\nNODE_IMAGE=docker.io/library/node:24-bookworm-slim@sha256:0e0ff40c39bc087845bfb27465a0df4ea419520094bc35842ff83dd8cbe6f9b6" }
+          - { key: executor-node22, name: cite-executor-node, dockerfile: images/executor-node/Dockerfile, node: "22", args: "NODE_MAJOR=22" }
+          - { key: executor-node24, name: cite-executor-node, dockerfile: images/executor-node/Dockerfile, node: "24", args: "NODE_MAJOR=24\nEXECUTOR_IMAGE=gcr.io/distroless/nodejs24-debian12:nonroot@sha256:14d42e2511532589a7c7e01a753667a74fcc96266e137e8125006b87b0c32d0a" }
+          - { key: executor-bun, name: cite-executor-bun, dockerfile: images/executor-bun/Dockerfile, node: "", args: "" }
+          - { key: executor-static, name: cite-executor-static, dockerfile: images/executor-static/Dockerfile, node: "", args: "" }
+        platform:
+          - { arch: amd64, runner: ubuntu-latest }
+          - { arch: arm64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.platform.runner }}
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: ${{ matrix.variant.dockerfile }}
+          platforms: linux/${{ matrix.platform.arch }}
+          build-args: |
+            VERSION=${{ needs.version.outputs.version }}
+            REVISION=${{ github.sha }}
+            ${{ matrix.variant.args }}
+          outputs: type=image,name=${{ env.IMAGE_PREFIX }}/${{ matrix.variant.name }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.variant.key }}-${{ matrix.platform.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.variant.key }}-${{ matrix.platform.arch }}
+      - env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p digests
+          touch "digests/${DIGEST#sha256:}"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: digests-${{ matrix.variant.key }}-${{ matrix.platform.arch }}
+          path: digests/*
+
+  manifests:
+    needs: [version, images]
+    strategy:
+      fail-fast: false
+      matrix:
+        variant:
+          - { key: manager-node22, name: cite-manager, suffix: "-node22" }
+          - { key: manager-node24, name: cite-manager, suffix: "-node24" }
+          - { key: executor-node22, name: cite-executor-node, suffix: "-node22" }
+          - { key: executor-node24, name: cite-executor-node, suffix: "-node24" }
+          - { key: executor-bun, name: cite-executor-bun, suffix: "" }
+          - { key: executor-static, name: cite-executor-static, suffix: "" }
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      packages: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: digests-${{ matrix.variant.key }}-*
+          merge-multiple: true
+          path: digests
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - env:
+          IMAGE: ${{ env.IMAGE_PREFIX }}/${{ matrix.variant.name }}
+          SUFFIX: ${{ matrix.variant.suffix }}
+          VERSION: ${{ needs.version.outputs.version }}
+        working-directory: digests
+        run: |
+          sources=()
+          for digest in *; do sources+=("${IMAGE}@sha256:${digest}"); done
+          docker buildx imagetools create \
+            -t "${IMAGE}:${VERSION}${SUFFIX}" \
+            -t "${IMAGE}:latest${SUFFIX}" \
+            "${sources[@]}"

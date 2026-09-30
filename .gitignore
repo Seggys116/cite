@@ -1,0 +1,14 @@
+.DS_Store
+/target
+**/target
+*.profraw
+.env
+build.env
+runtime.env
+*.log
+fuzz/artifacts
+fuzz/coverage
+.idea
+.vscode
+*.swp
+.claude/
