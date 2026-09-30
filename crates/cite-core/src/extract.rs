@@ -414,7 +414,8 @@ mod tests {
             let result = extract_archive(bytes.as_slice(), &dest, &ExtractLimits::default(), 1);
             prop_assert!(result.is_ok());
             prop_assert_eq!(fs::read(dir.path().join("canary")).unwrap(), b"safe");
-            for (name, data) in &files {
+            let expected: std::collections::BTreeMap<_, _> = files.iter().cloned().collect();
+            for (name, data) in &expected {
                 prop_assert_eq!(fs::read(dest.join(format!("{name}.txt"))).unwrap(), data.as_slice());
             }
         }
