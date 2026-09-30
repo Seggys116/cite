@@ -124,9 +124,14 @@ pub fn cache_env(cache_dir: &Path) -> HashMap<String, String> {
             cache_dir.join("npm").display().to_string(),
         ),
         (
-            "PNPM_STORE_PATH".into(),
+            "npm_config_store_dir".into(),
             cache_dir.join("pnpm").display().to_string(),
         ),
+        (
+            "COREPACK_HOME".into(),
+            cache_dir.join("corepack").display().to_string(),
+        ),
+        ("COREPACK_ENABLE_DOWNLOAD_PROMPT".into(), "0".into()),
         (
             "BUN_INSTALL_CACHE_DIR".into(),
             cache_dir.join("bun").display().to_string(),
@@ -1480,7 +1485,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let env = cache_env(dir.path());
         assert!(env["npm_config_cache"].ends_with("/npm"));
-        assert!(env["PNPM_STORE_PATH"].ends_with("/pnpm"));
+        assert!(env["npm_config_store_dir"].ends_with("/pnpm"));
+        assert!(env["COREPACK_HOME"].ends_with("/corepack"));
         assert!(env["BUN_INSTALL_CACHE_DIR"].ends_with("/bun"));
 
         let old = dir.path().join("old.bin");

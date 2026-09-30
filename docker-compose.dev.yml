@@ -58,7 +58,7 @@ services:
       - SETGID
       - DAC_READ_SEARCH
     tmpfs:
-      - /tmp:size=256m,mode=0755
+      - /tmp:size=256m,mode=1777
       - /run/cite:size=16m,mode=0750
     environment:
       CITE_REPO: ${CITE_REPO:-seggys116/example-site}
