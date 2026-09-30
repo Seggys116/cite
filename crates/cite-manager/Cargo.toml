@@ -24,7 +24,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 clap = { workspace = true }
 rustix = { workspace = true }
-nix = { version = "0.29", default-features = false, features = ["ptrace"] }
+nix = { version = "0.31", default-features = false, features = ["ptrace"] }
 sha2 = { workspace = true }
 time = { workspace = true }
 flate2 = { workspace = true }
