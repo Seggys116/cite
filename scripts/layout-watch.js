@@ -41,7 +41,8 @@ function check() {
     }
   }
   if (bad.length) fs.appendFileSync(violations, `${bad.join(" ")}\n`);
-  fs.writeFileSync(samples, String(n));
+  fs.writeFileSync(`${samples}.tmp`, String(n));
+  fs.renameSync(`${samples}.tmp`, samples);
 }
 
 setInterval(check, 20);
