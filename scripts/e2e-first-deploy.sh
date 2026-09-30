@@ -216,15 +216,14 @@ for version in v3 v4; do
 done
 [[ -n "$V4_SHA" ]] || fail "did not record the v4 sha"
 
-# Sequential requests across the v4 to v5 switch: one flip, no bad response, at least 50/s.
+# Four ordered request streams across the v4 to v5 switch: each flips once, no bad response, at least 50/s in total.
 rm -f target/e2e-probe-stop target/e2e-probe.jsonl target/e2e-probe-rate
 node -e '
 const http = require("http");
 const fs = require("fs");
-const agent = new http.Agent({ keepAlive: true, maxSockets: 1 });
 const port = Number(process.argv[1]);
 const out = fs.createWriteStream("target/e2e-probe.jsonl");
-function once() {
+function once(agent) {
   return new Promise((resolve) => {
     const req = http.get({ host: "127.0.0.1", port, path: "/", agent }, (res) => {
       const chunks = [];
@@ -234,14 +233,21 @@ function once() {
     req.on("error", (err) => resolve({ ok: false, body: err.message }));
   });
 }
-(async () => {
-  const started = Date.now();
+async function worker(id) {
+  const agent = new http.Agent({ keepAlive: true, maxSockets: 1 });
   let n = 0;
   while (!fs.existsSync("target/e2e-probe-stop")) {
-    const row = await once();
+    const row = await once(agent);
+    row.worker = id;
     n += 1;
     out.write(JSON.stringify(row) + "\n");
   }
+  return n;
+}
+(async () => {
+  const started = Date.now();
+  const counts = await Promise.all([0, 1, 2, 3].map(worker));
+  const n = counts.reduce((a, b) => a + b, 0);
   const elapsed = Math.max((Date.now() - started) / 1000, 0.001);
   fs.writeFileSync("target/e2e-probe-rate", String(n / elapsed));
   out.end(() => process.exit(0));
@@ -263,8 +269,8 @@ if (!(rate >= 50)) {
   console.error("request rate " + rate);
   process.exit(1);
 }
-let phase = "from";
-let flips = 0;
+const phase = {};
+const flips = {};
 let sawFrom = false;
 let sawTo = false;
 for (const row of lines) {
@@ -272,25 +278,28 @@ for (const row of lines) {
     console.error("bad response " + JSON.stringify(row));
     process.exit(1);
   }
+  const w = row.worker;
+  phase[w] = phase[w] || "from";
+  flips[w] = flips[w] || 0;
   if (row.body === from) {
     sawFrom = true;
-    if (phase !== "from") {
-      console.error("version flipped back");
+    if (phase[w] !== "from") {
+      console.error("version flipped back on worker " + w);
       process.exit(1);
     }
   } else {
     sawTo = true;
-    if (phase === "from") {
-      phase = "to";
-      flips += 1;
+    if (phase[w] === "from") {
+      phase[w] = "to";
+      flips[w] += 1;
     }
   }
 }
-if (!sawFrom || !sawTo || flips !== 1) {
-  console.error("flips=" + flips + " from=" + sawFrom + " to=" + sawTo + " n=" + lines.length);
+if (!sawFrom || !sawTo || Object.values(flips).some((f) => f > 1)) {
+  console.error("flips=" + JSON.stringify(flips) + " from=" + sawFrom + " to=" + sawTo + " n=" + lines.length);
   process.exit(1);
 }
-console.log("request loop: " + lines.length + " responses at " + rate.toFixed(1) + "/s, one flip");
+console.log("request loop: " + lines.length + " responses at " + rate.toFixed(1) + "/s, at most one flip per stream");
 ' "<html>v4</html>" "<html>v5</html>" || fail "zero-failed-request check"
 body="$(curl -fsS --max-time 2 "http://127.0.0.1:${PORT}/")" || fail "v5 was not reachable"
 printf '%s\n' "$body" | grep -q 'v5' || fail "expected v5, got $body"
