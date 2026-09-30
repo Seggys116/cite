@@ -16,6 +16,8 @@ docker compose exec manager cite status
 
 Requirements: **Docker Engine 26+** and **Compose v2.26+**. See [docs/install.md](docs/install.md).
 
+Images are published to `ghcr.io/seggys116` (used by `docker-compose.yml`) and mirrored to Docker Hub as `docker.io/seggy116`.
+
 ## What you get
 
 | Piece | Role |

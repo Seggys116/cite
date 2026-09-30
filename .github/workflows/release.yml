@@ -165,8 +165,13 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
       - env:
           IMAGE: ${{ env.IMAGE_PREFIX }}/${{ matrix.variant.name }}
+          HUB_IMAGE: docker.io/${{ secrets.DOCKERHUB_USERNAME }}/${{ matrix.variant.name }}
           SUFFIX: ${{ matrix.variant.suffix }}
           VERSION: ${{ needs.version.outputs.version }}
         working-directory: digests
@@ -176,4 +181,6 @@ jobs:
           docker buildx imagetools create \
             -t "${IMAGE}:${VERSION}${SUFFIX}" \
             -t "${IMAGE}:latest${SUFFIX}" \
+            -t "${HUB_IMAGE}:${VERSION}${SUFFIX}" \
+            -t "${HUB_IMAGE}:latest${SUFFIX}" \
             "${sources[@]}"
