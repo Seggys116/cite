@@ -1,0 +1,7 @@
+{
+  "name": "cite-runtime-pnpm",
+  "private": true,
+  "packageManager": "pnpm@12.8.1",
+  "scripts": { "build": "node build.js" },
+  "dependencies": { "is-number": "7.0.0" }
+}

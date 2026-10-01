@@ -46,6 +46,7 @@ docker compose -f docker-compose.dev.yml --profile mock up --build
 - [Threat model](docs/threat-model.md)
 - [Troubleshooting](docs/troubleshooting.md)
 - [Multiple sites](docs/multi-site.md)
+- [Running real sites](docs/sites.md): package managers, egress, persistent data, Next.js, memory
 - [HTTPS in front](docs/https.md)
 - [SECURITY](SECURITY.md)
 

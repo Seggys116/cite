@@ -1,5 +1,8 @@
-use std::fs;
+use std::io::Read;
 use std::path::Path;
+
+use cap_std::ambient_authority;
+use cap_std::fs::{Dir, OpenOptions, OpenOptionsExt};
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -20,6 +23,8 @@ pub struct Detection {
     pub start_argv: Vec<String>,
     pub spa_fallback: Option<String>,
     pub confidence: f32,
+    /// Non-fatal findings such as conflicting lockfiles; the manager logs them.
+    pub warnings: Vec<String>,
     /// Static sites pack only `output_dir`. SSR sites pack the app root.
     pub pack_output_only: bool,
 }
@@ -44,21 +49,48 @@ struct Engines {
 }
 
 pub fn detect_site(repo_dir: &Path) -> Result<Detection> {
-    let manifest = repo_dir.join("package.json");
-    if !manifest.is_file() {
-        if repo_dir.join("index.html").is_file() {
+    detect_site_with(repo_dir, None)
+}
+
+/// `package_manager` is the operator's explicit choice; `None` or `auto` detects it.
+pub fn detect_site_with(repo_dir: &Path, package_manager: Option<&str>) -> Result<Detection> {
+    detect_site_configured(repo_dir, package_manager, None)
+}
+
+/// `rendering` is the operator's explicit choice; when no framework is recognised it yields a generic detection instead of an error.
+pub fn detect_site_configured(
+    repo_dir: &Path,
+    package_manager: Option<&str>,
+    rendering: Option<Rendering>,
+) -> Result<Detection> {
+    let root = Dir::open_ambient_dir(repo_dir, ambient_authority())?;
+    if !root.is_file("package.json") {
+        if root.is_file("index.html") {
             return Ok(static_detection("generic-static", ".", None, 0.4));
         }
         return Err(Error::Config(
             "no package.json or index.html; set CITE_RENDERING and CITE_OUTPUT_DIR".into(),
         ));
     }
-    let text = read_capped(&manifest, 1_048_576)?;
+    let text = read_capped(&root, "package.json", 1_048_576)?;
     let pkg: PackageJson =
         serde_json::from_str(&text).map_err(|err| Error::Config(format!("package.json: {err}")))?;
-    let pm = package_manager(repo_dir, &pkg);
-    let node_major = node_major(repo_dir, &pkg);
-    let deps = dep_names(&pkg);
+    let mut warnings = Vec::new();
+    let pm = resolve_pm(&root, &pkg, package_manager, &mut warnings);
+    let node_major = node_major(&root, &pkg, &mut warnings);
+    let mut det = detect_framework(&root, &pkg, &pm, node_major, rendering)?;
+    det.warnings = warnings;
+    Ok(det)
+}
+
+fn detect_framework(
+    repo_dir: &Dir,
+    pkg: &PackageJson,
+    pm: &Pm,
+    node_major: Option<String>,
+    rendering: Option<Rendering>,
+) -> Result<Detection> {
+    let deps = dep_names(pkg);
     let has = |name: &str| deps.iter().any(|dep| dep == name);
 
     if has("next") {
@@ -74,9 +106,7 @@ pub fn detect_site(repo_dir: &Path) -> Result<Detection> {
             &["output: 'export'", "output: \"export\""],
         );
         if export {
-            return Ok(
-                static_detection("next", "out", None, 0.9).with_pm(repo_dir, &pm, node_major)
-            );
+            return Ok(static_detection("next", "out", None, 0.9).with_pm(repo_dir, pm, node_major));
         }
         let standalone = config_contains(
             repo_dir,
@@ -90,11 +120,20 @@ pub fn detect_site(repo_dir: &Path) -> Result<Detection> {
                 vec!["node".into(), ".next/standalone/server.js".into()],
             )
         } else {
-            ssr("next", "", vec!["next".into(), "start".into()])
+            ssr(
+                "next",
+                "",
+                vec![
+                    "next".into(),
+                    "start".into(),
+                    "-H".into(),
+                    "127.0.0.1".into(),
+                ],
+            )
         };
-        det.install_command = install_command(&pm, repo_dir);
-        det.build_command = build_with_pm(&pm, &det.build_command);
-        det.package_manager = pm;
+        det.install_command = install_command(pm, repo_dir);
+        det.build_command = build_with_pm(&pm.name, &det.build_command);
+        det.package_manager = pm.name.clone();
         det.node_major = node_major;
         return Ok(det);
     }
@@ -106,26 +145,26 @@ pub fn detect_site(repo_dir: &Path) -> Result<Detection> {
         );
         if static_site {
             return Ok(static_detection("nuxt", ".output/public", None, 0.85)
-                .with_pm(repo_dir, &pm, node_major));
+                .with_pm(repo_dir, pm, node_major));
         }
         return Ok(ssr(
             "nuxt",
             "",
             vec!["node".into(), ".output/server/index.mjs".into()],
         )
-        .with_pm(repo_dir, &pm, node_major));
+        .with_pm(repo_dir, pm, node_major));
     }
     if has("@sveltejs/kit") {
         if has("@sveltejs/adapter-static") {
             return Ok(static_detection("sveltekit", "build", None, 0.85)
-                .with_pm(repo_dir, &pm, node_major));
+                .with_pm(repo_dir, pm, node_major));
         }
         return Ok(ssr(
             "sveltekit",
             "",
             vec!["node".into(), "build/index.js".into()],
         )
-        .with_pm(repo_dir, &pm, node_major));
+        .with_pm(repo_dir, pm, node_major));
     }
     if has("astro") {
         if has("@astrojs/node") {
@@ -134,9 +173,9 @@ pub fn detect_site(repo_dir: &Path) -> Result<Detection> {
                 "",
                 vec!["node".into(), "dist/server/entry.mjs".into()],
             )
-            .with_pm(repo_dir, &pm, node_major));
+            .with_pm(repo_dir, pm, node_major));
         }
-        return Ok(static_detection("astro", "dist", None, 0.9).with_pm(repo_dir, &pm, node_major));
+        return Ok(static_detection("astro", "dist", None, 0.9).with_pm(repo_dir, pm, node_major));
     }
     if has("@angular/core") {
         let project = angular_project(repo_dir).unwrap_or_else(|| "app".into());
@@ -146,7 +185,7 @@ pub fn detect_site(repo_dir: &Path) -> Result<Detection> {
                 "",
                 vec!["node".into(), format!("dist/{project}/server/server.mjs")],
             )
-            .with_pm(repo_dir, &pm, node_major));
+            .with_pm(repo_dir, pm, node_major));
         }
         return Ok(static_detection(
             "angular",
@@ -154,7 +193,7 @@ pub fn detect_site(repo_dir: &Path) -> Result<Detection> {
             Some("index.html"),
             0.8,
         )
-        .with_pm(repo_dir, &pm, node_major));
+        .with_pm(repo_dir, pm, node_major));
     }
     if has("react-router") || has("@react-router/node") || has("@react-router/serve") {
         return Ok(ssr(
@@ -162,7 +201,7 @@ pub fn detect_site(repo_dir: &Path) -> Result<Detection> {
             "",
             vec!["react-router-serve".into(), "build/server/index.js".into()],
         )
-        .with_pm(repo_dir, &pm, node_major));
+        .with_pm(repo_dir, pm, node_major));
     }
     if has("@remix-run/node") || has("@remix-run/serve") {
         return Ok(ssr(
@@ -170,49 +209,66 @@ pub fn detect_site(repo_dir: &Path) -> Result<Detection> {
             "",
             vec!["remix-serve".into(), "build/index.js".into()],
         )
-        .with_pm(repo_dir, &pm, node_major));
+        .with_pm(repo_dir, pm, node_major));
     }
     if has("@docusaurus/core") {
         return Ok(
-            static_detection("docusaurus", "build", None, 0.9).with_pm(repo_dir, &pm, node_major)
+            static_detection("docusaurus", "build", None, 0.9).with_pm(repo_dir, pm, node_major)
         );
     }
     if has("vitepress") {
         return Ok(static_detection("vitepress", ".vitepress/dist", None, 0.9)
-            .with_pm(repo_dir, &pm, node_major));
+            .with_pm(repo_dir, pm, node_major));
     }
     if has("@11ty/eleventy") {
         return Ok(
-            static_detection("eleventy", "_site", None, 0.9).with_pm(repo_dir, &pm, node_major)
+            static_detection("eleventy", "_site", None, 0.9).with_pm(repo_dir, pm, node_major)
         );
     }
     if has("gatsby") {
         return Ok(
-            static_detection("gatsby", "public", None, 0.85).with_pm(repo_dir, &pm, node_major)
+            static_detection("gatsby", "public", None, 0.85).with_pm(repo_dir, pm, node_major)
         );
     }
     if has("vite") {
         return Ok(static_detection("vite", "dist", Some("index.html"), 0.8)
-            .with_pm(repo_dir, &pm, node_major));
+            .with_pm(repo_dir, pm, node_major));
     }
-    if script(&pkg, "start").is_some() {
-        let mut det = ssr("generic-node", "", Vec::new());
-        if let Some(start) = script(&pkg, "start")
-            && let Ok(argv) = crate::argv::split_command(start)
-            && crate::argv::validate_start_argv(&argv).is_ok()
-        {
-            det.start_argv = argv;
+    match rendering {
+        Some(Rendering::Static) => {
+            let mut det = static_detection("generic-static", ".", None, 0.4)
+                .with_pm(repo_dir, pm, node_major);
+            if script(pkg, "build").is_none() {
+                det.build_command = "true".into();
+            }
+            return Ok(det);
         }
+        Some(Rendering::Ssr) => {
+            let mut det = ssr("generic-node", "", Vec::new());
+            det.start_argv = start_script_argv(pkg).unwrap_or_default();
+            return Ok(det.with_pm(repo_dir, pm, node_major));
+        }
+        None => {}
+    }
+    if script(pkg, "start").is_some() {
+        let mut det = ssr("generic-node", "", Vec::new());
+        det.start_argv = start_script_argv(pkg).unwrap_or_default();
         if det.start_argv.is_empty() {
             return Err(Error::Config(
                 "could not derive an argv-only start command; set CITE_START_COMMAND".into(),
             ));
         }
-        return Ok(det.with_pm(repo_dir, &pm, node_major));
+        return Ok(det.with_pm(repo_dir, pm, node_major));
     }
     Err(Error::Config(
         "ambiguous site; set CITE_RENDERING (static or ssr)".into(),
     ))
+}
+
+fn start_script_argv(pkg: &PackageJson) -> Option<Vec<String>> {
+    let argv = crate::argv::split_command(script(pkg, "start")?).ok()?;
+    crate::argv::validate_start_argv(&argv).ok()?;
+    Some(argv)
 }
 
 fn static_detection(
@@ -232,6 +288,7 @@ fn static_detection(
         start_argv: Vec::new(),
         spa_fallback: spa.map(str::to_string),
         confidence,
+        warnings: Vec::new(),
         pack_output_only: true,
     }
 }
@@ -255,73 +312,148 @@ fn ssr(framework: &str, build_suffix: &str, start_argv: Vec<String>) -> Detectio
         start_argv,
         spa_fallback: None,
         confidence: 0.85,
+        warnings: Vec::new(),
         pack_output_only: false,
     }
 }
 
 impl Detection {
-    fn with_pm(mut self, dir: &Path, pm: &str, node_major: Option<String>) -> Self {
-        self.package_manager = pm.into();
+    fn with_pm(mut self, dir: &Dir, pm: &Pm, node_major: Option<String>) -> Self {
+        self.package_manager = pm.name.clone();
         self.node_major = node_major;
         if self.framework == "next" {
-            self.build_command = build_with_pm(pm, &self.build_command);
+            self.build_command = build_with_pm(&pm.name, &self.build_command);
         } else {
-            self.build_command = format!("{pm} run build");
+            self.build_command = format!("{} run build", pm.name);
         }
         self.install_command = install_command(pm, dir);
         self
     }
 }
 
+/// The resolved package manager; `berry` only matters for yarn 2 and newer.
+#[derive(Debug, Clone, PartialEq)]
+struct Pm {
+    name: String,
+    berry: bool,
+}
+
 fn build_with_pm(pm: &str, npm_command: &str) -> String {
     npm_command.replace("npm run build", &format!("{pm} run build"))
 }
 
-fn install_command(pm: &str, dir: &Path) -> String {
-    match pm {
-        "pnpm" if dir.join("pnpm-lock.yaml").is_file() => "pnpm install --frozen-lockfile".into(),
+fn install_command(pm: &Pm, dir: &Dir) -> String {
+    match pm.name.as_str() {
+        "pnpm" if dir.is_file("pnpm-lock.yaml") => "pnpm install --frozen-lockfile".into(),
         "pnpm" => "pnpm install".into(),
-        "bun" if dir.join("bun.lock").is_file() || dir.join("bun.lockb").is_file() => {
+        "yarn" if !dir.is_file("yarn.lock") => "yarn install".into(),
+        "yarn" if pm.berry => "yarn install --immutable".into(),
+        "yarn" => "yarn install --frozen-lockfile".into(),
+        "bun" if dir.is_file("bun.lock") || dir.is_file("bun.lockb") => {
             "bun install --frozen-lockfile".into()
         }
         "bun" => "bun install".into(),
-        _ if dir.join("package-lock.json").is_file()
-            || dir.join("npm-shrinkwrap.json").is_file() =>
-        {
+        _ if dir.is_file("package-lock.json") || dir.is_file("npm-shrinkwrap.json") => {
             "npm ci".into()
         }
         _ => "npm install".into(),
     }
 }
 
-fn package_manager(dir: &Path, pkg: &PackageJson) -> String {
-    if let Some(field) = &pkg.package_manager
-        && let Some(name) = field.split('@').next()
-        && matches!(name, "pnpm" | "bun" | "npm")
-    {
-        return name.to_string();
+const LOCKFILES: [&str; 6] = [
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    "bun.lock",
+    "bun.lockb",
+    "package-lock.json",
+    "npm-shrinkwrap.json",
+];
+
+/// Precedence: explicit operator choice, then the `packageManager` field, then lockfiles (pnpm, yarn, bun, npm).
+fn resolve_pm(
+    dir: &Dir,
+    pkg: &PackageJson,
+    explicit: Option<&str>,
+    warnings: &mut Vec<String>,
+) -> Pm {
+    let field = pkg.package_manager.as_deref().and_then(|field| {
+        let (name, version) = field.split_once('@').unwrap_or((field, ""));
+        matches!(name, "pnpm" | "bun" | "npm" | "yarn").then(|| (name.to_string(), version))
+    });
+    let (name, reason) = if let Some(name) = explicit.filter(|name| *name != "auto") {
+        (name.to_string(), "CITE_PACKAGE_MANAGER")
+    } else if let Some((name, _)) = &field {
+        (name.clone(), "the packageManager field in package.json")
+    } else if let Some(name) = lockfile_manager(dir) {
+        (name.to_string(), "lockfile precedence pnpm, yarn, bun, npm")
+    } else {
+        ("npm".to_string(), "no lockfile found")
+    };
+    let found: Vec<&str> = LOCKFILES
+        .iter()
+        .copied()
+        .filter(|name| dir.exists(name))
+        .collect();
+    if found.len() > 1 {
+        warnings.push(format!(
+            "multiple lockfiles found ({}); using {name} because of {reason}",
+            found.join(", ")
+        ));
     }
-    if dir.join("pnpm-lock.yaml").exists() {
-        return "pnpm".into();
-    }
-    if dir.join("bun.lock").exists() || dir.join("bun.lockb").exists() {
-        return "bun".into();
-    }
-    "npm".into()
+    let berry = dir.is_file(".yarnrc.yml")
+        || field.as_ref().is_some_and(|(field_name, version)| {
+            field_name == "yarn"
+                && leading_major(version).is_some_and(|major| major != "1" && major != "0")
+        });
+    Pm { name, berry }
 }
 
-fn node_major(dir: &Path, pkg: &PackageJson) -> Option<String> {
+fn lockfile_manager(dir: &Dir) -> Option<&'static str> {
+    if dir.exists("pnpm-lock.yaml") {
+        Some("pnpm")
+    } else if dir.exists("yarn.lock") {
+        Some("yarn")
+    } else if dir.exists("bun.lock") || dir.exists("bun.lockb") {
+        Some("bun")
+    } else if dir.exists("package-lock.json") || dir.exists("npm-shrinkwrap.json") {
+        Some("npm")
+    } else {
+        None
+    }
+}
+
+fn node_major(dir: &Dir, pkg: &PackageJson, warnings: &mut Vec<String>) -> Option<String> {
     for name in [".nvmrc", ".node-version"] {
-        if let Ok(text) = fs::read_to_string(dir.join(name))
-            && let Some(major) = leading_major(text.trim().trim_start_matches('v'))
-        {
+        let Some(text) = read_optional(dir, name) else {
+            continue;
+        };
+        let Some(value) = text
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty() && !line.starts_with('#'))
+        else {
+            continue;
+        };
+        if let Some(major) = version_major(value) {
             return Some(major);
         }
+        warnings.push(format!(
+            "{name} is not a numeric version (version aliases are unsupported); ignoring it"
+        ));
     }
     pkg.engines
         .as_ref()
         .and_then(|engines| engines.node.as_deref())
         .and_then(leading_major)
+}
+
+/// Accepts `22`, `v22.1.0` and `22.x`; aliases such as `lts/*` or `node` yield `None`.
+fn version_major(value: &str) -> Option<String> {
+    let rest = value.strip_prefix(['v', 'V']).unwrap_or(value);
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    let after = &rest[digits.len()..];
+    (!digits.is_empty() && (after.is_empty() || after.starts_with(['.', ' ', '-', 'x'])))
+        .then_some(digits)
 }
 
 fn leading_major(text: &str) -> Option<String> {
@@ -351,35 +483,55 @@ fn script<'a>(pkg: &'a PackageJson, name: &str) -> Option<&'a str> {
     pkg.scripts.get(name).and_then(Value::as_str)
 }
 
-fn config_contains(dir: &Path, files: &[&str], needles: &[&str]) -> bool {
+fn config_contains(dir: &Dir, files: &[&str], needles: &[&str]) -> bool {
     files.iter().any(|name| {
-        fs::read_to_string(dir.join(name))
-            .ok()
+        read_optional(dir, name)
             .is_some_and(|text| needles.iter().any(|needle| text.contains(needle)))
     })
 }
 
-fn angular_project(dir: &Path) -> Option<String> {
-    let text = fs::read_to_string(dir.join("angular.json")).ok()?;
+fn angular_project(dir: &Dir) -> Option<String> {
+    let text = read_optional(dir, "angular.json")?;
     let value: Value = serde_json::from_str(&text).ok()?;
     value.get("projects")?.as_object()?.keys().next().cloned()
 }
 
-fn read_capped(path: &Path, max: u64) -> Result<String> {
-    let meta = fs::metadata(path)?;
+/// Reads through the repo-rooted handle so a symlink in the checkout cannot point outside it.
+fn read_capped(dir: &Dir, name: &str, max: u64) -> Result<String> {
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(rustix::fs::OFlags::NONBLOCK.bits() as i32);
+    let file = dir.open_with(name, &options)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(Error::msg(format!("{name} is not a regular file")));
+    }
     if meta.len() > max {
         return Err(Error::TooLarge {
             len: meta.len(),
             max,
         });
     }
-    let bytes = fs::read(path)?;
+    let mut bytes = Vec::new();
+    file.take(max + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max {
+        return Err(Error::TooLarge {
+            len: bytes.len() as u64,
+            max,
+        });
+    }
     String::from_utf8(bytes).map_err(|err| Error::msg(err.to_string()))
+}
+
+fn read_optional(dir: &Dir, name: &str) -> Option<String> {
+    read_capped(dir, name, 262_144).ok()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use tempfile::tempdir;
 
     fn site(files: &[(&str, &str)]) -> tempfile::TempDir {
@@ -423,7 +575,7 @@ mod tests {
         let det = detect_site(next.path()).unwrap();
         assert_eq!(det.framework, "next");
         assert_eq!(det.rendering, Rendering::Ssr);
-        assert_eq!(det.start_argv, vec!["next", "start"]);
+        assert_eq!(det.start_argv, vec!["next", "start", "-H", "127.0.0.1"]);
         assert_eq!(det.build_command, "npm run build");
 
         let standalone = site(&[
@@ -453,6 +605,278 @@ mod tests {
             detect_site(nuxt.path()).unwrap().start_argv[1],
             ".output/server/index.mjs"
         );
+    }
+
+    const NEXT_STANDALONE: [(&str, &str); 2] = [
+        (
+            "package.json",
+            r#"{"dependencies":{"next":"15.0.0"},"scripts":{"build":"next build"}}"#,
+        ),
+        (
+            "next.config.ts",
+            "export default { output: 'standalone' };\n",
+        ),
+    ];
+
+    fn next_with(extra: &[(&str, &str)]) -> tempfile::TempDir {
+        let mut files = NEXT_STANDALONE.to_vec();
+        files.extend_from_slice(extra);
+        site(&files)
+    }
+
+    #[test]
+    fn explicit_package_manager_drives_install_and_build() {
+        let dir = next_with(&[("pnpm-lock.yaml", "lockfileVersion: 9\n")]);
+        let auto = detect_site(dir.path()).unwrap();
+        assert!(auto.build_command.starts_with("pnpm run build && "));
+        for choice in [None, Some("auto")] {
+            let det = detect_site_with(dir.path(), choice).unwrap();
+            assert_eq!(det.package_manager, "pnpm");
+        }
+        let det = detect_site_with(dir.path(), Some("npm")).unwrap();
+        assert_eq!(det.package_manager, "npm");
+        assert!(det.build_command.starts_with("npm run build && "));
+        assert!(!det.build_command.contains("pnpm"));
+        assert_eq!(det.install_command, "npm install");
+        assert!(det.warnings.is_empty());
+
+        let det = detect_site_with(dir.path(), Some("yarn")).unwrap();
+        assert!(det.build_command.starts_with("yarn run build && "));
+        assert_eq!(det.install_command, "yarn install");
+    }
+
+    #[test]
+    fn explicit_package_manager_drives_non_next_presets() {
+        let dir = site(&[
+            ("package.json", r#"{"dependencies":{"vite":"^6"}}"#),
+            ("package-lock.json", "{}"),
+        ]);
+        let det = detect_site_with(dir.path(), Some("bun")).unwrap();
+        assert_eq!(det.build_command, "bun run build");
+        assert_eq!(det.install_command, "bun install");
+    }
+
+    #[test]
+    fn multiple_lockfiles_warn_with_the_winner_and_reason() {
+        let dir = next_with(&[
+            ("pnpm-lock.yaml", "x"),
+            ("package-lock.json", "{}"),
+            ("yarn.lock", "x"),
+        ]);
+        let det = detect_site(dir.path()).unwrap();
+        assert_eq!(det.warnings.len(), 1);
+        let warning = &det.warnings[0];
+        for needle in [
+            "pnpm-lock.yaml",
+            "package-lock.json",
+            "yarn.lock",
+            "using pnpm",
+            "lockfile precedence",
+        ] {
+            assert!(warning.contains(needle), "{warning}");
+        }
+        let det = detect_site_with(dir.path(), Some("npm")).unwrap();
+        assert!(det.warnings[0].contains("using npm because of CITE_PACKAGE_MANAGER"));
+
+        let single = next_with(&[("yarn.lock", "x")]);
+        assert!(detect_site(single.path()).unwrap().warnings.is_empty());
+    }
+
+    #[test]
+    fn package_manager_field_outranks_lockfiles() {
+        let dir = site(&[
+            (
+                "package.json",
+                r#"{"packageManager":"npm@10.0.0","dependencies":{"vite":"^6"}}"#,
+            ),
+            ("pnpm-lock.yaml", "x"),
+            ("bun.lockb", "x"),
+        ]);
+        let det = detect_site(dir.path()).unwrap();
+        assert_eq!(det.package_manager, "npm");
+        assert!(det.warnings[0].contains("packageManager field"));
+    }
+
+    #[test]
+    fn lockfile_precedence_is_pnpm_yarn_bun_npm() {
+        let pm = |files: &[(&str, &str)]| {
+            let mut all = vec![("package.json", r#"{"dependencies":{"vite":"^6"}}"#)];
+            all.extend_from_slice(files);
+            detect_site(site(&all).path()).unwrap().package_manager
+        };
+        assert_eq!(
+            pm(&[("pnpm-lock.yaml", ""), ("yarn.lock", ""), ("bun.lock", "")]),
+            "pnpm"
+        );
+        assert_eq!(
+            pm(&[
+                ("yarn.lock", ""),
+                ("bun.lock", ""),
+                ("package-lock.json", "")
+            ]),
+            "yarn"
+        );
+        assert_eq!(pm(&[("bun.lock", ""), ("package-lock.json", "")]), "bun");
+        assert_eq!(pm(&[("npm-shrinkwrap.json", "")]), "npm");
+        assert_eq!(pm(&[]), "npm");
+    }
+
+    #[test]
+    fn shrinkwrap_is_npm_ci() {
+        let dir = site(&[
+            ("package.json", r#"{"dependencies":{"vite":"^6"}}"#),
+            ("npm-shrinkwrap.json", "{}"),
+        ]);
+        let det = detect_site(dir.path()).unwrap();
+        assert_eq!(det.package_manager, "npm");
+        assert_eq!(det.install_command, "npm ci");
+    }
+
+    #[test]
+    fn yarn_classic_and_berry() {
+        let classic = next_with(&[("yarn.lock", "# yarn lockfile v1\n")]);
+        let det = detect_site(classic.path()).unwrap();
+        assert_eq!(det.package_manager, "yarn");
+        assert_eq!(det.install_command, "yarn install --frozen-lockfile");
+        assert!(det.build_command.starts_with("yarn run build && "));
+
+        let rc = next_with(&[
+            ("yarn.lock", "x"),
+            (".yarnrc.yml", "nodeLinker: node-modules\n"),
+        ]);
+        assert_eq!(
+            detect_site(rc.path()).unwrap().install_command,
+            "yarn install --immutable"
+        );
+
+        let field = |version: &str| {
+            let json =
+                format!(r#"{{"packageManager":"yarn@{version}","dependencies":{{"vite":"^6"}}}}"#);
+            let dir = site(&[("package.json", json.as_str()), ("yarn.lock", "x")]);
+            detect_site(dir.path()).unwrap().install_command
+        };
+        assert_eq!(field("4.1.0+sha256.abc"), "yarn install --immutable");
+        assert_eq!(field("2.4.3"), "yarn install --immutable");
+        assert_eq!(field("1.22.22"), "yarn install --frozen-lockfile");
+
+        let det = detect_site_with(classic.path(), Some("yarn")).unwrap();
+        assert_eq!(det.package_manager, "yarn");
+    }
+
+    #[test]
+    fn node_version_files_accept_v_prefix_and_ignore_aliases() {
+        let major = |name: &str, body: &str| {
+            let dir = site(&[
+                (
+                    "package.json",
+                    r#"{"dependencies":{"vite":"^6"},"engines":{"node":">=18"}}"#,
+                ),
+                (name, body),
+            ]);
+            detect_site(dir.path()).unwrap()
+        };
+        assert_eq!(
+            major(".nvmrc", "v20.11.1\n").node_major.as_deref(),
+            Some("20")
+        );
+        assert_eq!(
+            major(".node-version", "v22\n").node_major.as_deref(),
+            Some("22")
+        );
+        assert_eq!(
+            major(".nvmrc", "# pinned\n21.x\n").node_major.as_deref(),
+            Some("21")
+        );
+        for alias in ["lts/*", "lts/iron", "lts/-1", "node", "latest"] {
+            let det = major(".nvmrc", alias);
+            assert_eq!(det.node_major.as_deref(), Some("18"), "{alias}");
+            assert!(det.warnings.iter().any(|w| w.contains(".nvmrc")), "{alias}");
+            assert!(det.warnings.iter().all(|w| !w.contains(alias)), "{alias}");
+        }
+        assert_eq!(major(".nvmrc", "").node_major.as_deref(), Some("18"));
+    }
+
+    #[test]
+    fn ssr_presets_start_entries() {
+        let entry = |deps: &str| {
+            let json = format!(r#"{{"dependencies":{deps}}}"#);
+            detect_site(site(&[("package.json", json.as_str())]).path())
+                .unwrap()
+                .start_argv
+        };
+        assert_eq!(
+            entry(r#"{"@sveltejs/kit":"2"}"#),
+            ["node", "build/index.js"]
+        );
+        assert_eq!(
+            entry(r#"{"nuxt":"3"}"#),
+            ["node", ".output/server/index.mjs"]
+        );
+        assert_eq!(
+            entry(r#"{"astro":"5","@astrojs/node":"9"}"#),
+            ["node", "dist/server/entry.mjs"]
+        );
+    }
+
+    #[test]
+    fn explicit_rendering_rescues_frameworkless_sites() {
+        let dir = site(&[
+            ("package.json", r#"{"scripts":{"build":"node build.js"}}"#),
+            ("pnpm-lock.yaml", "x"),
+        ]);
+        assert!(detect_site(dir.path()).is_err());
+        let det = detect_site_configured(dir.path(), None, Some(Rendering::Static)).unwrap();
+        assert_eq!(det.framework, "generic-static");
+        assert_eq!(det.rendering, Rendering::Static);
+        assert_eq!(det.build_command, "pnpm run build");
+        assert_eq!(det.install_command, "pnpm install --frozen-lockfile");
+        let det = detect_site_configured(dir.path(), Some("npm"), Some(Rendering::Static)).unwrap();
+        assert_eq!(det.build_command, "npm run build");
+
+        let nobuild = site(&[("package.json", r#"{"name":"x"}"#)]);
+        let det = detect_site_configured(nobuild.path(), None, Some(Rendering::Static)).unwrap();
+        assert_eq!(det.build_command, "true");
+
+        let det = detect_site_configured(dir.path(), None, Some(Rendering::Ssr)).unwrap();
+        assert_eq!(det.framework, "generic-node");
+        assert_eq!(det.rendering, Rendering::Ssr);
+        assert!(det.start_argv.is_empty());
+
+        let started = site(&[("package.json", r#"{"scripts":{"start":"node server.js"}}"#)]);
+        let det = detect_site_configured(started.path(), None, Some(Rendering::Ssr)).unwrap();
+        assert_eq!(det.start_argv, ["node", "server.js"]);
+        let shell = site(&[("package.json", r#"{"scripts":{"start":"a && b"}}"#)]);
+        assert!(detect_site(shell.path()).is_err());
+        let det = detect_site_configured(shell.path(), None, Some(Rendering::Ssr)).unwrap();
+        assert!(det.start_argv.is_empty());
+    }
+
+    #[test]
+    fn explicit_rendering_does_not_change_recognised_frameworks() {
+        let dir = site(&[("package.json", r#"{"dependencies":{"vite":"^6"}}"#)]);
+        let det = detect_site_configured(dir.path(), None, Some(Rendering::Ssr)).unwrap();
+        assert_eq!(det.framework, "vite");
+    }
+
+    #[test]
+    fn detection_reads_do_not_follow_symlinks_out_of_the_repo() {
+        let outside = site(&[
+            ("secret.json", r#"{"dependencies":{"vite":"^6"}}"#),
+            ("version", "99\n"),
+        ]);
+        let repo = site(&[("package.json", r#"{"dependencies":{"vite":"^6"}}"#)]);
+        std::os::unix::fs::symlink(outside.path().join("version"), repo.path().join(".nvmrc"))
+            .unwrap();
+        let det = detect_site(repo.path()).unwrap();
+        assert_eq!(det.node_major, None);
+
+        let linked = site(&[]);
+        std::os::unix::fs::symlink(
+            outside.path().join("secret.json"),
+            linked.path().join("package.json"),
+        )
+        .unwrap();
+        assert!(detect_site(linked.path()).is_err());
     }
 
     #[test]

@@ -218,6 +218,8 @@ mod tests {
         let data = tmp.path().join("cite_data");
         let token = tmp.path().join("token");
         std::fs::write(&token, "ghp_citeMockGithubPat00000000000000001\n").unwrap();
+        std::fs::set_permissions(&token, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .unwrap();
         let pairs = [
             ("CITE_REPO", "owner/name"),
             ("CITE_DATA_DIR", data.to_str().unwrap()),
@@ -277,6 +279,8 @@ mod tests {
         let data = tmp.path().join("cite_data");
         let token = tmp.path().join("token");
         std::fs::write(&token, "ghp_citeMockGithubPat00000000000000001\n").unwrap();
+        std::fs::set_permissions(&token, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .unwrap();
         let pairs = [
             ("CITE_REPO", "owner/name"),
             ("CITE_DATA_DIR", data.to_str().unwrap()),
@@ -351,6 +355,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let token = tmp.path().join("token");
         std::fs::write(&token, "ghp_citeMockGithubPat00000000000000001\n").unwrap();
+        std::fs::set_permissions(&token, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .unwrap();
         let data = tmp.path().join("cite_data");
         let work = tmp.path().join("work");
         let cache = tmp.path().join("cache");

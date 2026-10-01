@@ -1,0 +1,16 @@
+services:
+  init:
+    image: ${CITE_E2E_MANAGER_IMAGE:-cite-manager:dev}
+  manager:
+    image: ${CITE_E2E_MANAGER_IMAGE:-cite-manager:dev}
+    environment:
+      CITE_GITHUB_API_URL: http://mock-github:8080
+      CITE_POLL_INTERVAL: "off"
+      CITE_RENDERING: ${CITE_E2E_RENDERING:-static}
+      CITE_OUTPUT_DIR: ${CITE_E2E_OUTPUT_DIR:-dist}
+      CITE_RUNTIME: ${CITE_E2E_RUNTIME:-node}
+      CITE_HEALTH_TIMEOUT: 30s
+  executor:
+    image: ${CITE_E2E_EXECUTOR_IMAGE:-cite-executor-node:e2e}
+  mock-github:
+    image: cite-mock-github:dev

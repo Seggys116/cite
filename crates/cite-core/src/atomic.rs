@@ -1,7 +1,9 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+use rustix::fs::{Mode, OFlags};
 
 use crate::error::{Error, Result};
 
@@ -30,15 +32,35 @@ pub fn ensure_dir(path: &Path, mode: u32) -> Result<()> {
     }
 }
 
+/// Opens without following a final symlink or blocking on a FIFO, and requires a regular file.
+pub fn open_regular(path: &Path) -> Result<(File, fs::Metadata)> {
+    let fd = rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(std::io::Error::from)?;
+    let file = File::from(fd);
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(Error::msg(format!(
+            "{} is not a regular file",
+            path.display()
+        )));
+    }
+    Ok((file, meta))
+}
+
 pub fn read_limited(path: &Path, max: u64) -> Result<Vec<u8>> {
-    let meta = fs::metadata(path)?;
+    let (file, meta) = open_regular(path)?;
     if meta.len() > max {
         return Err(Error::TooLarge {
             len: meta.len(),
             max,
         });
     }
-    let bytes = fs::read(path)?;
+    let mut bytes = Vec::new();
+    file.take(max + 1).read_to_end(&mut bytes)?;
     if bytes.len() as u64 > max {
         return Err(Error::TooLarge {
             len: bytes.len() as u64,
@@ -235,5 +257,29 @@ mod tests {
         fs::write(&path, vec![1u8; 64]).unwrap();
         let err = read_limited(&path, 16).unwrap_err();
         assert!(matches!(err, Error::TooLarge { .. }));
+    }
+
+    #[test]
+    fn read_limited_refuses_symlinks_devices_and_fifos() {
+        let dir = tempdir().unwrap();
+        let link = dir.path().join("status.json");
+        std::os::unix::fs::symlink("/dev/zero", &link).unwrap();
+        assert!(read_limited(&link, 1024).is_err());
+        assert!(read_limited(Path::new("/dev/zero"), 1024).is_err());
+
+        let real = dir.path().join("real");
+        fs::write(&real, b"{}").unwrap();
+        let to_file = dir.path().join("to_file");
+        std::os::unix::fs::symlink(&real, &to_file).unwrap();
+        assert!(read_limited(&to_file, 1024).is_err());
+        assert_eq!(read_limited(&real, 1024).unwrap(), b"{}");
+
+        let fifo = dir.path().join("fifo");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        assert!(read_limited(&fifo, 1024).is_err());
     }
 }

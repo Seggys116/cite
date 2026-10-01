@@ -29,6 +29,7 @@ pub struct SharedState {
     pub conn_count: Arc<AtomicU64>,
     pub slot_mgr: Arc<SlotManager>,
     pub requests: Arc<AtomicU64>,
+    pub limiter: Arc<crate::limits::Limiter>,
     #[allow(dead_code)] // available to handlers / future access-log redaction
     pub redactor: Arc<Redactor>,
     pub process_exit: watch::Sender<bool>,
@@ -876,6 +877,9 @@ async fn write_heartbeat(state: &SharedState) {
     let mut st = state.status.lock().await;
     st.updated_at = now_rfc3339();
     st.requests = state.requests.load(Ordering::Relaxed);
+    st.limited_requests = state.limiter.limited_requests();
+    st.bans = state.limiter.bans();
+    st.dropped_connections = state.limiter.dropped_connections();
     if let Some(result) = st.last_result.as_mut()
         && result.outcome == Outcome::Live
         && !tail.is_empty()
@@ -924,8 +928,11 @@ async fn set_last_result(
     st.last_result = Some(LastResult {
         generation,
         outcome,
-        reason,
-        log_tail,
+        reason: cite_core::escape_control(&reason, false),
+        log_tail: log_tail
+            .iter()
+            .map(|line| cite_core::escape_control(line, true))
+            .collect(),
     });
     st.updated_at = now_rfc3339();
     let _ = write_status(&state.config.status_path(), &st);

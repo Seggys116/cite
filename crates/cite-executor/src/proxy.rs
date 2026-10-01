@@ -1,8 +1,10 @@
 #![forbid(unsafe_code)]
 
 use std::net::{IpAddr, SocketAddr};
+use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -12,6 +14,7 @@ use http_body::Frame;
 use http_body_util::{BodyExt, LengthLimitError, Limited, StreamBody};
 use hyper::body::Incoming;
 use hyper_util::rt::TokioIo;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 
 use crate::error_page::{self, BoxBody, full_body, page_413, page_502, page_504};
@@ -28,7 +31,19 @@ const HOP_BY_HOP: &[&str] = &[
     "proxy-connection",
 ];
 
+/// Headers apps read as the client address or origin; only a trusted proxy may set them.
+const CLIENT_IDENTITY_HEADERS: &[&str] = &[
+    "x-real-ip",
+    "x-forwarded-port",
+    "x-forwarded-prefix",
+    "true-client-ip",
+    "x-client-ip",
+    "cf-connecting-ip",
+];
+
 pub struct ProxyConfig<'a> {
+    /// Kept alive by an upgraded tunnel so its connection permit is held until the tunnel closes.
+    pub hold: Option<Arc<dyn Send + Sync>>,
     pub port: u16,
     pub peer: SocketAddr,
     pub trusted_proxies: &'a [ipnet::IpNet],
@@ -63,7 +78,12 @@ pub async fn proxy_request(mut req: Request<Incoming>, cfg: ProxyConfig<'_>) -> 
 
     let is_upgrade = req.headers().contains_key(header::UPGRADE);
     strip_hop_by_hop(req.headers_mut(), is_upgrade);
-    set_forwarded_headers(req.headers_mut(), cfg.peer, cfg.trusted_proxies);
+    set_forwarded_headers_for(
+        req.headers_mut(),
+        cfg.peer,
+        cfg.trusted_proxies,
+        cfg.allowed_hosts,
+    );
 
     let upstream: SocketAddr = ([127, 0, 0, 1], cfg.port).into();
     let connect = TcpStream::connect(upstream);
@@ -197,7 +217,12 @@ pub async fn proxy_with_upgrade(req: Request<Incoming>, cfg: ProxyConfig<'_>) ->
     let body = limit_request_body(body, cfg.max_body, exceeded.clone());
     let mut upstream_req = Request::from_parts(parts, body);
     strip_hop_by_hop(upstream_req.headers_mut(), true);
-    set_forwarded_headers(upstream_req.headers_mut(), cfg.peer, cfg.trusted_proxies);
+    set_forwarded_headers_for(
+        upstream_req.headers_mut(),
+        cfg.peer,
+        cfg.trusted_proxies,
+        cfg.allowed_hosts,
+    );
 
     let upstream: SocketAddr = ([127, 0, 0, 1], cfg.port).into();
     let stream = match tokio::time::timeout(cfg.connect_timeout, TcpStream::connect(upstream)).await
@@ -239,14 +264,31 @@ pub async fn proxy_with_upgrade(req: Request<Incoming>, cfg: ProxyConfig<'_>) ->
     let (res_parts, res_body) = res.into_parts();
     let upstream_upgrade = hyper::upgrade::on(Response::from_parts(res_parts.clone(), res_body));
 
+    let hold = cfg.hold.clone();
+    let idle = cfg.idle_timeout;
     tokio::spawn(async move {
+        let _hold = hold;
         let (client, upstream) = match tokio::join!(client_upgrade, upstream_upgrade) {
             (Ok(c), Ok(u)) => (c, u),
             _ => return,
         };
-        let mut client = TokioIo::new(client);
-        let mut upstream = TokioIo::new(upstream);
-        let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+        let activity = Arc::new(AtomicU64::new(0));
+        let mut client = Watched::new(TokioIo::new(client), activity.clone());
+        let mut upstream = Watched::new(TokioIo::new(upstream), activity.clone());
+        let mut copy = std::pin::pin!(tokio::io::copy_bidirectional(&mut client, &mut upstream));
+        let mut seen = 0;
+        loop {
+            tokio::select! {
+                _ = &mut copy => break,
+                _ = tokio::time::sleep(idle) => {
+                    let now = activity.load(Ordering::Relaxed);
+                    if now == seen {
+                        break;
+                    }
+                    seen = now;
+                }
+            }
+        }
     });
 
     let mut out = Response::new(full_body(Bytes::new()));
@@ -255,6 +297,56 @@ pub async fn proxy_with_upgrade(req: Request<Incoming>, cfg: ProxyConfig<'_>) ->
         out.headers_mut().append(k.clone(), v.clone());
     }
     out
+}
+
+/// Counts bytes moved in either direction so an idle tunnel can be told from a busy one.
+struct Watched<T> {
+    inner: T,
+    activity: Arc<AtomicU64>,
+}
+
+impl<T> Watched<T> {
+    fn new(inner: T, activity: Arc<AtomicU64>) -> Self {
+        Self { inner, activity }
+    }
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for Watched<T> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let result = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if result.is_ready() {
+            let moved = buf.filled().len().saturating_sub(before);
+            self.activity.fetch_add(moved as u64, Ordering::Relaxed);
+        }
+        result
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for Watched<T> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        data: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let result = Pin::new(&mut self.inner).poll_write(cx, data);
+        if let Poll::Ready(Ok(moved)) = &result {
+            self.activity.fetch_add(*moved as u64, Ordering::Relaxed);
+        }
+        result
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
 }
 
 fn declared_length_exceeds(headers: &HeaderMap, max_body: u64) -> bool {
@@ -300,9 +392,54 @@ fn quote_forwarded(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
+pub fn is_trusted_ip(trusted: &[ipnet::IpNet], ip: IpAddr) -> bool {
+    let ip = ip.to_canonical();
+    trusted.iter().any(|net| net.contains(&ip))
+}
+
+/// The address a request is attributed to: the peer, or behind a trusted proxy the right-most untrusted X-Forwarded-For hop.
+pub fn client_ip(peer: IpAddr, headers: &HeaderMap, trusted: &[ipnet::IpNet]) -> IpAddr {
+    let peer = peer.to_canonical();
+    if !is_trusted_ip(trusted, peer) {
+        return peer;
+    }
+    for value in headers.get_all("x-forwarded-for").iter().rev() {
+        for hop in value.as_bytes().rsplit(|byte| *byte == b',') {
+            let Some(ip) = parse_hop(hop.trim_ascii()) else {
+                return peer;
+            };
+            if !is_trusted_ip(trusted, ip) {
+                return ip;
+            }
+        }
+    }
+    peer
+}
+
+fn parse_hop(hop: &[u8]) -> Option<IpAddr> {
+    let hop = std::str::from_utf8(hop).ok()?;
+    if let Ok(addr) = hop.parse::<SocketAddr>() {
+        return Some(addr.ip().to_canonical());
+    }
+    let bare = hop.trim_start_matches('[');
+    let ip: IpAddr = bare.split(']').next().unwrap_or(bare).parse().ok()?;
+    Some(ip.to_canonical())
+}
+
+#[cfg(test)]
 pub fn set_forwarded_headers(headers: &mut HeaderMap, peer: SocketAddr, trusted: &[ipnet::IpNet]) {
-    let peer_ip = peer.ip();
-    let trusted_peer = trusted.iter().any(|net| net.contains(&peer_ip));
+    set_forwarded_headers_for(headers, peer, trusted, &[]);
+}
+
+/// With a non-empty `allowed_hosts`, a trusted X-Forwarded-Host is kept only if it is allowed; otherwise the request's own Host replaces it.
+pub fn set_forwarded_headers_for(
+    headers: &mut HeaderMap,
+    peer: SocketAddr,
+    trusted: &[ipnet::IpNet],
+    allowed_hosts: &[String],
+) {
+    let peer_ip = peer.ip().to_canonical();
+    let trusted_peer = is_trusted_ip(trusted, peer_ip);
 
     let text_of = |headers: &HeaderMap, name: &str| {
         headers
@@ -322,6 +459,11 @@ pub fn set_forwarded_headers(headers: &mut HeaderMap, peer: SocketAddr, trusted:
         .unwrap_or("localhost")
         .to_string();
 
+    if !trusted_peer {
+        for name in CLIENT_IDENTITY_HEADERS {
+            headers.remove(*name);
+        }
+    }
     headers.remove("x-forwarded-for");
     headers.remove("x-forwarded-proto");
     headers.remove("x-forwarded-host");
@@ -335,7 +477,9 @@ pub fn set_forwarded_headers(headers: &mut HeaderMap, peer: SocketAddr, trusted:
         (
             xff,
             client_proto.unwrap_or_else(|| "http".to_string()),
-            client_host.unwrap_or(own_host),
+            client_host
+                .filter(|host| cite_core::host_allowed(allowed_hosts, host))
+                .unwrap_or(own_host),
         )
     } else {
         (peer_ip.to_string(), "http".to_string(), own_host)
@@ -440,6 +584,138 @@ mod tests {
             headers.get("x-forwarded-for").unwrap().to_str().unwrap(),
             "10.0.0.5"
         );
+    }
+
+    #[test]
+    fn untrusted_peers_lose_client_identity_headers() {
+        let names = [
+            "x-real-ip",
+            "x-forwarded-port",
+            "x-forwarded-prefix",
+            "true-client-ip",
+            "x-client-ip",
+            "cf-connecting-ip",
+        ];
+        let filled = || {
+            let mut headers = HeaderMap::new();
+            for name in names {
+                headers.insert(name, HeaderValue::from_static("1.2.3.4"));
+            }
+            headers
+        };
+        let peer = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 5), 1234));
+        let mut untrusted = filled();
+        set_forwarded_headers(&mut untrusted, peer, &[]);
+        assert!(names.iter().all(|name| !untrusted.contains_key(*name)));
+        let trusted: Vec<ipnet::IpNet> = vec!["10.0.0.0/8".parse().unwrap()];
+        let mut kept = filled();
+        set_forwarded_headers(&mut kept, peer, &trusted);
+        assert!(names.iter().all(|name| kept.contains_key(*name)));
+    }
+
+    #[test]
+    fn client_ip_uses_the_right_most_untrusted_hop_behind_trusted_proxies() {
+        let trusted: Vec<ipnet::IpNet> = vec!["10.0.0.0/8".parse().unwrap()];
+        let proxy: IpAddr = "10.0.0.5".parse().unwrap();
+        let outside: IpAddr = "198.51.100.7".parse().unwrap();
+        let with = |value: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-forwarded-for", HeaderValue::from_str(value).unwrap());
+            headers
+        };
+        assert_eq!(client_ip(outside, &with("1.1.1.1"), &trusted), outside);
+        assert_eq!(client_ip(proxy, &HeaderMap::new(), &trusted), proxy);
+        assert_eq!(
+            client_ip(proxy, &with("203.0.113.9"), &trusted),
+            "203.0.113.9".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(
+            client_ip(proxy, &with("6.6.6.6, 203.0.113.9, 10.1.1.1"), &trusted),
+            "203.0.113.9".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(
+            client_ip(proxy, &with("[2001:db8::1]:443"), &trusted),
+            "2001:db8::1".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(
+            client_ip(proxy, &with("10.2.2.2, 10.3.3.3"), &trusted),
+            proxy
+        );
+        assert_eq!(client_ip(proxy, &with("not-an-ip"), &trusted), proxy);
+        let mut raw = HeaderMap::new();
+        raw.insert(
+            "x-forwarded-for",
+            HeaderValue::from_bytes(b"\xff\xfe junk, 203.0.113.9").unwrap(),
+        );
+        assert_eq!(
+            client_ip(proxy, &raw, &trusted),
+            "203.0.113.9".parse::<IpAddr>().unwrap()
+        );
+        let mapped_peer: IpAddr = "::ffff:10.0.0.5".parse().unwrap();
+        assert_eq!(
+            client_ip(mapped_peer, &with("203.0.113.9"), &trusted),
+            "203.0.113.9".parse::<IpAddr>().unwrap()
+        );
+        assert!(is_trusted_ip(&trusted, mapped_peer));
+    }
+
+    #[test]
+    fn trusted_forwarded_host_must_pass_the_allowlist() {
+        let peer = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 5), 1234));
+        let trusted: Vec<ipnet::IpNet> = vec!["10.0.0.0/8".parse().unwrap()];
+        let allowed = vec!["example.com".to_string()];
+        let run = |forwarded: &str, allowed: &[String]| {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::HOST, HeaderValue::from_static("example.com"));
+            headers.insert(
+                "x-forwarded-host",
+                HeaderValue::from_str(forwarded).unwrap(),
+            );
+            set_forwarded_headers_for(&mut headers, peer, &trusted, allowed);
+            headers
+        };
+        let evil = run("evil.example", &allowed);
+        assert_eq!(evil.get("x-forwarded-host").unwrap(), "example.com");
+        assert!(
+            evil.get("forwarded")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("host=\"example.com\"")
+        );
+        assert_eq!(
+            run("example.com:8443", &allowed)
+                .get("x-forwarded-host")
+                .unwrap(),
+            "example.com:8443"
+        );
+        assert_eq!(
+            run("evil.example", &[]).get("x-forwarded-host").unwrap(),
+            "evil.example"
+        );
+    }
+
+    #[test]
+    fn mapped_ipv6_peer_is_trusted_and_written_canonically() {
+        let mapped: SocketAddr = "[::ffff:10.0.0.5]:1234".parse().unwrap();
+        let trusted: Vec<ipnet::IpNet> = vec!["10.0.0.0/8".parse().unwrap()];
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", HeaderValue::from_static("9.9.9.9"));
+        headers.insert("x-real-ip", HeaderValue::from_static("9.9.9.9"));
+        set_forwarded_headers(&mut headers, mapped, &trusted);
+        assert_eq!(headers.get("x-forwarded-for").unwrap(), "9.9.9.9, 10.0.0.5");
+        assert!(headers.contains_key("x-real-ip"));
+        assert!(
+            headers
+                .get("forwarded")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("for=\"10.0.0.5\"")
+        );
+        let mut untrusted = HeaderMap::new();
+        set_forwarded_headers(&mut untrusted, mapped, &[]);
+        assert_eq!(untrusted.get("x-forwarded-for").unwrap(), "10.0.0.5");
     }
 
     #[test]

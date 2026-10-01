@@ -43,6 +43,9 @@ async fn run_daemon() -> Result<()> {
     let config = ExecutorConfig::load()?;
     let redactor = cite_executor::runtime_redactor(&config);
     init_logging(redactor);
+    if let Some(limit) = cite_executor::raise_nofile_limit() {
+        tracing::debug!(limit, "open file limit");
+    }
 
     let mut running: RunningExecutor = spawn(config).await?;
     let mut sigterm = signal(SignalKind::terminate())?;

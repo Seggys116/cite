@@ -573,6 +573,8 @@ mod tests {
     fn client_for(port: u16, dir: &std::path::Path) -> GithubClient {
         let token = dir.join("token");
         std::fs::write(&token, "ghp_citeMockGithubPat00000000000000001\n").unwrap();
+        std::fs::set_permissions(&token, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .unwrap();
         GithubClient::new(
             &format!("http://127.0.0.1:{port}"),
             "owner",
@@ -684,6 +686,8 @@ mod tests {
 
         let token = dir.path().join("token");
         std::fs::write(&token, "ghp_citeMockGithubPat00000000000000001\n").unwrap();
+        std::fs::set_permissions(&token, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .unwrap();
         let client = GithubClient::new(
             &format!("https://127.0.0.1:{port}"),
             "owner",

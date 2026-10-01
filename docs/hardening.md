@@ -39,7 +39,7 @@ Production Compose caps each service so one site cannot exhaust the host:
 | Service | Memory | CPUs | PIDs |
 |---|---|---|---|
 | manager | 2 GB | 2 | 2048 |
-| executor | 512 MB | 1 | 256 |
+| executor | 1 GB | 1 | 256 |
 
 Build wall-clock time is capped by `CITE_BUILD_TIMEOUT` (default 15 m). The executor also caps connections, header bytes, and body bytes.
 
@@ -72,7 +72,7 @@ Also restrict cloud IAM / instance profiles to least privilege. Cite does not pr
 - Log driver: `json-file`, `max-size=10m`, `max-file=3`.
 - The PAT is set as `CITE_GITHUB_TOKEN` in `.env` and passed to the **manager container's environment only**. It is visible to `docker inspect` on the host and to root inside the manager, so restrict who can run Docker on the host and keep `.env` mode `600`.
 - It is not visible to the uid-10002 build process (builds run with a cleared environment and `/proc/1/environ` is unreadable to that uid), and the executor never receives it: `docker inspect` of the executor shows no PAT.
-- For rotation without a restart, mount a file and set `CITE_GITHUB_TOKEN_FILE` to its path; it is re-read on every poll.
+- For rotation without a restart, mount a file and set `CITE_GITHUB_TOKEN_FILE` to its path; it is re-read on every poll. The file must be a regular file readable only by its owner (mode `0400` or `0600`); Cite refuses a group- or world-readable token file, because the build uid could otherwise read a bind mount. Mount it under `/run/cite/` (a root-only tmpfs), for example `./github_token:/run/cite/github_token:ro`, so uid 10002 cannot reach it whatever its mode.
 - Use a fine-grained PAT limited to the one repository with `contents:read`.
 
 ## Executor shell-less

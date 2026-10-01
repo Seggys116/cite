@@ -12,12 +12,12 @@ Compose-level settings live in `.env` (copy `.env.example`). `.env` is gitignore
 | `CITE_GITHUB_TOKEN` | — | **required**, PAT with `contents:read`; passed to the manager only |
 | `CITE_BRANCH` | `main` | |
 | `CITE_POLL_INTERVAL` | `5m` | `1m`…`1d`, or `off` |
-| `CITE_VERSION` | `0.1.3` | Image tag shared by manager + executor |
+| `CITE_VERSION` | `0.1.4` | Image tag shared by manager + executor |
 | `CITE_NODE` | `22` | `22` or `24` — selects image pair |
 | `CITE_PORT` | `8080` | Host published port (container always `:8080`) |
 | `CITE_BIND` | `0.0.0.0` | Host bind address |
 | `CITE_MANAGER_MEM` / `_CPUS` / `_PIDS` | `2g` / `2.0` / `2048` | Compose limits |
-| `CITE_EXECUTOR_MEM` / `_CPUS` / `_PIDS` | `512m` / `1.0` / `256` | Compose limits |
+| `CITE_EXECUTOR_MEM` / `_CPUS` / `_PIDS` | `1g` / `1.0` / `256` | Compose limits |
 
 ## Path layout (both services)
 
@@ -37,7 +37,7 @@ Compose-level settings live in `.env` (copy `.env.example`). `.env` is gitignore
 | Var | Default | Notes |
 |---|---|---|
 | `CITE_GITHUB_TOKEN` | — | PAT; set through Compose from `.env` |
-| `CITE_GITHUB_TOKEN_FILE` | unset | Optional fallback: path to a file holding the PAT, re-read on every poll so it can be rotated without a restart |
+| `CITE_GITHUB_TOKEN_FILE` | unset | Optional fallback: path to a file holding the PAT, re-read on every poll so it can be rotated without a restart. Must be owner-only (`0400`/`0600`); mount it under `/run/cite/` |
 | `CITE_MIN_POLL` | `60s` | Floor for poll interval |
 | `CITE_RENDERING` | `auto` | `auto\|static\|ssr` |
 | `CITE_FRAMEWORK` | `auto` | Preset key |
@@ -67,7 +67,10 @@ Compose-level settings live in `.env` (copy `.env.example`). `.env` is gitignore
 |---|---|---|
 | `CITE_LISTEN` | `0.0.0.0:8080` | |
 | `CITE_PORT_BASE` | `3001` | Loopback: blue=base, green=base+1 |
-| `CITE_TRUSTED_PROXIES` | empty | CIDRs allowed to set `X-Forwarded-*` |
+| `CITE_TRUSTED_PROXIES` | private ranges | CIDRs whose `X-Forwarded-*` headers are trusted. Default: loopback, `10/8`, `172.16/12`, `192.168/16`, `100.64/10`, `169.254/16`, `fc00::/7`, `fe80::/10`. A list replaces the default; `none` trusts nobody |
+| `CITE_RATE_LIMIT` / `CITE_RATE_BURST` | `100` / `200` | Requests per second and burst per client; over it returns `429` with `Retry-After`. `off` disables rate limiting and bans |
+| `CITE_MAX_CONN_PER_IP` | `64` | Concurrent connections per untrusted peer; `0` disables |
+| `CITE_BAN_THRESHOLD` / `CITE_BAN_DURATION` | `50` / `60s` | A client with more than this many `429`s in 10 s is banned for the duration; banned direct peers are dropped at accept |
 | `CITE_ALLOWED_HOSTS` | empty | Empty = any |
 | `CITE_MAX_BODY` | `100MB` | |
 | `CITE_STATIC_HEADERS` | defaults | Extra/override static headers |
@@ -92,7 +95,19 @@ Builds run with a cleared environment plus these variables, so `CITE_GITHUB_TOKE
 ```yaml
 services:
   executor:
-    image: ghcr.io/seggys116/cite-executor-static:${CITE_VERSION:-0.1.3}
+    image: ghcr.io/seggys116/cite-executor-static:${CITE_VERSION:-0.1.4}
 ```
 
 Use `cite-executor-bun` for Bun sites. Both images set `CITE_RUNTIME` themselves.
+
+## Abuse protection
+
+The executor limits each client, not each connection: a client is the TCP peer, or, when the peer is a trusted proxy, the right-most untrusted address in `X-Forwarded-For`. IPv6 clients are grouped by /64. Trusted peers and clients resolving to a trusted address are never limited or banned, so a reverse proxy on the same host or Docker network (a private address, trusted by default) passes each visitor's own address through. If your proxy reaches the executor from a public address, add it to `CITE_TRUSTED_PROXIES`; the executor logs a warning when an untrusted peer keeps sending `X-Forwarded-For`. Counts of limited requests, bans and dropped connections appear in the executor status.
+
+Two cases need attention:
+
+- Your proxy must set `X-Forwarded-For` (append the client address) and overwrite `X-Forwarded-Proto`, `X-Forwarded-Host` and `X-Real-IP`. Caddy and Traefik do this by default; with nginx, set them explicitly (`proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;` and so on). With `CITE_ALLOWED_HOSTS` set, a forwarded host outside the allowlist is replaced by the request's own `Host`.
+- Some port forwarders rewrite the visitor's address to a private one: rootless Docker's default port driver, Podman rootless, Docker Desktop, or a daemon with `"iptables": false`. If visitors reach the executor directly through one of these, without a proxy in front, set `CITE_TRUSTED_PROXIES=none`, otherwise every visitor is treated as a trusted proxy and is not limited.
+
+Upgraded (WebSocket) connections hold a connection slot and close after `idle_timeout` (60 s) without traffic; use application-level pings for long-lived quiet sockets.
+

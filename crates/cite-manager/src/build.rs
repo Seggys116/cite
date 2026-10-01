@@ -8,8 +8,8 @@ use std::time::Duration;
 use cite_core::schema::{Health, ReleaseManifest, Rendering, Slot};
 use cite_core::{
     Detection, ExtractLimits, ManagerConfig, PackLimits, Redactor, RenderingSetting, RuntimeKind,
-    detect_site, extract_archive, hash_tree, new_id, now_rfc3339, pack_dir, split_command,
-    validate_start_argv,
+    detect_site_configured, extract_archive, hash_tree, new_id, now_rfc3339, pack_dir,
+    split_command, validate_start_argv,
 };
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
@@ -56,7 +56,13 @@ pub fn resolve_site(cfg: &ManagerConfig, src_root: &Path) -> Result<(Detection, 
     } else {
         src_root.join(&cfg.root_dir)
     };
-    let mut det = detect_site(&site_root).map_err(|err| {
+    let pm = (cfg.package_manager != "auto").then_some(cfg.package_manager.as_str());
+    let forced = match cfg.rendering {
+        RenderingSetting::Auto => None,
+        RenderingSetting::Static => Some(Rendering::Static),
+        RenderingSetting::Ssr => Some(Rendering::Ssr),
+    };
+    let mut det = detect_site_configured(&site_root, pm, forced).map_err(|err| {
         let msg = err.to_string();
         if msg.contains("ambiguous") || msg.contains("CITE_RENDERING") {
             ManagerError::new(format!("{msg} (set CITE_RENDERING)"))
@@ -67,9 +73,6 @@ pub fn resolve_site(cfg: &ManagerConfig, src_root: &Path) -> Result<(Detection, 
 
     if cfg.framework != "auto" {
         det.framework = cfg.framework.clone();
-    }
-    if cfg.package_manager != "auto" {
-        det.package_manager = cfg.package_manager.clone();
     }
     if let Some(cmd) = &cfg.install_command {
         det.install_command = cmd.clone();
@@ -118,28 +121,82 @@ pub fn resolve_site(cfg: &ManagerConfig, src_root: &Path) -> Result<(Detection, 
 }
 
 pub fn cache_env(cache_dir: &Path) -> HashMap<String, String> {
+    let sub = |name: &str| cache_dir.join(name).display().to_string();
     HashMap::from([
-        (
-            "npm_config_cache".into(),
-            cache_dir.join("npm").display().to_string(),
-        ),
-        (
-            "npm_config_store_dir".into(),
-            cache_dir.join("pnpm").display().to_string(),
-        ),
-        (
-            "COREPACK_HOME".into(),
-            cache_dir.join("corepack").display().to_string(),
-        ),
+        ("npm_config_cache".into(), sub("npm")),
+        ("npm_config_store_dir".into(), sub("pnpm")),
+        ("pnpm_config_store_dir".into(), sub("pnpm")),
+        ("COREPACK_HOME".into(), sub("corepack")),
         ("COREPACK_ENABLE_DOWNLOAD_PROMPT".into(), "0".into()),
-        (
-            "BUN_INSTALL_CACHE_DIR".into(),
-            cache_dir.join("bun").display().to_string(),
-        ),
+        ("BUN_INSTALL_CACHE_DIR".into(), sub("bun")),
+        ("YARN_CACHE_FOLDER".into(), sub("yarn")),
+        ("YARN_GLOBAL_FOLDER".into(), sub("yarn-global")),
+        ("YARN_ENABLE_GLOBAL_CACHE".into(), "true".into()),
+        ("XDG_CACHE_HOME".into(), sub("xdg")),
     ])
 }
 
-pub fn prune_command(pm: &str, rendering: Rendering, prune: Option<bool>) -> Option<String> {
+/// Directories tools write to under the job home, so nothing falls back to a location the build uid cannot write.
+const JOB_HOME_DIRS: [&str; 6] = [
+    "tmp",
+    ".cache",
+    ".config",
+    ".local/share",
+    ".local/state",
+    ".local/share/pnpm",
+];
+
+/// Creates the per-job directories a build needs; the caller hands `home` to the build uid afterwards.
+pub fn prepare_job_home(home: &Path) -> Result<()> {
+    for sub in JOB_HOME_DIRS {
+        std::fs::create_dir_all(home.join(sub))?;
+    }
+    Ok(())
+}
+
+/// Build environment rooted in the job home; cache settings override the defaults when a cache volume is in use.
+pub fn job_env(home: &Path, cache_dir: Option<&Path>) -> HashMap<String, String> {
+    let sub = |name: &str| home.join(name).display().to_string();
+    let tmp = sub("tmp");
+    let mut env = HashMap::from([
+        ("HOME".to_string(), home.display().to_string()),
+        ("TMPDIR".into(), tmp.clone()),
+        ("TMP".into(), tmp.clone()),
+        ("TEMP".into(), tmp),
+        ("XDG_CACHE_HOME".into(), sub(".cache")),
+        ("XDG_CONFIG_HOME".into(), sub(".config")),
+        ("XDG_DATA_HOME".into(), sub(".local/share")),
+        ("XDG_STATE_HOME".into(), sub(".local/state")),
+        ("PNPM_HOME".into(), sub(".local/share/pnpm")),
+    ]);
+    if let Some(cache) = cache_dir {
+        env.extend(cache_env(cache));
+    }
+    env
+}
+
+/// Berry (yarn 2+) is recognised by its config file, the `packageManager` field, or its `--immutable` install flag.
+fn yarn_berry(site_src: &Path, install_command: &str) -> bool {
+    if site_src.join(".yarnrc.yml").is_file() || install_command.contains("--immutable") {
+        return true;
+    }
+    let Ok(text) = std::fs::read_to_string(site_src.join("package.json")) else {
+        return false;
+    };
+    serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|v| v.get("packageManager")?.as_str().map(str::to_string))
+        .and_then(|field| field.strip_prefix("yarn@").map(str::to_string))
+        .and_then(|version| version.split('.').next()?.parse::<u32>().ok())
+        .is_some_and(|major| major >= 2)
+}
+
+pub fn prune_command(
+    pm: &str,
+    rendering: Rendering,
+    prune: Option<bool>,
+    yarn_berry: bool,
+) -> Option<String> {
     let should = match prune {
         Some(true) => true,
         Some(false) => false,
@@ -150,7 +207,8 @@ pub fn prune_command(pm: &str, rendering: Rendering, prune: Option<bool>) -> Opt
     }
     match pm {
         "pnpm" => Some("pnpm prune --prod".into()),
-        "bun" => None,
+        "yarn" if yarn_berry => Some("yarn workspaces focus --production".into()),
+        "yarn" | "bun" => None,
         _ => Some("npm prune --omit=dev".into()),
     }
 }
@@ -168,6 +226,13 @@ fn start_target_problem(site_src: &Path, argv: &[String]) -> Option<String> {
                 "SSR start binary missing: node_modules/.bin/{name} (is it a devDependency removed by the production prune? set CITE_PRUNE=false or use a node start command)"
             )
         }),
+    }
+}
+
+/// Detection findings go to the log and the build log ring, redacted like build output.
+fn log_detection_warnings(det: &Detection, redactor: &Redactor) {
+    for warning in &det.warnings {
+        warn!(phase = "build", "{}", redactor.redact_line(warning));
     }
 }
 
@@ -330,18 +395,17 @@ async fn build_in_job(
     let (det, rendering) = resolve_site(cfg, &src).map_err(BuildFailure::permanent)?;
 
     let build_env = load_build_env(cfg)?;
+    log_detection_warnings(&det, redactor);
+    prepare_job_home(&home)?;
     let mut env = build_env;
-    env.insert("HOME".into(), home.display().to_string());
-    env.insert("TMPDIR".into(), home.display().to_string());
-    env.insert("TMP".into(), home.display().to_string());
-    env.insert("TEMP".into(), home.display().to_string());
+    let cache = cfg.build_cache.then_some(cfg.cache_dir.as_path());
+    env.extend(job_env(&home, cache));
     env.insert(
         "PATH".into(),
         std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into()),
     );
     if cfg.build_cache {
         prepare_cache(cfg)?;
-        env.extend(cache_env(&cfg.cache_dir));
     }
 
     let site_src = if cfg.root_dir == "." {
@@ -357,7 +421,12 @@ async fn build_in_job(
         out: out.clone(),
         install_command: det.install_command.clone(),
         build_command: det.build_command.clone(),
-        prune_command: prune_command(&det.package_manager, rendering, cfg.prune),
+        prune_command: prune_command(
+            &det.package_manager,
+            rendering,
+            cfg.prune,
+            yarn_berry(&site_src, &det.install_command),
+        ),
         env,
         cache_dir: cfg.build_cache.then(|| cfg.cache_dir.clone()),
         timeout_s: cfg.build_timeout.as_secs().max(1),
@@ -452,8 +521,18 @@ async fn execute_build(
         // umask 027 leaves these 0750 root:root; the build user must traverse them.
         allow_traverse(job_dir)?;
         allow_traverse(&job.out)?;
+        let src_root = job_dir.join("src");
+        if job.src != src_root && src_root.is_dir() {
+            // A nested site root leaves its parent root-owned 0750, which the build user must still traverse.
+            allow_traverse(&src_root)?;
+        }
         give_tree(&job.src, uid, gid)?;
         give_tree(&job.home, uid, gid)?;
+        verify_build_access(&job.src, uid, gid)?;
+        verify_build_access(&job.home, uid, gid)?;
+        if let Some(tmp) = job.env.get("TMPDIR") {
+            verify_build_access(Path::new(tmp), uid, gid)?;
+        }
         std::os::unix::fs::lchown(&job_json_path, Some(uid), Some(gid))
             .map_err(|err| BuildFailure::transient(format!("chown job.json: {err}")))?;
         return run_helper_async(
@@ -804,6 +883,50 @@ fn allow_traverse(path: &Path) -> Result<()> {
     {
         let _ = path;
         Ok(())
+    }
+}
+
+/// The build uid must own the directory and hold rwx on it, or tools fail later with an opaque EACCES.
+fn verify_build_access(path: &Path, uid: u32, gid: u32) -> BuildResult<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let meta = std::fs::symlink_metadata(path)
+        .map_err(|err| BuildFailure::transient(format!("stat {}: {err}", path.display())))?;
+    let rwx = meta.permissions().mode() & 0o700 == 0o700;
+    if !meta.is_dir() || meta.uid() != uid || meta.gid() != gid || !rwx {
+        return Err(BuildFailure::transient(format!(
+            "{} is not an rwx directory owned by the build uid {uid}:{gid}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Some tools (pnpm 12 among them) create lock directories in /tmp regardless of TMPDIR, so it must be sticky and world-writable.
+pub fn ensure_shared_tmp(cfg: &ManagerConfig) {
+    if drops_privileges(cfg) {
+        ensure_sticky_world_writable(Path::new("/tmp"));
+    }
+}
+
+fn ensure_sticky_world_writable(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let current = match std::fs::metadata(dir) {
+        Ok(meta) => meta.permissions().mode() & 0o7777,
+        Err(err) => {
+            warn!(dir = %dir.display(), %err, "cannot stat the shared temp directory");
+            return;
+        }
+    };
+    if current == 0o1777 {
+        return;
+    }
+    match std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o1777)) {
+        Ok(()) => {
+            info!(dir = %dir.display(), from = format!("{current:o}"), "made the shared temp directory mode 1777");
+        }
+        Err(err) => {
+            warn!(dir = %dir.display(), %err, "could not make the shared temp directory mode 1777; builds that lock in /tmp may fail");
+        }
     }
 }
 
@@ -1404,7 +1527,7 @@ mod tests {
     use cite_core::ManagerConfig;
     use cite_core::schema::{Rendering, Slot};
     use std::collections::HashMap;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn give_tree_chowns_nested_files_and_stops_at_a_symlink() {
@@ -1464,20 +1587,23 @@ mod tests {
     fn prune_command_follows_rendering_and_package_manager() {
         use cite_core::schema::Rendering;
         assert_eq!(
-            prune_command("npm", Rendering::Ssr, None).as_deref(),
+            prune_command("npm", Rendering::Ssr, None, false).as_deref(),
             Some("npm prune --omit=dev")
         );
         assert_eq!(
-            prune_command("pnpm", Rendering::Ssr, None).as_deref(),
+            prune_command("pnpm", Rendering::Ssr, None, false).as_deref(),
             Some("pnpm prune --prod")
         );
-        assert_eq!(prune_command("bun", Rendering::Ssr, None), None);
-        assert_eq!(prune_command("npm", Rendering::Static, None), None);
+        assert_eq!(prune_command("bun", Rendering::Ssr, None, false), None);
+        assert_eq!(prune_command("npm", Rendering::Static, None, false), None);
         assert_eq!(
-            prune_command("npm", Rendering::Static, Some(true)).as_deref(),
+            prune_command("npm", Rendering::Static, Some(true), false).as_deref(),
             Some("npm prune --omit=dev")
         );
-        assert_eq!(prune_command("npm", Rendering::Ssr, Some(false)), None);
+        assert_eq!(
+            prune_command("npm", Rendering::Ssr, Some(false), false),
+            None
+        );
     }
 
     #[test]
@@ -1488,6 +1614,11 @@ mod tests {
         assert!(env["npm_config_store_dir"].ends_with("/pnpm"));
         assert!(env["COREPACK_HOME"].ends_with("/corepack"));
         assert!(env["BUN_INSTALL_CACHE_DIR"].ends_with("/bun"));
+        assert!(env["pnpm_config_store_dir"].ends_with("/pnpm"));
+        assert!(env["YARN_CACHE_FOLDER"].ends_with("/yarn"));
+        assert!(env["YARN_GLOBAL_FOLDER"].ends_with("/yarn-global"));
+        assert_eq!(env["YARN_ENABLE_GLOBAL_CACHE"], "true");
+        assert!(env["XDG_CACHE_HOME"].starts_with(dir.path().to_str().unwrap()));
 
         let old = dir.path().join("old.bin");
         let new = dir.path().join("new.bin");
@@ -1500,6 +1631,149 @@ mod tests {
         prune_cache(dir.path(), 100);
         assert!(!old.exists());
         assert!(new.exists());
+    }
+
+    #[test]
+    fn prune_command_for_yarn_depends_on_berry() {
+        assert_eq!(prune_command("yarn", Rendering::Ssr, None, false), None);
+        assert_eq!(
+            prune_command("yarn", Rendering::Ssr, None, true).as_deref(),
+            Some("yarn workspaces focus --production")
+        );
+        assert_eq!(prune_command("yarn", Rendering::Static, None, true), None);
+    }
+
+    #[test]
+    fn yarn_berry_is_read_from_config_field_or_install_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!super::yarn_berry(
+            dir.path(),
+            "yarn install --frozen-lockfile"
+        ));
+        assert!(super::yarn_berry(dir.path(), "yarn install --immutable"));
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"packageManager":"yarn@1.22.22"}"#,
+        )
+        .unwrap();
+        assert!(!super::yarn_berry(dir.path(), "yarn install"));
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"packageManager":"yarn@4.5.0"}"#,
+        )
+        .unwrap();
+        assert!(super::yarn_berry(dir.path(), "yarn install"));
+        std::fs::write(dir.path().join("package.json"), "{}").unwrap();
+        std::fs::write(dir.path().join(".yarnrc.yml"), "nodeLinker: node-modules\n").unwrap();
+        assert!(super::yarn_berry(dir.path(), "yarn install"));
+    }
+
+    #[test]
+    fn job_env_roots_every_writable_location_under_home_and_tmp_is_per_job() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        super::prepare_job_home(&home).unwrap();
+        let env = super::job_env(&home, None);
+        let under_home = |key: &str| Path::new(&env[key]).starts_with(&home);
+        for key in [
+            "HOME",
+            "TMPDIR",
+            "TMP",
+            "TEMP",
+            "PNPM_HOME",
+            "XDG_DATA_HOME",
+            "XDG_CACHE_HOME",
+            "XDG_STATE_HOME",
+            "XDG_CONFIG_HOME",
+        ] {
+            assert!(under_home(key), "{key} escapes the job home: {}", env[key]);
+        }
+        assert_ne!(env["TMPDIR"], env["HOME"]);
+        for key in [
+            "TMPDIR",
+            "PNPM_HOME",
+            "XDG_DATA_HOME",
+            "XDG_CACHE_HOME",
+            "XDG_STATE_HOME",
+            "XDG_CONFIG_HOME",
+        ] {
+            assert!(Path::new(&env[key]).is_dir(), "{key} dir missing");
+        }
+        assert!(!env.contains_key("YARN_CACHE_FOLDER"));
+
+        let cache = dir.path().join("cache");
+        let cached = super::job_env(&home, Some(&cache));
+        assert_eq!(
+            cached["XDG_CACHE_HOME"],
+            cache.join("xdg").display().to_string()
+        );
+        assert_eq!(
+            cached["pnpm_config_store_dir"],
+            cache.join("pnpm").display().to_string()
+        );
+        assert_eq!(cached["XDG_DATA_HOME"], env["XDG_DATA_HOME"]);
+    }
+
+    #[test]
+    fn shared_tmp_is_made_sticky_and_world_writable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = dir.path().join("tmp");
+        std::fs::create_dir(&tmp).unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
+        super::ensure_sticky_world_writable(&tmp);
+        let mode = std::fs::metadata(&tmp).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o1777);
+        super::ensure_sticky_world_writable(&tmp);
+        let again = std::fs::metadata(&tmp).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(again, 0o1777);
+        super::ensure_sticky_world_writable(&dir.path().join("missing"));
+    }
+
+    #[test]
+    fn verify_build_access_requires_ownership_and_rwx() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let uid = rustix::process::geteuid().as_raw();
+        let gid = rustix::process::getegid().as_raw();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o750)).unwrap();
+        super::verify_build_access(dir.path(), uid, gid).unwrap();
+        assert!(super::verify_build_access(dir.path(), uid.wrapping_add(1), gid).is_err());
+        assert!(super::verify_build_access(dir.path(), uid, gid.wrapping_add(1)).is_err());
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o550)).unwrap();
+        assert!(super::verify_build_access(dir.path(), uid, gid).is_err());
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o750)).unwrap();
+        assert!(super::verify_build_access(&dir.path().join("missing"), uid, gid).is_err());
+    }
+
+    #[test]
+    fn detection_warnings_are_logged_redacted_into_the_build_log_ring() {
+        use tracing_subscriber::Layer;
+        use tracing_subscriber::layer::SubscriberExt;
+        let mut det = cite_core::detect_site(&{
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("index.html"), "x").unwrap();
+            dir.keep()
+        })
+        .unwrap();
+        det.warnings = vec![
+            "multiple lockfiles found (pnpm-lock.yaml, yarn.lock-warn-5e1d)".into(),
+            "secret tok-warn-5e1d leaked".into(),
+        ];
+        let mut redactor = cite_core::Redactor::new();
+        redactor.push_secret("tok-warn-5e1d");
+        let subscriber = tracing_subscriber::registry()
+            .with(crate::deploy::BuildLogLayer.with_filter(crate::deploy::build_log_filter()));
+        tracing::subscriber::with_default(subscriber, || {
+            super::log_detection_warnings(&det, &redactor);
+        });
+        let lines = crate::deploy::log_lines();
+        assert!(lines.iter().any(|l| l.contains("yarn.lock-warn-5e1d")));
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("secret") && !l.contains("tok-warn-5e1d"))
+        );
     }
 
     #[test]
@@ -1669,6 +1943,31 @@ mod tests {
         env.insert("CITE_START_COMMAND".into(), "npm start".into());
         let err = ManagerConfig::load_from(&env, None).unwrap_err();
         assert!(err.to_string().contains("cannot run"), "{err}");
+    }
+
+    #[test]
+    fn resolve_site_uses_the_configured_package_manager_and_rendering() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("yarn.lock"), "").unwrap();
+        std::fs::write(dir.path().join("pnpm-lock.yaml"), "").unwrap();
+        let mut env = HashMap::new();
+        env.insert("CITE_REPO".into(), "owner/name".into());
+        env.insert("CITE_RENDERING".into(), "static".into());
+        env.insert("CITE_PACKAGE_MANAGER".into(), "yarn".into());
+        env.insert("CITE_OUTPUT_DIR".into(), "dist".into());
+        let cfg = ManagerConfig::load_from(&env, None).unwrap();
+        let (det, rendering) = resolve_site(&cfg, dir.path()).unwrap();
+        assert_eq!(rendering, Rendering::Static);
+        assert_eq!(det.package_manager, "yarn");
+        assert_eq!(det.install_command, "yarn install --frozen-lockfile");
+        assert!(
+            det.warnings
+                .iter()
+                .any(|w| w.contains("multiple lockfiles")),
+            "{:?}",
+            det.warnings
+        );
     }
 
     #[test]

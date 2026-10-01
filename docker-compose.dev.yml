@@ -182,7 +182,7 @@ services:
           subpath: status
     networks:
       - no_egress
-    mem_limit: ${CITE_EXECUTOR_MEM:-512m}
+    mem_limit: ${CITE_EXECUTOR_MEM:-1g}
     cpus: ${CITE_EXECUTOR_CPUS:-1.0}
     pids_limit: ${CITE_EXECUTOR_PIDS:-256}
     logging:

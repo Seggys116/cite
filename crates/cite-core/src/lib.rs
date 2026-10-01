@@ -20,7 +20,7 @@ pub use atomic::{AtomicPoint, ensure_dir, set_tight_umask, write_atomic, write_a
 pub use config::{
     ExecutorConfig, GithubToken, ManagerConfig, RenderingSetting, SiteEnv, parse_env_file,
 };
-pub use detect::{Detection, detect_site};
+pub use detect::{Detection, detect_site, detect_site_configured, detect_site_with};
 pub use duration::{PollInterval, parse_byte_size, parse_duration, parse_poll_interval};
 pub use error::{Error, Result};
 pub use extract::{ExtractLimits, ExtractReport, extract_archive};
@@ -31,8 +31,8 @@ pub use schema::{
     ControlRequest, ControlResponse, DeployRecord, Desired, DesiredAction, ExecutorStatus, Health,
     HealthExpect, LastResult, ManagerState, Outcome, ReleaseManifest, RuntimeKind, SCHEMA_VERSION,
     Slot, SlotState, SlotStatus, decode_desired, decode_release, decode_state, decode_status,
-    new_id, now_rfc3339, read_desired, read_release, read_state, read_status, write_desired,
-    write_release, write_state, write_status,
+    escape_control, new_id, now_rfc3339, read_desired, read_release, read_state, read_status,
+    write_desired, write_release, write_state, write_status,
 };
 pub use volume::{
     filesystem_free_bytes, layout_violations, remove_dir_contents, slot_is_sealed,
@@ -161,7 +161,7 @@ mod workspace_invariants {
         assert!(hardening.contains("169.254.169.254"));
         assert!(hardening.contains("rootless Docker"));
         assert!(hardening.contains("Resource limits"));
-        assert!(hardening.contains("512 MB"));
+        assert!(hardening.contains("1 GB"));
     }
 
     #[test]

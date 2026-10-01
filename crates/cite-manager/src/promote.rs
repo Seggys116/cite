@@ -406,6 +406,8 @@ mod tests {
         }
         let token = root.join("token");
         std::fs::write(&token, "ghp_citeMockGithubPat00000000000000001\n").unwrap();
+        std::fs::set_permissions(&token, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .unwrap();
         let work = root.join("work");
         let cache = root.join("cache");
         let socket = root.join("manager.sock");

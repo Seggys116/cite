@@ -47,15 +47,7 @@ impl GithubToken {
     pub fn read(&self) -> Result<String> {
         let token = match self {
             Self::Env(token) => token.trim().to_string(),
-            Self::File(path) => std::fs::read_to_string(path)
-                .map_err(|err| {
-                    Error::Config(format!(
-                        "cannot read CITE_GITHUB_TOKEN_FILE {}: {err}",
-                        path.display()
-                    ))
-                })?
-                .trim()
-                .to_string(),
+            Self::File(path) => read_token_file(path)?,
         };
         if token.is_empty() {
             return Err(Error::Config(
@@ -64,6 +56,29 @@ impl GithubToken {
         }
         Ok(token)
     }
+}
+
+/// The token file must be a regular file readable only by its owner, so a build uid cannot read it.
+fn read_token_file(path: &Path) -> Result<String> {
+    let fail = |why: &str| {
+        Error::Config(format!(
+            "cannot read CITE_GITHUB_TOKEN_FILE {}: {why}",
+            path.display()
+        ))
+    };
+    let (mut file, meta) =
+        crate::atomic::open_regular(path).map_err(|err| fail(&err.to_string()))?;
+    let mode = std::os::unix::fs::PermissionsExt::mode(&meta.permissions());
+    if mode & 0o077 != 0 {
+        return Err(fail(&format!(
+            "mode {:04o} lets other users read it; run chmod 600",
+            mode & 0o7777
+        )));
+    }
+    let mut text = String::new();
+    std::io::Read::read_to_string(&mut std::io::Read::take(&mut file, 65_536), &mut text)
+        .map_err(|err| fail(&err.to_string()))?;
+    Ok(text.trim().to_string())
 }
 
 const HOST_ENV: &[&str] = &[
@@ -190,6 +205,14 @@ pub struct ExecutorConfig {
     pub access_log: bool,
     pub crash_limit: u32,
     pub crash_window: Duration,
+    /// Concurrent connections allowed per client address; 0 disables the cap.
+    pub max_conn_per_ip: usize,
+    /// Requests per second per client; 0 disables rate limiting and bans.
+    pub rate_limit: u32,
+    pub rate_burst: u32,
+    /// Rate-limited requests within ten seconds that trigger a ban.
+    pub ban_threshold: u32,
+    pub ban_duration: Duration,
     pub version: String,
     pub child_term_grace: Duration,
 }
@@ -510,7 +533,7 @@ impl ExecutorConfig {
         Ok(Self {
             listen,
             port_base,
-            trusted_proxies: parse_nets(&pick(
+            trusted_proxies: parse_trusted_proxies(&pick(
                 env,
                 &file,
                 "CITE_TRUSTED_PROXIES",
@@ -621,6 +644,29 @@ impl ExecutorConfig {
                 "crash_window",
                 "2m",
             ))?,
+            max_conn_per_ip: parse_u64(
+                &pick(env, &file, "CITE_MAX_CONN_PER_IP", "max_conn_per_ip", "64"),
+                "CITE_MAX_CONN_PER_IP",
+            )? as usize,
+            rate_limit: parse_rate_limit(&pick(
+                env,
+                &file,
+                "CITE_RATE_LIMIT",
+                "rate_limit",
+                "100",
+            ))?,
+            rate_burst: positive_u32(
+                &pick(env, &file, "CITE_RATE_BURST", "rate_burst", "200"),
+                "CITE_RATE_BURST",
+            )?,
+            ban_threshold: positive_u32(
+                &pick(env, &file, "CITE_BAN_THRESHOLD", "ban_threshold", "50"),
+                "CITE_BAN_THRESHOLD",
+            )?,
+            ban_duration: positive_duration(
+                &pick(env, &file, "CITE_BAN_DURATION", "ban_duration", "60s"),
+                "CITE_BAN_DURATION",
+            )?,
             version: pick(
                 env,
                 &file,
@@ -833,9 +879,9 @@ fn parse_rendering(value: &str) -> Result<RenderingSetting> {
 
 fn parse_pm(value: &str) -> Result<String> {
     match value {
-        "auto" | "npm" | "pnpm" | "bun" => Ok(value.to_string()),
+        "auto" | "npm" | "pnpm" | "yarn" | "bun" => Ok(value.to_string()),
         _ => Err(Error::Config(format!(
-            "CITE_PACKAGE_MANAGER must be auto, npm, pnpm, or bun, got `{value}`"
+            "CITE_PACKAGE_MANAGER must be auto, npm, pnpm, yarn, or bun, got `{value}`"
         ))),
     }
 }
@@ -859,6 +905,28 @@ fn parse_expect(value: &str) -> Result<HealthExpect> {
             "CITE_HEALTH_EXPECT must be non2xx-ok or 2xx, got `{value}`"
         ))),
     }
+}
+
+fn parse_rate_limit(value: &str) -> Result<u32> {
+    if value.eq_ignore_ascii_case("off") {
+        return Ok(0);
+    }
+    parse_u32(value, "CITE_RATE_LIMIT (an integer or `off`)")
+}
+
+fn positive_u32(value: &str, field: &str) -> Result<u32> {
+    match parse_u32(value, field)? {
+        0 => Err(Error::Config(format!("{field} must be at least 1"))),
+        n => Ok(n),
+    }
+}
+
+fn positive_duration(value: &str, field: &str) -> Result<Duration> {
+    let dur = parse_duration(value).map_err(|err| Error::Config(format!("{field}: {err}")))?;
+    if dur.is_zero() {
+        return Err(Error::Config(format!("{field} must be greater than zero")));
+    }
+    Ok(dur)
 }
 
 fn parse_u32(value: &str, field: &str) -> Result<u32> {
@@ -886,6 +954,31 @@ fn split_list(value: &str) -> Vec<String> {
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .collect()
+}
+
+/// Private and local ranges trusted when CITE_TRUSTED_PROXIES is unset or empty.
+pub const DEFAULT_TRUSTED_PROXIES: &[&str] = &[
+    "127.0.0.0/8",
+    "::1/128",
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "100.64.0.0/10",
+    "fc00::/7",
+    "fe80::/10",
+    "169.254.0.0/16",
+];
+
+/// Unset or empty selects the private ranges, `none` trusts nobody, anything else replaces the default.
+fn parse_trusted_proxies(value: &str) -> Result<Vec<IpNet>> {
+    let value = value.trim();
+    if value.is_empty() {
+        return parse_nets(&DEFAULT_TRUSTED_PROXIES.join(","));
+    }
+    if value.eq_ignore_ascii_case("none") {
+        return Ok(Vec::new());
+    }
+    parse_nets(value)
 }
 
 fn parse_nets(value: &str) -> Result<Vec<IpNet>> {
@@ -933,6 +1026,141 @@ mod tests {
             .iter()
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect()
+    }
+
+    #[test]
+    fn token_file_must_be_private_regular_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token");
+        std::fs::write(&path, "ghp_secret\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let token = GithubToken::File(path.clone());
+        let err = token.read().unwrap_err().to_string();
+        assert!(
+            err.contains("chmod 600") && !err.contains("ghp_secret"),
+            "{err}"
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        assert!(token.read().is_err());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(token.read().unwrap(), "ghp_secret");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        assert_eq!(token.read().unwrap(), "ghp_secret");
+
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(GithubToken::File(link).read().is_err());
+        assert!(GithubToken::File(dir.path().to_path_buf()).read().is_err());
+        assert_eq!(GithubToken::Env(" tok ".into()).read().unwrap(), "tok");
+    }
+
+    #[test]
+    fn trusted_proxies_default_override_and_none() {
+        let load = |pairs: &[(&str, &str)]| {
+            ExecutorConfig::load_from(&env(pairs), None)
+                .unwrap()
+                .trusted_proxies
+        };
+        let default = load(&[]);
+        assert_eq!(default.len(), DEFAULT_TRUSTED_PROXIES.len());
+        let has = |nets: &[IpNet], ip: &str| {
+            nets.iter()
+                .any(|n| n.contains(&ip.parse::<std::net::IpAddr>().unwrap()))
+        };
+        for ip in [
+            "127.0.0.1",
+            "::1",
+            "10.1.2.3",
+            "172.17.0.1",
+            "192.168.1.1",
+            "100.64.0.9",
+            "fd00::1",
+            "fe80::1",
+            "169.254.1.1",
+        ] {
+            assert!(has(&default, ip), "{ip}");
+        }
+        for ip in ["8.8.8.8", "172.32.0.1", "2001:db8::1"] {
+            assert!(!has(&default, ip), "{ip}");
+        }
+        assert_eq!(load(&[("CITE_TRUSTED_PROXIES", "")]), default);
+        let custom = load(&[("CITE_TRUSTED_PROXIES", "203.0.113.0/24, 198.51.100.7")]);
+        assert_eq!(custom.len(), 2);
+        assert!(!has(&custom, "10.0.0.1"));
+        assert!(load(&[("CITE_TRUSTED_PROXIES", "none")]).is_empty());
+        assert!(load(&[("CITE_TRUSTED_PROXIES", "NONE")]).is_empty());
+        let bad =
+            ExecutorConfig::load_from(&env(&[("CITE_TRUSTED_PROXIES", "10.0.0.0/8, nope")]), None);
+        assert!(bad.is_err());
+    }
+
+    #[test]
+    fn abuse_protection_defaults_and_validation() {
+        let load = |pairs: &[(&str, &str)]| ExecutorConfig::load_from(&env(pairs), None);
+        let cfg = load(&[]).unwrap();
+        assert_eq!(cfg.max_conn_per_ip, 64);
+        assert_eq!(cfg.rate_limit, 100);
+        assert_eq!(cfg.rate_burst, 200);
+        assert_eq!(cfg.ban_threshold, 50);
+        assert_eq!(cfg.ban_duration, Duration::from_secs(60));
+
+        let cfg = load(&[
+            ("CITE_MAX_CONN_PER_IP", "8"),
+            ("CITE_RATE_LIMIT", "5"),
+            ("CITE_RATE_BURST", "10"),
+            ("CITE_BAN_THRESHOLD", "3"),
+            ("CITE_BAN_DURATION", "2m"),
+        ])
+        .unwrap();
+        assert_eq!(
+            (
+                cfg.max_conn_per_ip,
+                cfg.rate_limit,
+                cfg.rate_burst,
+                cfg.ban_threshold
+            ),
+            (8, 5, 10, 3)
+        );
+        assert_eq!(cfg.ban_duration, Duration::from_secs(120));
+
+        assert_eq!(load(&[("CITE_RATE_LIMIT", "off")]).unwrap().rate_limit, 0);
+        assert_eq!(load(&[("CITE_RATE_LIMIT", "0")]).unwrap().rate_limit, 0);
+        assert_eq!(
+            load(&[("CITE_MAX_CONN_PER_IP", "0")])
+                .unwrap()
+                .max_conn_per_ip,
+            0
+        );
+        for (key, value) in [
+            ("CITE_RATE_LIMIT", "fast"),
+            ("CITE_RATE_BURST", "0"),
+            ("CITE_BAN_THRESHOLD", "0"),
+            ("CITE_BAN_DURATION", "0s"),
+            ("CITE_BAN_DURATION", "soon"),
+            ("CITE_MAX_CONN_PER_IP", "-1"),
+        ] {
+            let err = load(&[(key, value)]).unwrap_err().to_string();
+            assert!(err.contains(key), "{key}: {err}");
+        }
+    }
+
+    #[test]
+    fn package_manager_accepts_yarn_and_rejects_unknown() {
+        for pm in ["auto", "npm", "pnpm", "yarn", "bun"] {
+            let cfg = ManagerConfig::load_from(
+                &env(&[("CITE_REPO", "o/n"), ("CITE_PACKAGE_MANAGER", pm)]),
+                None,
+            )
+            .unwrap();
+            assert_eq!(cfg.package_manager, pm);
+        }
+        let err = ManagerConfig::load_from(
+            &env(&[("CITE_REPO", "o/n"), ("CITE_PACKAGE_MANAGER", "deno")]),
+            None,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("yarn"));
     }
 
     #[test]
@@ -1047,6 +1275,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("token");
         std::fs::write(&file, "from-file\n").unwrap();
+        std::fs::set_permissions(&file, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .unwrap();
         let path = file.to_str().unwrap();
         let load = |pairs: &[(&str, &str)]| {
             let mut all = vec![("CITE_REPO", "owner/name")];

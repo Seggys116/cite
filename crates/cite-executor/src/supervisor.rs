@@ -22,6 +22,8 @@ use tracing::{info, warn};
 
 const LOG_RING: usize = 40;
 const LOG_LINE_MAX: usize = 1024;
+/// Bind-address variables frameworks read; forced to loopback so children stay behind the executor.
+const LOOPBACK_HOST_VARS: [&str; 3] = ["HOST", "HOSTNAME", "NITRO_HOST"];
 
 #[derive(Clone)]
 pub struct SlotManager {
@@ -52,7 +54,7 @@ impl SlotRuntime {
     }
 
     fn push_log(&mut self, line: String) {
-        let mut line = line;
+        let mut line = cite_core::escape_control(&line, true);
         if line.len() > LOG_LINE_MAX {
             let mut end = LOG_LINE_MAX;
             while !line.is_char_boundary(end) {
@@ -190,7 +192,6 @@ impl SlotManager {
                 },
                 port.to_string(),
             )
-            .env("HOST", "127.0.0.1")
             .env("NODE_ENV", "production");
 
         match self.config.runtime_env.resolve() {
@@ -198,6 +199,9 @@ impl SlotManager {
                 cmd.envs(vars);
             }
             Err(err) => warn!(error = %err, "runtime env unreadable; starting without it"),
+        }
+        for name in LOOPBACK_HOST_VARS {
+            cmd.env(name, "127.0.0.1");
         }
 
         let mut child = cmd.spawn()?;
@@ -473,6 +477,16 @@ async fn probe_once(port: u16, path: &str, expect: HealthExpect) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn push_log_escapes_terminal_control_characters() {
+        let mut rt = SlotRuntime::new();
+        rt.push_log("a\u{1b}[31mred\u{7}\tb".into());
+        let line = rt.log_tail().pop().unwrap();
+        assert!(!line.contains('\u{1b}') && !line.contains('\u{7}'));
+        assert!(line.contains('\t'));
+        assert!(line.contains("\\u{1b}[31m"));
+    }
 
     #[test]
     fn push_log_truncates_on_a_char_boundary() {

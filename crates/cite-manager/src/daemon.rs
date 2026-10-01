@@ -40,6 +40,8 @@ pub async fn run_daemon(cfg: ManagerConfig) -> Result<()> {
         ensure_dir(parent, 0o755)?;
     }
 
+    crate::build::ensure_shared_tmp(&cfg);
+
     let deployer = Deployer::new(cfg.clone()).await?;
     let gate = Arc::new(Mutex::new(()));
 
@@ -134,6 +136,8 @@ mod tests {
     fn test_cfg(dir: &std::path::Path, extra: &[(&str, &str)]) -> ManagerConfig {
         let token = dir.join("token");
         std::fs::write(&token, "ghp_citeMockGithubPat00000000000000001\n").unwrap();
+        std::fs::set_permissions(&token, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .unwrap();
         let mut env = HashMap::new();
         env.insert("CITE_REPO".into(), "owner/name".into());
         env.insert(

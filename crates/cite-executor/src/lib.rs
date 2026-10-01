@@ -5,6 +5,7 @@
 
 mod control;
 mod error_page;
+mod limits;
 mod proxy;
 mod route;
 mod server;
@@ -52,6 +53,25 @@ impl RunningExecutor {
     }
 }
 
+/// Raises the open-file soft limit to the hard limit (capped) so many connections do not hit EMFILE.
+pub fn raise_nofile_limit() -> Option<u64> {
+    use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+    const CAP: u64 = 1_048_576;
+    let limit = getrlimit(Resource::Nofile);
+    let target = limit.maximum.map_or(CAP, |max| max.min(CAP));
+    if limit.current.is_some_and(|cur| cur >= target) {
+        return limit.current;
+    }
+    let raised = Rlimit {
+        current: Some(target),
+        maximum: limit.maximum,
+    };
+    match setrlimit(Resource::Nofile, raised) {
+        Ok(()) => Some(target),
+        Err(_) => limit.current,
+    }
+}
+
 pub async fn spawn(config: ExecutorConfig) -> Result<RunningExecutor> {
     ensure_dir(&config.releases_dir, 0o755)?;
     ensure_dir(&config.control_dir, 0o755)?;
@@ -72,6 +92,7 @@ pub async fn spawn(config: ExecutorConfig) -> Result<RunningExecutor> {
     let conn_count = Arc::new(AtomicU64::new(0));
     let requests = Arc::new(AtomicU64::new(0));
     let slot_mgr = Arc::new(SlotManager::new(config.clone(), redactor.clone()));
+    let limiter = limits::Limiter::new(limits::LimitConfig::from_executor(&config));
 
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
     let addr = listener.local_addr()?;
@@ -89,6 +110,7 @@ pub async fn spawn(config: ExecutorConfig) -> Result<RunningExecutor> {
         conn_count: conn_count.clone(),
         slot_mgr: slot_mgr.clone(),
         requests,
+        limiter: limiter.clone(),
         redactor: Arc::new(redactor),
         process_exit: process_exit_tx,
     };
@@ -106,6 +128,7 @@ pub async fn spawn(config: ExecutorConfig) -> Result<RunningExecutor> {
             shutdown_rx.clone(),
         ));
         let reaper = tokio::spawn(reap_loop(shutdown_rx.clone()));
+        let sweeper = tokio::spawn(sweep_loop(limiter, shutdown_rx.clone()));
 
         let mut shutdown_rx = shutdown_rx;
         let mut process_exit_rx = state.process_exit.subscribe();
@@ -139,6 +162,7 @@ pub async fn spawn(config: ExecutorConfig) -> Result<RunningExecutor> {
         let _ = accept.await;
         let _ = control.await;
         let _ = reaper.await;
+        let _ = sweeper.await;
     });
 
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -162,6 +186,20 @@ pub fn runtime_redactor(config: &ExecutorConfig) -> Redactor {
         redactor.push_secret(value);
     }
     redactor
+}
+
+async fn sweep_loop(limiter: Arc<limits::Limiter>, mut shutdown: watch::Receiver<bool>) {
+    let mut interval = tokio::time::interval(limits::SWEEP_INTERVAL);
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() {
+                    break;
+                }
+            }
+            _ = interval.tick() => limiter.sweep(std::time::Instant::now()),
+        }
+    }
 }
 
 async fn reap_loop(mut shutdown: watch::Receiver<bool>) {

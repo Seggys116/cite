@@ -163,6 +163,7 @@ fn extract_tar<R: Read>(
                     .ok_or_else(|| Error::Archive("symlink target is not utf-8".into()))?;
                 let parent = rel.parent().unwrap_or(Path::new(""));
                 crate::pathsafe::resolve_lex(parent, Path::new(target))?;
+                reject_symlink_chain(&root, parent, Path::new(target))?;
                 ensure_parent(&root, &rel)?;
                 if root.try_exists(&rel).unwrap_or(false) {
                     let _ = root.remove_file(&rel);
@@ -267,6 +268,31 @@ fn map_io(err: io::Error) -> Error {
     }
 }
 
+/// Keeps every link's physical location equal to its lexical one so `..` folding in `resolve_lex` stays sound.
+fn reject_symlink_chain(root: &Dir, parent: &Path, target: &Path) -> Result<()> {
+    let mut seen_normal = false;
+    for component in target.components() {
+        match component {
+            Component::Normal(_) => seen_normal = true,
+            Component::ParentDir if seen_normal => {
+                return Err(Error::PathEscape(target.display().to_string()));
+            }
+            _ => {}
+        }
+    }
+    let mut prefix = PathBuf::new();
+    for component in parent.components() {
+        prefix.push(component);
+        if root
+            .symlink_metadata(&prefix)
+            .is_ok_and(|meta| meta.file_type().is_symlink())
+        {
+            return Err(Error::PathEscape(parent.display().to_string()));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -359,6 +385,36 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    fn chain(entries: &[(&str, &str)]) -> Result<ExtractReport> {
+        let mut builder = Builder::new(Vec::new());
+        for (name, target) in entries {
+            let mut header = Header::new_gnu();
+            header.set_entry_type(EntryType::Symlink);
+            header.set_size(0);
+            header.set_link_name(target).unwrap();
+            header.set_path(name).unwrap();
+            header.set_cksum();
+            builder.append(&header, std::io::empty()).unwrap();
+        }
+        let bytes = builder.into_inner().unwrap();
+        let dir = tempdir().unwrap();
+        extract_archive(
+            bytes.as_slice(),
+            &dir.path().join("out"),
+            &ExtractLimits::default(),
+            0,
+        )
+    }
+
+    #[test]
+    fn rejects_symlink_chains_that_escape_physically() {
+        assert!(chain(&[("d/x", ".."), ("e1", "d/x/..")]).is_err());
+        assert!(chain(&[("e1", "d/x/.."), ("d/x", "..")]).is_err());
+        assert!(chain(&[("d/x", ".."), ("d/x/y", "../..")]).is_err());
+        assert!(chain(&[("a/b", "../c")]).is_ok());
+        assert!(chain(&[("ok", "sub/file")]).is_ok());
     }
 
     #[test]

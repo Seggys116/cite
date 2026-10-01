@@ -13,7 +13,7 @@ CITE_BIND=127.0.0.1
 CITE_PORT=8080
 ```
 
-4. Set `CITE_TRUSTED_PROXIES` on the executor to the tunnel/proxy CIDRs if you rely on `X-Forwarded-*`.
+4. Proxies on the same host or Docker network are trusted by default (private ranges), so per-client rate limiting and `X-Forwarded-*` work out of the box. If your proxy reaches the executor from a public address (a remote load balancer, say), set `CITE_TRUSTED_PROXIES` to its CIDRs.
 
 ## Caddy
 
