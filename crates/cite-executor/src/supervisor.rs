@@ -2,7 +2,7 @@
 
 use std::collections::VecDeque;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -152,7 +152,10 @@ impl SlotManager {
                 manifest.runtime, self.config.runtime
             ));
         }
-        if manifest.rendering == Rendering::Ssr && manifest.node_major != self.config.node_major {
+        if self.config.runtime != RuntimeKind::Rust
+            && manifest.rendering == Rendering::Ssr
+            && manifest.node_major != self.config.node_major
+        {
             return Err(format!(
                 "release node_major {} does not match image {}",
                 manifest.node_major, self.config.node_major
@@ -394,6 +397,9 @@ fn resolve_argv(
     if argv.is_empty() {
         return Err(cite_core::Error::msg("empty start_argv"));
     }
+    if config.runtime == RuntimeKind::Rust {
+        return resolve_rust_argv(app_dir, argv);
+    }
     let argv0 = argv[0].as_str();
     match argv0 {
         "node" => Ok((PathBuf::from(&config.node_bin), argv[1..].to_vec())),
@@ -414,6 +420,29 @@ fn resolve_argv(
             Ok((interpreter, args))
         }
     }
+}
+
+fn resolve_rust_argv(app_dir: &Path, argv: &[String]) -> Result<(PathBuf, Vec<String>)> {
+    let argv0 = argv[0].as_str();
+    let rel = Path::new(argv0);
+    if argv0.is_empty()
+        || rel.is_absolute()
+        || rel
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err(cite_core::Error::msg(format!(
+            "rust start path `{argv0}` must stay inside the app directory"
+        )));
+    }
+    let program = app_dir.join(rel);
+    if !program.is_file() {
+        return Err(cite_core::Error::msg(format!(
+            "rust start binary `{}` not found",
+            program.display()
+        )));
+    }
+    Ok((program, argv[1..].to_vec()))
 }
 
 pub async fn probe_http_health(
@@ -514,5 +543,150 @@ mod tests {
         );
         assert_eq!(next_log_line(&mut reader).await.unwrap().unwrap(), "last");
         assert!(next_log_line(&mut reader).await.unwrap().is_none());
+    }
+
+    fn rust_config(releases: &Path, port: u16) -> ExecutorConfig {
+        let mut env = std::collections::HashMap::new();
+        env.insert("CITE_RUNTIME".into(), "rust".into());
+        env.insert("CITE_RELEASES_DIR".into(), releases.display().to_string());
+        env.insert("CITE_DATA_DIR".into(), releases.display().to_string());
+        env.insert("CITE_PORT_BASE".into(), port.to_string());
+        env.insert("CITE_LISTEN".into(), "127.0.0.1:0".into());
+        env.insert("CITE_NODE".into(), "22".into());
+        ExecutorConfig::load_from(&env, None).unwrap()
+    }
+
+    fn rust_manifest(node_major: &str) -> ReleaseManifest {
+        ReleaseManifest {
+            v: cite_core::SCHEMA_VERSION,
+            release_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".into(),
+            slot: Slot::Blue,
+            sha: "a".repeat(40),
+            branch: "main".into(),
+            commit_message: "hi".into(),
+            commit_author: "dev".into(),
+            built_at: "2026-01-01T00:00:00Z".into(),
+            rendering: Rendering::Ssr,
+            runtime: RuntimeKind::Rust,
+            node_major: node_major.into(),
+            start_argv: vec!["bin/hello".into()],
+            port_env: "PORT".into(),
+            health: cite_core::Health {
+                path: "/".into(),
+                expect: HealthExpect::TwoXx,
+                timeout_s: 5,
+                consecutive: 1,
+            },
+            spa_fallback: None,
+            root: "app".into(),
+            bytes: 1,
+            file_count: 1,
+            tree_sha256: "b".repeat(64),
+        }
+    }
+
+    #[test]
+    fn rust_resolve_argv_points_at_the_app_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = dir.path().join("app");
+        std::fs::create_dir_all(app.join("bin")).unwrap();
+        std::fs::write(app.join("bin/my-app"), b"x").unwrap();
+        let cfg = rust_config(dir.path(), 21_001);
+        let (program, args) =
+            resolve_argv(&cfg, &app, &["bin/my-app".into(), "--flag".into()]).unwrap();
+        assert_eq!(program, app.join("bin/my-app"));
+        assert_eq!(args, ["--flag"]);
+        assert!(resolve_argv(&cfg, &app, &["../bin/my-app".into()]).is_err());
+        assert!(resolve_argv(&cfg, &app, &[String::new()]).is_err());
+        assert!(resolve_argv(&cfg, &app, &["/bin/my-app".into()]).is_err());
+    }
+
+    #[test]
+    fn rust_image_skips_node_major_and_static_still_rejects_ssr() {
+        let dir = tempfile::tempdir().unwrap();
+        let rust = SlotManager::new(rust_config(dir.path(), 21_002), Redactor::new());
+        assert!(rust.check_release(&rust_manifest("18")).is_ok());
+        let mut node = rust_manifest("22");
+        node.runtime = RuntimeKind::Node;
+        assert!(
+            rust.check_release(&node)
+                .unwrap_err()
+                .contains("does not match")
+        );
+
+        let mut env = std::collections::HashMap::new();
+        env.insert("CITE_RUNTIME".into(), "static".into());
+        env.insert("CITE_PORT_BASE".into(), "21003".into());
+        env.insert("CITE_LISTEN".into(), "127.0.0.1:0".into());
+        let static_mgr = SlotManager::new(
+            ExecutorConfig::load_from(&env, None).unwrap(),
+            Redactor::new(),
+        );
+        let err = static_mgr.check_release(&rust_manifest("22")).unwrap_err();
+        assert!(err.contains("static runtime"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn rust_child_answers_probe_http_health() {
+        use std::io::{Read, Write};
+        use std::os::unix::fs::PermissionsExt;
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/runtime-rust");
+        let target = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new("cargo")
+            .args([
+                "build",
+                "--release",
+                "--locked",
+                "--offline",
+                "--manifest-path",
+            ])
+            .arg(fixture.join("Cargo.toml"))
+            .env("CARGO_TARGET_DIR", target.path())
+            .status()
+            .expect("cargo");
+        assert!(status.success(), "cargo build failed: {status}");
+        let built = target.path().join("release/hello");
+        let data = tempfile::tempdir().unwrap();
+        let bin_dir = data.path().join("releases/blue/app/bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let dest = bin_dir.join("hello");
+        std::fs::copy(&built, &dest).unwrap();
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let cfg = rust_config(&data.path().join("releases"), port);
+        let mgr = SlotManager::new(cfg, Redactor::new());
+        mgr.start_ssr(Slot::Blue, &rust_manifest("18"))
+            .await
+            .expect("start rust child");
+        let mut ok = false;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if probe_http_health(port, "/", HealthExpect::TwoXx, Duration::from_secs(1)).await {
+                ok = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        let mut body = Vec::new();
+        let _ = stream.read_to_end(&mut body);
+        mgr.shutdown_all().await;
+        assert!(ok, "probe_http_health did not see HTTP 200");
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("rust-ok true"), "{text}");
     }
 }

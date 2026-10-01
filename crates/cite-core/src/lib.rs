@@ -169,9 +169,11 @@ mod workspace_invariants {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let files = [
             "images/manager/Dockerfile",
+            "images/manager-rust/Dockerfile",
             "images/executor-node/Dockerfile",
             "images/executor-bun/Dockerfile",
             "images/executor-static/Dockerfile",
+            "images/executor-rust/Dockerfile",
             "docker-compose.yml",
             "docker-compose.dev.yml",
         ];
@@ -204,9 +206,11 @@ mod workspace_invariants {
         );
         for file in [
             "images/manager/Dockerfile",
+            "images/manager-rust/Dockerfile",
             "images/executor-node/Dockerfile",
             "images/executor-bun/Dockerfile",
             "images/executor-static/Dockerfile",
+            "images/executor-rust/Dockerfile",
             "images/mock-github/Dockerfile",
         ] {
             let text = std::fs::read_to_string(root.join(file)).unwrap();
@@ -276,9 +280,11 @@ mod workspace_invariants {
         assert_eq!(crate::VERSION, version);
         for file in [
             "images/manager/Dockerfile",
+            "images/manager-rust/Dockerfile",
             "images/executor-node/Dockerfile",
             "images/executor-bun/Dockerfile",
             "images/executor-static/Dockerfile",
+            "images/executor-rust/Dockerfile",
         ] {
             let text = std::fs::read_to_string(root.join(file)).unwrap();
             assert!(
@@ -319,12 +325,17 @@ mod workspace_invariants {
         let bun = std::fs::read_to_string(root.join("images/executor-bun/Dockerfile")).unwrap();
         let static_image =
             std::fs::read_to_string(root.join("images/executor-static/Dockerfile")).unwrap();
+        let manager_rust =
+            std::fs::read_to_string(root.join("images/manager-rust/Dockerfile")).unwrap();
+        let executor_rust =
+            std::fs::read_to_string(root.join("images/executor-rust/Dockerfile")).unwrap();
         assert!(manager.contains("bookworm"));
         assert!(executor.contains("debian12"));
         assert!(manager.contains("rust:1.98-bookworm"));
         assert!(executor.contains("rust:1.98-bookworm"));
         let release = std::fs::read_to_string(root.join(".github/workflows/release.yml")).unwrap();
-        let builds = format!("{manager}{executor}{bun}{static_image}{release}");
+        let builds =
+            format!("{manager}{executor}{bun}{static_image}{manager_rust}{executor_rust}{release}");
         for digest in matrix
             .lines()
             .filter(|line| line.contains("_digest = "))

@@ -1,0 +1,14 @@
+# docker-compose.dev.yml sets build:; image: alone leaves the Node Dockerfiles in place.
+# docker compose -f docker-compose.dev.yml -f docker-compose.dev.rust.yml up --build
+
+services:
+  manager:
+    build:
+      dockerfile: images/manager-rust/Dockerfile
+    environment:
+      CITE_RUNTIME: rust
+  executor:
+    build:
+      dockerfile: images/executor-rust/Dockerfile
+    environment:
+      CITE_RUNTIME: rust

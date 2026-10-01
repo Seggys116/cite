@@ -96,6 +96,8 @@ jobs:
           - { key: executor-node24, name: cite-executor-node, dockerfile: images/executor-node/Dockerfile, node: "24", args: "NODE_MAJOR=24\nEXECUTOR_IMAGE=gcr.io/distroless/nodejs24-debian12:nonroot@sha256:14d42e2511532589a7c7e01a753667a74fcc96266e137e8125006b87b0c32d0a" }
           - { key: executor-bun, name: cite-executor-bun, dockerfile: images/executor-bun/Dockerfile, node: "", args: "" }
           - { key: executor-static, name: cite-executor-static, dockerfile: images/executor-static/Dockerfile, node: "", args: "" }
+          - { key: manager-rust, name: cite-manager-rust, dockerfile: images/manager-rust/Dockerfile, node: "", args: "" }
+          - { key: executor-rust, name: cite-executor-rust, dockerfile: images/executor-rust/Dockerfile, node: "", args: "" }
         platform:
           - { arch: amd64, runner: ubuntu-latest }
           - { arch: arm64, runner: ubuntu-24.04-arm }
@@ -149,6 +151,8 @@ jobs:
           - { key: executor-node24, name: cite-executor-node, suffix: "-node24" }
           - { key: executor-bun, name: cite-executor-bun, suffix: "" }
           - { key: executor-static, name: cite-executor-static, suffix: "" }
+          - { key: manager-rust, name: cite-manager-rust, suffix: "" }
+          - { key: executor-rust, name: cite-executor-rust, suffix: "" }
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:

@@ -100,6 +100,22 @@ const nextConfig = {
 export default nextConfig;
 ```
 
+## Rust
+
+The rust images (`CITE_RUNTIME=rust`) require a `Cargo.toml`. Cite takes the binary name from `[[bin]]` when the manifest sets one, and from the package name when it does not. In a workspace, `CITE_ROOT_DIR` is the member that contains that binary; at the workspace root, Cite uses `default-members` or the first member.
+
+When `Cargo.lock` is present the manager runs `cargo build --release --locked`. The binary must listen on `127.0.0.1` and the `PORT` variable Cite sets; blue and green are loopback ports. The published port is still the executor's 8080 (`CITE_PORT` / `CITE_BIND`), the same as Node.
+
+Source is the GitHub tarball. Cite does not clone. `cargo` runs in the manager; the executor only runs the binary.
+
+The release contains that binary, plus `public`, `static`, `assets`, and `templates` when those directories exist. `target/` is not packed. Registry data and build output stay on the `cite_cache` volume (`CARGO_HOME`, `CARGO_TARGET_DIR`).
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.rust.yml up -d
+```
+
+A Rust child is one process. Warm grace still keeps the previous binary, so after a deploy the executor holds two processes until `CITE_WARM_GRACE` ends.
+
 ## Memory
 
 After a deploy the previous release keeps running for `CITE_WARM_GRACE` (24 h by default) so rollback is instant, so the executor holds two SSR processes. The default `CITE_EXECUTOR_MEM` is `1g`; raise it for heavy apps, or shorten `CITE_WARM_GRACE`.
@@ -109,3 +125,27 @@ After a deploy the previous release keeps running for `CITE_WARM_GRACE` (24 h by
 - A `CITE_GITHUB_TOKEN_FILE` must now be owner-only (`chmod 600`); a group- or world-readable token file is refused. Prefer the `CITE_GITHUB_TOKEN` environment variable, or mount the file under `/run/cite/`.
 - Rate limiting is on by default (see [config](config.md#abuse-protection)). Proxies on the same host or Docker network are trusted automatically; a proxy on a public address needs `CITE_TRUSTED_PROXIES`.
 - `CITE_EXECUTOR_MEM` defaults to `1g`.
+
+## Upgrading to 0.2.0
+
+- Rust sites use `cite-manager-rust` and `cite-executor-rust` (compose overlay below).
+- The app is a Cargo binary. It must listen on `127.0.0.1` and the `PORT` variable (blue/green loopback). The published port is still the executor's 8080 (`CITE_PORT` / `CITE_BIND`), same as Node.
+- Source is still the GitHub tarball. Cite does not clone. cargo runs in the manager; the executor only runs the binary.
+- The release contains the release binary (and `public`/`static`/`assets`/`templates` if present), not `target/`.
+- Registry and build output are cached on the existing cache volume (`CARGO_HOME`, `CARGO_TARGET_DIR`).
+
+```yaml
+services:
+  init:
+    image: ghcr.io/seggys116/cite-manager-rust:${CITE_VERSION:-0.2.0}
+  manager:
+    image: ghcr.io/seggys116/cite-manager-rust:${CITE_VERSION:-0.2.0}
+    environment:
+      CITE_RUNTIME: rust
+  executor:
+    image: ghcr.io/seggys116/cite-executor-rust:${CITE_VERSION:-0.2.0}
+    environment:
+      CITE_RUNTIME: rust
+```
+
+That file is `docker-compose.rust.yml`. For a local build, `docker-compose.dev.yml` keeps its `build:` keys unless you also pass `docker-compose.dev.rust.yml`.

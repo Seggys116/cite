@@ -66,6 +66,7 @@ pub enum RuntimeKind {
     Node,
     Bun,
     Static,
+    Rust,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -673,6 +674,14 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
     use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    #[test]
+    fn runtime_rust_serializes_as_rust() {
+        assert_eq!(
+            serde_json::to_value(RuntimeKind::Rust).unwrap(),
+            serde_json::json!("rust")
+        );
+    }
 
     #[test]
     fn slot_ports_are_base_and_base_plus_one() {

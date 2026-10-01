@@ -1,5 +1,5 @@
 use std::io::Read;
-use std::path::Path;
+use std::path::{Component, Path};
 
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions, OpenOptionsExt};
@@ -65,6 +65,9 @@ pub fn detect_site_configured(
 ) -> Result<Detection> {
     let root = Dir::open_ambient_dir(repo_dir, ambient_authority())?;
     if !root.is_file("package.json") {
+        if root.is_file("Cargo.toml") {
+            return detect_rust(&root);
+        }
         if root.is_file("index.html") {
             return Ok(static_detection("generic-static", ".", None, 0.4));
         }
@@ -528,6 +531,171 @@ fn read_optional(dir: &Dir, name: &str) -> Option<String> {
     read_capped(dir, name, 262_144).ok()
 }
 
+#[derive(Debug, Deserialize)]
+struct CargoToml {
+    #[serde(default)]
+    package: Option<CargoPackage>,
+    #[serde(default)]
+    bin: Option<Vec<CargoBin>>,
+    #[serde(default)]
+    workspace: Option<CargoWorkspace>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CargoPackage {
+    name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CargoBin {
+    name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CargoWorkspace {
+    #[serde(default)]
+    members: Option<Vec<String>>,
+    #[serde(default, rename = "default-members")]
+    default_members: Option<Vec<String>>,
+}
+
+pub fn detect_rust_site(repo_dir: &Path) -> Result<Detection> {
+    let root = Dir::open_ambient_dir(repo_dir, ambient_authority())?;
+    if !root.is_file("Cargo.toml") {
+        return Err(Error::Config(
+            "no Cargo.toml; this checkout is not a Rust crate".into(),
+        ));
+    }
+    detect_rust(&root)
+}
+
+fn detect_rust(root: &Dir) -> Result<Detection> {
+    let name = cargo_bin_name(root)?;
+    let locked = root.is_file("Cargo.lock");
+    let mut warnings = Vec::new();
+    if !locked {
+        warnings.push("no Cargo.lock; cargo fetch and cargo build omit --locked".into());
+    }
+    let (install_command, build_command) = if locked {
+        (
+            "cargo fetch --locked".to_string(),
+            "cargo build --release --locked".to_string(),
+        )
+    } else {
+        (
+            "cargo fetch".to_string(),
+            "cargo build --release".to_string(),
+        )
+    };
+    Ok(Detection {
+        framework: "rust".into(),
+        rendering: Rendering::Ssr,
+        package_manager: "cargo".into(),
+        node_major: None,
+        output_dir: ".".into(),
+        install_command,
+        build_command,
+        start_argv: vec![format!("bin/{name}")],
+        spa_fallback: None,
+        confidence: 0.9,
+        warnings,
+        pack_output_only: false,
+    })
+}
+
+fn cargo_bin_name(root: &Dir) -> Result<String> {
+    let text = read_capped(root, "Cargo.toml", 1_048_576)?;
+    bin_name_from_manifest(&text, Some(root))
+}
+
+fn bin_name_from_manifest(text: &str, root: Option<&Dir>) -> Result<String> {
+    let manifest: CargoToml =
+        toml::from_str(text).map_err(|err| Error::Config(format!("Cargo.toml: {err}")))?;
+    if let Some(name) = manifest
+        .bin
+        .as_ref()
+        .and_then(|bins| bins.first())
+        .and_then(|bin| bin.name.as_deref())
+    {
+        return checked_bin_name(name);
+    }
+    if let Some(name) = manifest
+        .package
+        .as_ref()
+        .and_then(|package| package.name.as_deref())
+    {
+        return checked_bin_name(name);
+    }
+    if let Some(root) = root
+        && let Some(member) = manifest.workspace.as_ref().and_then(workspace_member)
+    {
+        return member_bin_name(root, member);
+    }
+    Err(Error::Config(
+        "could not name a cargo binary; set CITE_START_COMMAND".into(),
+    ))
+}
+
+fn member_bin_name(root: &Dir, member: &str) -> Result<String> {
+    if !workspace_member_ok(member) {
+        return Err(Error::Config(format!(
+            "cargo workspace member `{member}` is absolute or contains `..`"
+        )));
+    }
+    let rel = Path::new(member).join("Cargo.toml");
+    let rel = rel
+        .to_str()
+        .ok_or_else(|| Error::Config(format!("cargo workspace member `{member}` is not utf-8")))?;
+    let text = read_capped(root, rel, 1_048_576)
+        .map_err(|err| Error::Config(format!("cargo workspace member `{member}`: {err}")))?;
+    bin_name_from_manifest(&text, None)
+}
+
+fn workspace_member(ws: &CargoWorkspace) -> Option<&str> {
+    let defaults = ws
+        .default_members
+        .as_deref()
+        .filter(|members| !members.is_empty());
+    let members = defaults.or(ws.members.as_deref())?;
+    members
+        .iter()
+        .find(|member| !member.is_empty())
+        .map(String::as_str)
+}
+
+fn workspace_member_ok(member: &str) -> bool {
+    if member.is_empty() || member.contains(['\0', '\\']) {
+        return false;
+    }
+    let path = Path::new(member);
+    if path.is_absolute() {
+        return false;
+    }
+    let mut saw_normal = false;
+    for component in path.components() {
+        match component {
+            Component::Normal(_) => saw_normal = true,
+            Component::CurDir => {}
+            _ => return false,
+        }
+    }
+    saw_normal
+}
+
+fn checked_bin_name(name: &str) -> Result<String> {
+    if bin_name_ok(name) {
+        Ok(name.to_string())
+    } else {
+        Err(Error::Config(format!(
+            "cargo binary name `{name}` is not a single path component; set CITE_START_COMMAND"
+        )))
+    }
+}
+
+fn bin_name_ok(name: &str) -> bool {
+    !name.is_empty() && !name.contains(['/', '\\', '\0']) && name != "." && name != ".."
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -884,5 +1052,101 @@ mod tests {
         let dir = site(&[("package.json", r#"{"name":"x"}"#)]);
         let err = detect_site(dir.path()).unwrap_err();
         assert!(err.to_string().contains("CITE_RENDERING"));
+    }
+
+    #[test]
+    fn detects_a_cargo_package_and_keeps_hyphens() {
+        let locked = site(&[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"my-app\"\nversion = \"0.1.0\"\n",
+            ),
+            ("Cargo.lock", ""),
+        ]);
+        let det = detect_site(locked.path()).unwrap();
+        assert_eq!(det.framework, "rust");
+        assert_eq!(det.rendering, Rendering::Ssr);
+        assert_eq!(det.package_manager, "cargo");
+        assert_eq!(det.node_major, None);
+        assert_eq!(det.output_dir, ".");
+        assert!(!det.pack_output_only);
+        assert_eq!(det.install_command, "cargo fetch --locked");
+        assert!(
+            det.build_command.contains("--release"),
+            "{}",
+            det.build_command
+        );
+        assert!(
+            det.build_command.contains("--locked"),
+            "{}",
+            det.build_command
+        );
+        assert_eq!(det.start_argv, ["bin/my-app"]);
+        assert!((det.confidence - 0.9).abs() < f32::EPSILON);
+        assert!(det.warnings.is_empty());
+
+        let unlocked = site(&[("Cargo.toml", "[package]\nname = \"my-app\"\n")]);
+        let det = detect_site(unlocked.path()).unwrap();
+        assert_eq!(det.build_command, "cargo build --release");
+        assert_eq!(det.install_command, "cargo fetch");
+        assert!(det.warnings.iter().any(|w| w.contains("Cargo.lock")));
+
+        let html = site(&[("index.html", "<html></html>\n")]);
+        assert_eq!(
+            detect_site(html.path()).unwrap().rendering,
+            Rendering::Static
+        );
+
+        let both = site(&[
+            ("package.json", r#"{"dependencies":{"vite":"^6"}}"#),
+            ("Cargo.toml", "[package]\nname = \"my-app\"\n"),
+        ]);
+        let det = detect_site(both.path()).unwrap();
+        assert_eq!(det.framework, "vite");
+        assert_ne!(det.package_manager, "cargo");
+        assert_eq!(detect_rust_site(both.path()).unwrap().framework, "rust");
+        assert_eq!(
+            detect_rust_site(both.path()).unwrap().start_argv,
+            ["bin/my-app"]
+        );
+    }
+
+    #[test]
+    fn rust_bin_name_prefers_bin_table_then_workspace_member() {
+        let named = site(&[(
+            "Cargo.toml",
+            "[package]\nname = \"my-app\"\n\n[[bin]]\nname = \"serve\"\n",
+        )]);
+        assert_eq!(detect_site(named.path()).unwrap().start_argv, ["bin/serve"]);
+
+        let workspace = site(&[
+            ("Cargo.toml", "[workspace]\nmembers = [\"server\"]\n"),
+            ("server/Cargo.toml", "[package]\nname = \"api\"\n"),
+        ]);
+        assert_eq!(
+            detect_site(workspace.path()).unwrap().start_argv,
+            ["bin/api"]
+        );
+
+        let preferred = site(&[
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers = [\"other\", \"server\"]\ndefault-members = [\"server\"]\n",
+            ),
+            ("other/Cargo.toml", "[package]\nname = \"other\"\n"),
+            ("server/Cargo.toml", "[package]\nname = \"api\"\n"),
+        ]);
+        assert_eq!(
+            detect_rust_site(preferred.path()).unwrap().start_argv,
+            ["bin/api"]
+        );
+
+        let escaped = site(&[("Cargo.toml", "[workspace]\nmembers = [\"../x\"]\n")]);
+        let err = detect_site(escaped.path()).unwrap_err();
+        assert!(err.to_string().contains(".."), "{err}");
+
+        let unnamed = site(&[("Cargo.toml", "[workspace]\nmembers = []\n")]);
+        let err = detect_site(unnamed.path()).unwrap_err();
+        assert!(err.to_string().contains("CITE_START_COMMAND"), "{err}");
     }
 }

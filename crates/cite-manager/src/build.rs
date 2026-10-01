@@ -1,7 +1,8 @@
 //! Build job helpers and privileged-helper invocation.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -62,14 +63,24 @@ pub fn resolve_site(cfg: &ManagerConfig, src_root: &Path) -> Result<(Detection, 
         RenderingSetting::Static => Some(Rendering::Static),
         RenderingSetting::Ssr => Some(Rendering::Ssr),
     };
-    let mut det = detect_site_configured(&site_root, pm, forced).map_err(|err| {
-        let msg = err.to_string();
-        if msg.contains("ambiguous") || msg.contains("CITE_RENDERING") {
-            ManagerError::new(format!("{msg} (set CITE_RENDERING)"))
-        } else {
-            ManagerError::from(err)
+    let mut det = if cfg.runtime == RuntimeKind::Rust {
+        cite_core::detect::detect_rust_site(&site_root)?
+    } else {
+        let det = detect_site_configured(&site_root, pm, forced).map_err(|err| {
+            let msg = err.to_string();
+            if msg.contains("ambiguous") || msg.contains("CITE_RENDERING") {
+                ManagerError::new(format!("{msg} (set CITE_RENDERING)"))
+            } else {
+                ManagerError::from(err)
+            }
+        })?;
+        if det.package_manager == "cargo" {
+            return Err(ManagerError::new(
+                "this checkout is a Rust crate; use the rust manager and cite-executor-rust with CITE_RUNTIME=rust",
+            ));
         }
-    })?;
+        det
+    };
 
     if cfg.framework != "auto" {
         det.framework = cfg.framework.clone();
@@ -107,6 +118,9 @@ pub fn resolve_site(cfg: &ManagerConfig, src_root: &Path) -> Result<(Detection, 
             Rendering::Ssr
         }
     };
+    if cfg.runtime == RuntimeKind::Rust && rendering == Rendering::Static {
+        return Err(ManagerError::new("rust runtime cannot be static"));
+    }
 
     if let Some(detected) = &det.node_major
         && detected != &cfg.node_major
@@ -133,6 +147,9 @@ pub fn cache_env(cache_dir: &Path) -> HashMap<String, String> {
         ("YARN_GLOBAL_FOLDER".into(), sub("yarn-global")),
         ("YARN_ENABLE_GLOBAL_CACHE".into(), "true".into()),
         ("XDG_CACHE_HOME".into(), sub("xdg")),
+        ("CARGO_HOME".into(), sub("cargo")),
+        ("CARGO_TARGET_DIR".into(), sub("cargo-target")),
+        ("CARGO_TERM_COLOR".into(), "never".into()),
     ])
 }
 
@@ -208,7 +225,7 @@ pub fn prune_command(
     match pm {
         "pnpm" => Some("pnpm prune --prod".into()),
         "yarn" if yarn_berry => Some("yarn workspaces focus --production".into()),
-        "yarn" | "bun" => None,
+        "yarn" | "bun" | "cargo" => None,
         _ => Some("npm prune --omit=dev".into()),
     }
 }
@@ -227,6 +244,125 @@ fn start_target_problem(site_src: &Path, argv: &[String]) -> Option<String> {
             )
         }),
     }
+}
+
+const RUST_ASSET_DIRS: [&str; 4] = ["public", "static", "assets", "templates"];
+
+fn stage_rust_release(
+    job_dir: &Path,
+    site_src: &Path,
+    env: &HashMap<String, String>,
+    start_argv: &[String],
+) -> BuildResult<PathBuf> {
+    let detected =
+        cite_core::detect::detect_rust_site(site_src).map_err(BuildFailure::permanent)?;
+    let detected_argv0 = detected.start_argv.first().ok_or_else(|| {
+        BuildFailure::permanent("could not name a cargo binary; set CITE_START_COMMAND")
+    })?;
+    let name = detected_argv0.strip_prefix("bin/").ok_or_else(|| {
+        BuildFailure::permanent(format!(
+            "rust start path `{detected_argv0}` is not bin/<name>"
+        ))
+    })?;
+    if !bin_component_ok(name) {
+        return Err(BuildFailure::permanent(format!(
+            "refusing cargo binary name `{name}`"
+        )));
+    }
+    let looked_up = rust_release_binary(site_src, env, name);
+    if !looked_up.is_file() {
+        return Err(BuildFailure::permanent(format!(
+            "rust release binary missing: {}",
+            looked_up.display()
+        )));
+    }
+    let stage = job_dir.join("out").join("app");
+    let dest = stage.join("bin").join(name);
+    if !path_within(&stage, &dest) {
+        return Err(BuildFailure::permanent(
+            "rust stage path escapes the job output",
+        ));
+    }
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::copy(&looked_up, &dest)?;
+    std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))?;
+    copy_rust_assets(site_src, &stage)?;
+    let argv0 = start_argv.first().map(String::as_str).unwrap_or("");
+    let expected = format!("bin/{name}");
+    if argv0 != expected {
+        return Err(BuildFailure::permanent(format!(
+            "rust start command `{argv0}` does not match staged binary `{expected}`"
+        )));
+    }
+    if !dest.is_file() {
+        return Err(BuildFailure::permanent(format!(
+            "staged rust binary missing: {}",
+            dest.display()
+        )));
+    }
+    Ok(stage)
+}
+
+fn rust_release_binary(site_src: &Path, env: &HashMap<String, String>, name: &str) -> PathBuf {
+    match env.get("CARGO_TARGET_DIR") {
+        Some(target) => Path::new(target).join("release").join(name),
+        None => site_src.join("target").join("release").join(name),
+    }
+}
+
+fn bin_component_ok(name: &str) -> bool {
+    !name.is_empty() && !name.contains(['/', '\\', '\0']) && name != "." && name != ".."
+}
+
+fn path_within(root: &Path, candidate: &Path) -> bool {
+    !candidate
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+        && candidate.starts_with(root)
+}
+
+fn copy_rust_assets(site_src: &Path, stage: &Path) -> BuildResult<()> {
+    for name in RUST_ASSET_DIRS {
+        let src = site_src.join(name);
+        let Ok(meta) = std::fs::symlink_metadata(&src) else {
+            continue;
+        };
+        if !meta.file_type().is_dir() {
+            continue;
+        }
+        let dest = stage.join(name);
+        if !path_within(stage, &dest) {
+            continue;
+        }
+        copy_dir_nofollow(&src, &dest, stage)?;
+    }
+    Ok(())
+}
+
+fn copy_dir_nofollow(src: &Path, dest: &Path, stage: &Path) -> BuildResult<()> {
+    if !path_within(stage, dest) {
+        return Ok(());
+    }
+    std::fs::create_dir_all(dest)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            continue;
+        }
+        let child = dest.join(entry.file_name());
+        if !path_within(stage, &child) {
+            continue;
+        }
+        if file_type.is_dir() {
+            copy_dir_nofollow(&entry.path(), &child, stage)?;
+        } else if file_type.is_file() {
+            std::fs::copy(entry.path(), &child)?;
+        }
+    }
+    Ok(())
 }
 
 /// Detection findings go to the log and the build log ring, redacted like build output.
@@ -440,7 +576,14 @@ async fn build_in_job(
         ));
     }
 
-    let pack_root = if det.pack_output_only || rendering == Rendering::Static {
+    let pack_root = if cfg.runtime == RuntimeKind::Rust {
+        if det.start_argv.is_empty() {
+            return Err(BuildFailure::permanent(
+                "SSR release requires a start command; set CITE_START_COMMAND",
+            ));
+        }
+        stage_rust_release(job_dir, &site_src, &job.env, &det.start_argv)?
+    } else if det.pack_output_only || rendering == Rendering::Static {
         let root = site_src.join(&det.output_dir);
         if !root.is_dir() {
             return Err(BuildFailure::permanent(format!(
@@ -1595,6 +1738,11 @@ mod tests {
             Some("pnpm prune --prod")
         );
         assert_eq!(prune_command("bun", Rendering::Ssr, None, false), None);
+        assert_eq!(prune_command("cargo", Rendering::Ssr, None, false), None);
+        assert_eq!(
+            prune_command("cargo", Rendering::Ssr, Some(true), false),
+            None
+        );
         assert_eq!(prune_command("npm", Rendering::Static, None, false), None);
         assert_eq!(
             prune_command("npm", Rendering::Static, Some(true), false).as_deref(),
@@ -1619,6 +1767,10 @@ mod tests {
         assert!(env["YARN_GLOBAL_FOLDER"].ends_with("/yarn-global"));
         assert_eq!(env["YARN_ENABLE_GLOBAL_CACHE"], "true");
         assert!(env["XDG_CACHE_HOME"].starts_with(dir.path().to_str().unwrap()));
+        assert!(env["CARGO_HOME"].ends_with("/cargo"));
+        assert!(env["CARGO_TARGET_DIR"].ends_with("/cargo-target"));
+        assert_eq!(env["CARGO_TERM_COLOR"], "never");
+        assert!(!env.contains_key("RUSTUP_HOME"));
 
         let old = dir.path().join("old.bin");
         let new = dir.path().join("new.bin");
@@ -2338,5 +2490,111 @@ mod tests {
         std::fs::create_dir_all(src.join("node_modules/.bin")).unwrap();
         std::fs::write(src.join("node_modules/.bin/next"), "").unwrap();
         assert!(super::start_target_problem(src, &argv(&["next", "start"])).is_none());
+        let rust_bin = super::start_target_problem(src, &argv(&["bin/my-app"])).unwrap();
+        assert!(rust_bin.contains("node_modules/.bin"), "{rust_bin}");
+        let escaped = super::start_target_problem(src, &argv(&["../bin/my-app"])).unwrap();
+        assert!(escaped.contains("node_modules/.bin"), "{escaped}");
+    }
+
+    #[test]
+    fn resolve_site_rejects_a_rust_crate_on_the_node_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"hello\"\n",
+        )
+        .unwrap();
+        let mut env = HashMap::new();
+        env.insert("CITE_REPO".into(), "owner/name".into());
+        let cfg = ManagerConfig::load_from(&env, None).unwrap();
+        let err = resolve_site(&cfg, dir.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("CITE_RUNTIME=rust"), "{msg}");
+        assert!(msg.contains("cite-executor-rust"), "{msg}");
+
+        env.insert("CITE_RUNTIME".into(), "rust".into());
+        env.insert("CITE_RENDERING".into(), "static".into());
+        let cfg = ManagerConfig::load_from(&env, None).unwrap();
+        let err = resolve_site(&cfg, dir.path()).unwrap_err();
+        assert!(err.to_string().contains("cannot be static"), "{err}");
+
+        env.insert("CITE_RENDERING".into(), "ssr".into());
+        env.insert("CITE_INSTALL_COMMAND".into(), "true".into());
+        env.insert("CITE_BUILD_COMMAND".into(), "true".into());
+        let cfg = ManagerConfig::load_from(&env, None).unwrap();
+        let (det, rendering) = resolve_site(&cfg, dir.path()).unwrap();
+        assert_eq!(rendering, Rendering::Ssr);
+        assert_eq!(det.framework, "rust");
+        assert_eq!(det.package_manager, "cargo");
+        assert_eq!(det.install_command, "true");
+        assert_eq!(det.build_command, "true");
+        assert_eq!(det.start_argv, ["bin/hello"]);
+        assert_eq!(det.node_major, None);
+    }
+
+    #[test]
+    fn stage_rust_release_copies_the_binary_and_real_asset_dirs() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let site = tmp.path().join("site");
+        let job = tmp.path().join("job");
+        std::fs::create_dir_all(site.join("target/release")).unwrap();
+        std::fs::create_dir_all(site.join("public")).unwrap();
+        std::fs::create_dir_all(job.join("out")).unwrap();
+        std::fs::write(site.join("Cargo.toml"), "[package]\nname = \"hello\"\n").unwrap();
+        std::fs::write(site.join("target/release/hello"), b"bin").unwrap();
+        std::fs::write(site.join("public/app.txt"), b"asset").unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret"), b"nope").unwrap();
+        std::os::unix::fs::symlink(&outside, site.join("static")).unwrap();
+        std::os::unix::fs::symlink(outside.join("secret"), site.join("public/link")).unwrap();
+        let stage =
+            super::stage_rust_release(&job, &site, &HashMap::new(), &["bin/hello".into()]).unwrap();
+        let staged = stage.join("bin/hello");
+        assert_eq!(std::fs::read(&staged).unwrap(), b"bin");
+        let mode = std::fs::metadata(&staged).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755);
+        assert_eq!(
+            std::fs::read(stage.join("public/app.txt")).unwrap(),
+            b"asset"
+        );
+        assert!(!stage.join("public/link").exists());
+        assert!(!stage.join("static").exists());
+        assert!(!stage.join("Cargo.toml").exists());
+
+        let cache = tmp.path().join("cargo-target");
+        std::fs::create_dir_all(cache.join("release")).unwrap();
+        std::fs::write(cache.join("release/hello"), b"cached").unwrap();
+        let env = HashMap::from([("CARGO_TARGET_DIR".into(), cache.display().to_string())]);
+        let stage = super::stage_rust_release(&job, &site, &env, &["bin/hello".into()]).unwrap();
+        assert_eq!(std::fs::read(stage.join("bin/hello")).unwrap(), b"cached");
+
+        let missing = super::stage_rust_release(
+            &job,
+            &site,
+            &HashMap::from([(
+                "CARGO_TARGET_DIR".into(),
+                tmp.path().join("empty").display().to_string(),
+            )]),
+            &["bin/hello".into()],
+        )
+        .unwrap_err();
+        assert!(
+            missing.to_string().contains("rust release binary missing"),
+            "{missing}"
+        );
+        assert!(
+            missing.to_string().contains("empty/release/hello"),
+            "{missing}"
+        );
+
+        let mismatch =
+            super::stage_rust_release(&job, &site, &HashMap::new(), &["bin/other".into()])
+                .unwrap_err();
+        assert!(
+            mismatch.to_string().contains("does not match"),
+            "{mismatch}"
+        );
     }
 }

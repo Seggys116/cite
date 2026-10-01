@@ -86,6 +86,30 @@ updates:
         update-types: ["minor", "patch"]
 
   - package-ecosystem: docker
+    directory: "/images/manager-rust"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "chore(deps)"
+    cooldown:
+      default-days: 3
+    groups:
+      docker-minor-patch:
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: docker
+    directory: "/images/executor-rust"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "chore(deps)"
+    cooldown:
+      default-days: 3
+    groups:
+      docker-minor-patch:
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: docker
     directory: "/images/mock-github"
     schedule:
       interval: weekly

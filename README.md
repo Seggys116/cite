@@ -16,7 +16,7 @@ docker compose exec manager cite status
 
 Requirements: **Docker Engine 26+** and **Compose v2.26+**. See [docs/install.md](docs/install.md).
 
-Images are published to `ghcr.io/seggys116` (used by `docker-compose.yml`) and mirrored to Docker Hub as `docker.io/seggy116`.
+Images are published to `ghcr.io/seggys116` (used by `docker-compose.yml`) and mirrored to Docker Hub as `docker.io/seggy116`. Rust sites use a separate image pair, `cite-manager-rust` and `cite-executor-rust`; see [docs/sites.md](docs/sites.md#rust).
 
 ## What you get
 
@@ -46,7 +46,7 @@ docker compose -f docker-compose.dev.yml --profile mock up --build
 - [Threat model](docs/threat-model.md)
 - [Troubleshooting](docs/troubleshooting.md)
 - [Multiple sites](docs/multi-site.md)
-- [Running real sites](docs/sites.md): package managers, egress, persistent data, Next.js, memory
+- [Running real sites](docs/sites.md): package managers, egress, persistent data, Next.js, Rust, memory
 - [HTTPS in front](docs/https.md)
 - [SECURITY](SECURITY.md)
 

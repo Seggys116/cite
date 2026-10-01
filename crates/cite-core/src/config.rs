@@ -891,8 +891,9 @@ fn parse_runtime(value: &str) -> Result<RuntimeKind> {
         "node" => Ok(RuntimeKind::Node),
         "bun" => Ok(RuntimeKind::Bun),
         "static" => Ok(RuntimeKind::Static),
+        "rust" => Ok(RuntimeKind::Rust),
         _ => Err(Error::Config(format!(
-            "CITE_RUNTIME must be node, bun, or static, got `{value}`"
+            "CITE_RUNTIME must be node, bun, static, or rust, got `{value}`"
         ))),
     }
 }
@@ -1297,6 +1298,27 @@ mod tests {
         assert_eq!(file_only.read().unwrap(), "rotated");
         assert!(load(&[]).read().is_err());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn runtime_rust_loads_from_the_env() {
+        let cfg = ManagerConfig::load_from(
+            &env(&[("CITE_REPO", "owner/name"), ("CITE_RUNTIME", "rust")]),
+            None,
+        )
+        .unwrap();
+        assert_eq!(cfg.runtime, RuntimeKind::Rust);
+        let cfg = ExecutorConfig::load_from(&env(&[("CITE_RUNTIME", "rust")]), None).unwrap();
+        assert_eq!(cfg.runtime, RuntimeKind::Rust);
+        let err = ManagerConfig::load_from(
+            &env(&[("CITE_REPO", "owner/name"), ("CITE_RUNTIME", "deno")]),
+            None,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        for word in ["node", "bun", "static", "rust"] {
+            assert!(msg.contains(word), "{msg}");
+        }
     }
 
     #[test]

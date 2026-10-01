@@ -4,7 +4,7 @@ name: cite
 
 services:
   init:
-    image: ghcr.io/seggys116/cite-manager:${CITE_VERSION:-0.1.4}-node${CITE_NODE:-22}
+    image: ghcr.io/seggys116/cite-manager:${CITE_VERSION:-0.2.0}-node${CITE_NODE:-22}
     restart: "no"
     user: "0:0"
     read_only: true
@@ -34,7 +34,7 @@ services:
         max-file: "3"
 
   manager:
-    image: ghcr.io/seggys116/cite-manager:${CITE_VERSION:-0.1.4}-node${CITE_NODE:-22}
+    image: ghcr.io/seggys116/cite-manager:${CITE_VERSION:-0.2.0}-node${CITE_NODE:-22}
     restart: unless-stopped
     depends_on:
       init:
@@ -117,7 +117,7 @@ services:
       start_period: 20s
 
   executor:
-    image: ghcr.io/seggys116/cite-executor-node:${CITE_VERSION:-0.1.4}-node${CITE_NODE:-22}
+    image: ghcr.io/seggys116/cite-executor-node:${CITE_VERSION:-0.2.0}-node${CITE_NODE:-22}
     restart: unless-stopped
     depends_on:
       init:

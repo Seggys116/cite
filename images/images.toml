@@ -1,4 +1,5 @@
 # Digests resolved 2026-09-30 via `docker buildx imagetools inspect`; node and base digests are multi-arch index digests.
+# cc_digest resolved 2026-10-01 the same way (multi-arch index).
 
 [meta]
 registry = "ghcr.io/seggys116"
@@ -10,9 +11,11 @@ bun_linux_aarch64_sha256 = "54328bbc2d9c8e0c9f892c544d66c57a83b84139e34909e5ee81
 
 [images]
 manager = "cite-manager"
+manager_rust = "cite-manager-rust"
 executor_node = "cite-executor-node"
 executor_bun = "cite-executor-bun"
 executor_static = "cite-executor-static"
+executor_rust = "cite-executor-rust"
 
 [[node]]
 major = 22
@@ -39,3 +42,5 @@ static_nonroot = "gcr.io/distroless/static:nonroot"
 static_digest = "sha256:e2e927ec666bae08560abb3c55d0659eceabb657f56b6782ab500a9fc7f555e3"
 bun_distroless = "docker.io/oven/bun:1-distroless"
 bun_digest = "sha256:1a0c31c7c5f9d193aedf60fe1cebdeb76ac8f6e29f24be8dd8cbd6df72df26ec"
+cc_nonroot = "gcr.io/distroless/cc-debian12:nonroot"
+cc_digest = "sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f"

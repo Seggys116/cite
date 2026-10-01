@@ -16,7 +16,7 @@ Example `site-a.env`:
 CITE_REPO=acme/marketing
 CITE_GITHUB_TOKEN=ghp_replace_me
 CITE_BRANCH=main
-CITE_VERSION=0.1.4
+CITE_VERSION=0.2.0
 CITE_NODE=22
 CITE_PORT=8081
 CITE_BIND=127.0.0.1
