@@ -158,6 +158,8 @@ pub struct SlotStatus {
     pub warm_until: Option<String>,
     #[serde(default)]
     pub pid: Option<u32>,
+    #[serde(default)]
+    pub inflight: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -222,6 +224,7 @@ impl ExecutorStatus {
             since: now.clone(),
             warm_until: None,
             pid: None,
+            inflight: 0,
         };
         Self {
             v: SCHEMA_VERSION,
@@ -840,6 +843,25 @@ mod tests {
             ),
             (0, 0, 0)
         );
+    }
+
+    #[test]
+    fn status_without_inflight_still_decodes() {
+        let mut value = serde_json::to_value(ExecutorStatus::initial("0.1.0")).unwrap();
+        for slot in ["blue", "green"] {
+            value["slots"][slot]
+                .as_object_mut()
+                .unwrap()
+                .remove("inflight");
+        }
+        let status = decode_status(&serde_json::to_vec(&value).unwrap()).unwrap();
+        assert_eq!(status.slots.blue.inflight, 0);
+        assert_eq!(status.slots.green.inflight, 0);
+        value["slots"]["blue"]["inflight"] = serde_json::json!(3);
+        let status = decode_status(&serde_json::to_vec(&value).unwrap()).unwrap();
+        assert_eq!(status.slots.blue.inflight, 3);
+        value["slots"]["blue"]["extra"] = serde_json::json!(1);
+        assert!(decode_status(&serde_json::to_vec(&value).unwrap()).is_err());
     }
 
     #[test]

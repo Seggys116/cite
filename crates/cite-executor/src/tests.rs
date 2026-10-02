@@ -3118,3 +3118,526 @@ async fn restart_child_spawn_failure_is_treated_as_a_crash() {
     assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
     exe.shutdown().await;
 }
+
+const UPSTREAM_RS: &str = r#"
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::thread;
+use std::time::Duration;
+
+fn main() {
+    let token = std::env::args().nth(1).unwrap_or_else(|| "alpha".into());
+    let chunks: u64 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(20);
+    let gap_ms: u64 = std::env::args().nth(3).and_then(|s| s.parse().ok()).unwrap_or(150);
+    let port = std::env::var("PORT").unwrap_or_else(|_| "9".into());
+    let listener = TcpListener::bind(format!("127.0.0.1:{port}")).unwrap();
+    for incoming in listener.incoming() {
+        let Ok(stream) = incoming else { continue };
+        let token = token.clone();
+        thread::spawn(move || serve(stream, &token, chunks, gap_ms));
+    }
+}
+
+fn serve(mut stream: TcpStream, token: &str, chunks: u64, gap_ms: u64) {
+    let _ = stream.set_nodelay(true);
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let mut buf = [0u8; 2048];
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        match stream.read(&mut buf[filled..]) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                filled += n;
+                if buf[..filled].windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+        }
+    }
+    let head = String::from_utf8_lossy(&buf[..filled]);
+    let slow = head.lines().next().unwrap_or("").contains(" /slow");
+    if slow {
+        let _ = stream.write_all(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+        );
+        let _ = stream.flush();
+        for _ in 0..chunks {
+            let chunk = format!("{:x}\r\n{token}\r\n", token.len());
+            if stream.write_all(chunk.as_bytes()).is_err() {
+                return;
+            }
+            let _ = stream.flush();
+            thread::sleep(Duration::from_millis(gap_ms));
+        }
+        let _ = stream.write_all(b"0\r\n\r\n");
+        return;
+    }
+    let body = token.as_bytes();
+    let resp = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let _ = stream.write_all(resp.as_bytes());
+    let _ = stream.write_all(body);
+}
+"#;
+
+fn compile_upstream(dir: &Path) -> std::path::PathBuf {
+    let src = dir.join("upstream.rs");
+    let bin = dir.join("upstream-bin");
+    std::fs::write(&src, UPSTREAM_RS).unwrap();
+    let output = Command::new("rustc")
+        .arg("--edition")
+        .arg("2021")
+        .arg("-o")
+        .arg(&bin)
+        .arg(&src)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "rustc upstream: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    bin
+}
+
+fn seal_rust_ssr(data: &Path, slot: Slot, release_id: &str, bin: &Path, args: &[&str]) {
+    use std::os::unix::fs::PermissionsExt;
+    let slot_dir = data.join("releases").join(slot.as_str());
+    let dest_dir = slot_dir.join("app/bin");
+    std::fs::create_dir_all(&dest_dir).unwrap();
+    let dest = dest_dir.join("upstream");
+    std::fs::copy(bin, &dest).unwrap();
+    std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut manifest = sample_ssr(slot, release_id);
+    manifest.runtime = RuntimeKind::Rust;
+    manifest.start_argv = std::iter::once("bin/upstream".to_string())
+        .chain(args.iter().map(|arg| (*arg).to_string()))
+        .collect();
+    manifest.health.consecutive = 1;
+    manifest.health.timeout_s = 8;
+    manifest.health.expect = HealthExpect::TwoXx;
+    std::fs::create_dir_all(data.join("control")).unwrap();
+    std::fs::create_dir_all(data.join("status")).unwrap();
+    write_release(&slot_dir.join("release.json"), &manifest).unwrap();
+}
+
+fn assert_no_slot_leak(body: &[u8]) {
+    let text = String::from_utf8_lossy(body);
+    assert!(
+        !text.contains("blue") && !text.contains("green") && !text.contains("127.0.0.1:"),
+        "{text}"
+    );
+}
+
+fn count_slice(buf: &[u8], needle: &[u8]) -> usize {
+    if needle.is_empty() || buf.len() < needle.len() {
+        return 0;
+    }
+    buf.windows(needle.len())
+        .filter(|window| *window == needle)
+        .count()
+}
+
+async fn open_get(addr: SocketAddr, path: &str) -> tokio::net::TcpStream {
+    use tokio::io::AsyncWriteExt;
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let req = format!("GET {path} HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n");
+    stream.write_all(req.as_bytes()).await.unwrap();
+    stream
+}
+
+async fn read_for(stream: &mut tokio::net::TcpStream, limit: Duration) -> Vec<u8> {
+    use tokio::io::AsyncReadExt;
+    let mut buf = Vec::new();
+    let deadline = tokio::time::Instant::now() + limit;
+    let mut tmp = [0u8; 1024];
+    while tokio::time::Instant::now() < deadline {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(left, stream.read(&mut tmp)).await {
+            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+            Ok(Ok(n)) => buf.extend_from_slice(&tmp[..n]),
+        }
+    }
+    buf
+}
+
+async fn read_until_token(
+    stream: &mut tokio::net::TcpStream,
+    token: &[u8],
+    count: usize,
+    limit: Duration,
+) -> Vec<u8> {
+    use tokio::io::AsyncReadExt;
+    let mut buf = Vec::new();
+    let deadline = tokio::time::Instant::now() + limit;
+    let mut tmp = [0u8; 1024];
+    while tokio::time::Instant::now() < deadline && count_slice(&buf, token) < count {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(left, stream.read(&mut tmp)).await {
+            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+            Ok(Ok(n)) => buf.extend_from_slice(&tmp[..n]),
+        }
+    }
+    buf
+}
+
+fn process_alive(pid: u32) -> bool {
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn rust_executor(data: &Path, drain_max: Duration) -> ExecutorConfig {
+    let mut cfg = config_from(data, "127.0.0.1:0");
+    cfg.runtime = RuntimeKind::Rust;
+    cfg.drain_max = drain_max;
+    cfg.child_term_grace = Duration::from_millis(500);
+    cfg
+}
+
+#[tokio::test]
+async fn slow_body_stays_on_the_slot_that_accepted_it() {
+    let dir = tempdir().unwrap();
+    let data = dir.path();
+    let bin = compile_upstream(data);
+    seal_rust_ssr(
+        data,
+        Slot::Blue,
+        "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        &bin,
+        &["alpha", "24", "120"],
+    );
+    seal_rust_ssr(
+        data,
+        Slot::Green,
+        "01ARZ3NDEKTSV4RRFFQ69G5FB0",
+        &bin,
+        &["beta", "4", "50"],
+    );
+    let cfg = rust_executor(data, Duration::from_secs(60));
+    let exe = spawn(cfg).await.unwrap();
+    let (st, _, body) = http_once(exe.addr, Method::GET, "/", &[]).await;
+    assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE);
+    assert_no_slot_leak(&body);
+
+    write_desired_grace(data, 1, Slot::Blue, DesiredAction::Activate, None, 30);
+    assert!(
+        wait_status(
+            data,
+            |s| s.active_slot == Some(Slot::Blue),
+            Duration::from_secs(15)
+        )
+        .await,
+        "blue did not go live"
+    );
+    let mut slow = open_get(exe.addr, "/slow").await;
+    let first = read_until_token(&mut slow, b"alpha", 1, Duration::from_secs(3)).await;
+    assert!(count_slice(&first, b"alpha") >= 1, "{first:?}");
+    assert_no_slot_leak(&first);
+
+    write_desired_grace(data, 2, Slot::Green, DesiredAction::Activate, None, 30);
+    assert!(
+        wait_status(
+            data,
+            |s| s.active_slot == Some(Slot::Green) && s.slots.blue.state == SlotState::Warm,
+            Duration::from_secs(15)
+        )
+        .await,
+        "green did not take over"
+    );
+    let more = read_until_token(&mut slow, b"alpha", 3, Duration::from_secs(3)).await;
+    let continued = [first, more].concat();
+    assert!(count_slice(&continued, b"alpha") >= 3, "{continued:?}");
+    assert_eq!(count_slice(&continued, b"beta"), 0, "{continued:?}");
+    assert_no_slot_leak(&continued);
+
+    let (st, _, body) = http_once(
+        exe.addr,
+        Method::GET,
+        "/",
+        &[("x-cite-slot", "blue"), ("x-upstream-port", "1")],
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(&body[..], b"beta");
+    assert_no_slot_leak(&body);
+
+    let rest = read_for(&mut slow, Duration::from_secs(8)).await;
+    assert_no_slot_leak(&rest);
+    drop(slow);
+    assert!(
+        wait_status(
+            data,
+            |s| s.slots.blue.inflight == 0 && s.slots.blue.state == SlotState::Warm,
+            Duration::from_secs(5)
+        )
+        .await,
+        "blue inflight did not return to 0: {:?}",
+        cite_core::read_status(&data.join("status/executor.json"))
+    );
+    exe.shutdown().await;
+}
+
+#[tokio::test]
+async fn warm_grace_does_not_stop_a_slot_that_still_has_a_stream() {
+    let dir = tempdir().unwrap();
+    let data = dir.path();
+    let bin = compile_upstream(data);
+    seal_rust_ssr(
+        data,
+        Slot::Blue,
+        "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        &bin,
+        &["alpha", "40", "150"],
+    );
+    seal_rust_ssr(
+        data,
+        Slot::Green,
+        "01ARZ3NDEKTSV4RRFFQ69G5FB0",
+        &bin,
+        &["beta", "2", "50"],
+    );
+    write_desired_grace(data, 1, Slot::Blue, DesiredAction::Activate, None, 1);
+    let exe = spawn(rust_executor(data, Duration::from_secs(20)))
+        .await
+        .unwrap();
+    assert!(
+        wait_status(
+            data,
+            |s| s.active_slot == Some(Slot::Blue),
+            Duration::from_secs(15)
+        )
+        .await,
+        "blue did not go live"
+    );
+    let mut slow = open_get(exe.addr, "/slow").await;
+    let opened = read_until_token(&mut slow, b"alpha", 1, Duration::from_secs(3)).await;
+    assert!(count_slice(&opened, b"alpha") >= 1, "{opened:?}");
+
+    write_desired_grace(data, 2, Slot::Green, DesiredAction::Activate, None, 1);
+    assert!(
+        wait_status(
+            data,
+            |s| s.active_slot == Some(Slot::Green) && s.slots.blue.state == SlotState::Warm,
+            Duration::from_secs(15)
+        )
+        .await,
+        "green did not take over"
+    );
+    let pid = cite_core::read_status(&data.join("status/executor.json"))
+        .unwrap()
+        .slots
+        .blue
+        .pid
+        .expect("warm child pid");
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let mid = cite_core::read_status(&data.join("status/executor.json")).unwrap();
+    assert_eq!(mid.slots.blue.state, SlotState::Warm, "{mid:?}");
+    assert!(
+        process_alive(pid),
+        "warm grace stopped the child while a stream was open"
+    );
+
+    let rest = read_for(&mut slow, Duration::from_secs(12)).await;
+    let all = [opened, rest].concat();
+    assert!(count_slice(&all, b"alpha") >= 30, "{all:?}");
+    assert_eq!(count_slice(&all, b"beta"), 0);
+    drop(slow);
+    assert!(
+        wait_status(
+            data,
+            |s| s.slots.blue.state == SlotState::Stopped && s.slots.blue.inflight == 0,
+            Duration::from_secs(5)
+        )
+        .await,
+        "slot did not stop after the stream ended: {:?}",
+        cite_core::read_status(&data.join("status/executor.json"))
+    );
+    assert!(!process_alive(pid));
+    exe.shutdown().await;
+}
+
+#[tokio::test]
+async fn drain_cap_stops_the_child_while_the_body_is_open() {
+    let dir = tempdir().unwrap();
+    let data = dir.path();
+    let bin = compile_upstream(data);
+    seal_rust_ssr(
+        data,
+        Slot::Blue,
+        "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        &bin,
+        &["alpha", "80", "200"],
+    );
+    seal_rust_ssr(
+        data,
+        Slot::Green,
+        "01ARZ3NDEKTSV4RRFFQ69G5FB0",
+        &bin,
+        &["beta", "2", "50"],
+    );
+    write_desired_grace(data, 1, Slot::Blue, DesiredAction::Activate, None, 1);
+    let exe = spawn(rust_executor(data, Duration::from_secs(8)))
+        .await
+        .unwrap();
+    assert!(
+        wait_status(
+            data,
+            |s| s.active_slot == Some(Slot::Blue),
+            Duration::from_secs(15)
+        )
+        .await,
+        "blue did not go live"
+    );
+    let mut slow = open_get(exe.addr, "/slow").await;
+    let opened = read_until_token(&mut slow, b"alpha", 1, Duration::from_secs(3)).await;
+    assert!(count_slice(&opened, b"alpha") >= 1, "{opened:?}");
+
+    write_desired_grace(data, 2, Slot::Green, DesiredAction::Activate, None, 1);
+    assert!(
+        wait_status(
+            data,
+            |s| s.active_slot == Some(Slot::Green) && s.slots.blue.state == SlotState::Warm,
+            Duration::from_secs(15)
+        )
+        .await,
+        "green did not take over"
+    );
+    let switched = tokio::time::Instant::now();
+    let pid = cite_core::read_status(&data.join("status/executor.json"))
+        .unwrap()
+        .slots
+        .blue
+        .pid
+        .expect("warm child pid");
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let mid = cite_core::read_status(&data.join("status/executor.json")).unwrap();
+    assert_eq!(
+        mid.slots.blue.state,
+        SlotState::Warm,
+        "grace expiry stopped a slot that was still inside the drain cap: {mid:?}"
+    );
+    assert!(process_alive(pid));
+    assert!(
+        wait_status(
+            data,
+            |s| s.slots.blue.state == SlotState::Stopped,
+            Duration::from_secs(8)
+        )
+        .await,
+        "drain cap did not stop the child: {:?}",
+        cite_core::read_status(&data.join("status/executor.json"))
+    );
+    assert!(
+        switched.elapsed() < Duration::from_secs(12),
+        "stop waited for the slow body instead of the cap"
+    );
+    assert!(!process_alive(pid));
+    let rest = read_for(&mut slow, Duration::from_secs(2)).await;
+    let all = [opened, rest].concat();
+    assert!(count_slice(&all, b"alpha") >= 1, "{all:?}");
+    assert!(count_slice(&all, b"alpha") < 80, "{all:?}");
+    assert_eq!(count_slice(&all, b"beta"), 0);
+    assert_no_slot_leak(&all);
+    drop(slow);
+    exe.shutdown().await;
+}
+
+#[tokio::test]
+async fn evict_waits_for_an_open_stream_then_acks() {
+    let dir = tempdir().unwrap();
+    let data = dir.path();
+    let bin = compile_upstream(data);
+    seal_rust_ssr(
+        data,
+        Slot::Blue,
+        "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        &bin,
+        &["alpha", "40", "200"],
+    );
+    seal_rust_ssr(
+        data,
+        Slot::Green,
+        "01ARZ3NDEKTSV4RRFFQ69G5FB0",
+        &bin,
+        &["beta", "2", "50"],
+    );
+    write_desired_grace(data, 1, Slot::Blue, DesiredAction::Activate, None, 30);
+    let exe = spawn(rust_executor(data, Duration::from_secs(30)))
+        .await
+        .unwrap();
+    assert!(
+        wait_status(
+            data,
+            |s| s.active_slot == Some(Slot::Blue),
+            Duration::from_secs(15)
+        )
+        .await,
+        "blue did not go live"
+    );
+    let mut slow = open_get(exe.addr, "/slow").await;
+    let opened = read_until_token(&mut slow, b"alpha", 1, Duration::from_secs(3)).await;
+    assert!(count_slice(&opened, b"alpha") >= 1, "{opened:?}");
+    assert_no_slot_leak(&opened);
+
+    write_desired_grace(data, 2, Slot::Green, DesiredAction::Activate, None, 30);
+    assert!(
+        wait_status(
+            data,
+            |s| s.active_slot == Some(Slot::Green) && s.slots.blue.state == SlotState::Warm,
+            Duration::from_secs(15)
+        )
+        .await,
+        "green did not take over"
+    );
+    let before = cite_core::read_status(&data.join("status/executor.json")).unwrap();
+    let pid = before.slots.blue.pid.expect("warm child pid");
+    write_desired_grace(
+        data,
+        3,
+        Slot::Green,
+        DesiredAction::Evict,
+        Some(Slot::Blue),
+        30,
+    );
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    let held = cite_core::read_status(&data.join("status/executor.json")).unwrap();
+    assert!(held.ack_generation < 3, "{held:?}");
+    assert_eq!(held.slots.blue.state, SlotState::Warm, "{held:?}");
+    assert!(process_alive(pid));
+    assert!(
+        held.last_result
+            .as_ref()
+            .is_none_or(|result| result.generation != 3 || result.outcome != Outcome::Failed),
+        "{held:?}"
+    );
+
+    drop(slow);
+    assert!(
+        wait_status(
+            data,
+            |s| s.ack_generation >= 3 && s.slots.blue.state == SlotState::Stopped,
+            Duration::from_secs(5)
+        )
+        .await,
+        "evict did not ack after the stream ended: {:?}",
+        cite_core::read_status(&data.join("status/executor.json"))
+    );
+    assert!(!process_alive(pid));
+    let (st, _, body) = http_once(exe.addr, Method::GET, "/", &[]).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(&body[..], b"beta");
+    assert_no_slot_leak(&body);
+    exe.shutdown().await;
+}

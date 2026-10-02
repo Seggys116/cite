@@ -15,6 +15,7 @@ use cite_core::{
 use tokio::sync::{Mutex, Notify, Semaphore, watch};
 use tracing::{error, info, warn};
 
+use crate::proxy::Inflight;
 use crate::route::{RouteKind, RouteTarget};
 use crate::static_files::static_health_ok;
 use crate::supervisor::{SlotManager, probe_http_health};
@@ -29,6 +30,7 @@ pub struct SharedState {
     pub conn_count: Arc<AtomicU64>,
     pub slot_mgr: Arc<SlotManager>,
     pub requests: Arc<AtomicU64>,
+    pub inflight: Arc<Inflight>,
     pub limiter: Arc<crate::limits::Limiter>,
     #[allow(dead_code)] // available to handlers / future access-log redaction
     pub redactor: Arc<Redactor>,
@@ -39,6 +41,7 @@ struct SlotMeta {
     state: SlotState,
     release_id: Option<String>,
     warm_until: Option<Instant>,
+    drain_until: Option<Instant>,
     switched_at: Option<Instant>,
     restart_at: Option<Instant>,
     evicted: bool,
@@ -65,6 +68,7 @@ impl SlotMeta {
             state: SlotState::Empty,
             release_id: None,
             warm_until: None,
+            drain_until: None,
             switched_at: None,
             restart_at: None,
             evicted: false,
@@ -310,6 +314,15 @@ async fn handle_evict(
         }
         return;
     }
+    if state.routing.load_full().slot != Some(slot) {
+        let inflight = state.inflight.get(slot);
+        let within_cap = meta_ref(slot, blue, green)
+            .drain_until
+            .is_some_and(|until| Instant::now() < until);
+        if inflight > 0 && within_cap {
+            return;
+        }
+    }
     state.slot_mgr.stop_slot(slot).await;
     if state.routing.load_full().slot == Some(slot) {
         state.routing.store(Arc::new(RouteTarget::empty()));
@@ -317,6 +330,7 @@ async fn handle_evict(
     let meta = meta_mut(slot, blue, green);
     meta.state = SlotState::Stopped;
     meta.warm_until = None;
+    meta.drain_until = None;
     meta.switched_at = None;
     meta.restart_at = None;
     meta.evicted = true;
@@ -447,10 +461,8 @@ async fn try_activate_slot(
     if demote_previous {
         if let Some(prev) = previous {
             if prev != slot {
-                let grace = Duration::from_secs(warm_grace_s.max(1));
                 let meta = meta_mut(prev, blue, green);
-                meta.state = SlotState::Warm;
-                meta.warm_until = Some(Instant::now() + grace);
+                mark_warm(meta, warm_grace_s, state.config.drain_max);
                 set_slot_status(state, prev, meta).await;
             }
         }
@@ -460,6 +472,7 @@ async fn try_activate_slot(
         let meta = meta_mut(slot, blue, green);
         meta.state = SlotState::Live;
         meta.warm_until = None;
+        meta.drain_until = None;
         meta.switched_at = Some(Instant::now());
         meta.release_id = Some(manifest.release_id.clone());
         set_slot_status(state, slot, meta).await;
@@ -487,6 +500,7 @@ async fn park_stopped(state: &SharedState, slot: Slot, blue: &mut SlotMeta, gree
     let meta = meta_mut(slot, blue, green);
     meta.state = SlotState::Stopped;
     meta.warm_until = None;
+    meta.drain_until = None;
     meta.restart_at = None;
     set_slot_status(state, slot, meta).await;
 }
@@ -567,15 +581,14 @@ async fn handle_rollback(
                     let meta = meta_mut(target, blue, green);
                     meta.state = SlotState::Live;
                     meta.warm_until = None;
+                    meta.drain_until = None;
                     meta.switched_at = Some(Instant::now());
                     set_slot_status(state, target, meta).await;
                 }
                 if let Some(prev) = previous {
                     if prev != target {
-                        let grace = Duration::from_secs(desired.warm_grace_s.max(1));
                         let meta = meta_mut(prev, blue, green);
-                        meta.state = SlotState::Warm;
-                        meta.warm_until = Some(Instant::now() + grace);
+                        mark_warm(meta, desired.warm_grace_s, state.config.drain_max);
                         set_slot_status(state, prev, meta).await;
                     }
                 }
@@ -683,20 +696,37 @@ async fn refuse_restart(state: &SharedState, generation: u64, slot: Slot) {
 }
 
 async fn check_warm_expiry(state: &SharedState, blue: &mut SlotMeta, green: &mut SlotMeta) {
+    let now = Instant::now();
     for slot in [Slot::Blue, Slot::Green] {
-        let expired = {
+        let stop = {
             let meta = meta_ref(slot, blue, green);
-            meta.state == SlotState::Warm
-                && meta.warm_until.is_some_and(|until| Instant::now() >= until)
+            if meta.state != SlotState::Warm {
+                false
+            } else {
+                let warm_done = meta.warm_until.is_some_and(|until| now >= until);
+                let drain_done = meta.drain_until.is_some_and(|until| now >= until);
+                let inflight = state.inflight.get(slot);
+                (warm_done && inflight == 0) || drain_done
+            }
         };
-        if expired {
-            state.slot_mgr.stop_slot(slot).await;
-            let meta = meta_mut(slot, blue, green);
-            meta.state = SlotState::Stopped;
-            meta.warm_until = None;
-            set_slot_status(state, slot, meta).await;
+        if !stop {
+            continue;
         }
+        state.slot_mgr.stop_slot(slot).await;
+        let meta = meta_mut(slot, blue, green);
+        meta.state = SlotState::Stopped;
+        meta.warm_until = None;
+        meta.drain_until = None;
+        set_slot_status(state, slot, meta).await;
     }
+}
+
+fn mark_warm(meta: &mut SlotMeta, warm_grace_s: u64, drain_max: Duration) {
+    let now = Instant::now();
+    let grace = Duration::from_secs(warm_grace_s.max(1));
+    meta.state = SlotState::Warm;
+    meta.warm_until = Some(now + grace);
+    meta.drain_until = Some(now + grace.max(drain_max));
 }
 
 async fn watch_crashes(state: &SharedState, blue: &mut SlotMeta, green: &mut SlotMeta) {
@@ -756,6 +786,7 @@ async fn fallback_to_previous(
                 let meta = meta_mut(previous, blue, green);
                 meta.state = SlotState::Live;
                 meta.warm_until = None;
+                meta.drain_until = None;
                 meta.switched_at = Some(Instant::now());
                 set_slot_status(state, previous, meta).await;
                 let mut st = state.status.lock().await;
@@ -781,6 +812,7 @@ async fn fallback_to_previous(
         let meta = meta_mut(live, blue, green);
         meta.state = SlotState::Failed;
         meta.warm_until = None;
+        meta.drain_until = None;
         meta.restart_at = None;
         set_slot_status(state, live, meta).await;
     }
@@ -830,6 +862,7 @@ async fn handle_crash(
             let meta = meta_mut(live, blue, green);
             meta.state = SlotState::Failed;
             meta.warm_until = None;
+            meta.drain_until = None;
             meta.restart_at = None;
             set_slot_status(state, live, meta).await;
             state.routing.store(Arc::new(RouteTarget::empty()));
@@ -863,6 +896,7 @@ async fn reap_dead_warm_slots(state: &SharedState, blue: &mut SlotMeta, green: &
             let meta = meta_mut(slot, blue, green);
             meta.state = SlotState::Stopped;
             meta.warm_until = None;
+            meta.drain_until = None;
             set_slot_status(state, slot, meta).await;
         }
     }
@@ -880,6 +914,8 @@ async fn write_heartbeat(state: &SharedState) {
     st.limited_requests = state.limiter.limited_requests();
     st.bans = state.limiter.bans();
     st.dropped_connections = state.limiter.dropped_connections();
+    st.slots.blue.inflight = state.inflight.get(Slot::Blue);
+    st.slots.green.inflight = state.inflight.get(Slot::Green);
     if let Some(result) = st.last_result.as_mut()
         && result.outcome == Outcome::Live
         && !tail.is_empty()
@@ -897,6 +933,7 @@ async fn set_slot_status(state: &SharedState, slot: Slot, meta: &SlotMeta) {
     s.release_id = meta.release_id.clone();
     s.since = now_rfc3339();
     s.pid = pid;
+    s.inflight = state.inflight.get(slot);
     s.warm_until = None;
     if let Some(until) = meta.warm_until {
         let left = until.saturating_duration_since(Instant::now());

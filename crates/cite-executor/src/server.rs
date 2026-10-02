@@ -180,6 +180,8 @@ async fn handle(req: Request<Incoming>, peer: SocketAddr, state: SharedState) ->
                 .map(|hold| hold.0.clone() as Arc<dyn Send + Sync>);
             let cfg = ProxyConfig {
                 hold,
+                slot: route.slot,
+                inflight: Arc::clone(&state.inflight),
                 port: *port,
                 peer,
                 trusted_proxies: &state.config.trusted_proxies,

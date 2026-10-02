@@ -152,6 +152,7 @@ pub struct ManagerConfig {
     pub health_consecutive: u32,
     pub spa_fallback: Option<String>,
     pub warm_grace: Duration,
+    pub drain_max: Duration,
     pub watch: Duration,
     pub build_timeout: Duration,
     pub build_cache: bool,
@@ -195,6 +196,7 @@ pub struct ExecutorConfig {
     pub node_bin: String,
     pub bun_bin: String,
     pub warm_grace: Duration,
+    pub drain_max: Duration,
     pub watch: Duration,
     pub runtime_env: SiteEnv,
     pub connect_timeout: Duration,
@@ -316,6 +318,7 @@ impl ManagerConfig {
             )?,
             spa_fallback: spa,
             warm_grace: parse_duration(&pick(env, &file, "CITE_WARM_GRACE", "warm_grace", "24h"))?,
+            drain_max: parse_duration(&pick(env, &file, "CITE_DRAIN_MAX", "drain_max", "1h"))?,
             watch: parse_duration(&pick(env, &file, "CITE_WATCH", "watch", "10m"))?,
             build_timeout: parse_duration(&pick(
                 env,
@@ -575,6 +578,7 @@ impl ExecutorConfig {
             node_bin: pick(env, &file, "CITE_NODE_BIN", "node_bin", "node"),
             bun_bin: pick(env, &file, "CITE_BUN_BIN", "bun_bin", "bun"),
             warm_grace: parse_duration(&pick(env, &file, "CITE_WARM_GRACE", "warm_grace", "24h"))?,
+            drain_max: parse_duration(&pick(env, &file, "CITE_DRAIN_MAX", "drain_max", "1h"))?,
             watch: parse_duration(&pick(env, &file, "CITE_WATCH", "watch", "10m"))?,
             runtime_env: SiteEnv::from_env(
                 env,
@@ -1259,6 +1263,27 @@ mod tests {
     fn executor_listens_on_all_interfaces_8080_by_default() {
         let cfg = ExecutorConfig::load_from(&env(&[]), None).unwrap();
         assert_eq!(cfg.listen.to_string(), "0.0.0.0:8080");
+    }
+
+    #[test]
+    fn drain_max_defaults_to_one_hour_and_parses_like_warm_grace() {
+        let exec = ExecutorConfig::load_from(&env(&[]), None).unwrap();
+        assert_eq!(exec.warm_grace, std::time::Duration::from_secs(24 * 3_600));
+        assert_eq!(exec.drain_max, std::time::Duration::from_secs(3_600));
+        let overridden =
+            ExecutorConfig::load_from(&env(&[("CITE_DRAIN_MAX", "90s")]), None).unwrap();
+        assert_eq!(overridden.drain_max, std::time::Duration::from_secs(90));
+        let manager = ManagerConfig::load_from(&env(&[("CITE_REPO", "owner/name")]), None).unwrap();
+        assert_eq!(manager.drain_max, std::time::Duration::from_secs(3_600));
+        let from_file = ManagerConfig::load_from(
+            &env(&[("CITE_REPO", "owner/name")]),
+            Some("drain_max = \"2h\"\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            from_file.drain_max,
+            std::time::Duration::from_secs(2 * 3_600)
+        );
     }
 
     #[test]

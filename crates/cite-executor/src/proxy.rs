@@ -17,6 +17,8 @@ use hyper_util::rt::TokioIo;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 
+use cite_core::Slot;
+
 use crate::error_page::{self, BoxBody, full_body, page_413, page_502, page_504};
 
 const HOP_BY_HOP: &[&str] = &[
@@ -41,9 +43,67 @@ const CLIENT_IDENTITY_HEADERS: &[&str] = &[
     "cf-connecting-ip",
 ];
 
+pub(crate) struct Inflight {
+    blue: AtomicU64,
+    green: AtomicU64,
+}
+
+pub(crate) struct Hold {
+    inflight: Arc<Inflight>,
+    slot: Slot,
+}
+
+impl Inflight {
+    pub fn new() -> Self {
+        Self {
+            blue: AtomicU64::new(0),
+            green: AtomicU64::new(0),
+        }
+    }
+
+    pub fn get(&self, slot: Slot) -> u64 {
+        self.counter(slot).load(Ordering::Acquire)
+    }
+
+    pub(crate) fn track(self: &Arc<Self>, slot: Slot) -> Arc<Hold> {
+        saturating_add(self.counter(slot));
+        Arc::new(Hold {
+            inflight: Arc::clone(self),
+            slot,
+        })
+    }
+
+    fn counter(&self, slot: Slot) -> &AtomicU64 {
+        match slot {
+            Slot::Blue => &self.blue,
+            Slot::Green => &self.green,
+        }
+    }
+}
+
+impl Drop for Hold {
+    fn drop(&mut self) {
+        saturating_sub(self.inflight.counter(self.slot));
+    }
+}
+
+fn saturating_add(counter: &AtomicU64) {
+    let _ = counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        Some(current.saturating_add(1))
+    });
+}
+
+fn saturating_sub(counter: &AtomicU64) {
+    let _ = counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        Some(current.saturating_sub(1))
+    });
+}
+
 pub struct ProxyConfig<'a> {
     /// Kept alive by an upgraded tunnel so its connection permit is held until the tunnel closes.
     pub hold: Option<Arc<dyn Send + Sync>>,
+    pub slot: Option<Slot>,
+    pub inflight: Arc<Inflight>,
     pub port: u16,
     pub peer: SocketAddr,
     pub trusted_proxies: &'a [ipnet::IpNet],
@@ -92,6 +152,7 @@ pub async fn proxy_request(mut req: Request<Incoming>, cfg: ProxyConfig<'_>) -> 
         Ok(Err(_)) => return page_502(),
         Err(_) => return page_504(),
     };
+    let hold = cfg.slot.map(|slot| cfg.inflight.track(slot));
     let _ = stream.set_nodelay(true);
     let io = TokioIo::new(stream);
 
@@ -100,8 +161,10 @@ pub async fn proxy_request(mut req: Request<Incoming>, cfg: ProxyConfig<'_>) -> 
         Err(_) => return page_502(),
     };
 
+    let conn_hold = hold.clone();
     let conn_fut = conn.with_upgrades();
     tokio::spawn(async move {
+        let _hold = conn_hold;
         let _ = conn_fut.await;
     });
 
@@ -130,7 +193,7 @@ pub async fn proxy_request(mut req: Request<Incoming>, cfg: ProxyConfig<'_>) -> 
         return handle_upgrade(res).await;
     }
 
-    response_from_upstream(res, cfg.idle_timeout)
+    response_from_upstream(res, cfg.idle_timeout, hold)
 }
 
 async fn handle_upgrade(res: Response<Incoming>) -> Response<BoxBody> {
@@ -152,23 +215,27 @@ async fn handle_upgrade(res: Response<Incoming>) -> Response<BoxBody> {
     out
 }
 
-fn response_from_upstream(res: Response<Incoming>, idle_timeout: Duration) -> Response<BoxBody> {
+fn response_from_upstream(
+    res: Response<Incoming>,
+    idle_timeout: Duration,
+    hold: Option<Arc<Hold>>,
+) -> Response<BoxBody> {
     let (parts, body) = res.into_parts();
 
-    let stream = stream::unfold(body, move |mut body| async move {
+    let stream = stream::unfold((body, hold), move |(mut body, hold)| async move {
         match tokio::time::timeout(idle_timeout, body.frame()).await {
             Ok(Some(Ok(frame))) => Some((
                 Ok::<Frame<Bytes>, Box<dyn std::error::Error + Send + Sync>>(frame),
-                body,
+                (body, hold),
             )),
-            Ok(Some(Err(err))) => Some((Err(std::io::Error::other(err).into()), body)),
+            Ok(Some(Err(err))) => Some((Err(std::io::Error::other(err).into()), (body, hold))),
             Ok(None) => None,
             Err(_) => Some((
                 Err(
                     std::io::Error::new(std::io::ErrorKind::TimedOut, "upstream idle timeout")
                         .into(),
                 ),
-                body,
+                (body, hold),
             )),
         }
     });
@@ -230,12 +297,15 @@ pub async fn proxy_with_upgrade(req: Request<Incoming>, cfg: ProxyConfig<'_>) ->
         Ok(Ok(s)) => s,
         _ => return page_502(),
     };
+    let hold = cfg.slot.map(|slot| cfg.inflight.track(slot));
     let io = TokioIo::new(stream);
     let (mut sender, conn) = match hyper::client::conn::http1::handshake(io).await {
         Ok(p) => p,
         Err(_) => return page_502(),
     };
+    let conn_hold = hold.clone();
     tokio::spawn(async move {
+        let _hold = conn_hold;
         let _ = conn.with_upgrades().await;
     });
 
@@ -258,16 +328,17 @@ pub async fn proxy_with_upgrade(req: Request<Incoming>, cfg: ProxyConfig<'_>) ->
         };
 
     if res.status() != StatusCode::SWITCHING_PROTOCOLS {
-        return response_from_upstream(res, cfg.idle_timeout);
+        return response_from_upstream(res, cfg.idle_timeout, hold);
     }
 
     let (res_parts, res_body) = res.into_parts();
     let upstream_upgrade = hyper::upgrade::on(Response::from_parts(res_parts.clone(), res_body));
 
-    let hold = cfg.hold.clone();
+    let permit = cfg.hold.clone();
     let idle = cfg.idle_timeout;
     tokio::spawn(async move {
-        let _hold = hold;
+        let _stream = hold;
+        let _hold = permit;
         let (client, upstream) = match tokio::join!(client_upgrade, upstream_upgrade) {
             (Ok(c), Ok(u)) => (c, u),
             _ => return,
@@ -549,6 +620,37 @@ fn _ip_addr_str(ip: IpAddr) -> String {
 mod tests {
     use super::*;
     use std::net::{Ipv4Addr, SocketAddrV4};
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+
+    use cite_core::Slot;
+
+    #[test]
+    fn inflight_counts_once_until_the_last_holder_drops() {
+        let inflight = Arc::new(Inflight::new());
+        let first = inflight.track(Slot::Blue);
+        let second = Arc::clone(&first);
+        assert_eq!(inflight.get(Slot::Blue), 1);
+        assert_eq!(inflight.get(Slot::Green), 0);
+        drop(first);
+        assert_eq!(inflight.get(Slot::Blue), 1);
+        drop(second);
+        assert_eq!(inflight.get(Slot::Blue), 0);
+    }
+
+    #[test]
+    fn inflight_arithmetic_saturates() {
+        let inflight = Inflight::new();
+        saturating_sub(inflight.counter(Slot::Blue));
+        assert_eq!(inflight.get(Slot::Blue), 0);
+        inflight
+            .counter(Slot::Green)
+            .store(u64::MAX, Ordering::SeqCst);
+        saturating_add(inflight.counter(Slot::Green));
+        assert_eq!(inflight.get(Slot::Green), u64::MAX);
+        saturating_sub(inflight.counter(Slot::Green));
+        assert_eq!(inflight.get(Slot::Green), u64::MAX - 1);
+    }
 
     #[test]
     fn hop_by_hop_headers_are_stripped_unless_upgrading() {

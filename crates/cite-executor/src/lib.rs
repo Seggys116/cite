@@ -25,6 +25,7 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
 use crate::control::SharedState;
+use crate::proxy::Inflight;
 use crate::route::RouteTarget;
 use crate::supervisor::SlotManager;
 
@@ -110,6 +111,7 @@ pub async fn spawn(config: ExecutorConfig) -> Result<RunningExecutor> {
         conn_count: conn_count.clone(),
         slot_mgr: slot_mgr.clone(),
         requests,
+        inflight: Arc::new(Inflight::new()),
         limiter: limiter.clone(),
         redactor: Arc::new(redactor),
         process_exit: process_exit_tx,

@@ -30,7 +30,7 @@ The manager downloads GitHub's source tarball for the pinned SHA. It does not ru
 - `control/desired.json` is the manager's intent (`generation`, `live_slot`, `action`).
 - `status/executor.json` is the executor's reality (heartbeat ≤2 s).
 - A slot is ignored until sealed (`release.json` written last).
-- After cutover the previous slot stays **warm** for `CITE_WARM_GRACE` (default 24 h), then is stopped but files remain until the next deploy needs the slot.
+- After cutover the previous slot stays **warm** for `CITE_WARM_GRACE` (default 24 h). New requests go to the new slot. A stream already in flight stays on the old one until it ends. The old process is not stopped while such a stream is open, until the later of `CITE_WARM_GRACE` and `CITE_DRAIN_MAX` (default 1 h), measured from the switch. The next deploy waits for the same bound before reusing the slot.
 
 ## Failure modes (short)
 

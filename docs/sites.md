@@ -114,11 +114,11 @@ The release contains that binary, plus `public`, `static`, `assets`, and `templa
 docker compose -f docker-compose.yml -f docker-compose.rust.yml up -d
 ```
 
-A Rust child is one process. Warm grace still keeps the previous binary, so after a deploy the executor holds two processes until `CITE_WARM_GRACE` ends.
+A Rust child is one process. Warm grace still keeps the previous binary. An open stream keeps that process until the stream ends, or until the later of `CITE_WARM_GRACE` and `CITE_DRAIN_MAX`.
 
 ## Memory
 
-After a deploy the previous release keeps running for `CITE_WARM_GRACE` (24 h by default) so rollback is instant, so the executor holds two SSR processes. The default `CITE_EXECUTOR_MEM` is `1g`; raise it for heavy apps, or shorten `CITE_WARM_GRACE`.
+After a deploy the previous release keeps running for `CITE_WARM_GRACE` (24 h by default) so rollback is instant, and the executor holds two SSR processes. An open stream (response body or WebSocket) keeps the previous process until it ends, or until the later of that grace and `CITE_DRAIN_MAX`. The default `CITE_EXECUTOR_MEM` is `1g`; raise it for heavy apps, or shorten `CITE_WARM_GRACE`. Raise `CITE_DRAIN_MAX` when a stream should outlive the grace.
 
 ## Upgrading to 0.1.4
 

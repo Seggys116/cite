@@ -14,7 +14,6 @@ use tracing::{error, info, warn};
 use crate::build::{BuiltRelease, release_manifest};
 use crate::{ManagerError, Result};
 
-const EVICT_TIMEOUT: Duration = Duration::from_secs(30);
 const HEARTBEAT_STALE: Duration = Duration::from_secs(6);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -200,8 +199,12 @@ fn status_slot_busy(cfg: &ManagerConfig, slot: Slot) -> bool {
     )
 }
 
+fn evict_wait(cfg: &ManagerConfig) -> Duration {
+    cfg.warm_grace.max(cfg.drain_max) + Duration::from_secs(30)
+}
+
 async fn wait_evict_ack(cfg: &ManagerConfig, generation: u64, slot: Slot) -> Result<()> {
-    let deadline = tokio::time::Instant::now() + EVICT_TIMEOUT;
+    let deadline = tokio::time::Instant::now() + evict_wait(cfg);
     loop {
         if !executor_responsive(cfg)? {
             return Err(ManagerError::new("executor_unresponsive during evict"));
@@ -560,6 +563,17 @@ mod tests {
         status.ack_generation = 9;
         write_status(&cfg.status_path(), &status).unwrap();
         assert_eq!(generation_floor(&cfg, 0), 9);
+    }
+
+    #[test]
+    fn evict_wait_is_the_longer_of_grace_and_drain_plus_thirty_seconds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = cfg_in(tmp.path());
+        cfg.warm_grace = Duration::from_secs(24 * 3_600);
+        cfg.drain_max = Duration::from_secs(3_600);
+        assert_eq!(evict_wait(&cfg), Duration::from_secs(24 * 3_600 + 30));
+        cfg.drain_max = Duration::from_secs(48 * 3_600);
+        assert_eq!(evict_wait(&cfg), Duration::from_secs(48 * 3_600 + 30));
     }
 
     #[test]

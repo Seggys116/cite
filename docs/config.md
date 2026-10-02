@@ -51,6 +51,7 @@ Compose-level settings live in `.env` (copy `.env.example`). `.env` is gitignore
 | `CITE_HEALTH_TIMEOUT` | `60s` | |
 | `CITE_SPA_FALLBACK` | preset | e.g. `index.html` |
 | `CITE_WARM_GRACE` | `24h` | Previous release keep-alive after cutover |
+| `CITE_DRAIN_MAX` | `1h` | Open streams hold the previous slot until they end. The hold is the later of this and `CITE_WARM_GRACE`, from the cutover |
 | `CITE_WATCH` | `10m` | Post-switch auto-fallback window |
 | `CITE_BUILD_TIMEOUT` | `15m` | |
 | `CITE_BUILD_CACHE` | `on` | |
