@@ -252,25 +252,26 @@ fn write_tar<W: Write>(root: &Dir, nodes: &[Node], writer: W) -> Result<()> {
             Kind::Dir => {
                 header.set_entry_type(EntryType::Directory);
                 header.set_size(0);
-                header.set_path(format!("{}/", node.rel.display()))?;
-                header.set_cksum();
-                builder.append(&header, io::empty())?;
+                builder.append_data(
+                    &mut header,
+                    format!("{}/", node.rel.display()),
+                    io::empty(),
+                )?;
             }
             Kind::Symlink => {
                 header.set_entry_type(EntryType::Symlink);
                 header.set_size(0);
-                header.set_path(node.rel.display().to_string())?;
-                header.set_link_name(node.link.as_ref().expect("symlink"))?;
-                header.set_cksum();
-                builder.append(&header, io::empty())?;
+                builder.append_link(
+                    &mut header,
+                    &node.rel,
+                    node.link.as_ref().expect("symlink"),
+                )?;
             }
             Kind::File => {
                 let data = root.read(&node.rel)?;
                 header.set_entry_type(EntryType::Regular);
                 header.set_size(data.len() as u64);
-                header.set_path(node.rel.display().to_string())?;
-                header.set_cksum();
-                builder.append(&header, data.as_slice())?;
+                builder.append_data(&mut header, &node.rel, data.as_slice())?;
             }
         }
     }
@@ -328,5 +329,25 @@ mod tests {
         symlink("/etc/passwd", src.join("bad")).unwrap();
         let mut sink = Vec::new();
         assert!(pack_dir(&src, &mut sink, &PackLimits::default()).is_err());
+    }
+
+    #[test]
+    fn long_node_modules_paths_survive_pack_and_extract() {
+        let dir = tempdir().unwrap();
+        let src = dir.path().join("src");
+        let deep = "node_modules/@base-ui/react/menu/checkbox-item-indicator/some-really-long-directory-name-for-testing/nested";
+        fs::create_dir_all(src.join(deep)).unwrap();
+        let file = format!("{deep}/CheckboxItemIndicator.production.min.js");
+        assert!(file.len() > 100);
+        fs::write(src.join(&file), b"module.exports = 1;").unwrap();
+        let link = format!("{deep}/alias-with-an-equally-long-name-to-exceed-the-ustar-limit.js");
+        symlink("CheckboxItemIndicator.production.min.js", src.join(&link)).unwrap();
+        let mut tar_bytes = Vec::new();
+        let report = pack_dir(&src, &mut tar_bytes, &PackLimits::default()).unwrap();
+        let dest = dir.path().join("dest");
+        extract_archive(tar_bytes.as_slice(), &dest, &ExtractLimits::default(), 0).unwrap();
+        assert_eq!(fs::read(dest.join(&file)).unwrap(), b"module.exports = 1;");
+        assert_eq!(fs::read(dest.join(&link)).unwrap(), b"module.exports = 1;");
+        assert_eq!(hash_tree(&dest).unwrap().tree_sha256, report.tree_sha256);
     }
 }

@@ -1,0 +1,6 @@
+{
+  "name": "cite-runtime-bun",
+  "private": true,
+  "scripts": { "build": "bun build.js", "start": "bun server.js" },
+  "dependencies": { "is-number": "7.0.0" }
+}

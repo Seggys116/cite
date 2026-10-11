@@ -12,3 +12,4 @@ fuzz/coverage
 .vscode
 *.swp
 .claude/
+node_modules/

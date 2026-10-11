@@ -58,7 +58,7 @@ services:
       - SETGID
       - DAC_READ_SEARCH
     tmpfs:
-      - /tmp:size=256m,mode=0755
+      - /tmp:size=256m,mode=1777
       - /run/cite:size=16m,mode=0750
     environment:
       CITE_REPO: ${CITE_REPO:-seggys116/example-site}
@@ -182,7 +182,7 @@ services:
           subpath: status
     networks:
       - no_egress
-    mem_limit: ${CITE_EXECUTOR_MEM:-512m}
+    mem_limit: ${CITE_EXECUTOR_MEM:-1g}
     cpus: ${CITE_EXECUTOR_CPUS:-1.0}
     pids_limit: ${CITE_EXECUTOR_PIDS:-256}
     logging:
