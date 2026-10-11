@@ -1,0 +1,11 @@
+services:
+  init:
+    image: ghcr.io/seggys116/cite-manager-rust:${CITE_VERSION:-0.2.0}
+  manager:
+    image: ghcr.io/seggys116/cite-manager-rust:${CITE_VERSION:-0.2.0}
+    environment:
+      CITE_RUNTIME: rust
+  executor:
+    image: ghcr.io/seggys116/cite-executor-rust:${CITE_VERSION:-0.2.0}
+    environment:
+      CITE_RUNTIME: rust

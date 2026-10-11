@@ -716,6 +716,7 @@ impl Deployer {
         let desired = read_desired(&self.cfg.desired_path()).ok();
         let responsive = crate::promote::executor_responsive(&self.cfg).unwrap_or(false);
         let disk_free_bytes = cite_core::filesystem_free_bytes(&self.cfg.releases_dir).ok();
+        let executor_reported = status.as_ref().is_some_and(|s| s.active_slot.is_some());
         Ok(serde_json::json!({
             "paused": state.paused,
             "token_invalid": state.token_invalid,
@@ -729,6 +730,7 @@ impl Deployer {
             "desired": desired,
             "executor": status,
             "executor_unresponsive": !responsive,
+            "executor_reported": executor_reported,
             "disk_free_bytes": disk_free_bytes,
         }))
     }
@@ -839,6 +841,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let token = tmp.path().join("token");
         std::fs::write(&token, "ghp_citeMockGithubPat00000000000000001\n").unwrap();
+        std::fs::set_permissions(&token, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .unwrap();
         let mut env = HashMap::new();
         env.insert("CITE_REPO".into(), "owner/name".into());
         env.insert(

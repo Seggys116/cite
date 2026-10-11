@@ -60,10 +60,19 @@ pub fn format_status_human(data: &serde_json::Value) -> String {
             .to_string()
     };
     let executor = data.get("executor");
-    let slot = executor
+    let live_sha = text("last_deployed_sha");
+    let reported = data
+        .get("executor_reported")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let slot = match executor
         .and_then(|e| e.get("active_slot"))
         .and_then(|v| v.as_str())
-        .unwrap_or("none");
+    {
+        Some(slot) => slot,
+        None if live_sha != "none" && !reported => "pending (executor not reported)",
+        None => "none",
+    };
     let heartbeat = executor
         .and_then(|e| e.get("updated_at"))
         .and_then(|v| v.as_str())
@@ -88,7 +97,7 @@ pub fn format_status_human(data: &serde_json::Value) -> String {
         .unwrap_or_else(|| "unknown".into());
     format!(
         "live sha: {}\nslot: {slot}\nprevious failure: {} ({})\nlast observed: {}\nnext poll: {}\nexecutor: {responsive} (heartbeat {heartbeat}, requests {requests})\ndisk free bytes: {disk}\ntoken invalid: {}\ntoken expires: {}\n",
-        text("last_deployed_sha"),
+        live_sha,
         text("last_failed_sha"),
         text("last_failed_reason"),
         text("last_observed_sha"),
@@ -130,5 +139,37 @@ mod tests {
         assert!(text.contains("executor: ok"));
         assert!(text.contains("requests 3"));
         assert!(!text.trim_start().starts_with('{'));
+    }
+
+    fn restart_status(reported: bool, sha: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "last_deployed_sha": sha,
+            "executor_unresponsive": true,
+            "executor_reported": reported,
+            "executor": null
+        })
+    }
+
+    #[test]
+    fn slot_is_pending_when_a_live_sha_has_no_executor_report() {
+        let text = format_status_human(&restart_status(false, "abc".into()));
+        assert!(text.contains("live sha: abc"));
+        assert!(text.contains("slot: pending (executor not reported)"));
+    }
+
+    #[test]
+    fn slot_stays_none_without_a_live_sha() {
+        let text = format_status_human(&restart_status(false, serde_json::Value::Null));
+        assert!(text.contains("slot: none"));
+        assert!(!text.contains("pending"));
+    }
+
+    #[test]
+    fn a_reported_executor_shows_its_slot_not_pending() {
+        let mut data = restart_status(true, "abc".into());
+        data["executor"] = serde_json::json!({"active_slot": "green"});
+        let text = format_status_human(&data);
+        assert!(text.contains("slot: green"));
+        assert!(!text.contains("pending"));
     }
 }

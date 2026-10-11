@@ -751,7 +751,7 @@ async fn child_gets_only_port_host_node_env_and_runtime_file() {
         data.join("releases/blue/app/server.js"),
         br#"const http=require('http');
 const keys=Object.keys(process.env).sort().join(',');
-const s=http.createServer((req,res)=>{res.writeHead(200);res.end(keys+'\n'+process.env.PORT+'\n'+process.env.HOST+'\n'+process.env.NODE_ENV+'\n'+process.env.PUBLIC_FOO);});
+const s=http.createServer((req,res)=>{res.writeHead(200);res.end(keys+'\n'+process.env.PORT+'\n'+process.env.HOST+'\n'+process.env.NODE_ENV+'\n'+process.env.PUBLIC_FOO+'\n'+process.env.HOSTNAME+'\n'+process.env.NITRO_HOST);});
 s.listen(process.env.PORT,'127.0.0.1');
 "#,
     )
@@ -765,7 +765,11 @@ s.listen(process.env.PORT,'127.0.0.1');
     let mut cfg = config_from(data, "127.0.0.1:0");
     cfg.node_bin = which_node();
     let port = Slot::Blue.loopback_port(cfg.port_base).unwrap();
-    std::fs::write(data.join("runtime.env"), "PUBLIC_FOO=from-runtime\n").unwrap();
+    std::fs::write(
+        data.join("runtime.env"),
+        "PUBLIC_FOO=from-runtime\nHOSTNAME=0.0.0.0\nHOST=0.0.0.0\nNITRO_HOST=0.0.0.0\n",
+    )
+    .unwrap();
     let exe = spawn(cfg).await.unwrap();
     assert!(
         wait_status(
@@ -794,6 +798,8 @@ s.listen(process.env.PORT,'127.0.0.1');
     assert_eq!(lines.next().unwrap(), "127.0.0.1");
     assert_eq!(lines.next().unwrap(), "production");
     assert_eq!(lines.next().unwrap(), "from-runtime");
+    assert_eq!(lines.next().unwrap(), "127.0.0.1");
+    assert_eq!(lines.next().unwrap(), "127.0.0.1");
     exe.shutdown().await;
 }
 
@@ -1529,6 +1535,326 @@ s.listen(process.env.PORT,'127.0.0.1');
         .unwrap()
         .unwrap();
     assert_eq!(&buf[..n], b"hello-ws");
+    exe.shutdown().await;
+}
+
+#[tokio::test]
+async fn websocket_keeps_its_permit_and_closes_when_idle() {
+    let node = Command::new("node").arg("-v").output();
+    if node.is_err() || !node.unwrap().status.success() {
+        eprintln!("skipping websocket test: node not on PATH");
+        return;
+    }
+    let dir = tempdir().unwrap();
+    let data = dir.path();
+    std::fs::create_dir_all(data.join("releases/blue/app")).unwrap();
+    std::fs::create_dir_all(data.join("control")).unwrap();
+    std::fs::create_dir_all(data.join("status")).unwrap();
+    std::fs::write(
+        data.join("releases/blue/app/server.js"),
+        br#"const http=require('http');
+const crypto=require('crypto');
+const s=http.createServer((req,res)=>res.end('ok'));
+s.on('upgrade',(req,socket)=>{
+  const key=req.headers['sec-websocket-key']||'';
+  const accept=crypto.createHash('sha1').update(key+'258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64');
+  socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: '+accept+'\r\n\r\n');
+  socket.on('data',(buf)=>socket.write(buf));
+});
+s.listen(process.env.PORT,'127.0.0.1');
+"#,
+    )
+    .unwrap();
+    write_release(
+        &data.join("releases/blue/release.json"),
+        &sample_ssr(Slot::Blue, "01ARZ3NDEKTSV4RRFFQ69G5FAV"),
+    )
+    .unwrap();
+    write_desired_action(data, 1, Slot::Blue, DesiredAction::Activate, None);
+    let mut cfg = config_from(data, "127.0.0.1:0");
+    cfg.node_bin = which_node();
+    cfg.max_connections = 1;
+    cfg.idle_timeout = Duration::from_millis(600);
+    let exe = spawn(cfg).await.unwrap();
+    assert!(
+        wait_status(
+            data,
+            |s| s.active_slot == Some(Slot::Blue),
+            Duration::from_secs(15)
+        )
+        .await
+    );
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut ws = tokio::net::TcpStream::connect(exe.addr).await.unwrap();
+    ws.write_all(
+        b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+    )
+    .await
+    .unwrap();
+    let mut buf = [0u8; 512];
+    let n = ws.read(&mut buf).await.unwrap();
+    assert!(String::from_utf8_lossy(&buf[..n]).contains("101"));
+
+    let mut other = tokio::net::TcpStream::connect(exe.addr).await.unwrap();
+    let _ = other
+        .write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        .await;
+    let mut got = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_millis(300), other.read_to_end(&mut got)).await;
+    assert!(
+        got.is_empty(),
+        "an open websocket must still hold the only permit"
+    );
+
+    let closed = tokio::time::timeout(Duration::from_secs(5), ws.read(&mut buf))
+        .await
+        .expect("idle websocket was not closed")
+        .unwrap_or(0);
+    assert_eq!(closed, 0);
+
+    let mut text = String::new();
+    for _ in 0..40 {
+        text = raw_request(
+            exe.addr,
+            "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        if text.starts_with("HTTP/1.1 200") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(text.starts_with("HTTP/1.1 200"), "{text}");
+    exe.shutdown().await;
+}
+
+#[tokio::test]
+async fn allowlist_rejects_requests_without_a_host() {
+    let dir = tempdir().unwrap();
+    let data = dir.path();
+    std::fs::create_dir_all(data.join("control")).unwrap();
+    std::fs::create_dir_all(data.join("status")).unwrap();
+    std::fs::create_dir_all(data.join("releases")).unwrap();
+    let mut cfg = config_from(data, "127.0.0.1:0");
+    cfg.allowed_hosts = vec!["example.com".into()];
+    let exe = spawn(cfg).await.unwrap();
+    let text = raw_request(exe.addr, "GET / HTTP/1.0\r\n\r\n").await;
+    assert!(
+        text.starts_with("HTTP/1.0 400") || text.starts_with("HTTP/1.1 400"),
+        "{text}"
+    );
+    let text = raw_request(
+        exe.addr,
+        "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(!text.contains(" 400 "), "{text}");
+    exe.shutdown().await;
+}
+
+async fn idle_executor(
+    tune: impl FnOnce(&mut ExecutorConfig),
+) -> (tempfile::TempDir, crate::RunningExecutor) {
+    let dir = tempdir().unwrap();
+    let data = dir.path();
+    std::fs::create_dir_all(data.join("control")).unwrap();
+    std::fs::create_dir_all(data.join("status")).unwrap();
+    std::fs::create_dir_all(data.join("releases")).unwrap();
+    let mut cfg = config_from(data, "127.0.0.1:0");
+    tune(&mut cfg);
+    let exe = spawn(cfg).await.unwrap();
+    (dir, exe)
+}
+
+async fn status_via(exe: &crate::RunningExecutor, headers: &[(&str, &str)]) -> StatusCode {
+    http_once(exe.addr, Method::GET, "/", headers).await.0
+}
+
+#[test]
+fn raising_the_file_limit_never_lowers_it() {
+    let before = rustix::process::getrlimit(rustix::process::Resource::Nofile).current;
+    let after = crate::raise_nofile_limit();
+    assert!(after >= before);
+}
+
+#[tokio::test]
+async fn rate_limit_returns_429_with_retry_after_after_the_burst() {
+    let (_dir, exe) = idle_executor(|cfg| {
+        cfg.trusted_proxies = Vec::new();
+        cfg.rate_limit = 1;
+        cfg.rate_burst = 3;
+        cfg.ban_threshold = 1000;
+    })
+    .await;
+    for _ in 0..3 {
+        assert_eq!(status_via(&exe, &[]).await, StatusCode::SERVICE_UNAVAILABLE);
+    }
+    let (status, headers, body) = http_once(exe.addr, Method::GET, "/", &[]).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(headers.get("retry-after").unwrap(), "1");
+    assert!(body.len() < 200);
+    exe.shutdown().await;
+}
+
+#[tokio::test]
+async fn repeated_violations_ban_the_peer_at_accept_and_the_ban_expires() {
+    let (dir, exe) = idle_executor(|cfg| {
+        cfg.trusted_proxies = Vec::new();
+        cfg.rate_limit = 1;
+        cfg.rate_burst = 1;
+        cfg.ban_threshold = 2;
+        cfg.ban_duration = Duration::from_millis(1500);
+    })
+    .await;
+    let mut seen_429 = 0;
+    let mut banned = false;
+    for _ in 0..8 {
+        let text = raw_request(
+            exe.addr,
+            "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        if text.is_empty() {
+            banned = true;
+            break;
+        }
+        if text.starts_with("HTTP/1.1 429") {
+            seen_429 += 1;
+        }
+    }
+    assert!(banned, "a banned peer must be dropped at accept");
+    assert!(seen_429 >= 2);
+    assert!(
+        wait_status(
+            dir.path(),
+            |s| s.bans >= 1 && s.limited_requests >= 2,
+            Duration::from_secs(8)
+        )
+        .await,
+        "counters must reach the status file"
+    );
+    tokio::time::sleep(Duration::from_millis(1700)).await;
+    assert_eq!(status_via(&exe, &[]).await, StatusCode::SERVICE_UNAVAILABLE);
+    exe.shutdown().await;
+}
+
+#[tokio::test]
+async fn per_ip_connection_cap_drops_extra_connections() {
+    let (dir, exe) = idle_executor(|cfg| {
+        cfg.trusted_proxies = Vec::new();
+        cfg.max_conn_per_ip = 2;
+        cfg.rate_limit = 0;
+    })
+    .await;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let first = tokio::net::TcpStream::connect(exe.addr).await.unwrap();
+    let second = tokio::net::TcpStream::connect(exe.addr).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut third = tokio::net::TcpStream::connect(exe.addr).await.unwrap();
+    let _ = third
+        .write_all(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        .await;
+    let mut got = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(2), third.read_to_end(&mut got)).await;
+    assert!(got.is_empty(), "{}", String::from_utf8_lossy(&got));
+    drop(first);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(status_via(&exe, &[]).await, StatusCode::SERVICE_UNAVAILABLE);
+    drop(second);
+    assert!(
+        wait_status(
+            dir.path(),
+            |s| s.dropped_connections >= 1,
+            Duration::from_secs(8)
+        )
+        .await
+    );
+    exe.shutdown().await;
+}
+
+#[tokio::test]
+async fn clients_behind_a_trusted_proxy_are_limited_independently() {
+    let (_dir, exe) = idle_executor(|cfg| {
+        cfg.trusted_proxies = vec!["127.0.0.0/8".parse().unwrap()];
+        cfg.rate_limit = 1;
+        cfg.rate_burst = 2;
+        cfg.ban_threshold = 1000;
+        cfg.max_conn_per_ip = 2;
+    })
+    .await;
+    let a = [("x-forwarded-for", "203.0.113.1")];
+    let b = [("x-forwarded-for", "203.0.113.2")];
+    let spoofed = [("x-forwarded-for", "203.0.113.1, 198.51.100.50")];
+    assert_eq!(status_via(&exe, &a).await, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(status_via(&exe, &a).await, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(status_via(&exe, &a).await, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(status_via(&exe, &b).await, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(status_via(&exe, &b).await, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(status_via(&exe, &b).await, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        status_via(&exe, &spoofed).await,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+
+    let mut held = Vec::new();
+    for _ in 0..5 {
+        held.push(tokio::net::TcpStream::connect(exe.addr).await.unwrap());
+    }
+    assert_eq!(
+        status_via(&exe, &[("x-forwarded-for", "203.0.113.77")]).await,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "the per-address cap must not apply to a trusted proxy peer"
+    );
+    drop(held);
+    exe.shutdown().await;
+}
+
+#[tokio::test]
+async fn private_peers_are_trusted_by_default_and_never_banned() {
+    let (_dir, exe) = idle_executor(|cfg| {
+        cfg.rate_limit = 1;
+        cfg.rate_burst = 2;
+        cfg.ban_threshold = 2;
+        cfg.ban_duration = Duration::from_secs(30);
+    })
+    .await;
+    for _ in 0..40 {
+        assert_eq!(status_via(&exe, &[]).await, StatusCode::SERVICE_UNAVAILABLE);
+    }
+    let attacker = [("x-forwarded-for", "203.0.113.50")];
+    let mut limited = false;
+    for _ in 0..30 {
+        if status_via(&exe, &attacker).await == StatusCode::TOO_MANY_REQUESTS {
+            limited = true;
+        }
+    }
+    assert!(limited);
+    let visitor = [("x-forwarded-for", "203.0.113.51")];
+    assert_eq!(
+        status_via(&exe, &visitor).await,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(status_via(&exe, &[]).await, StatusCode::SERVICE_UNAVAILABLE);
+    let text = raw_request(
+        exe.addr,
+        "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(text.starts_with("HTTP/1.1 503"), "{text}");
+    exe.shutdown().await;
+}
+
+#[tokio::test]
+async fn disabled_rate_limit_never_answers_429() {
+    let (_dir, exe) = idle_executor(|cfg| {
+        cfg.trusted_proxies = Vec::new();
+        cfg.rate_limit = 0;
+    })
+    .await;
+    for _ in 0..300 {
+        assert_eq!(status_via(&exe, &[]).await, StatusCode::SERVICE_UNAVAILABLE);
+    }
     exe.shutdown().await;
 }
 
@@ -2790,5 +3116,528 @@ async fn restart_child_spawn_failure_is_treated_as_a_crash() {
     );
     let (code, _, _) = http_once(exe.addr, Method::GET, "/", &[]).await;
     assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+    exe.shutdown().await;
+}
+
+const UPSTREAM_RS: &str = r#"
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::thread;
+use std::time::Duration;
+
+fn main() {
+    let token = std::env::args().nth(1).unwrap_or_else(|| "alpha".into());
+    let chunks: u64 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(20);
+    let gap_ms: u64 = std::env::args().nth(3).and_then(|s| s.parse().ok()).unwrap_or(150);
+    let port = std::env::var("PORT").unwrap_or_else(|_| "9".into());
+    let listener = TcpListener::bind(format!("127.0.0.1:{port}")).unwrap();
+    for incoming in listener.incoming() {
+        let Ok(stream) = incoming else { continue };
+        let token = token.clone();
+        thread::spawn(move || serve(stream, &token, chunks, gap_ms));
+    }
+}
+
+fn serve(mut stream: TcpStream, token: &str, chunks: u64, gap_ms: u64) {
+    let _ = stream.set_nodelay(true);
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let mut buf = [0u8; 2048];
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        match stream.read(&mut buf[filled..]) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                filled += n;
+                if buf[..filled].windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+        }
+    }
+    let head = String::from_utf8_lossy(&buf[..filled]);
+    let slow = head.lines().next().unwrap_or("").contains(" /slow");
+    if slow {
+        let _ = stream.write_all(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+        );
+        let _ = stream.flush();
+        for _ in 0..chunks {
+            let chunk = format!("{:x}\r\n{token}\r\n", token.len());
+            if stream.write_all(chunk.as_bytes()).is_err() {
+                return;
+            }
+            let _ = stream.flush();
+            thread::sleep(Duration::from_millis(gap_ms));
+        }
+        let _ = stream.write_all(b"0\r\n\r\n");
+        return;
+    }
+    let body = token.as_bytes();
+    let resp = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let _ = stream.write_all(resp.as_bytes());
+    let _ = stream.write_all(body);
+}
+"#;
+
+fn compile_upstream(dir: &Path) -> std::path::PathBuf {
+    let src = dir.join("upstream.rs");
+    let bin = dir.join("upstream-bin");
+    std::fs::write(&src, UPSTREAM_RS).unwrap();
+    let output = Command::new("rustc")
+        .arg("--edition")
+        .arg("2021")
+        .arg("-o")
+        .arg(&bin)
+        .arg(&src)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "rustc upstream: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    bin
+}
+
+fn seal_rust_ssr(data: &Path, slot: Slot, release_id: &str, bin: &Path, args: &[&str]) {
+    use std::os::unix::fs::PermissionsExt;
+    let slot_dir = data.join("releases").join(slot.as_str());
+    let dest_dir = slot_dir.join("app/bin");
+    std::fs::create_dir_all(&dest_dir).unwrap();
+    let dest = dest_dir.join("upstream");
+    std::fs::copy(bin, &dest).unwrap();
+    std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut manifest = sample_ssr(slot, release_id);
+    manifest.runtime = RuntimeKind::Rust;
+    manifest.start_argv = std::iter::once("bin/upstream".to_string())
+        .chain(args.iter().map(|arg| (*arg).to_string()))
+        .collect();
+    manifest.health.consecutive = 1;
+    manifest.health.timeout_s = 8;
+    manifest.health.expect = HealthExpect::TwoXx;
+    std::fs::create_dir_all(data.join("control")).unwrap();
+    std::fs::create_dir_all(data.join("status")).unwrap();
+    write_release(&slot_dir.join("release.json"), &manifest).unwrap();
+}
+
+fn assert_no_slot_leak(body: &[u8]) {
+    let text = String::from_utf8_lossy(body);
+    assert!(
+        !text.contains("blue") && !text.contains("green") && !text.contains("127.0.0.1:"),
+        "{text}"
+    );
+}
+
+fn count_slice(buf: &[u8], needle: &[u8]) -> usize {
+    if needle.is_empty() || buf.len() < needle.len() {
+        return 0;
+    }
+    buf.windows(needle.len())
+        .filter(|window| *window == needle)
+        .count()
+}
+
+async fn open_get(addr: SocketAddr, path: &str) -> tokio::net::TcpStream {
+    use tokio::io::AsyncWriteExt;
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let req = format!("GET {path} HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n");
+    stream.write_all(req.as_bytes()).await.unwrap();
+    stream
+}
+
+async fn read_for(stream: &mut tokio::net::TcpStream, limit: Duration) -> Vec<u8> {
+    use tokio::io::AsyncReadExt;
+    let mut buf = Vec::new();
+    let deadline = tokio::time::Instant::now() + limit;
+    let mut tmp = [0u8; 1024];
+    while tokio::time::Instant::now() < deadline {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(left, stream.read(&mut tmp)).await {
+            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+            Ok(Ok(n)) => buf.extend_from_slice(&tmp[..n]),
+        }
+    }
+    buf
+}
+
+async fn read_until_token(
+    stream: &mut tokio::net::TcpStream,
+    token: &[u8],
+    count: usize,
+    limit: Duration,
+) -> Vec<u8> {
+    use tokio::io::AsyncReadExt;
+    let mut buf = Vec::new();
+    let deadline = tokio::time::Instant::now() + limit;
+    let mut tmp = [0u8; 1024];
+    while tokio::time::Instant::now() < deadline && count_slice(&buf, token) < count {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(left, stream.read(&mut tmp)).await {
+            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+            Ok(Ok(n)) => buf.extend_from_slice(&tmp[..n]),
+        }
+    }
+    buf
+}
+
+fn process_alive(pid: u32) -> bool {
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn rust_executor(data: &Path, drain_max: Duration) -> ExecutorConfig {
+    let mut cfg = config_from(data, "127.0.0.1:0");
+    cfg.runtime = RuntimeKind::Rust;
+    cfg.drain_max = drain_max;
+    cfg.child_term_grace = Duration::from_millis(500);
+    cfg
+}
+
+#[tokio::test]
+async fn slow_body_stays_on_the_slot_that_accepted_it() {
+    let dir = tempdir().unwrap();
+    let data = dir.path();
+    let bin = compile_upstream(data);
+    seal_rust_ssr(
+        data,
+        Slot::Blue,
+        "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        &bin,
+        &["alpha", "24", "120"],
+    );
+    seal_rust_ssr(
+        data,
+        Slot::Green,
+        "01ARZ3NDEKTSV4RRFFQ69G5FB0",
+        &bin,
+        &["beta", "4", "50"],
+    );
+    let cfg = rust_executor(data, Duration::from_secs(60));
+    let exe = spawn(cfg).await.unwrap();
+    let (st, _, body) = http_once(exe.addr, Method::GET, "/", &[]).await;
+    assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE);
+    assert_no_slot_leak(&body);
+
+    write_desired_grace(data, 1, Slot::Blue, DesiredAction::Activate, None, 30);
+    assert!(
+        wait_status(
+            data,
+            |s| s.active_slot == Some(Slot::Blue),
+            Duration::from_secs(15)
+        )
+        .await,
+        "blue did not go live"
+    );
+    let mut slow = open_get(exe.addr, "/slow").await;
+    let first = read_until_token(&mut slow, b"alpha", 1, Duration::from_secs(3)).await;
+    assert!(count_slice(&first, b"alpha") >= 1, "{first:?}");
+    assert_no_slot_leak(&first);
+
+    write_desired_grace(data, 2, Slot::Green, DesiredAction::Activate, None, 30);
+    assert!(
+        wait_status(
+            data,
+            |s| s.active_slot == Some(Slot::Green) && s.slots.blue.state == SlotState::Warm,
+            Duration::from_secs(15)
+        )
+        .await,
+        "green did not take over"
+    );
+    let more = read_until_token(&mut slow, b"alpha", 3, Duration::from_secs(3)).await;
+    let continued = [first, more].concat();
+    assert!(count_slice(&continued, b"alpha") >= 3, "{continued:?}");
+    assert_eq!(count_slice(&continued, b"beta"), 0, "{continued:?}");
+    assert_no_slot_leak(&continued);
+
+    let (st, _, body) = http_once(
+        exe.addr,
+        Method::GET,
+        "/",
+        &[("x-cite-slot", "blue"), ("x-upstream-port", "1")],
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(&body[..], b"beta");
+    assert_no_slot_leak(&body);
+
+    let rest = read_for(&mut slow, Duration::from_secs(8)).await;
+    assert_no_slot_leak(&rest);
+    drop(slow);
+    assert!(
+        wait_status(
+            data,
+            |s| s.slots.blue.inflight == 0 && s.slots.blue.state == SlotState::Warm,
+            Duration::from_secs(5)
+        )
+        .await,
+        "blue inflight did not return to 0: {:?}",
+        cite_core::read_status(&data.join("status/executor.json"))
+    );
+    exe.shutdown().await;
+}
+
+#[tokio::test]
+async fn warm_grace_does_not_stop_a_slot_that_still_has_a_stream() {
+    let dir = tempdir().unwrap();
+    let data = dir.path();
+    let bin = compile_upstream(data);
+    seal_rust_ssr(
+        data,
+        Slot::Blue,
+        "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        &bin,
+        &["alpha", "40", "150"],
+    );
+    seal_rust_ssr(
+        data,
+        Slot::Green,
+        "01ARZ3NDEKTSV4RRFFQ69G5FB0",
+        &bin,
+        &["beta", "2", "50"],
+    );
+    write_desired_grace(data, 1, Slot::Blue, DesiredAction::Activate, None, 1);
+    let exe = spawn(rust_executor(data, Duration::from_secs(20)))
+        .await
+        .unwrap();
+    assert!(
+        wait_status(
+            data,
+            |s| s.active_slot == Some(Slot::Blue),
+            Duration::from_secs(15)
+        )
+        .await,
+        "blue did not go live"
+    );
+    let mut slow = open_get(exe.addr, "/slow").await;
+    let opened = read_until_token(&mut slow, b"alpha", 1, Duration::from_secs(3)).await;
+    assert!(count_slice(&opened, b"alpha") >= 1, "{opened:?}");
+
+    write_desired_grace(data, 2, Slot::Green, DesiredAction::Activate, None, 1);
+    assert!(
+        wait_status(
+            data,
+            |s| s.active_slot == Some(Slot::Green) && s.slots.blue.state == SlotState::Warm,
+            Duration::from_secs(15)
+        )
+        .await,
+        "green did not take over"
+    );
+    let pid = cite_core::read_status(&data.join("status/executor.json"))
+        .unwrap()
+        .slots
+        .blue
+        .pid
+        .expect("warm child pid");
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let mid = cite_core::read_status(&data.join("status/executor.json")).unwrap();
+    assert_eq!(mid.slots.blue.state, SlotState::Warm, "{mid:?}");
+    assert!(
+        process_alive(pid),
+        "warm grace stopped the child while a stream was open"
+    );
+
+    let rest = read_for(&mut slow, Duration::from_secs(12)).await;
+    let all = [opened, rest].concat();
+    assert!(count_slice(&all, b"alpha") >= 30, "{all:?}");
+    assert_eq!(count_slice(&all, b"beta"), 0);
+    drop(slow);
+    assert!(
+        wait_status(
+            data,
+            |s| s.slots.blue.state == SlotState::Stopped && s.slots.blue.inflight == 0,
+            Duration::from_secs(5)
+        )
+        .await,
+        "slot did not stop after the stream ended: {:?}",
+        cite_core::read_status(&data.join("status/executor.json"))
+    );
+    assert!(!process_alive(pid));
+    exe.shutdown().await;
+}
+
+#[tokio::test]
+async fn drain_cap_stops_the_child_while_the_body_is_open() {
+    let dir = tempdir().unwrap();
+    let data = dir.path();
+    let bin = compile_upstream(data);
+    seal_rust_ssr(
+        data,
+        Slot::Blue,
+        "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        &bin,
+        &["alpha", "80", "200"],
+    );
+    seal_rust_ssr(
+        data,
+        Slot::Green,
+        "01ARZ3NDEKTSV4RRFFQ69G5FB0",
+        &bin,
+        &["beta", "2", "50"],
+    );
+    write_desired_grace(data, 1, Slot::Blue, DesiredAction::Activate, None, 1);
+    let exe = spawn(rust_executor(data, Duration::from_secs(8)))
+        .await
+        .unwrap();
+    assert!(
+        wait_status(
+            data,
+            |s| s.active_slot == Some(Slot::Blue),
+            Duration::from_secs(15)
+        )
+        .await,
+        "blue did not go live"
+    );
+    let mut slow = open_get(exe.addr, "/slow").await;
+    let opened = read_until_token(&mut slow, b"alpha", 1, Duration::from_secs(3)).await;
+    assert!(count_slice(&opened, b"alpha") >= 1, "{opened:?}");
+
+    write_desired_grace(data, 2, Slot::Green, DesiredAction::Activate, None, 1);
+    assert!(
+        wait_status(
+            data,
+            |s| s.active_slot == Some(Slot::Green) && s.slots.blue.state == SlotState::Warm,
+            Duration::from_secs(15)
+        )
+        .await,
+        "green did not take over"
+    );
+    let switched = tokio::time::Instant::now();
+    let pid = cite_core::read_status(&data.join("status/executor.json"))
+        .unwrap()
+        .slots
+        .blue
+        .pid
+        .expect("warm child pid");
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let mid = cite_core::read_status(&data.join("status/executor.json")).unwrap();
+    assert_eq!(
+        mid.slots.blue.state,
+        SlotState::Warm,
+        "grace expiry stopped a slot that was still inside the drain cap: {mid:?}"
+    );
+    assert!(process_alive(pid));
+    assert!(
+        wait_status(
+            data,
+            |s| s.slots.blue.state == SlotState::Stopped,
+            Duration::from_secs(8)
+        )
+        .await,
+        "drain cap did not stop the child: {:?}",
+        cite_core::read_status(&data.join("status/executor.json"))
+    );
+    assert!(
+        switched.elapsed() < Duration::from_secs(12),
+        "stop waited for the slow body instead of the cap"
+    );
+    assert!(!process_alive(pid));
+    let rest = read_for(&mut slow, Duration::from_secs(2)).await;
+    let all = [opened, rest].concat();
+    assert!(count_slice(&all, b"alpha") >= 1, "{all:?}");
+    assert!(count_slice(&all, b"alpha") < 80, "{all:?}");
+    assert_eq!(count_slice(&all, b"beta"), 0);
+    assert_no_slot_leak(&all);
+    drop(slow);
+    exe.shutdown().await;
+}
+
+#[tokio::test]
+async fn evict_waits_for_an_open_stream_then_acks() {
+    let dir = tempdir().unwrap();
+    let data = dir.path();
+    let bin = compile_upstream(data);
+    seal_rust_ssr(
+        data,
+        Slot::Blue,
+        "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        &bin,
+        &["alpha", "40", "200"],
+    );
+    seal_rust_ssr(
+        data,
+        Slot::Green,
+        "01ARZ3NDEKTSV4RRFFQ69G5FB0",
+        &bin,
+        &["beta", "2", "50"],
+    );
+    write_desired_grace(data, 1, Slot::Blue, DesiredAction::Activate, None, 30);
+    let exe = spawn(rust_executor(data, Duration::from_secs(30)))
+        .await
+        .unwrap();
+    assert!(
+        wait_status(
+            data,
+            |s| s.active_slot == Some(Slot::Blue),
+            Duration::from_secs(15)
+        )
+        .await,
+        "blue did not go live"
+    );
+    let mut slow = open_get(exe.addr, "/slow").await;
+    let opened = read_until_token(&mut slow, b"alpha", 1, Duration::from_secs(3)).await;
+    assert!(count_slice(&opened, b"alpha") >= 1, "{opened:?}");
+    assert_no_slot_leak(&opened);
+
+    write_desired_grace(data, 2, Slot::Green, DesiredAction::Activate, None, 30);
+    assert!(
+        wait_status(
+            data,
+            |s| s.active_slot == Some(Slot::Green) && s.slots.blue.state == SlotState::Warm,
+            Duration::from_secs(15)
+        )
+        .await,
+        "green did not take over"
+    );
+    let before = cite_core::read_status(&data.join("status/executor.json")).unwrap();
+    let pid = before.slots.blue.pid.expect("warm child pid");
+    write_desired_grace(
+        data,
+        3,
+        Slot::Green,
+        DesiredAction::Evict,
+        Some(Slot::Blue),
+        30,
+    );
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    let held = cite_core::read_status(&data.join("status/executor.json")).unwrap();
+    assert!(held.ack_generation < 3, "{held:?}");
+    assert_eq!(held.slots.blue.state, SlotState::Warm, "{held:?}");
+    assert!(process_alive(pid));
+    assert!(
+        held.last_result
+            .as_ref()
+            .is_none_or(|result| result.generation != 3 || result.outcome != Outcome::Failed),
+        "{held:?}"
+    );
+
+    drop(slow);
+    assert!(
+        wait_status(
+            data,
+            |s| s.ack_generation >= 3 && s.slots.blue.state == SlotState::Stopped,
+            Duration::from_secs(5)
+        )
+        .await,
+        "evict did not ack after the stream ended: {:?}",
+        cite_core::read_status(&data.join("status/executor.json"))
+    );
+    assert!(!process_alive(pid));
+    let (st, _, body) = http_once(exe.addr, Method::GET, "/", &[]).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(&body[..], b"beta");
+    assert_no_slot_leak(&body);
     exe.shutdown().await;
 }
