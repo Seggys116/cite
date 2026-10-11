@@ -63,6 +63,22 @@ pub fn page_413() -> Response<BoxBody> {
     )
 }
 
+pub fn page_429(retry_after: u64, close: bool) -> Response<BoxBody> {
+    let mut res = html_response(
+        StatusCode::TOO_MANY_REQUESTS,
+        "<!doctype html><title>Too Many Requests</title><h1>429</h1>",
+    );
+    res.headers_mut().insert(
+        http::header::RETRY_AFTER,
+        HeaderValue::from(retry_after.max(1)),
+    );
+    if close {
+        res.headers_mut()
+            .insert(http::header::CONNECTION, HeaderValue::from_static("close"));
+    }
+    res
+}
+
 pub fn page_404() -> Response<BoxBody> {
     html_response(
         StatusCode::NOT_FOUND,

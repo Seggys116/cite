@@ -6,7 +6,8 @@
 | **Malicious build output** | Symlink/hardlink escape, specials, bombs | Pack via no-follow handles as 10002, then re-extract by the hardened manager into fresh inodes; size/count caps |
 | **Malicious tarball** | Zip-slip, symlink escape, bombs | Hardened extractor + fuzzing |
 | **RCE in the deployed site** | Shell, persist, pivot | Shell-less distroless executor; read-only rootfs; releases **ro**; non-root; caps dropped; no-new-privileges; pids/mem limits; egress denied by default; can write only `status/`; never receives the PAT |
-| **Forged `status/` files** | Mislead manager | Strict schema + size caps; worst case false status, never code execution |
+| **Abusive visitors** | Floods, connection exhaustion | Per-client token-bucket rate limit, per-IP connection cap, timed bans dropped at accept, bounded tracking table, header and idle timeouts |
+| **Forged `status/` files** | Mislead manager, exhaust it | No-follow, regular-file-only, size-capped reads; strict schema; control characters rejected; worst case false status, never code execution |
 | **Visitor traffic** | Smuggling, Host/XFF spoofing, slowloris, traversal | Strict HTTP parsing, header policy, timeouts/limits, path containment |
 | **Supply chain** | Bad deps/images/actions | `cargo deny` + audit, digest-pinned images, SHA-pinned Actions, Dependabot |
 | **Host** | Container breakout | No socket, no privileged, minimal caps, default seccomp; prefer rootless / userns-remap |
@@ -19,7 +20,9 @@ The PAT is an environment variable (`CITE_GITHUB_TOKEN`) of the **manager contai
 - read `.env` on the host;
 - run code as root inside the manager container.
 
-It is not visible to the uid-10002 build process or to the executor and the site it hosts. A compromised executor or site cannot obtain it; a compromise of the manager's root user or the Docker host can. Limit the blast radius with a fine-grained, read-only, single-repository PAT.
+It is not visible to the uid-10002 build process or to the executor and the site it hosts. With `CITE_GITHUB_TOKEN_FILE`, that holds only for an owner-only file (Cite refuses group- or world-readable token files); mount it under `/run/cite/`. A compromised executor or site cannot obtain it; a compromise of the manager's root user or the Docker host can. Limit the blast radius with a fine-grained, read-only, single-repository PAT.
+
+The package-manager and tool caches on `cite_cache` are shared across builds of the same repo, so a malicious commit can leave cached files that a later build uses even after the commit is reverted. That stays within the build uid and the same repository; clear the `cite_cache` volume after removing a malicious commit.
 
 ## Trust boundaries
 
