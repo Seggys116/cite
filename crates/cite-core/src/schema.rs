@@ -354,7 +354,7 @@ pub fn now_rfc3339() -> String {
 }
 
 pub fn new_id() -> String {
-    ulid::Ulid::new().to_string()
+    ulid::Ulid::generate().to_string()
 }
 
 pub fn decode_release(bytes: &[u8]) -> Result<ReleaseManifest> {
