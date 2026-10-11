@@ -27,7 +27,7 @@ tar = { version = "0.4", default-features = false }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 cap-std = "4"
 rustix = { version = "1", features = ["fs", "process", "net", "param"] }
-sha2 = "0.10"
+sha2 = "0.11"
 subtle = "2"
 time = { version = "0.3", features = ["formatting", "parsing"] }
 ulid = "1"
