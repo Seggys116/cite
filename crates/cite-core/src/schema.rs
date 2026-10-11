@@ -66,6 +66,7 @@ pub enum RuntimeKind {
     Node,
     Bun,
     Static,
+    Rust,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -157,6 +158,8 @@ pub struct SlotStatus {
     pub warm_until: Option<String>,
     #[serde(default)]
     pub pid: Option<u32>,
+    #[serde(default)]
+    pub inflight: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -201,6 +204,15 @@ pub struct ExecutorStatus {
     /// Requests handled since boot. Exposed only through executor status.
     #[serde(default)]
     pub requests: u64,
+    /// Requests answered 429 by the per-client rate limit since boot.
+    #[serde(default)]
+    pub limited_requests: u64,
+    /// Clients banned for repeated rate-limit violations since boot.
+    #[serde(default)]
+    pub bans: u64,
+    /// Connections refused at accept (banned address or per-address cap) since boot.
+    #[serde(default)]
+    pub dropped_connections: u64,
 }
 
 impl ExecutorStatus {
@@ -212,6 +224,7 @@ impl ExecutorStatus {
             since: now.clone(),
             warm_until: None,
             pid: None,
+            inflight: 0,
         };
         Self {
             v: SCHEMA_VERSION,
@@ -227,6 +240,9 @@ impl ExecutorStatus {
             },
             last_result: None,
             requests: 0,
+            limited_requests: 0,
+            bans: 0,
+            dropped_connections: 0,
         }
     }
 
@@ -475,11 +491,11 @@ impl ExecutorStatus {
         check_version(self.v)?;
         check_time(&self.updated_at)?;
         check_id(&self.boot_id)?;
-        check_text("executor_version", &self.executor_version, 64)?;
+        check_plain("executor_version", &self.executor_version, 64, false)?;
         self.slots.blue.validate()?;
         self.slots.green.validate()?;
         if let Some(result) = &self.last_result {
-            check_text("reason", &result.reason, 4096)?;
+            check_plain("reason", &result.reason, 4096, false)?;
             if result.log_tail.len() > MAX_LOG_LINES {
                 return Err(Error::msg("log tail too long"));
             }
@@ -487,6 +503,7 @@ impl ExecutorStatus {
                 if line.len() > MAX_LOG_LINE {
                     return Err(Error::msg("log line too long"));
                 }
+                check_plain("log line", line, MAX_LOG_LINE, true)?;
             }
         }
         Ok(())
@@ -619,6 +636,31 @@ fn check_text(field: &str, value: &str, max: usize) -> Result<()> {
     Ok(())
 }
 
+/// Rejects ASCII and C1 control characters so status text cannot inject terminal escapes; tabs are optional.
+fn check_plain(field: &str, value: &str, max: usize, allow_tab: bool) -> Result<()> {
+    check_text(field, value, max)?;
+    if value
+        .chars()
+        .any(|c| c.is_control() && !(allow_tab && c == '\t'))
+    {
+        return Err(Error::msg(format!("{field} contains control characters")));
+    }
+    Ok(())
+}
+
+/// Escapes control characters (except tab when `keep_tab`) so the text passes status validation.
+pub fn escape_control(text: &str, keep_tab: bool) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c.is_control() && !(keep_tab && c == '\t') {
+            out.extend(c.escape_default());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 fn check_health(health: &Health) -> Result<()> {
     check_text("health.path", &health.path, 512)?;
     if !health.path.starts_with('/') {
@@ -635,6 +677,14 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
     use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    #[test]
+    fn runtime_rust_serializes_as_rust() {
+        assert_eq!(
+            serde_json::to_value(RuntimeKind::Rust).unwrap(),
+            serde_json::json!("rust")
+        );
+    }
 
     #[test]
     fn slot_ports_are_base_and_base_plus_one() {
@@ -775,5 +825,65 @@ mod tests {
             .is_err();
             prop_assert!(!panicked);
         }
+    }
+
+    #[test]
+    fn status_without_abuse_counters_still_decodes() {
+        let mut value = serde_json::to_value(ExecutorStatus::initial("0.1.0")).unwrap();
+        let map = value.as_object_mut().unwrap();
+        for key in ["limited_requests", "bans", "dropped_connections"] {
+            map.remove(key);
+        }
+        let status = decode_status(&serde_json::to_vec(&value).unwrap()).unwrap();
+        assert_eq!(
+            (
+                status.limited_requests,
+                status.bans,
+                status.dropped_connections
+            ),
+            (0, 0, 0)
+        );
+    }
+
+    #[test]
+    fn status_without_inflight_still_decodes() {
+        let mut value = serde_json::to_value(ExecutorStatus::initial("0.1.0")).unwrap();
+        for slot in ["blue", "green"] {
+            value["slots"][slot]
+                .as_object_mut()
+                .unwrap()
+                .remove("inflight");
+        }
+        let status = decode_status(&serde_json::to_vec(&value).unwrap()).unwrap();
+        assert_eq!(status.slots.blue.inflight, 0);
+        assert_eq!(status.slots.green.inflight, 0);
+        value["slots"]["blue"]["inflight"] = serde_json::json!(3);
+        let status = decode_status(&serde_json::to_vec(&value).unwrap()).unwrap();
+        assert_eq!(status.slots.blue.inflight, 3);
+        value["slots"]["blue"]["extra"] = serde_json::json!(1);
+        assert!(decode_status(&serde_json::to_vec(&value).unwrap()).is_err());
+    }
+
+    #[test]
+    fn status_text_rejects_terminal_escapes() {
+        let with = |reason: &str, line: &str| {
+            let mut status = ExecutorStatus::initial("0.1.0");
+            status.last_result = Some(LastResult {
+                generation: 1,
+                outcome: Outcome::Failed,
+                reason: reason.into(),
+                log_tail: vec![line.into()],
+            });
+            serde_json::to_vec(&status).unwrap()
+        };
+        assert!(decode_status(&with("ok", "tab\there")).is_ok());
+        assert!(decode_status(&with("bad\u{1b}[2J", "fine")).is_err());
+        assert!(decode_status(&with("tab\tin reason", "fine")).is_err());
+        assert!(decode_status(&with("ok", "\u{1b}]0;title\u{7}")).is_err());
+        assert!(decode_status(&with("ok", "line\nbreak")).is_err());
+        assert!(decode_status(&with("ok", "c1\u{9b}31m")).is_err());
+        let escaped = escape_control("a\u{1b}[0m\tb", true);
+        assert_eq!(escaped, "a\\u{1b}[0m\tb");
+        assert!(decode_status(&with(&escape_control("x\ty\u{1b}", false), &escaped)).is_ok());
     }
 }

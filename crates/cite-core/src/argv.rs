@@ -92,14 +92,18 @@ pub fn validate_start_argv(argv: &[String]) -> Result<()> {
         return Err(Error::Config("start argv is empty".into()));
     }
     let argv0 = argv[0].as_str();
-    if matches!(argv0, "npm" | "npx" | "pnpm" | "yarn" | "corepack")
-        || argv0.ends_with("/npm")
+    if matches!(
+        argv0,
+        "npm" | "npx" | "pnpm" | "yarn" | "corepack" | "cargo" | "rustc"
+    ) || argv0.ends_with("/npm")
         || argv0.ends_with("/npx")
         || argv0.ends_with("/pnpm")
         || argv0.ends_with("/yarn")
+        || argv0.ends_with("/cargo")
+        || argv0.ends_with("/rustc")
     {
         return Err(Error::Config(format!(
-            "`{argv0}` cannot run in the executor; use node or bun argv (no package manager)"
+            "`{argv0}` cannot run in the executor; use node, bun, or a release binary"
         )));
     }
     Ok(())
@@ -150,6 +154,15 @@ mod tests {
             split_command("react-router-serve build/server/index.js").unwrap(),
             vec!["react-router-serve", "build/server/index.js"]
         );
+    }
+
+    #[test]
+    fn rejects_cargo_and_rustc() {
+        for argv0 in ["cargo", "rustc", "/usr/bin/cargo", "bin/rustc"] {
+            let err = validate_start_argv(&[argv0.into()]).unwrap_err();
+            assert!(err.to_string().contains("cannot run"), "{argv0}: {err}");
+        }
+        assert!(validate_start_argv(&["bin/hello".into()]).is_ok());
     }
 
     #[test]

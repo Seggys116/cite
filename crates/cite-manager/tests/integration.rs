@@ -147,6 +147,11 @@ impl Harness {
         let mock = MockGithub::spawn().await.expect("mock github");
         let token_file = tmp.path().join("token");
         std::fs::write(&token_file, mock.token()).unwrap();
+        std::fs::set_permissions(
+            &token_file,
+            std::os::unix::fs::PermissionsExt::from_mode(0o600),
+        )
+        .unwrap();
         let build_env_file = tmp.path().join("build.env");
         std::fs::write(&build_env_file, "SECRET_BUILD_VALUE=super-secret-build\n").unwrap();
 
@@ -731,6 +736,11 @@ async fn github_validation_reports_branch_and_bad_token() {
     );
 
     std::fs::write(&h.token_file, "ghp_wrongtokenwrongtokenwrongtoken01\n").unwrap();
+    std::fs::set_permissions(
+        &h.token_file,
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    )
+    .unwrap();
     let bad_token = cite_manager::github::GithubClient::new(
         h.mock.base_url(),
         "owner",
@@ -746,6 +756,11 @@ async fn github_validation_reports_branch_and_bad_token() {
     );
 
     std::fs::write(&h.token_file, h.mock.token()).unwrap();
+    std::fs::set_permissions(
+        &h.token_file,
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    )
+    .unwrap();
     h.mock.set_expiry(Some("2099-01-01T00:00:00Z".into()));
     let ok = cite_manager::github::GithubClient::new(
         h.mock.base_url(),
@@ -772,6 +787,7 @@ async fn stale_executor_heartbeat_is_unresponsive() {
     let deployer = h.deployer().await;
     let json = deployer.status_json().await.unwrap();
     assert_eq!(json["executor_unresponsive"], true);
+    assert_eq!(json["executor_reported"], false);
     h.shutdown().await;
 }
 
@@ -805,6 +821,11 @@ async fn bad_token_stops_polling_until_the_file_is_rotated() {
     tokio::time::sleep(Duration::from_millis(500)).await;
     let deployer = h.deployer().await;
     std::fs::write(&h.token_file, "ghp_wrongtokenwrongtokenwrongtoken01\n").unwrap();
+    std::fs::set_permissions(
+        &h.token_file,
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    )
+    .unwrap();
     let err = deployer
         .handle(DeployCmd::Poll { force: true })
         .await
@@ -817,6 +838,11 @@ async fn bad_token_stops_polling_until_the_file_is_rotated() {
     assert!(state.token_invalid);
 
     std::fs::write(&h.token_file, h.mock.token()).unwrap();
+    std::fs::set_permissions(
+        &h.token_file,
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    )
+    .unwrap();
     deployer
         .handle(DeployCmd::Poll { force: true })
         .await
@@ -887,6 +913,11 @@ async fn rejected_token_is_not_retried_until_it_changes() {
     assert_eq!(skipped["skipped"], "token_invalid");
 
     std::fs::write(&h.token_file, "ghp_anotherrotatedtokenvalue0000000001\n").unwrap();
+    std::fs::set_permissions(
+        &h.token_file,
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    )
+    .unwrap();
     let err = deployer
         .handle(DeployCmd::Poll { force: false })
         .await
@@ -894,6 +925,11 @@ async fn rejected_token_is_not_retried_until_it_changes() {
     assert!(err.to_string().contains("token_invalid"), "{err}");
 
     std::fs::write(&h.token_file, h.mock.token()).unwrap();
+    std::fs::set_permissions(
+        &h.token_file,
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    )
+    .unwrap();
     let executor = h.spawn_executor().await;
     tokio::time::sleep(Duration::from_millis(500)).await;
     deployer
@@ -1090,6 +1126,7 @@ fn cli_talks_to_a_live_daemon_and_helpers_run() {
     let cache = dir.path().join("cache");
     let token = dir.path().join("token");
     std::fs::write(&token, "ghp_citeMockGithubPat00000000000000001\n").unwrap();
+    std::fs::set_permissions(&token, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
     // Accept and drop. A closed port can sit until the HTTP connect timeout.
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let api = format!("http://{}", listener.local_addr().unwrap());
