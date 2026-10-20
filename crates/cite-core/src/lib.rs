@@ -18,7 +18,8 @@ pub mod volume;
 pub use argv::{render_argv, split_command, validate_start_argv};
 pub use atomic::{AtomicPoint, ensure_dir, set_tight_umask, write_atomic, write_atomic_failpoint};
 pub use config::{
-    ExecutorConfig, GithubToken, ManagerConfig, RenderingSetting, SiteEnv, parse_env_file,
+    BinShims, ExecutorConfig, GithubToken, ManagerConfig, RenderingSetting, SiteEnv,
+    node_flag_denied, parse_env_file,
 };
 pub use detect::{Detection, detect_site, detect_site_configured, detect_site_with};
 pub use duration::{PollInterval, parse_byte_size, parse_duration, parse_poll_interval};

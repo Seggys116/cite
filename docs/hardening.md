@@ -75,6 +75,14 @@ Also restrict cloud IAM / instance profiles to least privilege. Cite does not pr
 - For rotation without a restart, mount a file and set `CITE_GITHUB_TOKEN_FILE` to its path; it is re-read on every poll. The file must be a regular file readable only by its owner (mode `0400` or `0600`); Cite refuses a group- or world-readable token file, because the build uid could otherwise read a bind mount. Mount it under `/run/cite/` (a root-only tmpfs), for example `./github_token:/run/cite/github_token:ro`, so uid 10002 cannot reach it whatever its mode.
 - Use a fine-grained PAT limited to the one repository with `contents:read`.
 
+## Start binaries
+
+The executor never runs a shell. A `node_modules/.bin` start binary is run by node, and a pnpm shim is read rather than executed: Cite takes the script its `exec node` line names and starts that.
+
+- Both the `.bin` entry and the script it resolves to must sit inside the release's app directory after symlinks are followed; anything else is refused.
+- The shim may pass no node options unless you list them in `CITE_BIN_NODE_FLAGS`, and options that run code or open a debug port are never allowed.
+- Set `CITE_BIN_SHIMS=deny` to refuse shell-script bins altogether, for sites that start with `node server.js` or an npm-style JS bin.
+
 ## Executor shell-less
 
 Executor images are distroless with no shell. `docker exec … sh` must fail.

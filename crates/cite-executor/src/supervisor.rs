@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use cite_core::schema::Rendering;
 use cite_core::{
-    ExecutorConfig, HealthExpect, Redactor, ReleaseManifest, Result, RuntimeKind, Slot,
-    validate_start_argv,
+    BinShims, ExecutorConfig, HealthExpect, Redactor, ReleaseManifest, Result, RuntimeKind, Slot,
+    node_flag_denied, validate_start_argv,
 };
 use http::Request;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
@@ -416,7 +416,7 @@ fn resolve_argv(
                 RuntimeKind::Bun => PathBuf::from(&config.bun_bin),
                 _ => PathBuf::from(&config.node_bin),
             };
-            let (script, node_flags) = node_bin_script(&bin)?;
+            let (script, node_flags) = node_bin_script(config, app_dir, &bin)?;
             let mut args = node_flags;
             args.push(script.to_string_lossy().into_owned());
             args.extend(argv[1..].iter().cloned());
@@ -426,9 +426,15 @@ fn resolve_argv(
 }
 
 /// npm links `.bin/<name>` to a JS file; pnpm writes a `#!/bin/sh` shim that `exec`s node, and the executor image has no shell.
-fn node_bin_script(bin: &Path) -> Result<(PathBuf, Vec<String>)> {
+fn node_bin_script(
+    config: &ExecutorConfig,
+    app_dir: &Path,
+    bin: &Path,
+) -> Result<(PathBuf, Vec<String>)> {
+    let app_root = app_dir.canonicalize()?;
+    let real_bin = confined(&app_root, bin)?;
     let mut head = Vec::new();
-    std::fs::File::open(bin)?
+    std::fs::File::open(&real_bin)?
         .take(SHIM_READ_MAX)
         .read_to_end(&mut head)?;
     let head = String::from_utf8_lossy(&head);
@@ -440,6 +446,12 @@ fn node_bin_script(bin: &Path) -> Result<(PathBuf, Vec<String>)> {
     if !is_shell {
         return Ok((bin.to_path_buf(), Vec::new()));
     }
+    if config.bin_shims == BinShims::Deny {
+        return Err(cite_core::Error::msg(format!(
+            "start binary `{}` is a shell script and CITE_BIN_SHIMS=deny",
+            bin.display()
+        )));
+    }
     let unresolved = || {
         cite_core::Error::msg(format!(
             "start binary `{}` is a shell script and its node target could not be resolved",
@@ -447,17 +459,37 @@ fn node_bin_script(bin: &Path) -> Result<(PathBuf, Vec<String>)> {
         ))
     };
     let (rel, flags) = parse_shim_exec(&head).ok_or_else(unresolved)?;
-    let basedir = bin.canonicalize()?;
-    let script = basedir
-        .parent()
-        .ok_or_else(unresolved)?
-        .join(rel)
-        .canonicalize()
-        .map_err(|_| unresolved())?;
+    if let Some(flag) = flags.iter().find(|flag| !shim_flag_allowed(config, flag)) {
+        return Err(cite_core::Error::msg(format!(
+            "start binary `{}` passes node option `{flag}`; allow it with CITE_BIN_NODE_FLAGS",
+            bin.display()
+        )));
+    }
+    let basedir = real_bin.parent().ok_or_else(unresolved)?;
+    let script = confined(&app_root, &basedir.join(rel))?;
     if !script.is_file() {
         return Err(unresolved());
     }
     Ok((script, flags))
+}
+
+fn shim_flag_allowed(config: &ExecutorConfig, flag: &str) -> bool {
+    let name = flag.split_once('=').map_or(flag, |(name, _)| name);
+    !node_flag_denied(flag) && config.bin_node_flags.iter().any(|allowed| allowed == name)
+}
+
+/// Resolves symlinks and requires the result to sit inside the app directory.
+fn confined(app_root: &Path, path: &Path) -> Result<PathBuf> {
+    let real = path.canonicalize().map_err(|err| {
+        cite_core::Error::msg(format!("cannot resolve `{}`: {err}", path.display()))
+    })?;
+    if !real.starts_with(app_root) {
+        return Err(cite_core::Error::msg(format!(
+            "start binary `{}` resolves outside the app directory",
+            path.display()
+        )));
+    }
+    Ok(real)
 }
 
 /// Pulls the script (relative to the shim's directory) and node flags from the shim's `exec node ... "$basedir/<script>"` line.
@@ -743,6 +775,54 @@ fi
 
         std::fs::remove_file(target_dir.join("next")).unwrap();
         assert!(resolve_argv(&cfg, &app, &["next".into()]).is_err());
+    }
+
+    #[test]
+    fn shims_can_be_denied_and_cannot_escape_the_app_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = dir.path().join("app");
+        let bin_dir = app.join("node_modules/.bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::fs::create_dir_all(app.join("node_modules/pkg")).unwrap();
+        std::fs::write(app.join("node_modules/pkg/cli.js"), "").unwrap();
+        std::fs::write(dir.path().join("outside.js"), "").unwrap();
+        let shim = |exec: &str| format!("#!/bin/sh\nexec node {exec} \"$@\"\n");
+        std::fs::write(bin_dir.join("ok"), shim("\"$basedir/../pkg/cli.js\"")).unwrap();
+        std::fs::write(
+            bin_dir.join("escape"),
+            shim("\"$basedir/../../../outside.js\""),
+        )
+        .unwrap();
+        std::fs::write(
+            bin_dir.join("flagged"),
+            shim("--no-warnings \"$basedir/../pkg/cli.js\""),
+        )
+        .unwrap();
+        std::fs::write(
+            bin_dir.join("inspect"),
+            shim("--inspect \"$basedir/../pkg/cli.js\""),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(dir.path().join("outside.js"), bin_dir.join("link")).unwrap();
+        let mut cfg = node_config(dir.path());
+
+        assert!(resolve_argv(&cfg, &app, &["ok".into()]).is_ok());
+        let err = resolve_argv(&cfg, &app, &["escape".into()]).unwrap_err();
+        assert!(err.to_string().contains("outside the app"), "{err}");
+        let err = resolve_argv(&cfg, &app, &["link".into()]).unwrap_err();
+        assert!(err.to_string().contains("outside the app"), "{err}");
+
+        let err = resolve_argv(&cfg, &app, &["flagged".into()]).unwrap_err();
+        assert!(err.to_string().contains("CITE_BIN_NODE_FLAGS"), "{err}");
+        cfg.bin_node_flags = vec!["--no-warnings".into()];
+        let (_, args) = resolve_argv(&cfg, &app, &["flagged".into()]).unwrap();
+        assert_eq!(args[0], "--no-warnings");
+        let err = resolve_argv(&cfg, &app, &["inspect".into()]).unwrap_err();
+        assert!(err.to_string().contains("--inspect"), "{err}");
+
+        cfg.bin_shims = BinShims::Deny;
+        let err = resolve_argv(&cfg, &app, &["ok".into()]).unwrap_err();
+        assert!(err.to_string().contains("CITE_BIN_SHIMS=deny"), "{err}");
     }
 
     #[test]

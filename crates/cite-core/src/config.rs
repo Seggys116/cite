@@ -180,6 +180,39 @@ pub struct ManagerConfig {
     pub dev_same_user: bool,
 }
 
+/// What the executor does with a `node_modules/.bin` entry that is a shell script (pnpm writes these).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinShims {
+    /// Run the node script the shim `exec`s.
+    Resolve,
+    /// Refuse shell-script bins; only JS bins start.
+    Deny,
+}
+
+/// Node options that execute code or open a debug port. A shim may never pass them, and they cannot be allowlisted.
+pub fn node_flag_denied(flag: &str) -> bool {
+    let name = flag.split_once('=').map_or(flag, |(name, _)| name);
+    !name.starts_with("--")
+        || name.starts_with("--inspect")
+        || name.starts_with("--debug")
+        || matches!(
+            name,
+            "--eval"
+                | "--print"
+                | "--require"
+                | "--import"
+                | "--loader"
+                | "--experimental-loader"
+                | "--interactive"
+                | "--input-type"
+                | "--env-file"
+                | "--env-file-if-exists"
+                | "--run"
+                | "--test"
+                | "--watch"
+        )
+}
+
 #[derive(Debug, Clone)]
 pub struct ExecutorConfig {
     pub listen: SocketAddr,
@@ -217,6 +250,9 @@ pub struct ExecutorConfig {
     pub ban_duration: Duration,
     pub version: String,
     pub child_term_grace: Duration,
+    pub bin_shims: BinShims,
+    /// Node options (names, without values) a resolved shim may pass; empty refuses any shim that passes options.
+    pub bin_node_flags: Vec<String>,
 }
 
 impl ManagerConfig {
@@ -685,6 +721,20 @@ impl ExecutorConfig {
                 "child_term_grace",
                 "10s",
             ))?,
+            bin_shims: parse_bin_shims(&pick(
+                env,
+                &file,
+                "CITE_BIN_SHIMS",
+                "bin_shims",
+                "resolve",
+            ))?,
+            bin_node_flags: parse_node_flags(&pick(
+                env,
+                &file,
+                "CITE_BIN_NODE_FLAGS",
+                "bin_node_flags",
+                "",
+            ))?,
         })
     }
 
@@ -900,6 +950,28 @@ fn parse_runtime(value: &str) -> Result<RuntimeKind> {
             "CITE_RUNTIME must be node, bun, static, or rust, got `{value}`"
         ))),
     }
+}
+
+fn parse_bin_shims(value: &str) -> Result<BinShims> {
+    match value {
+        "resolve" => Ok(BinShims::Resolve),
+        "deny" => Ok(BinShims::Deny),
+        _ => Err(Error::Config(format!(
+            "CITE_BIN_SHIMS must be resolve or deny, got `{value}`"
+        ))),
+    }
+}
+
+fn parse_node_flags(value: &str) -> Result<Vec<String>> {
+    let flags = split_list(value);
+    for flag in &flags {
+        if flag.contains('=') || flag.contains(char::is_whitespace) || node_flag_denied(flag) {
+            return Err(Error::Config(format!(
+                "CITE_BIN_NODE_FLAGS entry `{flag}` must be a safe `--name` node option without a value"
+            )));
+        }
+    }
+    Ok(flags)
 }
 
 fn parse_expect(value: &str) -> Result<HealthExpect> {
@@ -1147,6 +1219,71 @@ mod tests {
         ] {
             let err = load(&[(key, value)]).unwrap_err().to_string();
             assert!(err.contains(key), "{key}: {err}");
+        }
+    }
+
+    #[test]
+    fn bin_shim_settings_default_hard_and_reject_unsafe_flags() {
+        let load = |pairs: &[(&str, &str)]| ExecutorConfig::load_from(&env(pairs), None);
+        let cfg = load(&[]).unwrap();
+        assert_eq!(cfg.bin_shims, BinShims::Resolve);
+        assert!(cfg.bin_node_flags.is_empty());
+
+        let cfg = load(&[
+            ("CITE_BIN_SHIMS", "deny"),
+            ("CITE_BIN_NODE_FLAGS", "--no-warnings, --enable-source-maps"),
+        ])
+        .unwrap();
+        assert_eq!(cfg.bin_shims, BinShims::Deny);
+        assert_eq!(
+            cfg.bin_node_flags,
+            ["--no-warnings", "--enable-source-maps"]
+        );
+
+        let toml_text = "bin_shims = \"deny\"\nbin_node_flags = \"--no-warnings\"\n";
+        let cfg = ExecutorConfig::load_from(&env(&[]), Some(toml_text)).unwrap();
+        assert_eq!(cfg.bin_shims, BinShims::Deny);
+        assert_eq!(cfg.bin_node_flags, ["--no-warnings"]);
+
+        for (key, value) in [
+            ("CITE_BIN_SHIMS", "allow"),
+            ("CITE_BIN_NODE_FLAGS", "--inspect"),
+            ("CITE_BIN_NODE_FLAGS", "--require"),
+            ("CITE_BIN_NODE_FLAGS", "-e"),
+            ("CITE_BIN_NODE_FLAGS", "--max-old-space-size=512"),
+            ("CITE_BIN_NODE_FLAGS", "--no-warnings --x"),
+        ] {
+            let err = load(&[(key, value)]).unwrap_err().to_string();
+            assert!(err.contains(key), "{key}={value}: {err}");
+        }
+    }
+
+    #[test]
+    fn denied_node_flags_cover_code_execution_and_debug_ports() {
+        for flag in [
+            "-e",
+            "-pe",
+            "--eval=x",
+            "--print",
+            "--require=./x.js",
+            "--import",
+            "--loader=x",
+            "--experimental-loader",
+            "--inspect",
+            "--inspect-brk=0.0.0.0:9229",
+            "--debug-port=1",
+            "--env-file=.env",
+            "--test",
+            "--watch",
+        ] {
+            assert!(node_flag_denied(flag), "{flag}");
+        }
+        for flag in [
+            "--no-warnings",
+            "--max-old-space-size=512",
+            "--enable-source-maps",
+        ] {
+            assert!(!node_flag_denied(flag), "{flag}");
         }
     }
 

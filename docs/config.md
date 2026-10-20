@@ -72,6 +72,8 @@ Compose-level settings live in `.env` (copy `.env.example`). `.env` is gitignore
 | `CITE_RATE_LIMIT` / `CITE_RATE_BURST` | `100` / `200` | Requests per second and burst per client; over it returns `429` with `Retry-After`. `off` disables rate limiting and bans |
 | `CITE_MAX_CONN_PER_IP` | `64` | Concurrent connections per untrusted peer; `0` disables |
 | `CITE_BAN_THRESHOLD` / `CITE_BAN_DURATION` | `50` / `60s` | A client with more than this many `429`s in 10 s is banned for the duration; banned direct peers are dropped at accept |
+| `CITE_BIN_SHIMS` | `resolve` | How a `node_modules/.bin` start binary that is a shell script (pnpm's shim) is handled. `resolve` runs the node script the shim points at; `deny` refuses shell scripts, so only JS bins and `node`/`bun` start commands work |
+| `CITE_BIN_NODE_FLAGS` | empty | Comma-separated node options (`--name`, no values) a resolved shim may pass. A shim that passes any other option is refused. Options that run code or open a debug port (`--eval`, `--require`, `--import`, `--loader`, `--inspect*`, `--env-file`, short flags) are always refused and are rejected here at startup |
 | `CITE_ALLOWED_HOSTS` | empty | Empty = any |
 | `CITE_MAX_BODY` | `100MB` | |
 | `CITE_STATIC_HEADERS` | defaults | Extra/override static headers |
