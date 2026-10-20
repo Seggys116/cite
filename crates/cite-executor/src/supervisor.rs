@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::collections::VecDeque;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -22,6 +22,7 @@ use tracing::{info, warn};
 
 const LOG_RING: usize = 40;
 const LOG_LINE_MAX: usize = 1024;
+const SHIM_READ_MAX: u64 = 16 * 1024;
 /// Bind-address variables frameworks read; forced to loopback so children stay behind the executor.
 const LOOPBACK_HOST_VARS: [&str; 3] = ["HOST", "HOSTNAME", "NITRO_HOST"];
 
@@ -415,11 +416,70 @@ fn resolve_argv(
                 RuntimeKind::Bun => PathBuf::from(&config.bun_bin),
                 _ => PathBuf::from(&config.node_bin),
             };
-            let mut args = vec![bin.to_string_lossy().into_owned()];
+            let (script, node_flags) = node_bin_script(&bin)?;
+            let mut args = node_flags;
+            args.push(script.to_string_lossy().into_owned());
             args.extend(argv[1..].iter().cloned());
             Ok((interpreter, args))
         }
     }
+}
+
+/// npm links `.bin/<name>` to a JS file; pnpm writes a `#!/bin/sh` shim that `exec`s node, and the executor image has no shell.
+fn node_bin_script(bin: &Path) -> Result<(PathBuf, Vec<String>)> {
+    let mut head = Vec::new();
+    std::fs::File::open(bin)?
+        .take(SHIM_READ_MAX)
+        .read_to_end(&mut head)?;
+    let head = String::from_utf8_lossy(&head);
+    let shebang = head.lines().next().unwrap_or("");
+    let is_shell = shebang.starts_with("#!")
+        && shebang
+            .split_whitespace()
+            .any(|word| matches!(word.rsplit('/').next(), Some("sh" | "bash" | "dash")));
+    if !is_shell {
+        return Ok((bin.to_path_buf(), Vec::new()));
+    }
+    let unresolved = || {
+        cite_core::Error::msg(format!(
+            "start binary `{}` is a shell script and its node target could not be resolved",
+            bin.display()
+        ))
+    };
+    let (rel, flags) = parse_shim_exec(&head).ok_or_else(unresolved)?;
+    let basedir = bin.canonicalize()?;
+    let script = basedir
+        .parent()
+        .ok_or_else(unresolved)?
+        .join(rel)
+        .canonicalize()
+        .map_err(|_| unresolved())?;
+    if !script.is_file() {
+        return Err(unresolved());
+    }
+    Ok((script, flags))
+}
+
+/// Pulls the script (relative to the shim's directory) and node flags from the shim's `exec node ... "$basedir/<script>"` line.
+fn parse_shim_exec(shim: &str) -> Option<(String, Vec<String>)> {
+    const BASEDIR: &str = "\"$basedir/";
+    let rest = shim
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("exec node "))?;
+    let start = rest.find(BASEDIR)?;
+    let flags: Vec<String> = rest[..start]
+        .split_whitespace()
+        .map(str::to_string)
+        .collect();
+    if flags
+        .iter()
+        .any(|flag| !flag.starts_with('-') || flag.contains(['$', '"', '\'', '\\']))
+    {
+        return None;
+    }
+    let after = &rest[start + BASEDIR.len()..];
+    let rel = &after[..after.find('"')?];
+    (!rel.is_empty() && !rel.contains('$')).then(|| (rel.to_string(), flags))
 }
 
 fn resolve_rust_argv(app_dir: &Path, argv: &[String]) -> Result<(PathBuf, Vec<String>)> {
@@ -599,6 +659,90 @@ mod tests {
         assert!(resolve_argv(&cfg, &app, &["../bin/my-app".into()]).is_err());
         assert!(resolve_argv(&cfg, &app, &[String::new()]).is_err());
         assert!(resolve_argv(&cfg, &app, &["/bin/my-app".into()]).is_err());
+    }
+
+    const PNPM_SHIM: &str = r#"#!/bin/sh
+basedir=$(dirname "$(echo "$0" | sed -e 's,\\,/,g')")
+
+if [ -z "$NODE_PATH" ]; then
+  export NODE_PATH="/build/node_modules/.pnpm/next@16.0.0/node_modules/next/node_modules"
+else
+  export NODE_PATH="/build/node_modules/.pnpm/next@16.0.0/node_modules/next/node_modules:$NODE_PATH"
+fi
+if [ -x "$basedir/node" ]; then
+  exec "$basedir/node"  "$basedir/../.pnpm/next@16.0.0/node_modules/next/dist/bin/next" "$@"
+else
+  exec node  "$basedir/../.pnpm/next@16.0.0/node_modules/next/dist/bin/next" "$@"
+fi
+"#;
+
+    fn node_config(releases: &Path) -> ExecutorConfig {
+        let mut env = std::collections::HashMap::new();
+        env.insert("CITE_RELEASES_DIR".into(), releases.display().to_string());
+        env.insert("CITE_DATA_DIR".into(), releases.display().to_string());
+        env.insert("CITE_PORT_BASE".into(), "21004".into());
+        env.insert("CITE_LISTEN".into(), "127.0.0.1:0".into());
+        env.insert("CITE_NODE".into(), "22".into());
+        ExecutorConfig::load_from(&env, None).unwrap()
+    }
+
+    #[test]
+    fn parses_the_pnpm_shim_exec_line() {
+        let (rel, flags) = parse_shim_exec(PNPM_SHIM).unwrap();
+        assert_eq!(rel, "../.pnpm/next@16.0.0/node_modules/next/dist/bin/next");
+        assert!(flags.is_empty());
+
+        let flagged = "#!/bin/sh\nexec node --no-warnings \"$basedir/../x/cli.js\" \"$@\"\n";
+        let (rel, flags) = parse_shim_exec(flagged).unwrap();
+        assert_eq!(rel, "../x/cli.js");
+        assert_eq!(flags, ["--no-warnings"]);
+
+        assert!(parse_shim_exec("#!/bin/sh\necho hi\n").is_none());
+        assert!(parse_shim_exec("exec node $(evil) \"$basedir/x.js\"\n").is_none());
+        assert!(parse_shim_exec("exec node \"$basedir/$X/x.js\"\n").is_none());
+    }
+
+    #[test]
+    fn resolve_argv_runs_pnpm_shims_through_node_and_leaves_js_bins_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = dir.path().join("app");
+        let bin_dir = app.join("node_modules/.bin");
+        let target_dir = app.join("node_modules/.pnpm/next@16.0.0/node_modules/next/dist/bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::fs::create_dir_all(&target_dir).unwrap();
+        std::fs::write(target_dir.join("next"), "#!/usr/bin/env node\n").unwrap();
+        std::fs::write(bin_dir.join("next"), PNPM_SHIM).unwrap();
+        std::fs::write(bin_dir.join("srv"), "#!/usr/bin/env node\n").unwrap();
+        std::fs::write(bin_dir.join("bare"), "require('http');").unwrap();
+        std::fs::write(bin_dir.join("broken"), "#!/bin/sh\necho hi\n").unwrap();
+        let cfg = node_config(dir.path());
+
+        let (program, args) =
+            resolve_argv(&cfg, &app, &["next".into(), "start".into(), "-p".into()]).unwrap();
+        assert_eq!(program, PathBuf::from(&cfg.node_bin));
+        assert_eq!(
+            args,
+            [
+                target_dir
+                    .join("next")
+                    .canonicalize()
+                    .unwrap()
+                    .display()
+                    .to_string(),
+                "start".to_string(),
+                "-p".to_string(),
+            ]
+        );
+
+        for name in ["srv", "bare"] {
+            let (_, args) = resolve_argv(&cfg, &app, &[name.into()]).unwrap();
+            assert_eq!(args, [bin_dir.join(name).display().to_string()]);
+        }
+        let err = resolve_argv(&cfg, &app, &["broken".into()]).unwrap_err();
+        assert!(err.to_string().contains("shell script"), "{err}");
+
+        std::fs::remove_file(target_dir.join("next")).unwrap();
+        assert!(resolve_argv(&cfg, &app, &["next".into()]).is_err());
     }
 
     #[test]

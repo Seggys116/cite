@@ -66,7 +66,7 @@ To keep data from an existing deployment, declare the old volume instead: `site_
 
 ## Next.js
 
-- `output: 'standalone'` in `next.config.*` runs `.next/standalone/server.js`; otherwise Cite runs `next start` from `node_modules/.bin`. Keep `next` in `dependencies`, because SSR builds prune dev dependencies (`CITE_PRUNE=false` turns that off).
+- `output: 'standalone'` in `next.config.*` runs `.next/standalone/server.js`; otherwise Cite runs `next start` from `node_modules/.bin`, including the shell shim pnpm writes there (the executor has no shell, so Cite runs the script the shim points at with node). Keep `next` in `dependencies`, because SSR builds prune dev dependencies (`CITE_PRUNE=false` turns that off).
 - Every SSR child is bound to loopback (`HOST`, `HOSTNAME` and `NITRO_HOST` are forced to `127.0.0.1`), so the blue and green ports are never reachable from other containers; only the executor's port is.
 - ISR and on-demand revalidation try to write regenerated pages into `.next`, which is read-only in a release, so the site logs `EROFS`/`ENOENT` "Failed to update prerender cache" errors. Pages still serve, and the regenerated copy is kept in memory. To stop the errors, keep the cache in memory with a cache handler:
 

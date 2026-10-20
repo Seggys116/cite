@@ -3069,6 +3069,52 @@ async fn large_static_files_stream_ranges_and_skip_gzip_above_the_cap() {
 }
 
 #[tokio::test]
+async fn pnpm_shell_shim_start_binary_serves() {
+    if !node_available() {
+        eprintln!("skipping pnpm shim test: node not on PATH");
+        return;
+    }
+    let dir = tempdir().unwrap();
+    let data = dir.path();
+    std::fs::create_dir_all(data.join("control")).unwrap();
+    std::fs::create_dir_all(data.join("status")).unwrap();
+    let app = data.join("releases/blue/app/node_modules");
+    let pkg_bin = app.join(".pnpm/srv@1.0.0/node_modules/srv/bin");
+    std::fs::create_dir_all(&pkg_bin).unwrap();
+    std::fs::create_dir_all(app.join(".bin")).unwrap();
+    std::fs::write(
+        pkg_bin.join("srv.js"),
+        "require('http').createServer((q,r)=>r.end('pnpm-shim-ok')).listen(process.env.PORT,'127.0.0.1');",
+    )
+    .unwrap();
+    std::fs::write(
+        app.join(".bin/srv"),
+        "#!/bin/sh\nbasedir=$(dirname \"$(echo \"$0\" | sed -e 's,\\\\,/,g')\")\n\nif [ -x \"$basedir/node\" ]; then\n  exec \"$basedir/node\"  \"$basedir/../.pnpm/srv@1.0.0/node_modules/srv/bin/srv.js\" \"$@\"\nelse\n  exec node  \"$basedir/../.pnpm/srv@1.0.0/node_modules/srv/bin/srv.js\" \"$@\"\nfi\n",
+    )
+    .unwrap();
+    let mut manifest = sample_ssr(Slot::Blue, "01ARZ3NDEKTSV4RRFFQ69G5FAV");
+    manifest.start_argv = vec!["srv".into()];
+    write_release(&data.join("releases/blue/release.json"), &manifest).unwrap();
+    write_desired_action(data, 1, Slot::Blue, DesiredAction::Activate, None);
+    let mut cfg = config_from(data, "127.0.0.1:0");
+    cfg.node_bin = which_node();
+    cfg.watch = Duration::from_secs(60);
+    let exe = spawn(cfg).await.unwrap();
+    assert!(
+        wait_status(
+            data,
+            |s| s.active_slot == Some(Slot::Blue),
+            Duration::from_secs(15)
+        )
+        .await
+    );
+    let (code, _, body) = http_once(exe.addr, Method::GET, "/", &[]).await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(&body[..], b"pnpm-shim-ok");
+    exe.shutdown().await;
+}
+
+#[tokio::test]
 async fn restart_child_spawn_failure_is_treated_as_a_crash() {
     if !node_available() {
         eprintln!("skipping restart failure test: node not on PATH");
