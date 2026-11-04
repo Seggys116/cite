@@ -2,6 +2,10 @@
 resolver = "3"
 members = [
     "crates/cite-core",
+    "crates/cite-edge",
+    "crates/cite-connector",
+    "crates/cite-client",
+    "crates/cite-dashboard",
     "crates/cite-manager",
     "crates/cite-executor",
     "crates/cite-mock-github",
@@ -17,6 +21,8 @@ repository = "https://github.com/seggys116/cite"
 
 [workspace.dependencies]
 cite-core = { path = "crates/cite-core" }
+cite-edge = { path = "crates/cite-edge" }
+cite-client = { path = "crates/cite-client" }
 cite-executor = { path = "crates/cite-executor" }
 cite-mock-github = { path = "crates/cite-mock-github" }
 serde = { version = "1", features = ["derive"] }
