@@ -126,6 +126,14 @@ pub struct Source {
     pub repo: String,
     #[serde(default)]
     pub branch: Option<String>,
+    #[serde(default)]
+    pub runtime: Option<String>,
+    #[serde(default)]
+    pub node_major: Option<u8>,
+    #[serde(default)]
+    pub poll_interval: Option<String>,
+    #[serde(default)]
+    pub secret: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
