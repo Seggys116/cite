@@ -36,7 +36,7 @@ tower.workspace = true
 reqwest.workspace = true
 arc-swap.workspace = true
 clap.workspace = true
-libc.workspace = true
+rustix.workspace = true
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-pemfile = "2"
