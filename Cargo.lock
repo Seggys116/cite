@@ -436,7 +436,6 @@ name = "cite-edge"
 version = "0.3.0"
 dependencies = [
  "argon2",
- "blake2",
  "getrandom 0.3.4",
  "hmac",
  "ipnet",

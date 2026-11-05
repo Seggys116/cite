@@ -3,8 +3,6 @@ use std::fmt;
 
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::{Algorithm, Argon2, Params, Version};
-use blake2::digest::consts::U32;
-use blake2::{Blake2b, Digest};
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 
@@ -16,6 +14,8 @@ const MIN_PASSWORD_CHARS: usize = 12;
 const MAX_PASSWORD_BYTES: usize = 256;
 const GENERATED_PASSWORD_CHARS: usize = 24;
 const TOKEN_PREFIX: &str = "cite_";
+const TOKEN_ID_HEX: usize = 16;
+const TOKEN_SECRET_HEX: usize = 64;
 const PASSWORD_ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
 
 #[cfg(not(test))]
@@ -135,15 +135,35 @@ pub fn validate_password_strength(p: &str) -> Result<(), AuthError> {
     Ok(())
 }
 
-pub fn random_token() -> Result<String, AuthError> {
-    let bytes = random_bytes::<32>()?;
-    Ok(format!("{TOKEN_PREFIX}{}", to_hex(&bytes)))
+// The id is a public lookup key; only the secret authenticates.
+fn random_parts() -> Result<(String, String), AuthError> {
+    Ok((
+        to_hex(&random_bytes::<8>()?),
+        to_hex(&random_bytes::<32>()?),
+    ))
 }
 
-// Tokens carry 256 random bits, so a fast hash is enough to keep a leaked table from being usable as credentials.
-pub fn hash_token(token: &str) -> String {
-    let digest = Blake2b::<U32>::digest(token.as_bytes());
-    to_hex(digest.as_slice())
+fn join_token(id: &str, secret: &str) -> String {
+    format!("{TOKEN_PREFIX}{id}.{secret}")
+}
+
+pub fn random_token() -> Result<String, AuthError> {
+    let (id, secret) = random_parts()?;
+    Ok(join_token(&id, &secret))
+}
+
+fn is_lower_hex(s: &str) -> bool {
+    s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+// Returns (id, secret) only for the exact `cite_<16 hex>.<64 hex>` shape, so malformed input is rejected before any lookup or hashing.
+pub fn parse_token(token: &str) -> Option<(&str, &str)> {
+    let (id, secret) = token.strip_prefix(TOKEN_PREFIX)?.split_once('.')?;
+    let shaped = id.len() == TOKEN_ID_HEX
+        && secret.len() == TOKEN_SECRET_HEX
+        && is_lower_hex(id)
+        && is_lower_hex(secret);
+    shaped.then_some((id, secret))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,19 +171,55 @@ pub enum SessionKind {
     Interactive,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SessionInfo {
     pub username: String,
     pub kind: SessionKind,
     pub created: u64,
     pub expires: u64,
     pub last_seen: u64,
+    pub csrf: String,
+}
+
+impl fmt::Debug for SessionInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SessionInfo")
+            .field("username", &self.username)
+            .field("kind", &self.kind)
+            .field("created", &self.created)
+            .field("expires", &self.expires)
+            .field("last_seen", &self.last_seen)
+            .field("csrf", &"[redacted]")
+            .finish()
+    }
+}
+
+#[derive(Clone)]
+pub struct NewSession {
+    pub token: String,
+    pub expires: u64,
+    pub csrf: String,
+}
+
+impl fmt::Debug for NewSession {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NewSession")
+            .field("token", &"[redacted]")
+            .field("expires", &self.expires)
+            .field("csrf", &"[redacted]")
+            .finish()
+    }
+}
+
+struct SessionEntry {
+    secret: String,
+    info: SessionInfo,
 }
 
 pub struct SessionStore {
     ttl_secs: u64,
     idle_secs: u64,
-    sessions: HashMap<String, SessionInfo>,
+    sessions: HashMap<String, SessionEntry>,
 }
 
 impl SessionStore {
@@ -180,7 +236,13 @@ impl SessionStore {
     }
 
     pub fn create(&mut self, username: &str, now: u64) -> Result<(String, u64), AuthError> {
-        let token = random_token()?;
+        let opened = self.open(username, now)?;
+        Ok((opened.token, opened.expires))
+    }
+
+    pub fn open(&mut self, username: &str, now: u64) -> Result<NewSession, AuthError> {
+        let (id, secret) = random_parts()?;
+        let csrf = to_hex(&random_bytes::<32>()?);
         // At capacity dead sessions go first, then the oldest live one, so a login flood cannot grow the table without bound.
         if self.sessions.len() >= MAX_SESSIONS {
             self.sweep(now);
@@ -189,7 +251,7 @@ impl SessionStore {
             let oldest = self
                 .sessions
                 .iter()
-                .min_by_key(|(_, s)| s.created)
+                .min_by_key(|(_, s)| s.info.created)
                 .map(|(k, _)| k.clone());
             match oldest {
                 Some(key) => self.sessions.remove(&key),
@@ -203,31 +265,48 @@ impl SessionStore {
             created: now,
             expires,
             last_seen: now,
+            csrf: csrf.clone(),
         };
-        self.sessions.insert(hash_token(&token), info);
-        Ok((token, expires))
+        let token = join_token(&id, &secret);
+        self.sessions.insert(id, SessionEntry { secret, info });
+        Ok(NewSession {
+            token,
+            expires,
+            csrf,
+        })
+    }
+
+    // A wrong secret under a live id leaves the session untouched, so guessing cannot log anyone out.
+    fn entry_for(&self, token: &str) -> Option<&SessionEntry> {
+        let (id, secret) = parse_token(token)?;
+        let entry = self.sessions.get(id)?;
+        bool::from(entry.secret.as_bytes().ct_eq(secret.as_bytes())).then_some(entry)
     }
 
     pub fn validate(&mut self, token: &str, now: u64) -> Option<SessionInfo> {
-        let key = hash_token(token);
-        let live = self.is_live(self.sessions.get(&key)?, now);
+        let (id, _) = parse_token(token)?;
+        let live = self.is_live(&self.entry_for(token)?.info, now);
         if !live {
-            self.sessions.remove(&key);
+            self.sessions.remove(id);
             return None;
         }
-        let info = self.sessions.get_mut(&key)?;
-        info.last_seen = now;
-        Some(info.clone())
+        let entry = self.sessions.get_mut(id)?;
+        entry.info.last_seen = now;
+        Some(entry.info.clone())
     }
 
     pub fn revoke(&mut self, token: &str) {
-        self.sessions.remove(&hash_token(token));
+        if self.entry_for(token).is_some()
+            && let Some((id, _)) = parse_token(token)
+        {
+            self.sessions.remove(id);
+        }
     }
 
     pub fn sweep(&mut self, now: u64) {
         let idle = self.idle_secs;
         self.sessions
-            .retain(|_, s| now < s.expires && now.saturating_sub(s.last_seen) <= idle);
+            .retain(|_, s| now < s.info.expires && now.saturating_sub(s.info.last_seen) <= idle);
     }
 
     pub fn len(&self) -> usize {
@@ -248,9 +327,81 @@ pub struct ApiToken {
     pub last_used_at: Option<String>,
 }
 
+impl ApiToken {
+    // Runs Argon2, so async callers should do this off the executor and before taking any lock.
+    pub fn mint(name: &str) -> Result<(ApiToken, String), AuthError> {
+        let (id, secret) = random_parts()?;
+        let created_at = time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_default();
+        let token = ApiToken {
+            hash: hash_password(&secret)?,
+            id: id.clone(),
+            name: name.to_string(),
+            created_at,
+            last_used_at: None,
+        };
+        Ok((token, join_token(&id, &secret)))
+    }
+}
+
+// Secrets that already passed Argon2, held in memory only so repeat requests skip the expensive check.
+#[derive(Clone, Default)]
+struct VerifiedCache(HashMap<String, String>);
+
+impl fmt::Debug for VerifiedCache {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "VerifiedCache({} entries)", self.0.len())
+    }
+}
+
+impl VerifiedCache {
+    fn holds(&self, id: &str, secret: &str) -> bool {
+        self.0
+            .get(id)
+            .is_some_and(|known| bool::from(known.as_bytes().ct_eq(secret.as_bytes())))
+    }
+
+    fn remember(&mut self, id: &str, secret: &str) {
+        if self.0.len() >= MAX_API_TOKENS && !self.0.contains_key(id) {
+            self.0.clear();
+        }
+        self.0.insert(id.to_string(), secret.to_string());
+    }
+}
+
+// A token that matched a stored record but still needs its Argon2 check; it owns copies so the check can run without any lock.
+#[derive(Clone)]
+pub struct PendingToken {
+    id: String,
+    secret: String,
+    phc: String,
+}
+
+impl PendingToken {
+    pub fn check(&self) -> bool {
+        #[cfg(test)]
+        ARGON_CHECKS.with(|c| c.set(c.get() + 1));
+        verify_password(&self.secret, &self.phc)
+    }
+}
+
+pub enum TokenLookup {
+    Unknown,
+    Verified(ApiToken),
+    Pending(PendingToken),
+}
+
+#[cfg(test)]
+thread_local! {
+    static ARGON_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ApiTokens {
     tokens: Vec<ApiToken>,
+    #[serde(skip)]
+    verified: VerifiedCache,
 }
 
 impl ApiTokens {
@@ -258,41 +409,75 @@ impl ApiTokens {
         Self::default()
     }
 
-    pub fn create(&mut self, name: &str) -> Result<(ApiToken, String), AuthError> {
-        if self.tokens.len() >= MAX_API_TOKENS {
-            return Err(AuthError::Weak("api token limit reached"));
-        }
-        let plaintext = random_token()?;
-        let id = to_hex(&random_bytes::<8>()?);
-        let created_at = time::OffsetDateTime::now_utc()
-            .format(&time::format_description::well_known::Rfc3339)
-            .unwrap_or_default();
-        let token = ApiToken {
-            id,
-            name: name.to_string(),
-            hash: hash_token(&plaintext),
-            created_at,
-            last_used_at: None,
-        };
-        self.tokens.push(token.clone());
+    // Test-only: it hashes inline, which async callers must never do under a lock.
+    #[cfg(test)]
+    fn create(&mut self, name: &str) -> Result<(ApiToken, String), AuthError> {
+        self.ensure_room()?;
+        let (token, plaintext) = ApiToken::mint(name)?;
+        self.insert(token.clone())?;
         Ok((token, plaintext))
     }
 
-    pub fn verify(&mut self, token: &str, now_rfc3339: &str) -> Option<&ApiToken> {
-        let presented = hash_token(token);
-        let mut found: Option<usize> = None;
-        // Every stored hash is compared so the match position is not revealed by timing.
-        for (i, stored) in self.tokens.iter().enumerate() {
-            if bool::from(stored.hash.as_bytes().ct_eq(presented.as_bytes())) {
-                found = Some(i);
-            }
+    fn ensure_room(&self) -> Result<(), AuthError> {
+        if self.tokens.len() >= MAX_API_TOKENS {
+            return Err(AuthError::Weak("api token limit reached"));
         }
-        let entry = self.tokens.get_mut(found?)?;
+        Ok(())
+    }
+
+    pub fn insert(&mut self, token: ApiToken) -> Result<(), AuthError> {
+        self.ensure_room()?;
+        self.tokens.push(token);
+        Ok(())
+    }
+
+    // Cheap and lock-friendly: malformed tokens and unknown ids end here without Argon2.
+    pub fn begin_verify(&mut self, token: &str, now_rfc3339: &str) -> TokenLookup {
+        let Some((id, secret)) = parse_token(token) else {
+            return TokenLookup::Unknown;
+        };
+        let Some(entry) = self.tokens.iter_mut().find(|t| t.id == id) else {
+            return TokenLookup::Unknown;
+        };
+        if self.verified.holds(id, secret) {
+            entry.last_used_at = Some(now_rfc3339.to_string());
+            return TokenLookup::Verified(entry.clone());
+        }
+        TokenLookup::Pending(PendingToken {
+            id: entry.id.clone(),
+            secret: secret.to_string(),
+            phc: entry.hash.clone(),
+        })
+    }
+
+    // Re-checks that the same record is still present, since it may have been revoked while Argon2 ran unlocked.
+    pub fn complete(&mut self, pending: &PendingToken, now_rfc3339: &str) -> Option<&ApiToken> {
+        let entry = self
+            .tokens
+            .iter_mut()
+            .find(|t| t.id == pending.id && t.hash == pending.phc)?;
         entry.last_used_at = Some(now_rfc3339.to_string());
+        self.verified.remember(&pending.id, &pending.secret);
         Some(&*entry)
     }
 
+    #[cfg(test)]
+    fn verify(&mut self, token: &str, now_rfc3339: &str) -> Option<&ApiToken> {
+        let pending = match self.begin_verify(token, now_rfc3339) {
+            TokenLookup::Unknown => return None,
+            TokenLookup::Verified(hit) => {
+                return self.tokens.iter().find(|t| t.id == hit.id);
+            }
+            TokenLookup::Pending(pending) => pending,
+        };
+        if !pending.check() {
+            return None;
+        }
+        self.complete(&pending, now_rfc3339)
+    }
+
     pub fn revoke(&mut self, id: &str) -> bool {
+        self.verified.0.remove(id);
         let before = self.tokens.len();
         self.tokens.retain(|t| t.id != id);
         self.tokens.len() != before
@@ -425,16 +610,51 @@ mod tests {
         assert!(!validate_username("adm\u{e9}n"));
     }
 
+    fn argon_checks() -> usize {
+        ARGON_CHECKS.with(std::cell::Cell::get)
+    }
+
+    const NOW_TS: &str = "2026-01-01T00:00:00Z";
+
     #[test]
-    fn tokens_have_prefix_and_hash_to_blake2b_hex() {
+    fn tokens_have_id_and_secret_parts() {
         let token = random_token().expect("rng");
         assert!(token.starts_with("cite_"));
-        assert_eq!(token.len(), 5 + 64);
+        assert_eq!(token.len(), 5 + 16 + 1 + 64);
         assert_ne!(token, random_token().expect("rng"));
+        let (id, secret) = parse_token(&token).expect("parses");
+        assert_eq!(id.len(), 16);
+        assert_eq!(secret.len(), 64);
+    }
+
+    #[test]
+    fn parse_token_accepts_only_the_exact_shape() {
+        let id = "0123456789abcdef";
+        let secret = "0123456789abcdef".repeat(4);
         assert_eq!(
-            hash_token("abc"),
-            "bddd813c634239723171ef3fee98579b94964e3bb1cb3e427262c8c068d52319"
+            parse_token(&format!("cite_{id}.{secret}")),
+            Some((id, secret.as_str()))
         );
+        let bad = [
+            String::new(),
+            "cite_".to_string(),
+            format!("tok_{id}.{secret}"),
+            format!("{id}.{secret}"),
+            format!("cite_{id}{secret}"),
+            format!("cite_{}.{secret}", &id[..15]),
+            format!("cite_{id}0.{secret}"),
+            format!("cite_{id}.{}", &secret[..63]),
+            format!("cite_{id}.{secret}0"),
+            format!("cite_{}.{secret}", id.to_uppercase()),
+            format!("cite_{id}.{}", secret.to_uppercase()),
+            format!("cite_{id}.{}.{}", &secret[..32], &secret[32..]),
+            format!("cite_{id}..{}", &secret[..63]),
+            format!("cite_{id}.{secret} "),
+            format!("cite_{}g.{secret}", &id[..15]),
+        ];
+        for token in bad {
+            assert!(parse_token(&token).is_none(), "{token:?}");
+        }
     }
 
     #[test]
@@ -447,6 +667,58 @@ mod tests {
         assert_eq!(info.created, 1000);
         assert_eq!(info.last_seen, 1010);
         assert!(store.validate("cite_unknown", 1010).is_none());
+    }
+
+    #[test]
+    fn session_tokens_are_not_derived_from_stored_values() {
+        let mut store = SessionStore::new(100, 30);
+        let opened = store.open("admin", 1000).expect("open");
+        let (id, secret) = parse_token(&opened.token).expect("shape");
+        assert_eq!(opened.csrf.len(), 64);
+        assert!(is_lower_hex(&opened.csrf));
+        assert_ne!(opened.csrf, secret);
+        assert_ne!(opened.csrf, id);
+        assert_eq!(
+            store.validate(&opened.token, 1001).expect("live").csrf,
+            opened.csrf
+        );
+    }
+
+    #[test]
+    fn session_debug_output_hides_secrets() {
+        let mut store = SessionStore::new(100, 30);
+        let opened = store.open("admin", 1000).expect("open");
+        let (_, secret) = parse_token(&opened.token).expect("shape");
+        let info = store.validate(&opened.token, 1001).expect("live");
+        for shown in [format!("{opened:?}"), format!("{info:?}")] {
+            assert!(!shown.contains(secret), "{shown}");
+            assert!(!shown.contains(&opened.csrf), "{shown}");
+            assert!(!shown.contains(&opened.token), "{shown}");
+        }
+        assert!(format!("{info:?}").contains("admin"));
+    }
+
+    #[test]
+    fn session_csrf_differs_between_sessions() {
+        let mut store = SessionStore::new(100, 30);
+        let a = store.open("admin", 1000).expect("a");
+        let b = store.open("admin", 1000).expect("b");
+        assert_ne!(a.csrf, b.csrf);
+    }
+
+    #[test]
+    fn session_with_wrong_secret_or_unknown_id_is_rejected_and_kept() {
+        let mut store = SessionStore::new(100, 30);
+        let (token, _) = store.create("admin", 1000).expect("create");
+        let (id, secret) = parse_token(&token).expect("shape");
+        let first = if secret.starts_with('0') { '1' } else { '0' };
+        let flipped = format!("{first}{}", &secret[1..]);
+        let forged = format!("cite_{id}.{flipped}");
+        assert!(store.validate(&forged, 1001).is_none());
+        store.revoke(&forged);
+        assert!(store.validate(&token, 1002).is_some());
+        let other = format!("cite_{}.{secret}", "f".repeat(16));
+        assert!(store.validate(&other, 1002).is_none());
     }
 
     #[test]
@@ -505,29 +777,148 @@ mod tests {
     fn api_token_create_verify_revoke() {
         let mut tokens = ApiTokens::new();
         let (meta, plaintext) = tokens.create("ci").expect("create");
-        assert!(plaintext.starts_with("cite_"));
-        assert_eq!(meta.hash, hash_token(&plaintext));
-        assert!(
-            !serde_json::to_string(&tokens)
-                .expect("json")
-                .contains(&plaintext)
-        );
+        let (id, secret) = parse_token(&plaintext).expect("shape");
+        assert_eq!(meta.id, id);
+        assert!(meta.hash.starts_with("$argon2id$"));
+        assert!(verify_password(secret, &meta.hash));
+        assert!(!meta.hash.contains(secret));
+        let json = serde_json::to_string(&tokens).expect("json");
+        assert!(!json.contains(secret));
+        assert!(!json.contains(&plaintext));
 
-        let hit = tokens
-            .verify(&plaintext, "2026-01-01T00:00:00Z")
-            .expect("match");
+        let hit = tokens.verify(&plaintext, NOW_TS).expect("match");
         assert_eq!(hit.id, meta.id);
-        assert_eq!(hit.last_used_at.as_deref(), Some("2026-01-01T00:00:00Z"));
-        assert!(
-            tokens
-                .verify("cite_wrong", "2026-01-01T00:00:00Z")
-                .is_none()
-        );
+        assert_eq!(hit.last_used_at.as_deref(), Some(NOW_TS));
+        assert!(tokens.verify("cite_wrong", NOW_TS).is_none());
 
         assert!(tokens.revoke(&meta.id));
         assert!(!tokens.revoke(&meta.id));
-        assert!(tokens.verify(&plaintext, "2026-01-01T00:00:00Z").is_none());
+        assert!(tokens.verify(&plaintext, NOW_TS).is_none());
         assert!(tokens.list().is_empty());
+    }
+
+    #[test]
+    fn api_token_with_wrong_secret_fails_and_is_not_cached() {
+        let mut tokens = ApiTokens::new();
+        let (meta, _) = tokens.create("ci").expect("create");
+        let wrong = join_token(&meta.id, &"0".repeat(64));
+        let before = argon_checks();
+        assert!(tokens.verify(&wrong, NOW_TS).is_none());
+        assert!(tokens.verify(&wrong, NOW_TS).is_none());
+        assert_eq!(argon_checks() - before, 2);
+        assert!(tokens.list()[0].last_used_at.is_none());
+    }
+
+    #[test]
+    fn verified_tokens_skip_argon2_until_revoked() {
+        let mut tokens = ApiTokens::new();
+        let (meta, plaintext) = tokens.create("ci").expect("create");
+        let before = argon_checks();
+        assert!(tokens.verify(&plaintext, NOW_TS).is_some());
+        assert_eq!(argon_checks() - before, 1);
+        let again = tokens
+            .verify(&plaintext, "2026-02-02T00:00:00Z")
+            .expect("hit");
+        assert_eq!(again.last_used_at.as_deref(), Some("2026-02-02T00:00:00Z"));
+        assert_eq!(argon_checks() - before, 1);
+
+        assert!(tokens.revoke(&meta.id));
+        assert!(tokens.verify(&plaintext, NOW_TS).is_none());
+        assert_eq!(argon_checks() - before, 1);
+    }
+
+    #[test]
+    fn cached_secret_does_not_admit_a_different_secret() {
+        let mut tokens = ApiTokens::new();
+        let (meta, plaintext) = tokens.create("ci").expect("create");
+        assert!(tokens.verify(&plaintext, NOW_TS).is_some());
+        let wrong = join_token(&meta.id, &"1".repeat(64));
+        let before = argon_checks();
+        assert!(tokens.verify(&wrong, NOW_TS).is_none());
+        assert_eq!(argon_checks() - before, 1);
+    }
+
+    #[test]
+    fn unknown_ids_and_malformed_tokens_never_reach_argon2() {
+        let mut tokens = ApiTokens::new();
+        let (_, plaintext) = tokens.create("ci").expect("create");
+        let (_, secret) = parse_token(&plaintext).expect("shape");
+        let before = argon_checks();
+        assert!(tokens.verify("", NOW_TS).is_none());
+        assert!(tokens.verify("garbage", NOW_TS).is_none());
+        assert!(
+            tokens
+                .verify(&format!("cite_{}", "ab".repeat(32)), NOW_TS)
+                .is_none()
+        );
+        assert!(
+            tokens
+                .verify(&join_token(&"e".repeat(16), secret), NOW_TS)
+                .is_none()
+        );
+        assert_eq!(argon_checks(), before);
+    }
+
+    #[test]
+    fn old_format_records_load_but_never_verify() {
+        let old_plain = format!("cite_{}", "ab".repeat(32));
+        let json = format!(
+            r#"{{"tokens":[{{"id":"00112233445566ff","name":"legacy","hash":"{}","created_at":"2025-01-01T00:00:00Z","last_used_at":null}}]}}"#,
+            "cd".repeat(32)
+        );
+        let mut tokens: ApiTokens = serde_json::from_str(&json).expect("loads");
+        assert_eq!(tokens.list().len(), 1);
+        assert!(tokens.verify(&old_plain, NOW_TS).is_none());
+        let shaped = join_token("00112233445566ff", &"cd".repeat(32));
+        assert!(tokens.verify(&shaped, NOW_TS).is_none());
+        assert!(tokens.list()[0].last_used_at.is_none());
+        assert!(tokens.revoke("00112233445566ff"));
+    }
+
+    #[test]
+    fn completing_a_revoked_token_fails() {
+        let mut tokens = ApiTokens::new();
+        let (meta, plaintext) = tokens.create("ci").expect("create");
+        let TokenLookup::Pending(pending) = tokens.begin_verify(&plaintext, NOW_TS) else {
+            panic!("fresh token must need an argon2 check");
+        };
+        assert!(pending.check());
+        assert!(tokens.revoke(&meta.id));
+        assert!(tokens.complete(&pending, NOW_TS).is_none());
+        assert!(matches!(
+            tokens.begin_verify(&plaintext, NOW_TS),
+            TokenLookup::Unknown
+        ));
+    }
+
+    #[test]
+    fn verified_cache_is_not_serialised_or_printed() {
+        let mut tokens = ApiTokens::new();
+        let (_, plaintext) = tokens.create("ci").expect("create");
+        let (_, secret) = parse_token(&plaintext).expect("shape");
+        assert!(tokens.verify(&plaintext, NOW_TS).is_some());
+        assert!(
+            !serde_json::to_string(&tokens)
+                .expect("json")
+                .contains(secret)
+        );
+        assert!(!format!("{tokens:?}").contains(secret));
+        let json = serde_json::to_string(&tokens).expect("json");
+        let mut reloaded: ApiTokens = serde_json::from_str(&json).expect("parse");
+        let before = argon_checks();
+        assert!(reloaded.verify(&plaintext, NOW_TS).is_some());
+        assert_eq!(argon_checks() - before, 1);
+    }
+
+    #[test]
+    fn verified_cache_stays_bounded() {
+        let mut cache = VerifiedCache::default();
+        for i in 0..MAX_API_TOKENS * 2 {
+            cache.remember(&format!("id{i}"), "secret");
+            assert!(cache.0.len() <= MAX_API_TOKENS);
+        }
+        assert!(cache.holds("id127", "secret"));
+        assert!(!cache.holds("id127", "other"));
     }
 
     #[test]

@@ -462,7 +462,7 @@ pub fn fmt_targets(targets: &[Target]) -> String {
         .join(", ")
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct SiteDraft {
     pub api: bool,
     pub name: String,
@@ -475,6 +475,24 @@ pub struct SiteDraft {
     pub repo: String,
     pub branch: String,
     pub github_token: String,
+}
+
+impl std::fmt::Debug for SiteDraft {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SiteDraft")
+            .field("api", &self.api)
+            .field("name", &self.name)
+            .field("id", &self.id)
+            .field("hosts", &self.hosts)
+            .field("path_regex", &self.path_regex)
+            .field("blue", &self.blue)
+            .field("green", &self.green)
+            .field("health_path", &self.health_path)
+            .field("repo", &self.repo)
+            .field("branch", &self.branch)
+            .field("github_token", &"[redacted]")
+            .finish()
+    }
 }
 
 pub fn build_site(draft: &SiteDraft) -> Result<Site, String> {
@@ -972,6 +990,15 @@ mod tests {
         assert!(!format!("{plan:?}").contains("ghp_secret"));
         d.repo.clear();
         assert_eq!(draft_github_token(&d), None);
+    }
+
+    #[test]
+    fn site_draft_debug_hides_the_github_token() {
+        let mut d = draft();
+        d.github_token = "ghp_secret".into();
+        let shown = format!("{d:?}");
+        assert!(!shown.contains("ghp_secret"));
+        assert!(shown.contains(&d.name));
     }
 
     #[test]

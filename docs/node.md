@@ -112,7 +112,7 @@ Everything lives in the `cite_conf` volume, mounted at `/conf`.
 |---|---|---|
 | `edge.json` | 0600 | The node's configuration: sites, maintenance pages, firewall rules, settings. |
 | `credentials.json` | 0600 | Username, Argon2id password hash, TOTP secret. |
-| `tokens.json` | 0600 | API token hashes, names and last-used times. At most 64 tokens. |
+| `tokens.json` | 0600 | API token ids, Argon2id hashes, names and last-used times. At most 64 tokens. |
 | `secrets.json` | 0600 | GitHub tokens for orchestrated sites. |
 | `audit.jsonl`, `audit.jsonl.1` | 0600 | Audit log of changes and logins. |
 | `analytics/analytics.db` | 0600 | SQLite analytics database, with its `-wal` and `-shm` files. An old `analytics.json` is imported once and then deleted. |
