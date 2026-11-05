@@ -1115,11 +1115,12 @@ do_update() {
   say "Volumes were kept; credentials and certificates are unchanged."
 }
 
-# A failed pull is fine when every image the stack needs was built or loaded locally.
+# A failed bulk pull is fine when each missing image can still be pulled alone or is already local.
 pull_stack() {
   dc_stack "$1" pull && return 0
   for _img in $(dc_stack "$1" config --images); do
-    docker image inspect "$_img" >/dev/null 2>&1 || die "could not pull the $1 images"
+    docker image inspect "$_img" >/dev/null 2>&1 && continue
+    docker pull "$_img" >/dev/null 2>&1 || die "could not pull $_img for the $1 stack"
   done
   warn "the registry pull failed; using the images already present locally"
 }
