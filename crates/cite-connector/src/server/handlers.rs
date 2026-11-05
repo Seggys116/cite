@@ -17,7 +17,7 @@ use super::{
     ApiError, ApiResult, AppState, JsonBody, MaybeJson, Params, Peer, Principal, lock_std,
 };
 use crate::ConnectorError;
-use crate::store::{now_unix, unix_to_rfc3339};
+use crate::store::{LoginOutcome, now_unix, unix_to_rfc3339};
 
 const DEFAULT_LIST_LIMIT: usize = 100;
 const MAX_LIST_LIMIT: usize = 1000;
@@ -92,30 +92,33 @@ pub(super) async fn login(
     JsonBody(req): JsonBody<LoginReq>,
 ) -> ApiResult<Response> {
     let ip = peer.addr.ip().to_canonical().to_string();
-    let now = now_unix();
-    let blocked = lock_std(&st.limiter).check(&ip, now);
-    if let Err(retry) = blocked {
-        return Err(ApiError::too_many(retry));
-    }
-    let accepted = st
+    // The limiter is checked and updated inside the store's login lock so a burst cannot all pass the check.
+    let outcome = st
         .store
-        .verify_login(&req.username, &req.password, &req.totp, now)
+        .verify_login_gated(
+            &req.username,
+            &req.password,
+            &req.totp,
+            |now| lock_std(&st.limiter).check(&ip, now),
+            |now| lock_std(&st.limiter).record_failure(&ip, now),
+        )
         .await?;
-    // The audit entry carries the peer and a sanitised username, never the password.
-    let shown: String = req
-        .username
-        .chars()
-        .filter(|c| !c.is_control())
-        .take(64)
-        .collect();
-    if !accepted {
-        lock_std(&st.limiter).record_failure(&ip, now);
-        let detail = format!("peer={ip} user={shown:?}");
-        st.store.audit("anonymous", "login.failure", &detail).await;
-        return Err(ConnectorError::Unauthorized("invalid credentials".into()).into());
+    match outcome {
+        LoginOutcome::Blocked(retry) => return Err(ApiError::too_many(retry)),
+        LoginOutcome::Rejected => {
+            // The submitted username is never stored, since it may hold a pasted password.
+            let known = st
+                .store
+                .credentials()
+                .is_some_and(|c| c.username == req.username);
+            let detail = format!("peer={ip} username_matched={known}");
+            st.store.audit("anonymous", "login.failure", &detail).await;
+            return Err(ConnectorError::Unauthorized("invalid credentials".into()).into());
+        }
+        LoginOutcome::Accepted => {}
     }
     lock_std(&st.limiter).record_success(&ip);
-    let (token, expires) = st.store.create_session(&req.username, now)?;
+    let (token, expires) = st.store.create_session(&req.username, now_unix())?;
     st.store
         .audit(&req.username, "login.success", &format!("peer={ip}"))
         .await;
@@ -137,7 +140,23 @@ pub(super) async fn me(Extension(p): Extension<Principal>) -> Response {
     Json(json!({ "username": p.name, "kind": p.kind, "expires_at": p.expires_at })).into_response()
 }
 
-pub(super) async fn list_tokens(State(st): State<AppState>) -> ApiResult<Response> {
+// API tokens must not be able to mint or revoke tokens, or a stolen one could outlive its own revocation.
+fn require_session(p: &Principal) -> ApiResult<()> {
+    if p.kind == "session" {
+        Ok(())
+    } else {
+        Err(ApiError::new(
+            axum::http::StatusCode::FORBIDDEN,
+            "this action needs an interactive session",
+        ))
+    }
+}
+
+pub(super) async fn list_tokens(
+    State(st): State<AppState>,
+    Extension(p): Extension<Principal>,
+) -> ApiResult<Response> {
+    require_session(&p)?;
     let items: Vec<Value> = st
         .store
         .list_api_tokens()
@@ -165,6 +184,7 @@ pub(super) async fn create_token(
     Extension(p): Extension<Principal>,
     JsonBody(req): JsonBody<NameReq>,
 ) -> ApiResult<Response> {
+    require_session(&p)?;
     let name = clean_text("name", &req.name, MAX_NAME_CHARS)?;
     let (meta, token) = st.store.create_api_token(&name).await?;
     let detail = format!("id={} name={name:?}", meta.id);
@@ -177,6 +197,7 @@ pub(super) async fn delete_token(
     Extension(p): Extension<Principal>,
     Path(id): Path<String>,
 ) -> ApiResult<Response> {
+    require_session(&p)?;
     let well_formed = id.len() <= 32 && id.bytes().all(|b| b.is_ascii_hexdigit());
     if !well_formed || !st.store.revoke_api_token(&id).await? {
         return Err(missing("token"));

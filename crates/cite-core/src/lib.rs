@@ -71,6 +71,10 @@ mod workspace_invariants {
                 if name == "target" || name.starts_with('.') {
                     continue;
                 }
+                // the opt-in orchestrator and its filtering proxy are the only Docker API users
+                if name == "orchestrator.rs" || name == "cite-dockerproxy" {
+                    continue;
+                }
                 if path.is_dir() {
                     scan(&path, client, sock);
                 } else if name.ends_with(".rs") || name == "Cargo.toml" {

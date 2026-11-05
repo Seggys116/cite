@@ -38,7 +38,7 @@ docker compose -f docker-compose.node.yml ps
 | TOTP key | Base32 key, `otpauth://` URI and a QR code. Codes are six digits with a 30 second step. |
 | CA certificate | Path and SHA-256 fingerprint of the node's certificate authority. |
 
-Save all of it. It cannot be shown again. `init` refuses to run when credentials exist and tells you to pass `--force` or use `reset-credentials`. A reset issues new credentials and revokes every API token.
+Save all of it. It cannot be shown again. `init` refuses to run when credentials exist and tells you to pass `--force` or use `reset-credentials`. A reset issues new credentials and revokes every API token. `reset-credentials` and `init --force` write a new generation number into `credentials.json` and `tokens.json`. A running connector notices the change on its next request, adopts the new credentials, drops the old API tokens and signs out every session, so no restart is needed.
 
 The connector API will not start without credentials, but it still writes the HAProxy config first so HAProxy can boot.
 

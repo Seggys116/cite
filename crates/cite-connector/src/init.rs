@@ -114,12 +114,11 @@ pub async fn provision(
         totp_secret: totp_secret.clone(),
         totp_last_step: 0,
     };
-    store.set_credentials(credentials).await?;
+    // Every provision empties the API tokens, since they were issued under the old credentials.
+    store.reset_credentials(credentials).await?;
 
-    // A reset also drops API tokens, since they were issued under the old credentials.
     let reset = mode == Mode::Reset;
     if reset {
-        store.clear_api_tokens().await?;
         store
             .audit("cli", "credentials.reset", "api tokens revoked")
             .await;
@@ -173,7 +172,9 @@ pub fn format_report(p: &Provisioned) -> Result<String> {
         out.push_str(&format!("  CA SHA-256       {}\n", t.fingerprint));
         out.push_str("  Copy the CA certificate to the dashboard and check this fingerprint.\n");
     }
-    out.push_str("\nRestart a running connector so it picks up these credentials.\n");
+    out.push_str(
+        "\nA running connector picks up these credentials on its next request and signs out every session. No restart is needed.\n",
+    );
     Ok(out)
 }
 
@@ -326,6 +327,77 @@ mod tests {
             .expect("reset");
         assert!(reset.reset);
         assert!(store.verify_api_token(&token).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn running_store_adopts_a_cli_reset_and_cannot_overwrite_it() {
+        let (dir, cfg, running) = setup().await;
+        let first = provision(&cfg, &running, "admin", Mode::Init { force: false })
+            .await
+            .expect("provision");
+        let (_, api) = running.create_api_token("ci").await.expect("token");
+        let (session, _) = running
+            .create_session("admin", now_unix())
+            .expect("session");
+        assert!(running.validate_session(&session, now_unix()).is_some());
+
+        let cli = Store::open(&cfg).await.expect("cli store");
+        let second = provision(&cfg, &cli, "admin", Mode::Reset)
+            .await
+            .expect("reset");
+
+        assert!(running.validate_session(&session, now_unix()).is_none());
+        assert!(running.verify_api_token(&api).await.is_none());
+        assert!(running.list_api_tokens().await.is_empty());
+        let now = now_unix();
+        let old_code = totp::code_at(&first.totp_secret, now).expect("code");
+        assert!(
+            !running
+                .verify_login("admin", &first.password, &old_code, now)
+                .await
+                .expect("old login")
+        );
+        let new_code = totp::code_at(&second.totp_secret, now).expect("code");
+        assert!(
+            running
+                .verify_login("admin", &second.password, &new_code, now)
+                .await
+                .expect("new login")
+        );
+
+        // The running store's writes keep the reset state on disk.
+        let (_, fresh) = running.create_api_token("later").await.expect("token");
+        let reopened = Store::open(&cfg).await.expect("reopen");
+        assert!(reopened.verify_api_token(&api).await.is_none());
+        assert!(reopened.verify_api_token(&fresh).await.is_some());
+        let on_disk = reopened.credentials().expect("creds");
+        assert_eq!(on_disk.totp_secret, second.totp_secret);
+        assert!(dir.path().join("credentials.json").is_file());
+    }
+
+    #[tokio::test]
+    async fn stale_login_cannot_overwrite_newer_credentials_on_disk() {
+        let (_dir, cfg, running) = setup().await;
+        let first = provision(&cfg, &running, "admin", Mode::Init { force: false })
+            .await
+            .expect("provision");
+        let cli = Store::open(&cfg).await.expect("cli store");
+        let second = provision(&cfg, &cli, "admin", Mode::Init { force: true })
+            .await
+            .expect("force");
+        let now = now_unix();
+        let old_code = totp::code_at(&first.totp_secret, now).expect("code");
+        assert!(
+            !running
+                .verify_login("admin", &first.password, &old_code, now)
+                .await
+                .expect("old login")
+        );
+        let reopened = Store::open(&cfg).await.expect("reopen");
+        assert_eq!(
+            reopened.credentials().expect("creds").totp_secret,
+            second.totp_secret
+        );
     }
 
     #[tokio::test]

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard};
 
@@ -47,6 +47,38 @@ struct AuditState {
     last_prune: u64,
 }
 
+// credentials.json and tokens.json carry a generation so a running connector can tell a CLI reset from its own writes.
+#[derive(Serialize, Deserialize)]
+struct Stamped<T> {
+    #[serde(default)]
+    generation: u64,
+    #[serde(flatten)]
+    value: T,
+}
+
+#[derive(Deserialize)]
+struct GenerationOnly {
+    #[serde(default)]
+    generation: u64,
+}
+
+type FileKey = (i64, i64, u64, u64);
+
+// None for a key means the file must be read before it is trusted again.
+#[derive(Default)]
+struct AuthDisk {
+    creds_gen: u64,
+    creds_key: Option<FileKey>,
+    tokens_gen: u64,
+    tokens_key: Option<FileKey>,
+}
+
+pub enum LoginOutcome {
+    Accepted,
+    Rejected,
+    Blocked(u64),
+}
+
 struct Paths {
     edge: PathBuf,
     credentials: PathBuf,
@@ -66,6 +98,7 @@ pub struct Store {
     tokens: Mutex<ApiTokens>,
     sessions: StdMutex<SessionStore>,
     audit: Mutex<AuditState>,
+    disk: StdMutex<AuthDisk>,
 }
 
 pub fn now_rfc3339() -> String {
@@ -132,6 +165,18 @@ fn load_json<T: serde::de::DeserializeOwned>(path: &Path, max: u64) -> Result<Op
             .map_err(|e| internal(&format!("{} is invalid", path.display()), e)),
         None => Ok(None),
     }
+}
+
+fn file_key(path: &Path) -> Option<FileKey> {
+    let meta = fs::symlink_metadata(path).ok()?;
+    Some((meta.mtime(), meta.mtime_nsec(), meta.size(), meta.ino()))
+}
+
+fn disk_generation(path: &Path) -> u64 {
+    load_json::<GenerationOnly>(path, MAX_SMALL_FILE_BYTES)
+        .ok()
+        .flatten()
+        .map_or(0, |g| g.generation)
 }
 
 fn make_dir(path: &Path, mode: u32) -> Result<()> {
@@ -275,11 +320,16 @@ impl Store {
                 c
             }
         };
-        let creds = load_json::<Credentials>(&paths.credentials, MAX_SMALL_FILE_BYTES)?;
+        let creds = load_json::<Stamped<Credentials>>(&paths.credentials, MAX_SMALL_FILE_BYTES)?;
         let secrets = load_json::<HashMap<String, String>>(&paths.secrets, MAX_SMALL_FILE_BYTES)?
             .unwrap_or_default();
-        let tokens =
-            load_json::<ApiTokens>(&paths.tokens, MAX_SMALL_FILE_BYTES)?.unwrap_or_default();
+        let tokens = load_json::<Stamped<ApiTokens>>(&paths.tokens, MAX_SMALL_FILE_BYTES)?;
+        let disk = AuthDisk {
+            creds_gen: creds.as_ref().map_or(0, |c| c.generation),
+            creds_key: None,
+            tokens_gen: tokens.as_ref().map_or(0, |t| t.generation),
+            tokens_key: None,
+        };
         let audit_size = fs::symlink_metadata(&paths.audit).map_or(0, |m| m.len());
 
         Ok(Store {
@@ -288,14 +338,15 @@ impl Store {
             paths,
             config: ArcSwap::from_pointee(config),
             write_lock: Mutex::new(()),
-            creds: ArcSwapOption::from(creds.map(Arc::new)),
+            creds: ArcSwapOption::from(creds.map(|c| Arc::new(c.value))),
             login_lock: Mutex::new(()),
             secrets: Mutex::new(secrets),
-            tokens: Mutex::new(tokens),
+            tokens: Mutex::new(tokens.map(|t| t.value).unwrap_or_default()),
             audit: Mutex::new(AuditState {
                 size: audit_size,
                 last_prune: 0,
             }),
+            disk: StdMutex::new(disk),
         })
     }
 
@@ -421,18 +472,115 @@ impl Store {
     }
 
     pub fn credentials(&self) -> Option<Credentials> {
+        self.refresh_creds();
         self.creds.load_full().map(|c| (*c).clone())
+    }
+
+    fn creds_generation(&self) -> u64 {
+        lock(&self.disk).creds_gen
+    }
+
+    // A newer generation on disk means a CLI reset: adopt it and drop every session.
+    fn refresh_creds(&self) {
+        let mut disk = lock(&self.disk);
+        let Some(key) = file_key(&self.paths.credentials) else {
+            return;
+        };
+        if disk.creds_key == Some(key) {
+            return;
+        }
+        disk.creds_key = Some(key);
+        match load_json::<Stamped<Credentials>>(&self.paths.credentials, MAX_SMALL_FILE_BYTES) {
+            Ok(Some(next)) if next.generation > disk.creds_gen => {
+                disk.creds_gen = next.generation;
+                self.creds.store(Some(Arc::new(next.value)));
+                self.clear_sessions();
+            }
+            Ok(_) => {}
+            Err(e) => tracing::error!(error = %e, "credentials.json could not be reloaded"),
+        }
+    }
+
+    fn refresh_tokens(&self, tokens: &mut ApiTokens) {
+        let mut disk = lock(&self.disk);
+        let Some(key) = file_key(&self.paths.tokens) else {
+            return;
+        };
+        if disk.tokens_key == Some(key) {
+            return;
+        }
+        disk.tokens_key = Some(key);
+        match load_json::<Stamped<ApiTokens>>(&self.paths.tokens, MAX_SMALL_FILE_BYTES) {
+            Ok(Some(next)) if next.generation > disk.tokens_gen => {
+                disk.tokens_gen = next.generation;
+                *tokens = next.value;
+                self.clear_sessions();
+            }
+            Ok(_) => {}
+            Err(e) => tracing::error!(error = %e, "tokens.json could not be reloaded"),
+        }
     }
 
     pub async fn set_credentials(&self, c: Credentials) -> Result<()> {
         let _guard = self.login_lock.lock().await;
+        self.refresh_creds();
         self.persist_credentials(c).await
     }
 
     async fn persist_credentials(&self, c: Credentials) -> Result<()> {
-        let bytes = serde_json::to_vec_pretty(&c)?;
+        let stamped = Stamped {
+            generation: self.creds_generation(),
+            value: c,
+        };
+        let bytes = serde_json::to_vec_pretty(&stamped)?;
         write_file(self.paths.credentials.clone(), bytes, 0o600).await?;
-        self.creds.store(Some(Arc::new(c)));
+        lock(&self.disk).creds_key = None;
+        self.creds.store(Some(Arc::new(stamped.value)));
+        Ok(())
+    }
+
+    // Replaces credentials and empties the token list under a generation newer than any seen, so running connectors adopt it.
+    pub async fn reset_credentials(&self, c: Credentials) -> Result<()> {
+        let _login = self.login_lock.lock().await;
+        let mut tokens = self.tokens.lock().await;
+        let generation = {
+            let disk = lock(&self.disk);
+            disk.creds_gen
+                .max(disk.tokens_gen)
+                .max(disk_generation(&self.paths.credentials))
+                .max(disk_generation(&self.paths.tokens))
+                .saturating_add(1)
+        };
+        let empty = Stamped {
+            generation,
+            value: ApiTokens::new(),
+        };
+        write_file(
+            self.paths.tokens.clone(),
+            serde_json::to_vec_pretty(&empty)?,
+            0o600,
+        )
+        .await?;
+        let creds = Stamped {
+            generation,
+            value: c,
+        };
+        write_file(
+            self.paths.credentials.clone(),
+            serde_json::to_vec_pretty(&creds)?,
+            0o600,
+        )
+        .await?;
+        {
+            let mut disk = lock(&self.disk);
+            disk.creds_gen = generation;
+            disk.tokens_gen = generation;
+            disk.creds_key = None;
+            disk.tokens_key = None;
+        }
+        *tokens = empty.value;
+        self.creds.store(Some(Arc::new(creds.value)));
+        self.clear_sessions();
         Ok(())
     }
 
@@ -445,7 +593,40 @@ impl Store {
         now: u64,
     ) -> Result<bool> {
         let _guard = self.login_lock.lock().await;
+        self.verify_locked(username, password, totp, now).await
+    }
+
+    // The gate runs inside the serialised section and a failure is recorded before the next attempt is admitted.
+    pub async fn verify_login_gated(
+        &self,
+        username: &str,
+        password: &str,
+        totp: &str,
+        gate: impl FnOnce(u64) -> std::result::Result<(), u64>,
+        on_failure: impl FnOnce(u64),
+    ) -> Result<LoginOutcome> {
+        let _guard = self.login_lock.lock().await;
+        let now = now_unix();
+        if let Err(retry) = gate(now) {
+            return Ok(LoginOutcome::Blocked(retry));
+        }
+        if self.verify_locked(username, password, totp, now).await? {
+            Ok(LoginOutcome::Accepted)
+        } else {
+            on_failure(now);
+            Ok(LoginOutcome::Rejected)
+        }
+    }
+
+    async fn verify_locked(
+        &self,
+        username: &str,
+        password: &str,
+        totp: &str,
+        now: u64,
+    ) -> Result<bool> {
         let current = self.credentials();
+        let generation = self.creds_generation();
         let (user, pass, code) = (username.to_string(), password.to_string(), totp.to_string());
         let outcome = tokio::task::spawn_blocking(move || match current {
             Some(mut c) => authenticate(&mut c, &user, &pass, &code, now)
@@ -458,6 +639,11 @@ impl Store {
         })
         .await
         .map_err(|e| internal("login task", e))?;
+        // A reset that landed during the hash was not checked against, so the result is void.
+        self.refresh_creds();
+        if self.creds_generation() != generation {
+            return Ok(false);
+        }
         match outcome {
             Some(updated) => {
                 self.persist_credentials(updated).await?;
@@ -474,6 +660,7 @@ impl Store {
     }
 
     pub fn validate_session(&self, token: &str, now: u64) -> Option<SessionInfo> {
+        self.refresh_creds();
         lock(&self.sessions).validate(token, now)
     }
 
@@ -486,13 +673,20 @@ impl Store {
     }
 
     async fn persist_tokens(&self, tokens: &ApiTokens) -> Result<()> {
-        let bytes = serde_json::to_vec_pretty(tokens)?;
-        write_file(self.paths.tokens.clone(), bytes, 0o600).await
+        let stamped = Stamped {
+            generation: lock(&self.disk).tokens_gen,
+            value: tokens,
+        };
+        let bytes = serde_json::to_vec_pretty(&stamped)?;
+        write_file(self.paths.tokens.clone(), bytes, 0o600).await?;
+        lock(&self.disk).tokens_key = None;
+        Ok(())
     }
 
     pub async fn create_api_token(&self, name: &str) -> Result<(ApiToken, String)> {
         // Changes go to a copy that is persisted first, so a failed write keeps the live set intact.
         let mut tokens = self.tokens.lock().await;
+        self.refresh_tokens(&mut tokens);
         let mut next = tokens.clone();
         let created = next.create(name).map_err(|e| match e {
             AuthError::Weak(msg) => ConnectorError::Conflict(msg.to_string()),
@@ -506,15 +700,20 @@ impl Store {
     pub async fn verify_api_token(&self, token: &str) -> Option<ApiToken> {
         // last_used_at stays in memory and reaches disk with the next token change.
         let now = now_rfc3339();
-        self.tokens.lock().await.verify(token, &now).cloned()
+        let mut tokens = self.tokens.lock().await;
+        self.refresh_tokens(&mut tokens);
+        tokens.verify(token, &now).cloned()
     }
 
     pub async fn list_api_tokens(&self) -> Vec<ApiToken> {
-        self.tokens.lock().await.list().to_vec()
+        let mut tokens = self.tokens.lock().await;
+        self.refresh_tokens(&mut tokens);
+        tokens.list().to_vec()
     }
 
     pub async fn revoke_api_token(&self, id: &str) -> Result<bool> {
         let mut tokens = self.tokens.lock().await;
+        self.refresh_tokens(&mut tokens);
         let mut next = tokens.clone();
         if !next.revoke(id) {
             return Ok(false);
@@ -526,6 +725,7 @@ impl Store {
 
     pub async fn clear_api_tokens(&self) -> Result<()> {
         let mut tokens = self.tokens.lock().await;
+        self.refresh_tokens(&mut tokens);
         let empty = ApiTokens::new();
         self.persist_tokens(&empty).await?;
         *tokens = empty;

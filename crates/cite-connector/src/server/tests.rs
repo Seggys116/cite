@@ -1020,3 +1020,94 @@ async fn a_hand_written_http_1_1_request_is_served() {
     assert!(text.contains("cache-control: no-store"));
     assert!(text.contains("x-content-type-options: nosniff"));
 }
+
+#[tokio::test]
+async fn failed_login_audit_records_only_whether_the_username_matched() {
+    let h = start().await;
+    let code = current_code();
+    let pasted = "hunter2-pasted-into-the-username-field";
+    assert_eq!(
+        h.login_with(pasted, "wrong password here", &code)
+            .await
+            .status()
+            .as_u16(),
+        401
+    );
+    assert_eq!(
+        h.login_with("admin", "wrong password here", &code)
+            .await
+            .status()
+            .as_u16(),
+        401
+    );
+    let tail = h.state.store.audit_tail(5).await;
+    let details: Vec<&str> = tail
+        .iter()
+        .filter(|e| e.action == "login.failure")
+        .map(|e| e.detail.as_str())
+        .collect();
+    assert_eq!(details.len(), 2);
+    assert!(details.iter().all(|d| !d.contains(pasted)));
+    assert!(details.contains(&"peer=127.0.0.1 username_matched=false"));
+    assert!(details.contains(&"peer=127.0.0.1 username_matched=true"));
+}
+
+#[tokio::test]
+async fn concurrent_failed_logins_stop_at_the_per_client_limit() {
+    let h = start().await;
+    let code = current_code();
+    let mut tasks = Vec::new();
+    for _ in 0..40 {
+        let http = h.http.clone();
+        let url = h.url("/auth/login");
+        let body = json!({ "username": "admin", "password": "wrong password here", "totp": code });
+        tasks.push(tokio::spawn(async move {
+            http.post(url)
+                .json(&body)
+                .send()
+                .await
+                .expect("login request")
+                .status()
+                .as_u16()
+        }));
+    }
+    let mut rejected = 0;
+    let mut limited = 0;
+    for task in tasks {
+        match task.await.expect("task") {
+            401 => rejected += 1,
+            429 => limited += 1,
+            other => panic!("unexpected status {other}"),
+        }
+    }
+    assert_eq!(rejected, 5);
+    assert_eq!(limited, 35);
+    let failures = h
+        .state
+        .store
+        .audit_tail(100)
+        .await
+        .iter()
+        .filter(|e| e.action == "login.failure")
+        .count();
+    assert_eq!(failures, 5);
+}
+
+#[tokio::test]
+async fn api_tokens_cannot_manage_api_tokens() {
+    let h = start().await;
+    let session = h.token().await;
+    let (_, created) = h.post(&session, "/tokens", json!({ "name": "ci" })).await;
+    let api = created["token"].as_str().expect("token").to_string();
+    let id = created["id"].as_str().expect("id").to_string();
+
+    assert_eq!(h.get(&api, "/tokens").await.0, 403);
+    assert_eq!(
+        h.post(&api, "/tokens", json!({ "name": "evil" })).await.0,
+        403
+    );
+    assert_eq!(h.delete(&api, &format!("/tokens/{id}")).await.0, 403);
+    assert_eq!(h.get(&api, "/node").await.0, 200);
+    let (_, listed) = h.get(&session, "/tokens").await;
+    assert_eq!(listed.as_array().expect("array").len(), 1);
+}

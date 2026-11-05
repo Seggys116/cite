@@ -15,6 +15,8 @@ Errors are `{"error":"message"}` with a matching status code. Bodies are capped 
 | `POST /tokens` | `{name}` | `{id,name,token}` (token shown once) |
 | `DELETE /tokens/{id}` | none | `{ok:true}` |
 
+The three `/tokens` routes need a session token from login. An API token gets 403 on them.
+
 ## Node
 
 | Route | Response |
