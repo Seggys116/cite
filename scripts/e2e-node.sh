@@ -433,10 +433,12 @@ REQUESTS_BEFORE=$(printf '%s' "$BODY" | jq -r .requests)
 api GET /api/v1/firewall/rules
 RULES_BEFORE=$(printf '%s' "$BODY" | jq -r length)
 rm -f "$WORK/stop"
-traffic "$WORK/restart.out" 400 &
+traffic "$WORK/restart.out" 2000 &
 LOOP_PID=$!
-compose restart connector >"$WORK/restart.log" 2>&1 || fail "connector restart failed: $(<"$WORK/restart.log")"
-wait_api
+for _ in 1 2 3; do
+  compose restart connector >"$WORK/restart.log" 2>&1 || fail "connector restart failed: $(<"$WORK/restart.log")"
+  wait_api
+done
 : >"$WORK/stop"
 wait "$LOOP_PID"
 LOOP_PID=""

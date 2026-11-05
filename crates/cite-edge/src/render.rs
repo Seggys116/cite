@@ -345,7 +345,7 @@ fn render_global(cfg: &EdgeConfig, opts: &RenderOptions, tls: bool, out: &mut St
     push(out, "");
 }
 
-// Names resolve lazily so a stopped standby slot cannot stop HAProxy from loading.
+// libc resolves names at load so a reload serves at once; a name that does not resolve loads with no address, so a stopped standby slot cannot stop HAProxy.
 fn render_resolvers(out: &mut String) {
     push(out, "resolvers cite");
     push_in(out, "parse-resolv-conf");
@@ -658,7 +658,7 @@ fn render_backend(site: &Site, slot: Slot, out: &mut String) {
         push_in(
             out,
             &format!(
-                "server t{} {} check inter {}ms rise {} fall {} weight {} resolvers cite init-addr none",
+                "server t{} {} check inter {}ms rise {} fall {} weight {} resolvers cite init-addr libc,none",
                 i + 1,
                 t.addr,
                 h.interval_ms,
@@ -869,7 +869,7 @@ mod tests {
         );
         assert!(
             r.config
-                .contains("server t2 10.0.0.6:80 check inter 2000ms rise 2 fall 3 weight 10 resolvers cite init-addr none")
+                .contains("server t2 10.0.0.6:80 check inter 2000ms rise 2 fall 3 weight 10 resolvers cite init-addr libc,none")
         );
         assert!(r.config.contains("option httpchk GET /"));
     }
