@@ -3,8 +3,9 @@ use std::fmt;
 
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::{Algorithm, Argon2, Params, Version};
+use blake2::digest::consts::U32;
+use blake2::{Blake2b, Digest};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
 use crate::totp;
@@ -141,7 +142,7 @@ pub fn random_token() -> Result<String, AuthError> {
 
 // Tokens carry 256 random bits, so a fast hash is enough to keep a leaked table from being usable as credentials.
 pub fn hash_token(token: &str) -> String {
-    let digest = Sha256::digest(token.as_bytes());
+    let digest = Blake2b::<U32>::digest(token.as_bytes());
     to_hex(digest.as_slice())
 }
 
@@ -415,14 +416,14 @@ mod tests {
     }
 
     #[test]
-    fn tokens_have_prefix_and_hash_to_sha256_hex() {
+    fn tokens_have_prefix_and_hash_to_blake2b_hex() {
         let token = random_token().expect("rng");
         assert!(token.starts_with("cite_"));
         assert_eq!(token.len(), 5 + 64);
         assert_ne!(token, random_token().expect("rng"));
         assert_eq!(
             hash_token("abc"),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+            "bddd813c634239723171ef3fee98579b94964e3bb1cb3e427262c8c068d52319"
         );
     }
 
