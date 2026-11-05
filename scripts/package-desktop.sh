@@ -58,7 +58,9 @@ esac
 mkdir -p "$OUT_DIR"
 OUT_DIR=$(cd "$OUT_DIR" && pwd)
 ASSETS=$(cd "$(dirname "$0")/../apps/desktop/assets" && pwd)
-[ -f "$ASSETS/icon.icns" ] && [ -f "$ASSETS/icon.png" ] || die "icon files are missing from $ASSETS"
+if [ ! -f "$ASSETS/icon.icns" ] || [ ! -f "$ASSETS/icon.png" ]; then
+  die "icon files are missing from $ASSETS"
+fi
 STAGE=$(mktemp -d "${TMPDIR:-/tmp}/cite-desktop.XXXXXX")
 # The staging directory is removed on every exit path, including a failed archive step.
 trap 'rm -rf "$STAGE"' EXIT
