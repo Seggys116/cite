@@ -865,6 +865,7 @@ dependencies = [
 name = "cite-client"
 version = "0.2.0"
 dependencies = [
+ "bytes",
  "cite-edge",
  "futures-util",
  "reqwest",
@@ -896,6 +897,7 @@ name = "cite-edge"
 version = "0.2.0"
 dependencies = [
  "argon2",
+ "blake2",
  "getrandom 0.3.4",
  "hmac",
  "ipnet",

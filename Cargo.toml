@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/cite-core",
     "crates/cite-edge",
+    "crates/cite-store",
     "crates/cite-connector",
     "crates/cite-dockerproxy",
     "crates/cite-client",
@@ -23,6 +24,7 @@ repository = "https://github.com/seggys116/cite"
 [workspace.dependencies]
 cite-core = { path = "crates/cite-core" }
 cite-edge = { path = "crates/cite-edge" }
+cite-store = { path = "crates/cite-store" }
 cite-client = { path = "crates/cite-client" }
 cite-executor = { path = "crates/cite-executor" }
 cite-mock-github = { path = "crates/cite-mock-github" }
@@ -60,6 +62,7 @@ tokio-util = { version = "0.7", features = ["io", "codec"] }
 proptest = "1"
 tempfile = "3"
 libc = "0.2"
+rusqlite = { version = "0.37", features = ["bundled"] }
 
 [profile.release]
 lto = "thin"
