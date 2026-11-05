@@ -7,7 +7,6 @@ use axum::http::request::Parts;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use cite_edge::auth::hash_token;
 use subtle::ConstantTimeEq;
 
 use crate::error::ApiError;
@@ -54,20 +53,8 @@ impl<S: Send + Sync> FromRequestParts<S> for PeerIp {
     }
 }
 
-// IPv6 peers share one key per /64, since a single subscriber routinely controls the whole prefix.
 pub fn limiter_key(ip: IpAddr) -> String {
-    match ip.to_canonical() {
-        IpAddr::V4(v4) => v4.to_string(),
-        IpAddr::V6(v6) => {
-            let seg = v6.segments();
-            format!("{:x}:{:x}:{:x}:{:x}::/64", seg[0], seg[1], seg[2], seg[3])
-        }
-    }
-}
-
-// The token is derived from the session secret, so it needs no storage and dies with the session.
-pub fn csrf_for(session_token: &str) -> String {
-    hash_token(&format!("cite-csrf:{session_token}"))
+    cite_edge::ratelimit::client_key(ip)
 }
 
 // The __Host- prefix makes browsers refuse a copy planted by a sibling subdomain (no Domain, Path=/, Secure).
@@ -160,6 +147,10 @@ fn is_pre_auth(method: &Method, path: &str) -> bool {
     )
 }
 
+fn csrf_matches(presented: &str, session_csrf: &str) -> bool {
+    bool::from(presented.as_bytes().ct_eq(session_csrf.as_bytes()))
+}
+
 pub async fn api_guard(
     State(state): State<Arc<AppState>>,
     mut req: Request,
@@ -188,14 +179,14 @@ pub async fn api_guard(
     let Some(info) = info else {
         return ApiError::unauthorized("not signed in").into_response();
     };
-    let csrf = csrf_for(&token);
+    let csrf = info.csrf;
     if !safe {
         let presented = req
             .headers()
             .get(CSRF_HEADER)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
-        if !bool::from(presented.as_bytes().ct_eq(csrf.as_bytes())) {
+        if !csrf_matches(presented, &csrf) {
             return ApiError::forbidden("missing or invalid csrf token").into_response();
         }
     }
@@ -360,9 +351,28 @@ mod tests {
     }
 
     #[test]
-    fn csrf_tokens_are_per_session() {
-        assert_eq!(csrf_for("cite_a"), csrf_for("cite_a"));
-        assert_ne!(csrf_for("cite_a"), csrf_for("cite_b"));
-        assert_ne!(csrf_for("cite_a"), hash_token("cite_a"));
+    fn csrf_tokens_are_random_per_session_and_not_the_session_secret() {
+        let mut store = cite_edge::auth::SessionStore::new(100, 100);
+        let (a, _) = store.create("admin", 10).expect("a");
+        let (b, _) = store.create("admin", 10).expect("b");
+        let csrf_a = store.validate(&a, 11).expect("a live").csrf;
+        let csrf_b = store.validate(&b, 11).expect("b live").csrf;
+        assert_eq!(csrf_a.len(), 64);
+        assert_ne!(csrf_a, csrf_b);
+        assert_eq!(store.validate(&a, 12).expect("a live").csrf, csrf_a);
+        let secret = a.split_once('.').expect("token shape").1;
+        assert_ne!(csrf_a, secret);
+    }
+
+    #[test]
+    fn csrf_is_bound_to_its_own_session() {
+        let mut store = cite_edge::auth::SessionStore::new(100, 100);
+        let (a, _) = store.create("admin", 10).expect("a");
+        let (b, _) = store.create("admin", 10).expect("b");
+        let csrf_a = store.validate(&a, 11).expect("a live").csrf;
+        let csrf_b = store.validate(&b, 11).expect("b live").csrf;
+        assert!(csrf_matches(&csrf_a, &csrf_a));
+        assert!(!csrf_matches(&csrf_b, &csrf_a));
+        assert!(!csrf_matches("", &csrf_a));
     }
 }

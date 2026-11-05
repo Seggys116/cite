@@ -7,15 +7,15 @@ use arc_swap::{ArcSwap, ArcSwapOption};
 use cite_core::atomic::{ensure_dir, write_atomic_in};
 use cite_core::confined::{FileKey, FileName, TrustedDir};
 use cite_edge::auth::{
-    ApiToken, ApiTokens, AuthError, Credentials, SessionInfo, SessionStore, authenticate,
-    dummy_verify,
+    ApiToken, ApiTokens, AuthError, Credentials, SessionInfo, SessionStore, TokenLookup,
+    authenticate, dummy_verify,
 };
 use cite_edge::model::{CONFIG_VERSION, EdgeConfig};
 use cite_edge::validate::validate_config;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
 use crate::config::ConnectorConfig;
 use crate::{ConnectorError, Result};
@@ -31,6 +31,7 @@ const AUDIT_DETAIL_MAX: usize = 1024;
 const SECRET_NAME_MAX: usize = 128;
 const SECRET_VALUE_MAX: usize = 16 * 1024;
 const MAX_SECRETS: usize = 512;
+const TOKEN_CHECK_CONCURRENCY: usize = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditEntry {
@@ -102,9 +103,32 @@ pub struct Store {
     login_lock: Mutex<()>,
     secrets: Mutex<HashMap<String, String>>,
     tokens: Mutex<ApiTokens>,
+    // Bounds concurrent token Argon2 runs so a burst of guesses cannot exhaust memory.
+    token_permits: Arc<Semaphore>,
+    // One password hash at a time; the permit lives in the blocking job so a dropped login cannot start a second.
+    login_permits: Arc<Semaphore>,
     sessions: StdMutex<SessionStore>,
     audit: Mutex<AuditState>,
     disk: StdMutex<AuthDisk>,
+}
+
+pub enum TokenOutcome {
+    Accepted(ApiToken),
+    Rejected,
+    // A well-formed token with a known id but the wrong secret, the only case worth counting against a client.
+    WrongSecret,
+}
+
+// The permit moves into the blocking job, so it is held until the work ends even if the request future is dropped.
+fn spawn_holding<T: Send + 'static>(
+    permit: OwnedSemaphorePermit,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> tokio::task::JoinHandle<T> {
+    tokio::task::spawn_blocking(move || {
+        let out = work();
+        drop(permit);
+        out
+    })
 }
 
 pub fn now_rfc3339() -> String {
@@ -384,6 +408,8 @@ impl Store {
             login_lock: Mutex::new(()),
             secrets: Mutex::new(secrets),
             tokens: Mutex::new(tokens.map(|t| t.value).unwrap_or_default()),
+            token_permits: Arc::new(Semaphore::new(TOKEN_CHECK_CONCURRENCY)),
+            login_permits: Arc::new(Semaphore::new(1)),
             audit: Mutex::new(AuditState {
                 size: audit_size,
                 last_prune: 0,
@@ -593,7 +619,7 @@ impl Store {
         }
     }
 
-    pub async fn set_credentials(&self, c: Credentials) -> Result<()> {
+    pub async fn set_credentials(self: &Arc<Self>, c: Credentials) -> Result<()> {
         let _guard = self.login_lock.lock().await;
         self.refresh_creds();
         if self.persist_credentials(c).await? {
@@ -604,7 +630,7 @@ impl Store {
     }
 
     // False means a reset landed first: its state is adopted and nothing was written.
-    async fn persist_credentials(&self, c: Credentials) -> Result<bool> {
+    async fn persist_credentials(self: &Arc<Self>, c: Credentials) -> Result<bool> {
         let stamped = Stamped {
             generation: self.creds_generation(),
             value: c,
@@ -613,14 +639,27 @@ impl Store {
         let dir = self.paths.dir.clone();
         let lock_name = self.paths.auth_lock.clone();
         let target = self.paths.credentials.clone();
-        let written = guarded_write(dir, lock_name, target, stamped.generation, bytes).await?;
-        lock(&self.disk).creds_key = None;
-        if written {
-            self.creds.store(Some(Arc::new(stamped.value)));
-        } else {
-            self.refresh_creds();
-        }
-        Ok(written)
+        let this = Arc::clone(self);
+        // The write and the in-memory update run as one owned task, so a dropped request cannot leave the file ahead of memory.
+        tokio::spawn(async move {
+            let written = guarded_write(dir, lock_name, target, stamped.generation, bytes).await?;
+            // A reset adopted while the write was finishing is newer than this copy, so memory must keep it.
+            let stored = {
+                let mut disk = lock(&this.disk);
+                disk.creds_key = None;
+                let current = written && disk.creds_gen <= stamped.generation;
+                if current {
+                    this.creds.store(Some(Arc::new(stamped.value)));
+                }
+                current
+            };
+            if !stored {
+                this.refresh_creds();
+            }
+            Ok::<bool, ConnectorError>(written)
+        })
+        .await
+        .map_err(|e| internal("credentials task", e))?
     }
 
     // Replaces credentials and empties the token list under a generation newer than any seen, so running connectors adopt it.
@@ -686,7 +725,7 @@ impl Store {
 
     // Logins are serialised so two requests cannot both spend the same one-time code.
     pub async fn verify_login(
-        &self,
+        self: &Arc<Self>,
         username: &str,
         password: &str,
         totp: &str,
@@ -696,30 +735,30 @@ impl Store {
         self.verify_locked(username, password, totp, now).await
     }
 
-    // The gate runs inside the serialised section and a failure is recorded before the next attempt is admitted.
+    // `admit` runs inside the serialised section and must count the attempt as a failure before it returns Ok, so a dropped request still counts; `on_verified` takes that count back.
     pub async fn verify_login_gated(
-        &self,
+        self: &Arc<Self>,
         username: &str,
         password: &str,
         totp: &str,
-        gate: impl FnOnce(u64) -> std::result::Result<(), u64>,
-        on_failure: impl FnOnce(u64),
+        admit: impl FnOnce(u64) -> std::result::Result<(), u64>,
+        on_verified: impl FnOnce(),
     ) -> Result<LoginOutcome> {
         let _guard = self.login_lock.lock().await;
         let now = now_unix();
-        if let Err(retry) = gate(now) {
+        if let Err(retry) = admit(now) {
             return Ok(LoginOutcome::Blocked(retry));
         }
         if self.verify_locked(username, password, totp, now).await? {
+            on_verified();
             Ok(LoginOutcome::Accepted)
         } else {
-            on_failure(now);
             Ok(LoginOutcome::Rejected)
         }
     }
 
     async fn verify_locked(
-        &self,
+        self: &Arc<Self>,
         username: &str,
         password: &str,
         totp: &str,
@@ -728,7 +767,11 @@ impl Store {
         let current = self.credentials();
         let generation = self.creds_generation();
         let (user, pass, code) = (username.to_string(), password.to_string(), totp.to_string());
-        let outcome = tokio::task::spawn_blocking(move || match current {
+        let permit = Arc::clone(&self.login_permits)
+            .acquire_owned()
+            .await
+            .map_err(|e| internal("login permits", e))?;
+        let outcome = spawn_holding(permit, move || match current {
             Some(mut c) => authenticate(&mut c, &user, &pass, &code, now)
                 .is_ok()
                 .then_some(c),
@@ -791,24 +834,85 @@ impl Store {
     }
 
     pub async fn create_api_token(&self, name: &str) -> Result<(ApiToken, String)> {
+        // A reset that lands while the hash is being made must still supersede this request.
+        let started = {
+            let mut tokens = self.tokens.lock().await;
+            self.refresh_tokens(&mut tokens);
+            lock(&self.disk).tokens_gen
+        };
+        // The Argon2 hash is made before the lock is taken and off the executor.
+        let owned = name.to_string();
+        let permit = Arc::clone(&self.token_permits)
+            .acquire_owned()
+            .await
+            .map_err(|e| internal("token permits", e))?;
+        let (meta, plaintext) = spawn_holding(permit, move || ApiToken::mint(&owned))
+            .await
+            .map_err(|e| internal("token task", e))?
+            .map_err(|_| ConnectorError::Internal("token generation failed".into()))?;
         // Changes go to a copy that is persisted first, so a failed write keeps the live set intact.
         let mut tokens = self.tokens.lock().await;
         self.refresh_tokens(&mut tokens);
+        if lock(&self.disk).tokens_gen != started {
+            return Err(superseded("api tokens"));
+        }
         let mut next = tokens.clone();
-        let created = next.create(name).map_err(|e| match e {
+        next.insert(meta.clone()).map_err(|e| match e {
             AuthError::Weak(msg) => ConnectorError::Conflict(msg.to_string()),
             _ => ConnectorError::Internal("token generation failed".into()),
         })?;
         self.commit_tokens(&mut tokens, next).await?;
-        Ok(created)
+        Ok((meta, plaintext))
     }
 
     pub async fn verify_api_token(&self, token: &str) -> Option<ApiToken> {
+        match self.verify_api_token_gated(token, || true, || {}).await {
+            TokenOutcome::Accepted(meta) => Some(meta),
+            TokenOutcome::Rejected | TokenOutcome::WrongSecret => None,
+        }
+    }
+
+    // The tokens lock is held only for the cheap lookup and the final bookkeeping; Argon2 runs between them on a blocking thread.
+    // `admit` must count the attempt before it returns true, and `on_verified` undoes that count once the hash passes.
+    pub async fn verify_api_token_gated(
+        &self,
+        token: &str,
+        admit: impl FnOnce() -> bool,
+        on_verified: impl FnOnce(),
+    ) -> TokenOutcome {
         // last_used_at stays in memory and reaches disk with the next token change.
         let now = now_rfc3339();
+        let lookup = {
+            let mut tokens = self.tokens.lock().await;
+            self.refresh_tokens(&mut tokens);
+            tokens.begin_verify(token, &now)
+        };
+        let pending = match lookup {
+            TokenLookup::Unknown => return TokenOutcome::Rejected,
+            TokenLookup::Verified(meta) => return TokenOutcome::Accepted(meta),
+            TokenLookup::Pending(pending) => pending,
+        };
+        if !admit() {
+            return TokenOutcome::Rejected;
+        }
+        let Ok(permit) = Arc::clone(&self.token_permits).acquire_owned().await else {
+            return TokenOutcome::Rejected;
+        };
+        let to_check = pending.clone();
+        match spawn_holding(permit, move || to_check.check()).await {
+            Ok(true) => on_verified(),
+            Ok(false) => return TokenOutcome::WrongSecret,
+            Err(e) => {
+                tracing::error!(error = %e, "token check task failed");
+                return TokenOutcome::Rejected;
+            }
+        }
         let mut tokens = self.tokens.lock().await;
         self.refresh_tokens(&mut tokens);
-        tokens.verify(token, &now).cloned()
+        match tokens.complete(&pending, &now) {
+            Some(meta) => TokenOutcome::Accepted(meta.clone()),
+            None => TokenOutcome::Rejected,
+        }
     }
 
     pub async fn list_api_tokens(&self) -> Vec<ApiToken> {
@@ -1119,6 +1223,167 @@ mod tests {
         assert!(!reopened.revoke_api_token("nothing").await.expect("revoke"));
     }
 
+    #[tokio::test]
+    async fn api_token_checks_run_unlocked_and_wrong_secrets_are_reported() {
+        let (_dir, store) = open_temp().await;
+        let (meta, plain) = store.create_api_token("ci").await.expect("create");
+        let wrong = format!("cite_{}.{}", meta.id, "0".repeat(64));
+        assert!(matches!(
+            store.verify_api_token_gated(&wrong, || true, || {}).await,
+            TokenOutcome::WrongSecret
+        ));
+        let mut asked = false;
+        let refused = store
+            .verify_api_token_gated(
+                &plain,
+                || {
+                    asked = true;
+                    false
+                },
+                || {},
+            )
+            .await;
+        assert!(asked && matches!(refused, TokenOutcome::Rejected));
+        let mut verified = false;
+        assert!(matches!(
+            store
+                .verify_api_token_gated(&plain, || true, || verified = true)
+                .await,
+            TokenOutcome::Accepted(_)
+        ));
+        assert!(verified);
+        // A verified token never consults the gate again.
+        assert!(matches!(
+            store.verify_api_token_gated(&plain, || false, || {}).await,
+            TokenOutcome::Accepted(_)
+        ));
+        let unknown = format!("cite_{}.{}", "e".repeat(16), "0".repeat(64));
+        assert!(matches!(
+            store.verify_api_token_gated(&unknown, || true, || {}).await,
+            TokenOutcome::Rejected
+        ));
+        assert!(store.revoke_api_token(&meta.id).await.expect("revoke"));
+        assert!(store.verify_api_token(&plain).await.is_none());
+    }
+
+    // The attempt is counted inside the gate, so a burst cannot all pass the limiter before any failure lands.
+    #[tokio::test]
+    async fn concurrent_wrong_secrets_run_at_most_the_failure_limit_of_hashes() {
+        use cite_edge::ratelimit::LoginLimiter;
+        let (_dir, store) = open_temp().await;
+        let (meta, _) = store.create_api_token("ci").await.expect("create");
+        let wrong = format!("cite_{}.{}", meta.id, "0".repeat(64));
+        let limiter = Arc::new(StdMutex::new(LoginLimiter::new()));
+        let mut tasks = Vec::new();
+        for _ in 0..24 {
+            let (store, limiter, wrong) = (Arc::clone(&store), Arc::clone(&limiter), wrong.clone());
+            tasks.push(tokio::spawn(async move {
+                store
+                    .verify_api_token_gated(
+                        &wrong,
+                        || {
+                            let mut l = lock(&limiter);
+                            if l.check("client", 100).is_err() {
+                                return false;
+                            }
+                            l.record_provisional("client", 100);
+                            true
+                        },
+                        || {},
+                    )
+                    .await
+            }));
+        }
+        let (mut hashed, mut refused) = (0, 0);
+        for task in tasks {
+            match task.await.expect("join") {
+                TokenOutcome::WrongSecret => hashed += 1,
+                TokenOutcome::Rejected => refused += 1,
+                TokenOutcome::Accepted(_) => panic!("wrong secret accepted"),
+            }
+        }
+        assert_eq!((hashed, refused), (5, 19));
+        assert!(lock(&limiter).check("client", 100).is_err());
+    }
+
+    // The attempt is counted before hashing, so a login whose connection drops mid-hash still counts against the client.
+    #[tokio::test]
+    async fn a_dropped_login_attempt_still_counts_as_a_failure() {
+        use cite_edge::ratelimit::LoginLimiter;
+        let (_dir, store) = open_temp().await;
+        store.set_credentials(creds()).await.expect("set");
+        let limiter = Arc::new(StdMutex::new(LoginLimiter::new()));
+        let attempt = |store: Arc<Store>, limiter: Arc<StdMutex<LoginLimiter>>| async move {
+            store
+                .verify_login_gated(
+                    "admin",
+                    "wrong password!!",
+                    "000000",
+                    |now: u64| -> std::result::Result<(), u64> {
+                        let mut l = lock(&limiter);
+                        l.check("client", now)?;
+                        l.record_provisional("client", now);
+                        Ok(())
+                    },
+                    || {},
+                )
+                .await
+        };
+        let dropped = tokio::spawn(attempt(Arc::clone(&store), Arc::clone(&limiter)));
+        tokio::task::yield_now().await;
+        dropped.abort();
+        let _ = dropped.await;
+        for _ in 0..4 {
+            let outcome = attempt(Arc::clone(&store), Arc::clone(&limiter)).await;
+            assert!(matches!(outcome, Ok(LoginOutcome::Rejected)));
+        }
+        let blocked = attempt(Arc::clone(&store), Arc::clone(&limiter)).await;
+        assert!(matches!(blocked, Ok(LoginOutcome::Blocked(_))));
+    }
+
+    #[tokio::test]
+    async fn a_dropped_request_keeps_its_permit_until_the_hash_ends() {
+        let permits = Arc::new(Semaphore::new(TOKEN_CHECK_CONCURRENCY));
+        let permit = Arc::clone(&permits).acquire_owned().await.expect("permit");
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let job = spawn_holding(permit, move || wait.recv().is_ok());
+        drop(job);
+        assert_eq!(permits.available_permits(), TOKEN_CHECK_CONCURRENCY - 1);
+        release.send(()).expect("release");
+        for _ in 0..200 {
+            if permits.available_permits() == TOKEN_CHECK_CONCURRENCY {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("permit was never returned");
+    }
+
+    #[tokio::test]
+    async fn old_format_token_records_load_but_never_verify() {
+        let (dir, store) = open_temp().await;
+        drop(store);
+        let old = format!(
+            r#"{{"generation":1,"tokens":[{{"id":"00112233445566ff","name":"legacy","hash":"{}","created_at":"2025-01-01T00:00:00Z","last_used_at":null}}]}}"#,
+            "ab".repeat(32)
+        );
+        write_atomic(&dir.path().join("tokens.json"), old.as_bytes(), 0o600).expect("write");
+        let reopened = Store::open(&test_config(dir.path())).await.expect("reopen");
+        assert_eq!(reopened.list_api_tokens().await.len(), 1);
+        let legacy_plain = format!("cite_{}", "cd".repeat(32));
+        assert!(reopened.verify_api_token(&legacy_plain).await.is_none());
+        let shaped = format!("cite_00112233445566ff.{}", "ab".repeat(32));
+        assert!(reopened.verify_api_token(&shaped).await.is_none());
+        assert!(
+            reopened
+                .revoke_api_token("00112233445566ff")
+                .await
+                .expect("revoke")
+        );
+        let (_, fresh) = reopened.create_api_token("new").await.expect("create");
+        assert!(reopened.verify_api_token(&fresh).await.is_some());
+    }
+
     // Stands in for the CLI: a reset written at a newer generation while the server holds older state.
     fn write_reset(dir: &Path, generation: u64, secret: &str) {
         let empty = Stamped {
@@ -1158,6 +1423,60 @@ mod tests {
         assert_eq!(disk_generation(&root(dir.path()), &nm("tokens.json")), 5);
         let (_, fresh) = running.create_api_token("later").await.expect("token");
         assert!(running.verify_api_token(&fresh).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_reset_landing_during_token_minting_supersedes_the_new_token() {
+        let (dir, running) = open_temp().await;
+        running.reset_credentials(creds()).await.expect("seed");
+        let all = running
+            .token_permits
+            .clone()
+            .acquire_many_owned(TOKEN_CHECK_CONCURRENCY as u32)
+            .await
+            .expect("permits");
+        let writer = Arc::clone(&running);
+        let task = tokio::spawn(async move { writer.create_api_token("late").await });
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        write_reset(dir.path(), 5, "MFRGGZDFMZTWQ2LK");
+        drop(all);
+        let outcome = task.await.expect("join");
+        assert!(
+            matches!(outcome, Err(ConnectorError::Conflict(_))),
+            "{outcome:?}"
+        );
+        assert!(running.list_api_tokens().await.is_empty());
+    }
+
+    // The auth lock is held so the credential write is pending when the caller is aborted; driving the write directly keeps the test independent of hash speed.
+    #[tokio::test]
+    async fn an_aborted_login_still_records_the_spent_totp_step() {
+        let (dir, store) = open_temp().await;
+        store.set_credentials(creds()).await.expect("set");
+        let code = totp::code_at(SECRET, NOW).expect("code");
+        let mut spent = creds();
+        spent.totp_last_step = NOW / 30;
+        let held = lock_auth(&root(dir.path()), &nm("auth.lock")).expect("lock");
+        let attempt = Arc::clone(&store);
+        let task = tokio::spawn(async move { attempt.persist_credentials(spent).await });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        task.abort();
+        let _ = task.await;
+        drop(held);
+        let mut recorded = false;
+        for _ in 0..500 {
+            if store
+                .credentials()
+                .is_some_and(|c| c.totp_last_step == NOW / 30)
+            {
+                recorded = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(recorded, "the spent step never reached memory");
+        let replay = store.verify_login("admin", password(), &code, NOW).await;
+        assert!(!replay.expect("ok"));
     }
 
     #[tokio::test]

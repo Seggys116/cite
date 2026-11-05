@@ -126,11 +126,19 @@ async fn setup_begin(
     }
     validate_password_strength(&body.password).map_err(|e| ApiError::bad_request(e.to_string()))?;
     let password = body.password;
-    // Argon2 is deliberately slow, so it runs off the async workers.
-    let password_hash = tokio::task::spawn_blocking(move || hash_password(&password))
+    let permit = Arc::clone(&s.login_permits)
+        .acquire_owned()
         .await
-        .map_err(ApiError::internal)?
         .map_err(ApiError::internal)?;
+    // Argon2 is deliberately slow, so it runs off the async workers and holds its permit until it ends.
+    let password_hash = tokio::task::spawn_blocking(move || {
+        let hashed = hash_password(&password);
+        drop(permit);
+        hashed
+    })
+    .await
+    .map_err(ApiError::internal)?
+    .map_err(ApiError::internal)?;
     let secret = totp::generate_secret().map_err(ApiError::internal)?;
     let totp_uri = totp::otpauth_uri(TOTP_ISSUER, &username, &secret);
     let qr_svg = qr::svg(&totp_uri).map_err(ApiError::internal)?;
@@ -239,16 +247,16 @@ async fn session_login(
             limiter.record_failure_local(&key, now);
         }
     }
-    let _permit = s
-        .login_permits
-        .acquire()
+    let permit = Arc::clone(&s.login_permits)
+        .acquire_owned()
         .await
         .map_err(ApiError::internal)?;
     let now = now_unix();
     let verified = creds.clone();
-    // Argon2 runs without the write gate so slow logins never delay node changes.
+    // Argon2 runs without the write gate so slow logins never delay node changes, and the permit rides along so a dropped request cannot free it early.
     let (result, creds) = tokio::task::spawn_blocking(move || {
         let result = authenticate(&mut creds, &username, &password, &code, now);
+        drop(permit);
         (result, creds)
     })
     .await
@@ -273,20 +281,20 @@ async fn session_login(
     lock(&s.limiter).record_success(&key);
     cfg.admin = Some(creds.clone());
     s.commit_config(cfg).await?;
-    let (token, expires) = lock(&s.sessions)
-        .create(&creds.username, now)
+    let opened = lock(&s.sessions)
+        .open(&creds.username, now)
         .map_err(ApiError::internal)?;
-    let max_age = expires.saturating_sub(now);
+    let max_age = opened.expires.saturating_sub(now);
     let mut resp = Json(json!({
         "ok": true,
         "username": creds.username,
-        "csrf": security::csrf_for(&token),
-        "expires_at": expires,
+        "csrf": opened.csrf,
+        "expires_at": opened.expires,
     }))
     .into_response();
     resp.headers_mut().append(
         header::SET_COOKIE,
-        session_cookie_header(&s, &token, max_age)?,
+        session_cookie_header(&s, &opened.token, max_age)?,
     );
     Ok(resp)
 }

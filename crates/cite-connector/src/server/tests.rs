@@ -88,8 +88,10 @@ async fn start_with(tweak: impl FnOnce(&mut ConnectorConfig)) -> Harness {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
     let task = tokio::spawn(serve(listener, Arc::clone(&state), acceptor));
+    // Tests block the runtime for long stretches, so a pooled connection can go stale and be reset on reuse.
     let http = Client::builder()
         .redirect(reqwest::redirect::Policy::none())
+        .pool_max_idle_per_host(0)
         .build()
         .expect("client");
     Harness {
@@ -475,6 +477,27 @@ async fn api_tokens_can_be_created_used_listed_and_revoked() {
     assert_eq!(h.delete(&session, &format!("/tokens/{id}")).await.0, 200);
     assert_eq!(h.get(&api, "/node").await.0, 401);
     assert_eq!(h.delete(&session, &format!("/tokens/{id}")).await.0, 404);
+}
+
+// Wrong secrets under a real token id count against the client; tokens already verified still work, but new Argon2 checks are refused.
+#[tokio::test]
+async fn wrong_api_token_secrets_lock_out_new_checks_only() {
+    let h = start().await;
+    let session = h.token().await;
+    let mut tokens = Vec::new();
+    for name in ["first", "second"] {
+        let (_, created) = h.post(&session, "/tokens", json!({ "name": name })).await;
+        let token = created["token"].as_str().expect("token").to_string();
+        let id = created["id"].as_str().expect("id").to_string();
+        tokens.push((token, id));
+    }
+    assert_eq!(h.get(&tokens[0].0, "/node").await.0, 200);
+    let forged = format!("cite_{}.{}", tokens[0].1, "0".repeat(64));
+    for _ in 0..5 {
+        assert_eq!(h.get(&forged, "/node").await.0, 401);
+    }
+    assert_eq!(h.get(&tokens[0].0, "/node").await.0, 200);
+    assert_eq!(h.get(&tokens[1].0, "/node").await.0, 401);
 }
 
 #[tokio::test]
