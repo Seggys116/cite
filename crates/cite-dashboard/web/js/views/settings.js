@@ -358,6 +358,7 @@ export function settingsView(ctx) {
     holder.appendChild(noNodes());
     return;
   }
-  const panels = { retention: retentionPanel, limits: limitsPanel, tokens: tokensPanel, audit: auditPanel, haproxy: haproxyPanel };
-  holder.appendChild(panels[tab](node));
+  const panels = new Map([['retention', retentionPanel], ['limits', limitsPanel], ['tokens', tokensPanel], ['audit', auditPanel], ['haproxy', haproxyPanel]]);
+  const build = panels.get(tab) || retentionPanel;
+  holder.appendChild(build(node));
 }
