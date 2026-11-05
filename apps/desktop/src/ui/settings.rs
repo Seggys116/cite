@@ -378,7 +378,7 @@ impl Console {
                     .justify_between()
                     .gap(px(12.))
                     .p(px(12.))
-                    .rounded(px(6.))
+                    .rounded(px(crate::theme::ROW_RADIUS))
                     .border_1()
                     .border_color(c(Tone::Warn.color()))
                     .child(

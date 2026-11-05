@@ -368,7 +368,7 @@ fn node_card(snap: &NodeSnapshot, cx: &mut Context<Console>) -> AnyElement {
         .gap(px(12.))
         .w(px(358.))
         .p(px(16.))
-        .rounded(px(8.))
+        .rounded(px(crate::theme::CARD_RADIUS))
         .border_1()
         .border_color(c(BORDER))
         .bg(c(crate::theme::SURFACE))

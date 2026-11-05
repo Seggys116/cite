@@ -6,8 +6,7 @@ use std::time::Duration;
 
 use cite_client::{ClientError, MemoryTokenStore, NodeClient, TokenStore};
 use gpui::{
-    AnyElement, App, Context, Entity, FontWeight, IntoElement, Render, Window, deferred, div,
-    prelude::*, px,
+    AnyElement, App, Context, Entity, IntoElement, Render, Window, deferred, div, prelude::*, px,
 };
 
 use crate::api::{NodeHandle, spawn_io};
@@ -15,7 +14,8 @@ use crate::config::{DesktopConfig, DesktopNode};
 use crate::demo::{demo_config, demo_nodes};
 use crate::keychain::KeychainTokenStore;
 use crate::theme::{
-    ACCENT, BG, BLUE, BORDER, DIM, GREEN, SURFACE, SURFACE_HI, TEXT, Tone, c, tint,
+    ACCENT, BG, BLUE, BORDER, CARD_RADIUS, CHIP_RADIUS, DIM, DIVIDER, GREEN, INPUT, RED,
+    ROW_RADIUS, SIDEBAR, SURFACE, TEXT, TOPBAR, Tone, c, chip_fill, chip_stroke, tint,
 };
 use crate::ui::input::TextInput;
 use crate::ui::widgets::{BtnKind, btn, id, strong, text_dim};
@@ -379,7 +379,7 @@ impl Console {
 
     fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let section = self.view.section();
-        let mut nav = div().flex().flex_col().gap(px(2.)).mt(px(18.));
+        let mut nav = div().flex().flex_col().gap(px(2.)).mt(px(20.));
         for label in NAV {
             let active = label == section;
             nav = nav.child(
@@ -387,22 +387,15 @@ impl Console {
                     .id(id("nav", label))
                     .flex()
                     .items_center()
-                    .gap(px(10.))
-                    .h(px(34.))
-                    .px(px(12.))
-                    .rounded(px(6.))
+                    .h(px(32.))
+                    .px(px(10.))
+                    .rounded(px(ROW_RADIUS))
                     .cursor_pointer()
                     .text_size(px(13.))
-                    .font_weight(FontWeight::MEDIUM)
-                    .when(active, |d| d.bg(c(SURFACE_HI)).text_color(c(TEXT)))
+                    .when(active, |d| d.bg(chip_fill()).text_color(c(0xffffff)))
                     .when(!active, |d| {
                         d.text_color(c(DIM)).hover(|s| s.bg(tint(0xffffff, 0.04)))
                     })
-                    .child(div().w(px(3.)).h(px(14.)).rounded(px(2.)).bg(if active {
-                        c(ACCENT)
-                    } else {
-                        c(SURFACE)
-                    }))
                     .child(label)
                     .on_click(
                         cx.listener(move |this, _, _, cx| this.navigate(View::target(label), cx)),
@@ -413,13 +406,19 @@ impl Console {
             .flex()
             .flex_col()
             .flex_none()
-            .w(px(208.))
+            .w(px(240.))
             .h_full()
-            .p(px(14.))
-            .bg(c(SURFACE))
+            .px(px(10.))
+            .py(px(14.))
+            .bg(c(SIDEBAR))
             .border_r_1()
-            .border_color(c(BORDER))
-            .child(div().px(px(6.)).pt(px(4.)).child(logo(self.logo_flipped())))
+            .border_color(c(DIVIDER))
+            .child(
+                div()
+                    .px(px(10.))
+                    .pt(px(4.))
+                    .child(logo(self.logo_flipped())),
+            )
             .child(nav)
             .child(div().flex_1())
             .child(
@@ -428,7 +427,7 @@ impl Console {
                 } else {
                     "Keychain-backed"
                 })
-                .px(px(6.))
+                .px(px(10.))
                 .text_size(px(11.)),
             )
     }
@@ -441,14 +440,14 @@ impl Console {
                 .flex()
                 .items_center()
                 .gap(px(8.))
-                .h(px(30.))
-                .px(px(12.))
-                .rounded(px(6.))
+                .h(px(28.))
+                .px(px(10.))
+                .rounded(px(CHIP_RADIUS))
                 .border_1()
-                .border_color(c(BORDER))
-                .bg(c(BG))
+                .border_color(chip_stroke())
+                .bg(c(INPUT))
                 .cursor_pointer()
-                .text_size(px(13.))
+                .text_size(px(12.))
                 .child(text_dim("Node"))
                 .child(strong(label))
                 .child(text_dim("\u{25be}"))
@@ -460,11 +459,11 @@ impl Console {
         if self.switcher_open {
             let mut menu = div()
                 .absolute()
-                .top(px(34.))
+                .top(px(32.))
                 .right(px(0.))
                 .w(px(220.))
                 .p(px(4.))
-                .rounded(px(8.))
+                .rounded(px(CARD_RADIUS))
                 .border_1()
                 .border_color(c(BORDER))
                 .bg(c(SURFACE))
@@ -482,17 +481,17 @@ impl Console {
             .flex_none()
             .items_center()
             .justify_between()
-            .h(px(52.))
+            .h(px(36.))
             .px(px(24.))
             .border_b_1()
-            .border_color(c(BORDER))
-            .bg(c(BG))
+            .border_color(c(DIVIDER))
+            .bg(c(TOPBAR))
             .child(
                 div()
                     .flex()
                     .items_center()
                     .gap(px(8.))
-                    .child(strong(self.view.section()).text_size(px(14.)))
+                    .child(strong(self.view.section()).text_size(px(13.)))
                     .when_some(self.breadcrumb(), |d, crumb| {
                         d.child(text_dim("/")).child(text_dim(crumb))
                     }),
@@ -530,16 +529,16 @@ impl Console {
             .flex()
             .items_center()
             .justify_between()
-            .h(px(30.))
+            .h(px(32.))
             .px(px(10.))
-            .rounded(px(5.))
+            .rounded(px(ROW_RADIUS))
             .cursor_pointer()
             .text_size(px(13.))
-            .hover(|s| s.bg(c(SURFACE_HI)))
-            .child(text)
-            .when(active, |d| {
-                d.child(div().size(px(7.)).rounded_full().bg(c(GREEN)))
+            .when(active, |d| d.bg(chip_fill()).text_color(c(0xffffff)))
+            .when(!active, |d| {
+                d.text_color(c(DIM)).hover(|s| s.bg(tint(0xffffff, 0.04)))
             })
+            .child(text)
             .on_click(cx.listener(move |this, _, _, cx| this.select_node(name.clone(), cx)))
     }
 
@@ -558,7 +557,7 @@ impl Console {
                 .flex()
                 .flex_col()
                 .gap(px(12.))
-                .rounded(px(10.))
+                .rounded(px(CARD_RADIUS))
                 .border_1()
                 .border_color(c(BORDER))
                 .bg(c(SURFACE))
@@ -608,9 +607,9 @@ impl Console {
                 .max_w(px(420.))
                 .px(px(14.))
                 .py(px(10.))
-                .rounded(px(8.))
+                .rounded(px(CARD_RADIUS))
                 .border_1()
-                .border_color(c(color))
+                .border_color(tint(color, 0.5))
                 .bg(c(SURFACE))
                 .text_size(px(13.))
                 .child(toast.text.clone());
@@ -752,16 +751,16 @@ impl Console {
             .gap(px(12.))
             .px(px(14.))
             .py(px(12.))
-            .rounded(px(8.))
+            .rounded(px(CARD_RADIUS))
             .border_1()
-            .border_color(tint(ACCENT, 0.6))
-            .bg(tint(ACCENT, 0.08))
+            .border_color(tint(RED, 0.5))
+            .bg(tint(RED, 0.08))
             .child(
                 div()
                     .flex()
                     .flex_col()
                     .gap(px(2.))
-                    .child(strong("Could not load this view").text_color(c(ACCENT)))
+                    .child(strong("Could not load this view").text_color(c(RED)))
                     .child(text_dim(message.to_string()).text_size(px(12.))),
             )
             .child(

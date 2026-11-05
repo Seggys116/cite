@@ -8,7 +8,7 @@ use cite_edge::bot::{BotSummary, SCORE_BUCKETS};
 
 use crate::demo::iso;
 use crate::model::{merge_top, parse_rfc3339_ms};
-use crate::theme::{ACCENT, BLUE, DIM, GREEN, RED, TOOL, YELLOW};
+use crate::theme::{BLUE, DIM, GREEN, RED, TOOL, YELLOW};
 
 pub const METHODS: [&str; 7] = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
 pub const EXPORT_KINDS: [ExportKind; 4] = [
@@ -31,7 +31,7 @@ pub fn class_color(class: &str) -> u32 {
         "suspect" => YELLOW,
         "crawler" => BLUE,
         "tool" => TOOL,
-        "bot" => ACCENT,
+        "bot" => RED,
         _ => DIM,
     }
 }
@@ -73,7 +73,7 @@ pub fn band_index(score: u8) -> usize {
 }
 
 pub fn band_color(index: usize) -> u32 {
-    [GREEN, BLUE, YELLOW, ACCENT, RED][index.min(4)]
+    [GREEN, BLUE, YELLOW, TOOL, RED][index.min(4)]
 }
 
 pub fn score_color(score: u8) -> u32 {
@@ -533,7 +533,7 @@ mod tests {
         assert_eq!(class_color("Suspect"), YELLOW);
         assert_eq!(class_color("crawler"), BLUE);
         assert_eq!(class_color("tool"), TOOL);
-        assert_eq!(class_color("bot"), ACCENT);
+        assert_eq!(class_color("bot"), RED);
         assert_eq!(class_color(""), DIM);
         assert_eq!(class_color("alien"), DIM);
         assert_eq!(class_label("CRAWLER"), "Crawler");

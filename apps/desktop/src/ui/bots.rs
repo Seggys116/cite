@@ -622,7 +622,7 @@ fn help_note(title: &str, text: &str) -> AnyElement {
         .gap(px(4.))
         .px(px(14.))
         .py(px(10.))
-        .rounded(px(8.))
+        .rounded(px(crate::theme::CARD_RADIUS))
         .border_1()
         .border_color(c(BORDER))
         .bg(c(SURFACE))

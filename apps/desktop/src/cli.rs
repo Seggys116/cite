@@ -34,6 +34,11 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> 
     Ok(opts)
 }
 
+// Preview launches (--demo or --view) open without taking focus so they never steal input.
+pub fn takes_focus(opts: &Options) -> bool {
+    !opts.demo && opts.view.is_none()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -75,6 +80,14 @@ mod tests {
         assert_eq!(o.view, Some(View::Traffic));
         assert!(o.inspect);
         assert!(!run(&["--view", "traffic"]).expect("parse").inspect);
+    }
+
+    #[test]
+    fn previews_do_not_take_focus() {
+        assert!(takes_focus(&run(&[]).expect("parse")));
+        assert!(takes_focus(&run(&["--node", "edge-fra"]).expect("parse")));
+        assert!(!takes_focus(&run(&["--demo"]).expect("parse")));
+        assert!(!takes_focus(&run(&["--view", "traffic"]).expect("parse")));
     }
 
     #[test]

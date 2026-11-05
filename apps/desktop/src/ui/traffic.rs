@@ -8,7 +8,7 @@ use crate::model::{
     WINDOWS, fmt_bytes, fmt_clock, fmt_int, fmt_ms, fmt_num, fmt_pct, merge_series,
     merge_summaries, per_bucket_sizes,
 };
-use crate::theme::{ACCENT, BLUE, DIM, GREEN, Tone, YELLOW, c};
+use crate::theme::{BLUE, DIM, GREEN, RED, Tone, YELLOW, c};
 use crate::ui::bots::{bot_badge, request_detail};
 use crate::ui::chart::{Line, hbar, line_chart};
 use crate::ui::widgets::{
@@ -303,7 +303,7 @@ fn traffic_body(
         .gap(px(14.))
         .text_size(px(12.))
         .child(legend_item("Requests", BLUE))
-        .child(legend_item("Errors", ACCENT))
+        .child(legend_item("Errors", RED))
         .child(legend_item("Blocked", YELLOW));
     let chart = line_chart(
         vec![
@@ -314,7 +314,7 @@ fn traffic_body(
             },
             Line {
                 values: pts.iter().map(|p| p.errors).collect(),
-                color: ACCENT,
+                color: RED,
                 area: false,
             },
             Line {
@@ -357,7 +357,7 @@ fn traffic_body(
             "2xx" => GREEN,
             "3xx" => BLUE,
             "4xx" => YELLOW,
-            _ => ACCENT,
+            _ => RED,
         };
         let share = if total_status == 0 {
             0.0

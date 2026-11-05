@@ -25,6 +25,7 @@ fn main() {
             std::process::exit(2);
         }
     };
+    let focus = cli::takes_focus(&opts);
     Application::new().run(move |cx: &mut App| {
         ui::init(cx);
         cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
@@ -32,6 +33,7 @@ fn main() {
         let bounds = Bounds::centered(None, size(px(1320.), px(840.)), cx);
         let window = cx.open_window(
             WindowOptions {
+                focus,
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: Some(TitlebarOptions {
                     title: Some("Cite".into()),
@@ -46,6 +48,8 @@ fn main() {
             cx.quit();
             return;
         }
-        cx.activate(true);
+        if focus {
+            cx.activate(true);
+        }
     });
 }

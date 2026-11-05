@@ -299,7 +299,7 @@ impl Console {
                     .gap(px(8.))
                     .w(px(340.))
                     .p(px(12.))
-                    .rounded(px(8.))
+                    .rounded(px(crate::theme::CARD_RADIUS))
                     .border_1()
                     .border_color(c(crate::theme::BORDER))
                     .child(

@@ -9,7 +9,7 @@ use gpui::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::theme::{BG, BLUE, BORDER, DIM, MONO, TEXT, c, tint};
+use crate::theme::{ACCENT, BLUE, BORDER, CHIP_RADIUS, DIM, INPUT, MONO, TEXT, c, tint};
 
 actions!(
     cite_input,
@@ -788,10 +788,10 @@ impl Render for TextInput {
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .w_full()
-            .bg(c(BG))
+            .bg(c(INPUT))
             .border_1()
-            .border_color(if focused { c(BLUE) } else { c(BORDER) })
-            .rounded(px(6.))
+            .border_color(if focused { c(ACCENT) } else { c(BORDER) })
+            .rounded(px(CHIP_RADIUS))
             .px(px(10.))
             .py(px(6.))
             .overflow_hidden()

@@ -400,11 +400,11 @@ impl Console {
             .gap(px(10.))
             .child(title)
             .child(list);
-        let mut out = div().flex_1().min_w_0().child(card(None, None, body));
-        if active {
-            out = out.border_1().border_color(c(tone.color())).rounded(px(8.));
-        }
-        out.into_any_element()
+        div()
+            .flex_1()
+            .min_w_0()
+            .child(card(None, None, body))
+            .into_any_element()
     }
 
     fn deploy_card(&self, site: &Site, cx: &mut Context<Self>) -> AnyElement {

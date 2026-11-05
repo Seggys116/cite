@@ -3,7 +3,8 @@ use gpui::{
 };
 
 use crate::theme::{
-    ACCENT, BG, BLUE, BORDER, DIM, GREEN, MONO, SURFACE, SURFACE_HI, TEXT, Tone, c, tint,
+    ACCENT, BORDER, CARD_RADIUS, CHIP_RADIUS, DIM, DIVIDER, GREEN, INPUT, MONO, RED, ROW_RADIUS,
+    SURFACE, SURFACE_HI, TEXT, Tone, c, chip_fill, chip_stroke, tint,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -42,12 +43,8 @@ pub fn clip(s: impl Into<SharedString>) -> Div {
 pub fn btn(key: ElementId, label: &str, kind: BtnKind) -> Stateful<Div> {
     let (bg, fg, border): (Hsla, Hsla, Hsla) = match kind {
         BtnKind::Primary => (c(ACCENT).into(), c(0xffffff).into(), c(ACCENT).into()),
-        BtnKind::Danger => (
-            tint(ACCENT, 0.12).into(),
-            c(ACCENT).into(),
-            tint(ACCENT, 0.6).into(),
-        ),
-        BtnKind::Plain => (c(SURFACE_HI).into(), c(TEXT).into(), c(BORDER).into()),
+        BtnKind::Danger => (tint(RED, 0.12).into(), c(RED).into(), tint(RED, 0.5).into()),
+        BtnKind::Plain => (chip_fill().into(), c(TEXT).into(), chip_stroke().into()),
     };
     div()
         .id(key)
@@ -55,14 +52,14 @@ pub fn btn(key: ElementId, label: &str, kind: BtnKind) -> Stateful<Div> {
         .items_center()
         .justify_center()
         .flex_none()
-        .h(px(30.))
+        .h(px(28.))
         .px(px(12.))
-        .rounded(px(6.))
+        .rounded(px(CHIP_RADIUS))
         .border_1()
         .border_color(border)
         .bg(bg)
         .text_color(fg)
-        .text_size(px(13.))
+        .text_size(px(12.))
         .font_weight(FontWeight::MEDIUM)
         .cursor_pointer()
         .whitespace_nowrap()
@@ -83,8 +80,10 @@ pub fn pill_color(text: &str, color: u32) -> Div {
         .flex_none()
         .px(px(8.))
         .py(px(2.))
-        .rounded(px(10.))
-        .bg(tint(color, 0.16))
+        .rounded(px(CHIP_RADIUS))
+        .border_1()
+        .border_color(tint(color, 0.3))
+        .bg(tint(color, 0.12))
         .text_color(c(color))
         .text_size(px(11.))
         .font_weight(FontWeight::SEMIBOLD)
@@ -113,7 +112,7 @@ pub fn card(title: Option<&str>, subtitle: Option<&str>, body: impl IntoElement)
         .flex_col()
         .gap(px(12.))
         .p(px(16.))
-        .rounded(px(8.))
+        .rounded(px(CARD_RADIUS))
         .border_1()
         .border_color(c(BORDER))
         .bg(c(SURFACE));
@@ -136,7 +135,7 @@ pub fn stat(label: &str, value: String, sub: String, tone: Tone) -> Div {
         .flex_1()
         .min_w(px(150.))
         .p(px(14.))
-        .rounded(px(8.))
+        .rounded(px(CARD_RADIUS))
         .border_1()
         .border_color(c(BORDER))
         .bg(c(SURFACE))
@@ -192,7 +191,7 @@ pub fn skeleton(height: f32) -> Div {
     div()
         .w_full()
         .h(px(height))
-        .rounded(px(8.))
+        .rounded(px(CARD_RADIUS))
         .bg(c(SURFACE))
         .border_1()
         .border_color(c(BORDER))
@@ -207,9 +206,9 @@ pub fn notice(message: &str, tone: Tone) -> Div {
     div()
         .px(px(12.))
         .py(px(8.))
-        .rounded(px(6.))
+        .rounded(px(ROW_RADIUS))
         .border_1()
-        .border_color(tint(color, 0.5))
+        .border_color(tint(color, 0.4))
         .bg(tint(color, 0.1))
         .text_color(c(color))
         .text_size(px(13.))
@@ -244,7 +243,7 @@ pub fn toggle(key: ElementId, on: bool) -> Stateful<Div> {
     track = if on {
         track.bg(c(GREEN)).border_color(c(GREEN)).justify_end()
     } else {
-        track.bg(c(BG)).border_color(c(BORDER)).justify_start()
+        track.bg(c(INPUT)).border_color(c(BORDER)).justify_start()
     };
     track.child(knob)
 }
@@ -259,7 +258,7 @@ pub fn seg_item(key: ElementId, label: &str, active: bool) -> Stateful<Div> {
         .cursor_pointer()
         .whitespace_nowrap();
     item = if active {
-        item.bg(c(BLUE)).text_color(c(0xffffff))
+        item.bg(chip_fill()).text_color(c(0xffffff))
     } else {
         item.text_color(c(DIM)).hover(|s| s.bg(c(SURFACE_HI)))
     };
@@ -272,10 +271,10 @@ pub fn seg_row(items: Vec<AnyElement>) -> Div {
         .flex_none()
         .items_center()
         .overflow_hidden()
-        .rounded(px(6.))
+        .rounded(px(CHIP_RADIUS))
         .border_1()
-        .border_color(c(BORDER))
-        .bg(c(BG))
+        .border_color(chip_stroke())
+        .bg(c(INPUT))
         .children(items)
 }
 
@@ -334,7 +333,7 @@ pub fn table(cols: &[Col], rows: Vec<Vec<AnyElement>>, empty: Option<Div>) -> Di
         .py(px(8.))
         .border_b_1()
         .border_color(c(BORDER))
-        .text_size(px(11.))
+        .text_size(px(10.))
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(c(DIM));
     for col in cols {
@@ -347,19 +346,17 @@ pub fn table(cols: &[Col], rows: Vec<Vec<AnyElement>>, empty: Option<Div>) -> Di
         }
         return root;
     }
-    for (i, row) in rows.into_iter().enumerate() {
+    for row in rows {
         let mut line = div()
             .flex()
             .items_center()
-            .min_h(px(40.))
+            .min_h(px(34.))
             .px(px(10.))
             .py(px(6.))
             .text_size(px(13.))
             .border_b_1()
-            .border_color(tint(BORDER, 0.6));
-        if i % 2 == 1 {
-            line = line.bg(tint(0xffffff, 0.015));
-        }
+            .border_color(c(DIVIDER))
+            .hover(|s| s.bg(tint(0xffffff, 0.025)));
         for (col, child) in cols.iter().zip(row) {
             line = line.child(cell(col, child));
         }
