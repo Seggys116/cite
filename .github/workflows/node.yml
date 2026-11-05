@@ -237,7 +237,7 @@ jobs:
         if: always()
         run: |
           sh "$RUNNER_TEMP/cite/cite-setup.sh" uninstall --purge --yes
-          [ -z "$(docker ps -aq)" ] || { echo "::error::containers left behind"; docker ps -a; exit 1; }
+          [ -z "$(docker ps -aq --filter name=cite)" ] || { echo "::error::containers left behind"; docker ps -a; exit 1; }
           [ -z "$(docker volume ls -q | grep '^cite' || true)" ] || { echo "::error::volumes left behind"; exit 1; }
 
   e2e-orchestrator:
