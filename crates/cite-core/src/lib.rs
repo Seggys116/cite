@@ -5,6 +5,7 @@
 pub mod argv;
 pub mod atomic;
 pub mod config;
+pub mod confined;
 pub mod detect;
 pub mod duration;
 pub mod error;
@@ -21,6 +22,7 @@ pub use config::{
     BinShims, ExecutorConfig, GithubToken, ManagerConfig, RenderingSetting, SiteEnv,
     node_flag_denied, parse_env_file,
 };
+pub use confined::{FileKey, FileName, NAME_MAX, TrustedDir};
 pub use detect::{Detection, detect_site, detect_site_configured, detect_site_with};
 pub use duration::{PollInterval, parse_byte_size, parse_duration, parse_poll_interval};
 pub use error::{Error, Result};

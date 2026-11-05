@@ -1,10 +1,11 @@
-use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::fs::{self, File};
+use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use rustix::fs::{Mode, OFlags};
+use rustix::fs::Mode;
 
+use crate::confined::{FileName, TrustedDir, mode_bits};
 use crate::error::{Error, Result};
 
 const MAX_READ: u64 = 512 * 1024;
@@ -25,49 +26,45 @@ pub fn ensure_dir(path: &Path, mode: u32) -> Result<()> {
     if !already {
         fs::create_dir_all(path)?;
     }
-    match set_mode(path, mode) {
+    let applied = TrustedDir::open(path).and_then(|dir| dir.set_mode(mode));
+    match applied {
         Ok(()) => Ok(()),
-        Err(Error::Io(err)) if already && matches!(err.raw_os_error(), Some(1 | 30)) => Ok(()),
-        Err(err) => Err(err),
+        Err(err) if already && matches!(err.raw_os_error(), Some(1 | 13 | 30)) => Ok(()),
+        Err(err) => Err(err.into()),
     }
 }
 
 /// Opens without following a final symlink or blocking on a FIFO, and requires a regular file.
 pub fn open_regular(path: &Path) -> Result<(File, fs::Metadata)> {
-    let fd = rustix::fs::open(
-        path,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map_err(std::io::Error::from)?;
-    let file = File::from(fd);
-    let meta = file.metadata()?;
-    if !meta.is_file() {
-        return Err(Error::msg(format!(
-            "{} is not a regular file",
-            path.display()
-        )));
-    }
-    Ok((file, meta))
+    let (dir, name) = TrustedDir::split(path).map_err(|e| at_path(e, path))?;
+    dir.open_regular(&name).map_err(|e| at_path(e, path))
 }
 
 pub fn read_limited(path: &Path, max: u64) -> Result<Vec<u8>> {
-    let (file, meta) = open_regular(path)?;
-    if meta.len() > max {
-        return Err(Error::TooLarge {
-            len: meta.len(),
-            max,
-        });
+    let (dir, name) = TrustedDir::split(path).map_err(|e| at_path(e, path))?;
+    dir.read_limited(&name, max).map_err(|e| at_path(e, path))
+}
+
+// The handle-based calls only know a file name, so the path-based entry points put the full path back.
+fn at_path(err: Error, path: &Path) -> Error {
+    match err {
+        Error::Io(io) => Error::Io(std::io::Error::new(
+            io.kind(),
+            format!("{}: {io}", path.display()),
+        )),
+        Error::Message(msg) => Error::Message(format!("{}: {msg}", path.display())),
+        other => other,
     }
-    let mut bytes = Vec::new();
-    file.take(max + 1).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > max {
-        return Err(Error::TooLarge {
-            len: bytes.len() as u64,
-            max,
-        });
+}
+
+fn atomic_context(err: Error, what: &dyn std::fmt::Display) -> Error {
+    match err {
+        Error::Io(io) => Error::Io(std::io::Error::new(
+            io.kind(),
+            format!("atomic write of {what}: {io}"),
+        )),
+        other => other,
     }
-    Ok(bytes)
 }
 
 pub fn read_json_limited(path: &Path) -> Result<Vec<u8>> {
@@ -78,12 +75,14 @@ pub fn read_json_limited(path: &Path) -> Result<Vec<u8>> {
 pub fn set_tight_umask() {
     #[cfg(unix)]
     {
-        let _ = rustix::process::umask(rustix::fs::Mode::from_bits_truncate(0o027));
+        let _ = rustix::process::umask(Mode::from_bits_truncate(0o027));
     }
 }
 
 pub fn write_atomic(dest: &Path, bytes: &[u8], mode: u32) -> Result<()> {
-    write_atomic_inner(dest, bytes, mode, None, true)
+    let (dir, name) = split_dest(dest)?;
+    write_atomic_inner(&dir, &name, bytes, mode, None, true)
+        .map_err(|e| atomic_context(e, &dest.display()))
 }
 
 /// Errors at `fail_at` without rolling back a completed rename, to prove a crash never tears the destination.
@@ -93,94 +92,79 @@ pub fn write_atomic_failpoint(
     mode: u32,
     fail_at: AtomicPoint,
 ) -> Result<()> {
-    write_atomic_inner(dest, bytes, mode, Some(fail_at), false)
+    let (dir, name) = split_dest(dest)?;
+    write_atomic_inner(&dir, &name, bytes, mode, Some(fail_at), false)
+        .map_err(|e| atomic_context(e, &dest.display()))
+}
+
+/// Same guarantees as `write_atomic`, for a directory handle and a name that are already validated.
+pub fn write_atomic_in(dir: &TrustedDir, name: &FileName, bytes: &[u8], mode: u32) -> Result<()> {
+    write_atomic_inner(dir, name, bytes, mode, None, true).map_err(|e| atomic_context(e, name))
+}
+
+fn split_dest(dest: &Path) -> Result<(TrustedDir, FileName)> {
+    let name =
+        FileName::from_path_tail(dest).map_err(|_| Error::msg("atomic write needs a file name"))?;
+    let parent = dest
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let dir = TrustedDir::open(parent).map_err(|err| {
+        Error::msg(format!(
+            "atomic write parent missing: {} ({err})",
+            parent.display()
+        ))
+    })?;
+    Ok((dir, name))
 }
 
 fn write_atomic_inner(
-    dest: &Path,
+    dir: &TrustedDir,
+    name: &FileName,
     bytes: &[u8],
     mode: u32,
     fail_at: Option<AtomicPoint>,
     cleanup_tmp: bool,
 ) -> Result<()> {
-    let parent = dest
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    if !parent.is_dir() {
-        return Err(Error::msg(format!(
-            "atomic write parent missing: {}",
-            parent.display()
-        )));
-    }
-    let name = dest
-        .file_name()
-        .ok_or_else(|| Error::msg("atomic write needs a file name"))?;
     let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    let tmp_name = format!(
-        ".{}.tmp.{}.{:x}",
-        name.to_string_lossy(),
-        std::process::id(),
-        seq
-    );
-    let tmp_path = parent.join(&tmp_name);
+    let tmp = name.hidden_tmp(std::process::id(), seq);
 
     let write_result = (|| {
         {
-            let mut file = open_tmp(&tmp_path, mode)?;
+            let mut file = dir.create_new(&tmp, mode)?;
             file.write_all(bytes)?;
             if fail_at == Some(AtomicPoint::AfterTmpWrite) {
                 return Err(Error::msg("injected failure after tmp write"));
             }
             file.sync_all()?;
-            set_mode(&tmp_path, mode)?;
+            rustix::fs::fchmod(&file, mode_bits(mode)).map_err(std::io::Error::from)?;
             file.sync_all()?;
             if fail_at == Some(AtomicPoint::AfterFsyncFile) {
                 return Err(Error::msg("injected failure after fsync"));
             }
         }
         // Test seam: the temp file is durable and `dest` is still the previous bytes.
-        hold_during_desired_write(dest);
-        fs::rename(&tmp_path, dest)?;
+        hold_during_desired_write(name);
+        dir.rename(&tmp, name)?;
         if fail_at == Some(AtomicPoint::AfterRename) {
             return Err(Error::msg("injected failure after rename"));
         }
-        File::open(parent)?.sync_all()?;
+        dir.sync()?;
         if fail_at == Some(AtomicPoint::AfterFsyncDir) {
             return Err(Error::msg("injected failure after dir fsync"));
         }
         Ok(())
     })();
 
-    if write_result.is_err() && cleanup_tmp && tmp_path.exists() && dest != tmp_path {
-        // Only remove the temp file when rename has not consumed it.
-        if tmp_path.is_file() && !dest.exists() || (dest.exists() && tmp_path.exists()) {
-            let _ = fs::remove_file(&tmp_path);
-        }
+    if write_result.is_err() && cleanup_tmp {
+        // The unique temp name is gone once the rename has consumed it, so a failed unlink is expected then.
+        let _ = dir.unlink(&tmp);
     }
-    write_result.map_err(|err| match err {
-        Error::Io(io) => Error::Io(std::io::Error::new(
-            io.kind(),
-            format!("atomic write of {}: {io}", dest.display()),
-        )),
-        other => other,
-    })
+    write_result
 }
 
-/// Creates the temp file with the requested mode so it never exists with wider permissions.
-fn open_tmp(path: &Path, mode: u32) -> std::io::Result<File> {
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(mode);
-    }
-    options.open(path)
-}
-
-fn hold_during_desired_write(dest: &Path) {
-    if dest.file_name().and_then(|name| name.to_str()) != Some("desired.json") {
+fn hold_during_desired_write(name: &FileName) {
+    if name.as_os_str() != "desired.json" {
         return;
     }
     let Ok(raw) = std::env::var("CITE_FAULT_HOLD_DURING_ATOMIC_MS") else {
@@ -194,22 +178,10 @@ fn hold_during_desired_write(dest: &Path) {
     }
 }
 
-fn set_mode(path: &Path, mode: u32) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (path, mode);
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
 
@@ -232,7 +204,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let previous = rustix::process::umask(rustix::fs::Mode::empty());
         let path = dir.path().join("tmp-secret");
-        let opened = open_tmp(&path, 0o600);
+        let root = TrustedDir::open(dir.path()).unwrap();
+        let opened = root.create_new(&FileName::new("tmp-secret").unwrap(), 0o600);
         rustix::process::umask(previous);
         opened.unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
@@ -272,6 +245,69 @@ mod tests {
     }
 
     #[test]
+    fn write_atomic_refuses_traversal_empty_nul_and_long_names() {
+        let dir = tempdir().unwrap();
+        let base = dir.path().join("sub");
+        fs::create_dir(&base).unwrap();
+        assert!(write_atomic(&base.join(".."), b"x", 0o600).is_err());
+        assert!(write_atomic(Path::new("/"), b"x", 0o600).is_err());
+        assert!(write_atomic(Path::new(""), b"x", 0o600).is_err());
+        let nul = base.join(std::ffi::OsStr::from_bytes(b"a\0b"));
+        assert!(write_atomic(&nul, b"x", 0o600).is_err());
+        let long = base.join("x".repeat(crate::confined::NAME_MAX + 1));
+        assert!(write_atomic(&long, b"x", 0o600).is_err());
+        let missing = write_atomic(&base.join("missing/f"), b"x", 0o600).unwrap_err();
+        assert!(missing.to_string().contains(&base.display().to_string()));
+        let io_err = write_atomic(&base.join("nodir/f"), b"x", 0o600).unwrap_err();
+        assert!(io_err.to_string().contains("nodir"));
+        assert_eq!(fs::read_dir(&base).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn write_atomic_replaces_a_symlink_instead_of_writing_through_it() {
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let victim = outside.path().join("victim");
+        fs::write(&victim, b"keep").unwrap();
+        let link = dir.path().join("state.json");
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+        write_atomic(&link, b"new", 0o600).unwrap();
+        assert_eq!(fs::read(&victim).unwrap(), b"keep");
+        assert_eq!(fs::read(&link).unwrap(), b"new");
+        assert!(
+            !fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[test]
+    fn write_atomic_cleans_its_temp_file_on_failure() {
+        let dir = tempdir().unwrap();
+        let dest = dir.path().join("f.json");
+        let (root, name) = TrustedDir::split(&dest).unwrap();
+        let blocker = dir.path().join("f.json");
+        fs::create_dir(&blocker).unwrap();
+        assert!(write_atomic_in(&root, &name, b"x", 0o600).is_err());
+        let left: Vec<_> = fs::read_dir(dir.path()).unwrap().collect();
+        assert_eq!(left.len(), 1);
+    }
+
+    #[test]
+    fn ensure_dir_sets_the_mode_and_tolerates_an_existing_directory() {
+        let dir = tempdir().unwrap();
+        let made = dir.path().join("a/b");
+        ensure_dir(&made, 0o700).unwrap();
+        let mode = fs::metadata(&made).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+        ensure_dir(&made, 0o750).unwrap();
+        let mode = fs::metadata(&made).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o750);
+    }
+
+    #[test]
     fn read_limited_rejects_oversize() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("big");
@@ -285,7 +321,12 @@ mod tests {
         let dir = tempdir().unwrap();
         let link = dir.path().join("status.json");
         std::os::unix::fs::symlink("/dev/zero", &link).unwrap();
-        assert!(read_limited(&link, 1024).is_err());
+        let refused = read_limited(&link, 1024).unwrap_err();
+        assert!(
+            refused
+                .to_string()
+                .contains(&dir.path().display().to_string())
+        );
         assert!(read_limited(Path::new("/dev/zero"), 1024).is_err());
 
         let real = dir.path().join("real");
