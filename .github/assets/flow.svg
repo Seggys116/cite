@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 390" width="960" height="390" role="img" aria-labelledby="t d">
+<title id="t">request flow</title>
+<desc id="d">Clients reach HAProxy, which drops malicious requests and routes the rest to the live blue or green slot while the connector manages config and collects logs.</desc>
+<rect width="960" height="390" rx="18" fill="#0d1117"/>
+<rect x="1" y="1" width="958" height="388" rx="17" fill="none" stroke="#30363d" stroke-width="2"/>
+<rect x="168" y="72" width="6" height="6" fill="#8b949e" opacity="0.15"><animate attributeName="opacity" values="0.1;0.7;0.1" dur="3.39s" begin="1.06s" repeatCount="indefinite"/></rect>
+<rect x="872" y="104" width="6" height="6" fill="#8b949e" opacity="0.15"><animate attributeName="opacity" values="0.1;0.7;0.1" dur="2.65s" begin="3.80s" repeatCount="indefinite"/></rect>
+<rect x="560" y="208" width="4" height="4" fill="#8b949e" opacity="0.15"><animate attributeName="opacity" values="0.1;0.7;0.1" dur="4.19s" begin="3.66s" repeatCount="indefinite"/></rect>
+<rect x="800" y="288" width="4" height="4" fill="#8b949e" opacity="0.15"><animate attributeName="opacity" values="0.1;0.7;0.1" dur="4.85s" begin="3.45s" repeatCount="indefinite"/></rect>
+<rect x="736" y="152" width="6" height="6" fill="#8b949e" opacity="0.15"><animate attributeName="opacity" values="0.1;0.7;0.1" dur="3.44s" begin="0.67s" repeatCount="indefinite"/></rect>
+<rect x="808" y="136" width="6" height="6" fill="#8b949e" opacity="0.15"><animate attributeName="opacity" values="0.1;0.7;0.1" dur="3.85s" begin="2.01s" repeatCount="indefinite"/></rect>
+<rect x="672" y="136" width="6" height="6" fill="#8b949e" opacity="0.15"><animate attributeName="opacity" values="0.1;0.7;0.1" dur="4.47s" begin="3.94s" repeatCount="indefinite"/></rect>
+<rect x="896" y="120" width="4" height="4" fill="#8b949e" opacity="0.15"><animate attributeName="opacity" values="0.1;0.7;0.1" dur="4.48s" begin="2.96s" repeatCount="indefinite"/></rect>
+<rect x="256" y="120" width="6" height="6" fill="#8b949e" opacity="0.15"><animate attributeName="opacity" values="0.1;0.7;0.1" dur="3.73s" begin="2.92s" repeatCount="indefinite"/></rect>
+<rect x="48" y="160" width="4" height="4" fill="#8b949e" opacity="0.15"><animate attributeName="opacity" values="0.1;0.7;0.1" dur="3.20s" begin="2.77s" repeatCount="indefinite"/></rect>
+<rect x="376" y="248" width="6" height="6" fill="#8b949e" opacity="0.15"><animate attributeName="opacity" values="0.1;0.7;0.1" dur="4.87s" begin="3.82s" repeatCount="indefinite"/></rect>
+<rect x="392" y="64" width="4" height="4" fill="#8b949e" opacity="0.15"><animate attributeName="opacity" values="0.1;0.7;0.1" dur="2.83s" begin="1.88s" repeatCount="indefinite"/></rect>
+<rect x="368" y="128" width="4" height="4" fill="#8b949e" opacity="0.15"><animate attributeName="opacity" values="0.1;0.7;0.1" dur="4.04s" begin="3.60s" repeatCount="indefinite"/></rect>
+<rect x="880" y="24" width="4" height="4" fill="#8b949e" opacity="0.15"><animate attributeName="opacity" values="0.1;0.7;0.1" dur="4.69s" begin="1.38s" repeatCount="indefinite"/></rect>
+<rect x="40" y="150" width="130" height="60" rx="8" fill="#161b22" stroke="#30363d" stroke-width="2"/>
+<text x="105.0" y="178.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="15" fill="#e6edf3" text-anchor="middle" font-weight="600">clients</text>
+<text x="105.0" y="196.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#8b949e" text-anchor="middle" font-weight="400">browsers, bots</text>
+<rect x="300" y="140" width="170" height="80" rx="8" fill="#161b22" stroke="#ce422b" stroke-width="2"/>
+<text x="385.0" y="178.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="15" fill="#e6edf3" text-anchor="middle" font-weight="600">HAProxy</text>
+<text x="385.0" y="196.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#8b949e" text-anchor="middle" font-weight="400">firewall, routing</text>
+<rect x="640" y="60" width="170" height="70" rx="8" fill="#161b22" stroke="#3b82f6" stroke-width="2"/>
+<text x="725.0" y="93.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="15" fill="#e6edf3" text-anchor="middle" font-weight="600">blue</text>
+<text x="725.0" y="111.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#8b949e" text-anchor="middle" font-weight="400">live</text>
+<rect x="640" y="230" width="170" height="70" rx="8" fill="#161b22" stroke="#22c55e" stroke-width="2"/>
+<text x="725.0" y="263.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="15" fill="#e6edf3" text-anchor="middle" font-weight="600">green</text>
+<text x="725.0" y="281.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#8b949e" text-anchor="middle" font-weight="400">idle</text>
+<rect x="300" y="282" width="170" height="54" rx="8" fill="#161b22" stroke="#ffd23f" stroke-width="2"/>
+<text x="385.0" y="307.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="15" fill="#e6edf3" text-anchor="middle" font-weight="600">connector</text>
+<text x="385.0" y="325.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#8b949e" text-anchor="middle" font-weight="400">api, logs, config</text>
+<path d="M170 180 L300 180" stroke="#8b949e" stroke-width="2" fill="none" stroke-dasharray="6 6"/>
+<path d="M470 165 L640 100" stroke="#3b82f6" stroke-width="2" fill="none" stroke-dasharray="6 6"/>
+<path d="M470 195 L640 265" stroke="#22c55e" stroke-width="2" fill="none" stroke-dasharray="6 6"/>
+<path d="M385 220 L385 282" stroke="#ffd23f" stroke-width="2" fill="none" stroke-dasharray="6 6"/>
+<text x="560" y="112" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#8b949e" text-anchor="middle" font-weight="400">active.map</text>
+<text x="560" y="250" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#8b949e" text-anchor="middle" font-weight="400">standby</text>
+<rect width="8" height="8" x="-4" y="-4" fill="#e6edf3"><animateMotion path="M170 180 L300 180" dur="1.4s" begin="0.0s" repeatCount="indefinite"/><animate attributeName="opacity" values="0;1;1;0" keyTimes="0;0.1;0.9;1" dur="1.4s" begin="0.0s" repeatCount="indefinite"/></rect>
+<rect width="8" height="8" x="-4" y="-4" fill="#3b82f6"><animateMotion path="M470 165 L640 100" dur="1.8s" begin="1.2s" repeatCount="indefinite"/><animate attributeName="opacity" values="0;1;1;0" keyTimes="0;0.1;0.9;1" dur="1.8s" begin="1.2s" repeatCount="indefinite"/></rect>
+<rect width="8" height="8" x="-4" y="-4" fill="#e6edf3"><animateMotion path="M170 180 L300 180" dur="1.4s" begin="0.28s" repeatCount="indefinite"/><animate attributeName="opacity" values="0;1;1;0" keyTimes="0;0.1;0.9;1" dur="1.4s" begin="0.28s" repeatCount="indefinite"/></rect>
+<rect width="8" height="8" x="-4" y="-4" fill="#3b82f6"><animateMotion path="M470 165 L640 100" dur="1.8s" begin="1.56s" repeatCount="indefinite"/><animate attributeName="opacity" values="0;1;1;0" keyTimes="0;0.1;0.9;1" dur="1.8s" begin="1.56s" repeatCount="indefinite"/></rect>
+<rect width="8" height="8" x="-4" y="-4" fill="#e6edf3"><animateMotion path="M170 180 L300 180" dur="1.4s" begin="0.56s" repeatCount="indefinite"/><animate attributeName="opacity" values="0;1;1;0" keyTimes="0;0.1;0.9;1" dur="1.4s" begin="0.56s" repeatCount="indefinite"/></rect>
+<rect width="8" height="8" x="-4" y="-4" fill="#3b82f6"><animateMotion path="M470 165 L640 100" dur="1.8s" begin="1.92s" repeatCount="indefinite"/><animate attributeName="opacity" values="0;1;1;0" keyTimes="0;0.1;0.9;1" dur="1.8s" begin="1.92s" repeatCount="indefinite"/></rect>
+<rect width="8" height="8" x="-4" y="-4" fill="#e6edf3"><animateMotion path="M170 180 L300 180" dur="1.4s" begin="0.8400000000000001s" repeatCount="indefinite"/><animate attributeName="opacity" values="0;1;1;0" keyTimes="0;0.1;0.9;1" dur="1.4s" begin="0.8400000000000001s" repeatCount="indefinite"/></rect>
+<rect width="8" height="8" x="-4" y="-4" fill="#3b82f6"><animateMotion path="M470 165 L640 100" dur="1.8s" begin="2.2800000000000002s" repeatCount="indefinite"/><animate attributeName="opacity" values="0;1;1;0" keyTimes="0;0.1;0.9;1" dur="1.8s" begin="2.2800000000000002s" repeatCount="indefinite"/></rect>
+<rect width="8" height="8" x="-4" y="-4" fill="#e6edf3"><animateMotion path="M170 180 L300 180" dur="1.4s" begin="1.12s" repeatCount="indefinite"/><animate attributeName="opacity" values="0;1;1;0" keyTimes="0;0.1;0.9;1" dur="1.4s" begin="1.12s" repeatCount="indefinite"/></rect>
+<rect width="8" height="8" x="-4" y="-4" fill="#3b82f6"><animateMotion path="M470 165 L640 100" dur="1.8s" begin="2.6399999999999997s" repeatCount="indefinite"/><animate attributeName="opacity" values="0;1;1;0" keyTimes="0;0.1;0.9;1" dur="1.8s" begin="2.6399999999999997s" repeatCount="indefinite"/></rect>
+<rect width="8" height="8" x="-4" y="-4" fill="#ce422b"><animateMotion path="M170 180 L300 180" dur="1.4s" begin="0.7s" repeatCount="indefinite"/><animate attributeName="opacity" values="0;1;1;0" keyTimes="0;0.1;0.9;1" dur="1.4s" begin="0.7s" repeatCount="indefinite"/></rect>
+<text x="235" y="140" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#ce422b" text-anchor="middle" font-weight="400">.env</text>
+<g stroke="#ce422b" stroke-width="3"><path d="M292 172 l16 16 M308 172 l-16 16"><animate attributeName="opacity" values="0;0;1;0" keyTimes="0;0.45;0.55;1" dur="1.4s" begin="0.7s" repeatCount="indefinite"/></path></g>
+<text x="480.0" y="372" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#8b949e" text-anchor="middle" font-weight="400">a request for .env is dropped before it reaches a backend; the standby slot is promoted only after its health checks pass</text>
+</svg>

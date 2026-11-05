@@ -1,0 +1,50 @@
+[package]
+name = "cite-connector"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "Authenticated node connector: edge API, HAProxy control, log analytics, optional site orchestration"
+
+[[bin]]
+name = "cite-connector"
+path = "src/main.rs"
+
+[dependencies]
+cite-edge.workspace = true
+cite-core.workspace = true
+cite-store.workspace = true
+futures-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+regex.workspace = true
+ipnet.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+time.workspace = true
+ulid.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+bytes.workspace = true
+axum.workspace = true
+tower.workspace = true
+reqwest.workspace = true
+arc-swap.workspace = true
+clap.workspace = true
+rustix.workspace = true
+socket2 = "0.6"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rcgen = "0.13"
+qrcode = { version = "0.14", default-features = false }
+
+[dev-dependencies]
+tempfile.workspace = true
+proptest.workspace = true

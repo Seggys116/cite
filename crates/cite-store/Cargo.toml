@@ -1,0 +1,21 @@
+[package]
+name = "cite-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "Embedded SQLite analytics store for Cite node mode request events"
+
+[dependencies]
+cite-edge.workspace = true
+flate2.workspace = true
+rusqlite = { workspace = true, features = ["hooks", "backup"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

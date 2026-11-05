@@ -121,6 +121,42 @@ updates:
       docker-minor-patch:
         update-types: ["minor", "patch"]
 
+  - package-ecosystem: docker
+    directory: "/images/dashboard"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "chore(deps)"
+    cooldown:
+      default-days: 3
+    groups:
+      docker-minor-patch:
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: docker
+    directory: "/images/dockerproxy"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "chore(deps)"
+    cooldown:
+      default-days: 3
+    groups:
+      docker-minor-patch:
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: docker
+    directory: "/images/connector"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "chore(deps)"
+    cooldown:
+      default-days: 3
+    groups:
+      docker-minor-patch:
+        update-types: ["minor", "patch"]
+
   - package-ecosystem: docker-compose
     directory: "/"
     schedule:

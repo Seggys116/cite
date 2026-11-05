@@ -127,10 +127,7 @@ fn write_atomic_inner(
 
     let write_result = (|| {
         {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&tmp_path)?;
+            let mut file = open_tmp(&tmp_path, mode)?;
             file.write_all(bytes)?;
             if fail_at == Some(AtomicPoint::AfterTmpWrite) {
                 return Err(Error::msg("injected failure after tmp write"));
@@ -168,6 +165,18 @@ fn write_atomic_inner(
         )),
         other => other,
     })
+}
+
+/// Creates the temp file with the requested mode so it never exists with wider permissions.
+fn open_tmp(path: &Path, mode: u32) -> std::io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(mode);
+    }
+    options.open(path)
 }
 
 fn hold_during_desired_write(dest: &Path) {
@@ -216,6 +225,18 @@ mod tests {
         write_atomic(&dest, b"{}", 0o640).unwrap();
         let mode = std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o640);
+    }
+
+    #[test]
+    fn tmp_file_is_created_with_requested_mode_under_open_umask() {
+        let dir = tempdir().unwrap();
+        let previous = rustix::process::umask(rustix::fs::Mode::empty());
+        let path = dir.path().join("tmp-secret");
+        let opened = open_tmp(&path, 0o600);
+        rustix::process::umask(previous);
+        opened.unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 
     #[test]

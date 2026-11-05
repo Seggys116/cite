@@ -1,0 +1,59 @@
+# Overlay for docker-compose.node.yml; set DOCKER_GID in .env to the group id that owns /var/run/docker.sock (stat -c %g).
+# CITE_GITHUB_API_URL (GitHub Enterprise Server, for example https://ghe.example.com/api/v3) goes to both services: the proxy allows exactly that value in a manager.
+
+services:
+  dockerproxy:
+    image: ghcr.io/seggys116/cite-dockerproxy:${CITE_VERSION:-0.2.0}
+    restart: unless-stopped
+    init: true
+    user: "10001:10001"
+    group_add:
+      - "${DOCKER_GID:?set DOCKER_GID in .env to the group id of /var/run/docker.sock}"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    environment:
+      CITE_PROXY_LISTEN: 0.0.0.0:2375
+      CITE_PROXY_SOCKET: /var/run/docker.sock
+      CITE_PROXY_REGISTRY: ${CITE_REGISTRY:-ghcr.io/seggys116}
+      CITE_PROXY_HAPROXY_CONTAINER: cite-node-haproxy
+      CITE_PROXY_EDGE_NETWORK: cite_edge
+      CITE_PROXY_GITHUB_API_URL: ${CITE_GITHUB_API_URL:-}
+      RUST_LOG: ${RUST_LOG:-info}
+    # A read-only bind does not restrict the API on a unix socket; the filter in the proxy does.
+    volumes:
+      - type: bind
+        source: /var/run/docker.sock
+        target: /var/run/docker.sock
+        read_only: true
+    networks:
+      - docker_api
+    mem_limit: ${CITE_DOCKERPROXY_MEM:-128m}
+    cpus: ${CITE_DOCKERPROXY_CPUS:-0.5}
+    pids_limit: ${CITE_DOCKERPROXY_PIDS:-128}
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  connector:
+    depends_on:
+      dockerproxy:
+        condition: service_healthy
+    environment:
+      CITE_DOCKER_HOST: http://dockerproxy:2375
+      CITE_HAPROXY_CONTAINER: cite-node-haproxy
+      CITE_REGISTRY: ${CITE_REGISTRY:-ghcr.io/seggys116}
+      CITE_STACK_VERSION: ${CITE_STACK_VERSION:-}
+      CITE_STACK_GITHUB_API_URL: ${CITE_GITHUB_API_URL:-}
+      CITE_DEPLOY_BUILD_TIMEOUT: ${CITE_DEPLOY_BUILD_TIMEOUT:-600}
+    networks:
+      - docker_api
+
+networks:
+  docker_api:
+    driver: bridge
+    internal: true
