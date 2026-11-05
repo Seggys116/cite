@@ -86,7 +86,7 @@ jobs:
           dashboard="$(socks -f docker-compose.dashboard.yml)"
           [ -z "$node_only" ] || { echo "::error::docker-compose.node.yml mounts the Docker socket in: $node_only"; exit 1; }
           [ -z "$dashboard" ] || { echo "::error::docker-compose.dashboard.yml mounts the Docker socket in: $dashboard"; exit 1; }
-          [ "$overlay" = "socketproxy" ] || { echo "::error::the Docker socket must be mounted only by socketproxy, found: '$overlay'"; exit 1; }
+          [ "$overlay" = "dockerproxy" ] || { echo "::error::the Docker socket must be mounted only by dockerproxy, found: '$overlay'"; exit 1; }
 
   shell:
     runs-on: ubuntu-latest
@@ -148,7 +148,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        image: [connector, dashboard]
+        image: [connector, dashboard, dockerproxy]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

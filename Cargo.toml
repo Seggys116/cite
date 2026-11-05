@@ -4,6 +4,7 @@ members = [
     "crates/cite-core",
     "crates/cite-edge",
     "crates/cite-connector",
+    "crates/cite-dockerproxy",
     "crates/cite-client",
     "crates/cite-dashboard",
     "crates/cite-manager",

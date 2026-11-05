@@ -742,8 +742,8 @@ choose_orch() {
   if [ -z "$ORCH" ]; then
     ORCH=0
     if is_interactive; then
-      say "The orchestrator gives the connector a restricted Docker API proxy so it can start site containers."
-      say "The proxy still permits creating containers on this host, so a compromised connector could reach it."
+      say "The orchestrator lets the connector start site containers through a filtering Docker API proxy."
+      say "The proxy only allows cite site containers, but it holds the Docker socket, so keep this node dedicated."
       if confirm "Enable the orchestrator?"; then
         ORCH=1
       fi
@@ -769,6 +769,18 @@ collect_config() {
   return 0
 }
 
+# Group that owns the Docker socket; Docker Desktop shows it as root inside its VM, so fall back to 0 there.
+docker_socket_gid() {
+  _gid=$(stat -c %g /var/run/docker.sock 2>/dev/null || stat -f %g /var/run/docker.sock 2>/dev/null || echo 0)
+  case $(uname -s) in
+    Darwin) _gid=0 ;;
+  esac
+  case $_gid in
+    '' | *[!0-9]*) _gid=0 ;;
+  esac
+  printf '%s' "$_gid"
+}
+
 write_env() {
   if [ -f "$ENV_FILE" ]; then
     confirm "$ENV_FILE already exists. Replace it (a copy is kept as .env.bak)?" \
@@ -781,6 +793,9 @@ write_env() {
     printf 'CITE_VERSION=%s\n' "$VERSION"
     printf 'CITE_SETUP_MODE=%s\n' "$MODE"
     printf 'CITE_SETUP_ORCHESTRATOR=%s\n' "$ORCH"
+    if [ "$ORCH" = 1 ]; then
+      printf 'DOCKER_GID=%s\n' "$(docker_socket_gid)"
+    fi
     if stack_enabled node; then
       printf 'CITE_CONNECTOR_ALLOW=%s\n' "$ALLOW"
       printf 'CITE_CONNECTOR_BIND=%s\n' "$BIND"

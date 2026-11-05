@@ -8,37 +8,76 @@ This page covers the optional orchestrator: how a node's connector builds and ru
 docker compose -f docker-compose.node.yml -f docker-compose.orchestrator.yml up -d
 ```
 
-The overlay adds a `socketproxy` service (`docker.io/tecnativa/docker-socket-proxy:0.3.0`) and an internal network `docker_api`. It sets `CITE_DOCKER_HOST=tcp://socketproxy:2375` on the connector and attaches the connector to `docker_api`. The proxy is the only container that mounts `/var/run/docker.sock`, read-only.
+Set `DOCKER_GID` in `.env` first: it is the numeric group id that owns `/var/run/docker.sock` on the host (`stat -c %g /var/run/docker.sock`). The proxy runs as uid 10001 and gets that group through `group_add`, so it can open the socket without running as root.
+
+The overlay adds a `dockerproxy` service (`ghcr.io/seggys116/cite-dockerproxy`) and an internal network `docker_api`. It sets `CITE_DOCKER_HOST=http://dockerproxy:2375` and `CITE_HAPROXY_CONTAINER=cite-node-haproxy` on the connector and attaches the connector to `docker_api`. The proxy is the only container that mounts `/var/run/docker.sock`. The mount is marked read-only, but that does not limit the API: a read-only bind of a unix socket still lets a client send any request. The restriction comes from the proxy's filter, described below. `docker-compose.node.yml` names the HAProxy container `cite-node-haproxy` so the connector and the proxy can refer to it.
 
 `CITE_DOCKER_HOST` is what switches the orchestrator on. It accepts a bare `tcp://host:port` or `http://host:port`. Unix sockets, paths and query strings are rejected. At start the connector pings the Docker API and logs a warning if it cannot reach it. It keeps running, and deploys that need Docker fail until the API answers.
 
 Without the overlay, the connector runs no containers. A site can then only route to upstream addresses you provide in its blue and green targets, and creating or updating a site with a `source` is refused.
 
-## Socket proxy scope
+## The Docker proxy
 
-| Allowed | Denied |
+`cite-dockerproxy` is a purpose-built filter that sits between the connector and the Docker Engine socket. It is deny-by-default: it forwards only the calls the orchestrator makes, and only when the request body and query match what the orchestrator would send. Everything else gets `403 {"message":"denied"}` and a log line with the method, the normalised path and the reason. Request bodies are never logged.
+
+Generic socket proxies such as `tecnativa/docker-socket-proxy` filter by URL prefix. Allowing container creation there allows every method and every body under `/containers/`, so a compromised connector can create a privileged container with the host's root bind-mounted and start it. Volume creation with bind driver options, image pulls from any registry, and attaching any container to any network are open in the same way. The purpose-built proxy closes those paths by validating what is inside the request.
+
+| Allowed | Conditions |
 |---|---|
-| `CONTAINERS`, `NETWORKS`, `VOLUMES`, `IMAGES`, and `POST` (so those can be created and changed) | `EXEC`, `BUILD`, `COMMIT`, `SERVICES`, `SWARM`, `SECRETS`, `CONFIGS`, `DISTRIBUTION`, `PLUGINS`, `SYSTEM`, `AUTH`, `INFO`, `EVENTS`, `NODES`, `SESSION`, `TASKS` |
+| `GET /_ping` | None. |
+| `POST /images/create` | Only `fromImage` and `tag`. The image must be one of the Cite images under the configured registry with a matching tag form (`x.y.z-node22` or `x.y.z-node24` for the node images, `x.y.z` for the others). |
+| `GET /images/{ref}/json` | The same image references. |
+| `POST /volumes/create` | Body keys `Name` and `Labels` only (so no `Driver` or `DriverOpts`). The name must be `cite-<id>-<slot>-(data\|work\|cache)` and the labels must be exactly the four `cite.*` labels, consistent with the name. |
+| `GET` and `DELETE /volumes/{name}` | Same name pattern. Delete first inspects the volume and requires `cite.managed=true`. |
+| `POST /networks/create` | Body keys `Name`, `Driver` (`bridge` or absent), `Internal` and `Labels` only. Names are `cite-<id>-<slot>-net` (must be internal) or `cite-<id>-<slot>-egress` (must not be). |
+| `GET` and `DELETE /networks/{name}` | Same name patterns. Delete requires `cite.managed=true`. |
+| `POST /networks/{name}/connect` and `disconnect` | Only the per-stack `-net` networks, only for the HAProxy container, and only when the network carries `cite.managed=true`. |
+| `POST /containers/create?name=` | The name must be `cite-<id>-<slot>-(manager\|executor\|init)`. The body is compared structurally with the exact specification the orchestrator builds for that role. See below. |
+| `POST /containers/{name}/start`, `stop`, `restart`, `wait` | Name pattern, `cite.managed=true` on the container, and only the query parameters the orchestrator uses. |
+| `GET /containers/{name}/json` | Name pattern. |
+| `DELETE /containers/{name}` | Name pattern, `cite.managed=true`, optional `force`. |
+| `GET /containers/json` | The `filters` parameter must pin `cite.managed=true`. |
 
-The proxy limits which API endpoints the connector can call. It does not look inside a request. A client that may create containers can still ask for a privileged container or a bind mount of the host's root. Read [Security model](security-model.md) before enabling this on a node that holds anything you care about.
+A container create body is rebuilt by the proxy from the site id, slot and role in the name, and the request must equal it. Only a few values are free, and each is checked: the image (registry, image name for the role, tag form), the environment (a fixed list of keys, fixed values for paths, validated values for repo, branch, poll interval, node major and token), the memory, CPU and pids limits (positive and under a per-role cap), and the network (`none` for init, the stack's own egress network for the manager, the stack's own network or the configured edge network for the executor). Any other key or value is rejected, which covers `Privileged`, `Binds`, `Devices`, `PidMode`, `IpcMode`, `UsernsMode`, `CapAdd` beyond the fixed sets, other users, other mounts, `Sysctls`, `VolumesFrom`, port bindings and the rest. Mounts are volumes only, named after the same stack, with the exact subpaths and read-only flags.
 
-The connector uses Docker Engine API v1.45, which is why Docker Engine 26 or newer is required.
+The proxy also refuses, before any matching: request targets that are not origin-form, percent-encoding in paths, `.` and `..` segments, empty segments, backslashes and NUL bytes, API versions outside 1.45 to 1.99, duplicate query keys, any `Upgrade` or `Connection: upgrade` (so no attach, exec or hijack), any `Transfer-Encoding`, a body on a request that should have none, a body over 64 KiB, and a body without `Content-Type: application/json`. Client headers are not forwarded; the proxy builds its own request to the engine, so request smuggling toward Docker is not possible. Responses are streamed back (image pull progress) with a per-route deadline. Connections are capped (`CITE_PROXY_MAX_CONNS`, default 64) and request headers must arrive within 10 seconds.
+
+Proxy settings, all on the `dockerproxy` service:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `CITE_PROXY_LISTEN` | `0.0.0.0:2375` | Listen address. Keep it on the internal `docker_api` network. |
+| `CITE_PROXY_SOCKET` | `/var/run/docker.sock` | Engine socket. |
+| `CITE_PROXY_REGISTRY` | `ghcr.io/seggys116` | Registry prefix images must come from. Keep it equal to the connector's `CITE_REGISTRY`. |
+| `CITE_PROXY_HAPROXY_CONTAINER` | `cite-node-haproxy` | Container the proxy lets the connector attach to stack networks. |
+| `CITE_PROXY_EDGE_NETWORK` | `cite_edge` | Shared network executors may join when per-stack networks are off. |
+| `CITE_PROXY_MAX_CONNS` | `64` | Concurrent connections. |
+
+Because the stack version becomes an image tag, `CITE_STACK_VERSION` must be a plain `x.y.z` version. The connector uses Docker Engine API v1.45, which is why Docker Engine 26 or newer is required.
 
 ## What a site stack is
 
-A site with a `source` gets one stack per slot, created when the slot is first used. Names use the site id and slot: for site `shop` in the blue slot, `cite-shop-blue-manager`, `cite-shop-blue-executor`, `cite-shop-blue-init`, volumes `cite-shop-blue-data`, `-work` and `-cache`, and network `cite-shop-blue-egress`.
+A site with a `source` gets one stack per slot, created when the slot is first used. Names use the site id and slot: for site `shop` in the blue slot, `cite-shop-blue-manager`, `cite-shop-blue-executor`, `cite-shop-blue-init`, volumes `cite-shop-blue-data`, `-work` and `-cache`, and networks `cite-shop-blue-egress` and `cite-shop-blue-net`.
 
 | Container | Role | Network | Limits |
 |---|---|---|---|
 | `init` | Lays out the data volume, then exits | none | 128 MiB, 64 pids, caps `CHOWN` and `FOWNER` only |
 | `manager` | Polls the repo, builds, promotes into the stack's own volume | `cite-<id>-<slot>-egress`, its own network | 2 GiB, 2 CPUs, 2048 pids |
-| `executor` | Serves the built site on port 8080 | `cite_edge` (internal), alias `cite-<id>-<slot>-executor` | 1 GiB, 1 CPU, 256 pids, runs as 65532 |
+| `executor` | Serves the built site on port 8080 | `cite-<id>-<slot>-net` (internal), alias `cite-<id>-<slot>-executor` | 1 GiB, 1 CPU, 256 pids, runs as 65532 |
 
 Both long-running containers have `ReadonlyRootfs`, `no-new-privileges`, all capabilities dropped (the manager gets back `CHOWN`, `SETUID`, `SETGID` and `DAC_READ_SEARCH` to build as an unprivileged user), an init process, a health check every 30 seconds and a 10 MiB by 3 file log cap. They mount only their own named volumes, with subpath mounts matching single-site mode: the executor sees releases and control read-only. No host paths are mounted.
 
-HAProxy reaches the executor at `cite-<id>-<slot>-executor:8080` over `cite_edge`. The connector writes that address into the slot's targets. The connector itself is not on `cite_edge`, and neither HAProxy's admin sockets nor the connector can be reached from an executor: those sit on the separate `ctl` network that executors never join.
-
 These specifications mirror the `manager` and `executor` services in `docker-compose.yml`, so the single-site hardening in [Hardening](hardening.md) applies to each stack.
+
+## Site isolation
+
+Each stack gets its own internal network, `cite-<id>-<slot>-net`, and its executor is the only container on it besides HAProxy. The connector creates the network, then asks Docker (through the proxy) to connect the HAProxy container, named by `CITE_HAPROXY_CONTAINER` (default `cite-node-haproxy`). HAProxy reaches the executor at `cite-<id>-<slot>-executor:8080` over that network, and the connector writes the address into the slot's targets. Because the network is internal and unshared, site A's code cannot reach site B's executor, neither HAProxy's admin sockets nor the connector can be reached from an executor, and an executor has no route out.
+
+On stop, HAProxy is disconnected from the stack's network. The network itself stays so the stopped executor can start again. Removing a stack disconnects HAProxy and deletes both networks. If HAProxy is recreated, it loses its attachments; the connector re-attaches it to every running stack's network the first time it uses the orchestrator after start (and `reconcile_networks` can be called at any time). A container, volume or network that already has the expected name but lacks the `cite.managed=true` label is never adopted, changed or deleted; the connector reports a conflict.
+
+If `CITE_HAPROXY_CONTAINER` is set to an empty value, per-stack networks are off and executors join the shared `cite_edge` network as before. That mode is weaker: all executors on the node can reach each other directly, so one site's code can talk to another site's executor. Use it only for a node whose sites you fully trust. Stacks created in that mode move to their own network the next time they are ensured, because the executor is recreated when its network differs.
+
+The manager keeps its own `cite-<id>-<slot>-egress` network so it can reach GitHub and the package registries. That network is not shared with other stacks.
 
 ## Source settings
 
@@ -86,3 +125,5 @@ Deployment history keeps the last 50 entries per site.
 ## Resource planning
 
 Each active stack holds up to 3 GiB of memory limit and a data, work and cache volume. Sizing for those volumes is the same as in [Install](install.md#disk-sizing). A stopped standby stack frees its memory but keeps its volumes.
+
+Disk is not limited per stack. The `docker-compose.yml` work and cache volumes are unbounded and the orchestrator mirrors that, because the proxy forbids `StorageOpt` and volume driver options, the only per-container ways to set a quota. To bound disk use, put Docker's data root on an XFS filesystem mounted with project quotas, or monitor `docker system df -v`. A site whose build fills the disk can fill the host. This is listed under residual risk in the [security model](security-model.md#the-orchestrator-overlay).

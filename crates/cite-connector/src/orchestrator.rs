@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use cite_core::parse_poll_interval;
@@ -27,6 +28,7 @@ const DEFAULT_NODE_MAJOR: u8 = 22;
 const NODE_MAJORS: [u8; 2] = [22, 24];
 const MAX_REF_LEN: usize = 100;
 const MAX_TOKEN_LEN: usize = 512;
+pub const DEFAULT_HAPROXY_CONTAINER: &str = "cite-node-haproxy";
 
 const GIB: i64 = 1024 * 1024 * 1024;
 const MANAGER_MEMORY: i64 = 2 * GIB;
@@ -103,8 +105,60 @@ pub struct Orchestrator {
     http: reqwest::Client,
     base: String,
     edge_network: String,
+    haproxy_container: String,
     stack_version: String,
     registry: String,
+    reconciled: AtomicBool,
+}
+
+// Everything besides the site itself that shapes a stack; `isolate` gives each stack its own network.
+pub struct StackEnv<'a> {
+    pub registry: &'a str,
+    pub version: &'a str,
+    pub edge_network: &'a str,
+    pub isolate: bool,
+}
+
+// Names, images and bodies for one stack, in the form they are sent to the engine.
+pub struct SpecSet {
+    pub manager_name: String,
+    pub executor_name: String,
+    pub init_name: String,
+    pub manager_image: String,
+    pub executor_image: String,
+    pub manager: Value,
+    pub executor: Value,
+    pub init: Value,
+    pub volumes: Vec<String>,
+    pub networks: Vec<String>,
+}
+
+// The exact container specs a stack would be created from, for checking against the proxy's policy.
+pub fn stack_specs(
+    site: &Site,
+    slot: Slot,
+    git_ref: Option<&str>,
+    token: &str,
+    env: &StackEnv<'_>,
+) -> Result<SpecSet> {
+    let plan = plan_stack(site, slot, git_ref, token, env)?;
+    let names = plan.names;
+    let mut networks = vec![names.egress.clone()];
+    if env.isolate {
+        networks.push(names.net.clone());
+    }
+    Ok(SpecSet {
+        volumes: names.volumes().iter().map(|v| v.to_string()).collect(),
+        manager_name: names.manager,
+        executor_name: names.executor,
+        init_name: names.init,
+        manager_image: plan.manager_image,
+        executor_image: plan.executor_image,
+        manager: plan.manager,
+        executor: plan.executor,
+        init: plan.init,
+        networks,
+    })
 }
 
 struct Reply {
@@ -116,6 +170,7 @@ struct Inspected {
     running: bool,
     image: String,
     env: Vec<String>,
+    network: String,
 }
 
 impl Inspected {
@@ -130,7 +185,10 @@ impl Inspected {
                     .all(|e| self.env.iter().any(|have| have == e))
             })
             .unwrap_or(true);
-        self.image == image && env_ok
+        let network = spec["HostConfig"]["NetworkMode"]
+            .as_str()
+            .unwrap_or_default();
+        self.image == image && env_ok && self.network == network
     }
 }
 
@@ -145,6 +203,7 @@ struct StackNames {
     work: String,
     cache: String,
     egress: String,
+    net: String,
 }
 
 impl StackNames {
@@ -165,6 +224,7 @@ impl StackNames {
             work: format!("{base}-work"),
             cache: format!("{base}-cache"),
             egress: format!("{base}-egress"),
+            net: format!("{base}-net"),
         })
     }
 
@@ -186,9 +246,9 @@ impl Orchestrator {
     pub fn from_config(cfg: &ConnectorConfig) -> Result<Option<Orchestrator>> {
         match cfg.docker_host.as_deref() {
             None => Ok(None),
-            Some(host) => {
-                Self::new(host, &cfg.edge_network, &cfg.stack_version, &cfg.registry).map(Some)
-            }
+            Some(host) => Self::new(host, &cfg.edge_network, &cfg.stack_version, &cfg.registry)?
+                .with_haproxy_container(&cfg.haproxy_container)
+                .map(Some),
         }
     }
 
@@ -222,9 +282,36 @@ impl Orchestrator {
             http,
             base,
             edge_network: edge_network.to_string(),
+            haproxy_container: DEFAULT_HAPROXY_CONTAINER.to_string(),
             stack_version: stack_version.to_string(),
             registry: registry.to_string(),
+            reconciled: AtomicBool::new(false),
         })
+    }
+
+    // An empty name turns per-stack networks off and puts executors on the shared edge network.
+    pub fn with_haproxy_container(mut self, name: &str) -> Result<Orchestrator> {
+        if !name.is_empty() {
+            check_chars("haproxy container", name, |c| {
+                c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')
+            })?;
+        }
+        self.haproxy_container = name.to_string();
+        Ok(self)
+    }
+
+    // Per-stack networks need a named HAProxy container to attach; without one the edge network is used.
+    fn isolated(&self) -> bool {
+        !self.haproxy_container.is_empty()
+    }
+
+    fn stack_env(&self) -> StackEnv<'_> {
+        StackEnv {
+            registry: &self.registry,
+            version: &self.stack_version,
+            edge_network: &self.edge_network,
+            isolate: self.isolated(),
+        }
     }
 
     pub async fn ping(&self) -> Result<()> {
@@ -240,15 +327,8 @@ impl Orchestrator {
         git_ref: Option<&str>,
         github_token: &str,
     ) -> Result<Vec<Target>> {
-        let plan = plan_stack(
-            site,
-            slot,
-            git_ref,
-            github_token,
-            &self.registry,
-            &self.stack_version,
-            &self.edge_network,
-        )?;
+        let plan = plan_stack(site, slot, git_ref, github_token, &self.stack_env())?;
+        self.ensure_reconciled().await;
         let names = &plan.names;
         for image in [&plan.manager_image, &plan.executor_image] {
             self.ensure_image(image).await?;
@@ -256,8 +336,13 @@ impl Orchestrator {
         for volume in names.volumes() {
             self.create_volume(volume, &names.id, names.slot).await?;
         }
-        self.create_network(&names.egress, &names.id, names.slot)
+        self.create_network(&names.egress, &names.id, names.slot, false)
             .await?;
+        if self.isolated() {
+            self.create_network(&names.net, &names.id, names.slot, true)
+                .await?;
+            self.attach_haproxy(&names.net).await?;
+        }
 
         // Compare against the live containers so a changed ref or token recreates only what differs.
         let manager = self.inspect_owned(&names.manager).await?;
@@ -295,7 +380,8 @@ impl Orchestrator {
             )
             .await?;
         }
-        Ok(())
+        // The network stays so the stopped executor can start again; only HAProxy is cut off from it.
+        self.detach_haproxy(&names.net).await
     }
 
     pub async fn remove_stack(&self, site_id: &str, purge: bool) -> Result<()> {
@@ -304,15 +390,10 @@ impl Orchestrator {
             for name in [&names.executor, &names.manager, &names.init] {
                 self.remove_container(name).await?;
             }
-            self.send(
-                Method::DELETE,
-                &format!("{API}/networks/{}", names.egress),
-                &[],
-                None,
-                REQUEST_TIMEOUT,
-                &[404],
-            )
-            .await?;
+            self.detach_haproxy(&names.net).await?;
+            for network in [&names.net, &names.egress] {
+                self.remove_network(network).await?;
+            }
             if purge {
                 for volume in names.volumes() {
                     self.send(
@@ -331,6 +412,7 @@ impl Orchestrator {
     }
 
     pub async fn stack_running(&self, site_id: &str, slot: Slot) -> Result<bool> {
+        self.ensure_reconciled().await;
         let names = StackNames::new(site_id, slot)?;
         let manager = self.inspect_owned(&names.manager).await?;
         let executor = self.inspect_owned(&names.executor).await?;
@@ -338,6 +420,38 @@ impl Orchestrator {
     }
 
     pub async fn list_stacks(&self) -> Result<Vec<StackInfo>> {
+        self.ensure_reconciled().await;
+        self.list_stacks_raw().await
+    }
+
+    // HAProxy may have been recreated since the stacks started, which drops it from their networks.
+    pub async fn reconcile_networks(&self) -> Result<()> {
+        if !self.isolated() {
+            return Ok(());
+        }
+        let mut first_error = None;
+        for stack in self.list_stacks_raw().await?.iter().filter(|s| s.running) {
+            let names = StackNames::new(&stack.site, stack.slot)?;
+            if let Err(e) = self.attach_haproxy(&names.net).await {
+                tracing::warn!(site = %stack.site, error = %e, "could not reattach haproxy");
+                first_error.get_or_insert(e);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    // A failed attempt is retried on the next call, so a restart while Docker is down heals later.
+    async fn ensure_reconciled(&self) {
+        if self.reconciled.load(Ordering::Acquire) {
+            return;
+        }
+        match self.reconcile_networks().await {
+            Ok(()) => self.reconciled.store(true, Ordering::Release),
+            Err(e) => tracing::warn!(error = %e, "network reconcile failed, will retry"),
+        }
+    }
+
+    async fn list_stacks_raw(&self) -> Result<Vec<StackInfo>> {
         let filters = json!({ "label": ["cite.managed=true"] }).to_string();
         let reply = self
             .send(
@@ -439,34 +553,175 @@ impl Orchestrator {
         }
     }
 
+    // Looks a volume or network up and reports whether it carries the cite.managed label.
+    async fn managed_label(&self, kind: &str, name: &str) -> Result<Option<bool>> {
+        let reply = self
+            .send(
+                Method::GET,
+                &format!("{API}/{kind}/{name}"),
+                &[],
+                None,
+                REQUEST_TIMEOUT,
+                &[404],
+            )
+            .await?;
+        if reply.status == 404 {
+            return Ok(None);
+        }
+        let v: Value = serde_json::from_slice(&reply.body)?;
+        Ok(Some(v["Labels"]["cite.managed"].as_str() == Some("true")))
+    }
+
+    async fn require_managed(&self, kind: &str, name: &str) -> Result<()> {
+        match self.managed_label(kind, name).await? {
+            Some(true) => Ok(()),
+            Some(false) => Err(ConnectorError::Conflict(format!(
+                "{kind} {name} exists and is not managed by cite"
+            ))),
+            None => Err(ConnectorError::Conflict(format!(
+                "{kind} {name} disappeared during creation"
+            ))),
+        }
+    }
+
+    // The create call is idempotent and would silently adopt a foreign volume of the same name.
     async fn create_volume(&self, name: &str, id: &str, slot: Slot) -> Result<()> {
+        match self.managed_label("volumes", name).await? {
+            Some(true) => return Ok(()),
+            Some(false) => return self.require_managed("volumes", name).await,
+            None => {}
+        }
         let body = json!({ "Name": name, "Labels": labels(id, slot, "volume") });
+        let reply = self
+            .send(
+                Method::POST,
+                &format!("{API}/volumes/create"),
+                &[],
+                Some(&body),
+                REQUEST_TIMEOUT,
+                &[409],
+            )
+            .await?;
+        if reply.status == 409 {
+            self.require_managed("volumes", name).await?;
+        }
+        Ok(())
+    }
+
+    async fn create_network(&self, name: &str, id: &str, slot: Slot, internal: bool) -> Result<()> {
+        let body = json!({
+            "Name": name,
+            "Driver": "bridge",
+            "Internal": internal,
+            "Labels": labels(id, slot, "network"),
+        });
+        let reply = self
+            .send(
+                Method::POST,
+                &format!("{API}/networks/create"),
+                &[],
+                Some(&body),
+                REQUEST_TIMEOUT,
+                &[409],
+            )
+            .await?;
+        if reply.status == 409 {
+            self.require_managed("networks", name).await?;
+        }
+        Ok(())
+    }
+
+    async fn remove_network(&self, name: &str) -> Result<()> {
+        if self.managed_label("networks", name).await? == Some(false) {
+            return Err(ConnectorError::Conflict(format!(
+                "network {name} exists and is not managed by cite"
+            )));
+        }
         self.send(
-            Method::POST,
-            &format!("{API}/volumes/create"),
+            Method::DELETE,
+            &format!("{API}/networks/{name}"),
             &[],
-            Some(&body),
+            None,
             REQUEST_TIMEOUT,
-            &[],
+            &[404],
         )
         .await
         .map(|_| ())
     }
 
-    async fn create_network(&self, name: &str, id: &str, slot: Slot) -> Result<()> {
-        let body = json!({
-            "Name": name,
-            "Driver": "bridge",
-            "Internal": false,
-            "Labels": labels(id, slot, "network"),
-        });
+    // Names of the containers attached to a network, or None when the network is gone.
+    async fn network_members(&self, name: &str) -> Result<Option<Vec<String>>> {
+        let reply = self
+            .send(
+                Method::GET,
+                &format!("{API}/networks/{name}"),
+                &[],
+                None,
+                REQUEST_TIMEOUT,
+                &[404],
+            )
+            .await?;
+        if reply.status == 404 {
+            return Ok(None);
+        }
+        let v: Value = serde_json::from_slice(&reply.body)?;
+        let members = v["Containers"]
+            .as_object()
+            .map(|m| {
+                m.values()
+                    .filter_map(|c| c["Name"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(Some(members))
+    }
+
+    // Connecting an already attached container would fail, so membership is read first.
+    async fn attach_haproxy(&self, network: &str) -> Result<()> {
+        let Some(members) = self.network_members(network).await? else {
+            return Ok(());
+        };
+        if members.contains(&self.haproxy_container) {
+            return Ok(());
+        }
+        let body = json!({ "Container": self.haproxy_container });
+        let reply = self
+            .send(
+                Method::POST,
+                &format!("{API}/networks/{network}/connect"),
+                &[],
+                Some(&body),
+                REQUEST_TIMEOUT,
+                &[404],
+            )
+            .await?;
+        if reply.status == 404 {
+            return Err(ConnectorError::Unavailable(format!(
+                "haproxy container {:?} or network {network} not found; check CITE_HAPROXY_CONTAINER",
+                self.haproxy_container
+            )));
+        }
+        Ok(())
+    }
+
+    async fn detach_haproxy(&self, network: &str) -> Result<()> {
+        if !self.isolated() {
+            return Ok(());
+        }
+        let Some(members) = self.network_members(network).await? else {
+            return Ok(());
+        };
+        if !members.contains(&self.haproxy_container) {
+            return Ok(());
+        }
+        let body = json!({ "Container": self.haproxy_container });
         self.send(
             Method::POST,
-            &format!("{API}/networks/create"),
+            &format!("{API}/networks/{network}/disconnect"),
             &[],
             Some(&body),
             REQUEST_TIMEOUT,
-            &[409],
+            &[404],
         )
         .await
         .map(|_| ())
@@ -509,6 +764,10 @@ impl Orchestrator {
                         .collect()
                 })
                 .unwrap_or_default(),
+            network: v["HostConfig"]["NetworkMode"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
         }))
     }
 
@@ -538,7 +797,11 @@ impl Orchestrator {
         .map(|_| ())
     }
 
+    // Looking first means a container that merely shares our naming scheme is never deleted.
     async fn remove_container(&self, name: &str) -> Result<()> {
+        if self.inspect_owned(name).await?.is_none() {
+            return Ok(());
+        }
         self.send(
             Method::DELETE,
             &format!("{API}/containers/{name}"),
@@ -742,10 +1005,9 @@ fn plan_stack(
     slot: Slot,
     git_ref: Option<&str>,
     token: &str,
-    registry: &str,
-    version: &str,
-    edge_network: &str,
+    env: &StackEnv<'_>,
 ) -> Result<Plan> {
+    let (registry, version) = (env.registry, env.version);
     let names = StackNames::new(&site.id, slot)?;
     let source = site.source.as_ref().ok_or_else(|| {
         ConnectorError::BadRequest(format!("site {} has no source configured", site.id))
@@ -800,9 +1062,14 @@ fn plan_stack(
         executor_env.push(format!("CITE_NODE={node_major}"));
     }
 
+    let executor_network = if env.isolate {
+        names.net.clone()
+    } else {
+        env.edge_network.to_string()
+    };
     Ok(Plan {
         manager: manager_spec(&names, &manager_image, &manager_env),
-        executor: executor_spec(&names, &executor_image, &executor_env, edge_network),
+        executor: executor_spec(&names, &executor_image, &executor_env, &executor_network),
         init: init_spec(&names, &manager_image),
         names,
         manager_image,
@@ -885,8 +1152,8 @@ fn manager_spec(names: &StackNames, image: &str, env: &[String]) -> Value {
     })
 }
 
-// Mirrors the executor service in docker-compose.yml; reachable only through the internal edge network.
-fn executor_spec(names: &StackNames, image: &str, env: &[String], edge_network: &str) -> Value {
+// Mirrors the executor service in docker-compose.yml; reachable only through an internal network.
+fn executor_spec(names: &StackNames, image: &str, env: &[String], network: &str) -> Value {
     let data = names.data.as_str();
     json!({
         "Image": image,
@@ -905,7 +1172,7 @@ fn executor_spec(names: &StackNames, image: &str, env: &[String], edge_network: 
                 volume_mount(data, "/var/lib/cite/control", Some("control"), true),
                 volume_mount(data, "/var/lib/cite/status", Some("status"), false),
             ],
-            "NetworkMode": edge_network,
+            "NetworkMode": network,
             "Memory": EXECUTOR_MEMORY,
             "MemorySwap": EXECUTOR_MEMORY,
             "NanoCpus": EXECUTOR_NANO_CPUS,
@@ -914,7 +1181,7 @@ fn executor_spec(names: &StackNames, image: &str, env: &[String], edge_network: 
             "LogConfig": log_config(),
         },
         "NetworkingConfig": {
-            "EndpointsConfig": { edge_network: { "Aliases": [names.executor.as_str()] } }
+            "EndpointsConfig": { network: { "Aliases": [names.executor.as_str()] } }
         },
     })
 }
@@ -1082,16 +1349,25 @@ mod tests {
         running: bool,
     }
 
+    struct Net {
+        labels: Value,
+        internal: bool,
+        members: HashSet<String>,
+    }
+
     #[derive(Default)]
     struct Fake {
         images: HashSet<String>,
-        volumes: HashSet<String>,
-        networks: HashSet<String>,
+        volumes: BTreeMap<String, Value>,
+        networks: BTreeMap<String, Net>,
         containers: BTreeMap<String, Ctr>,
         log: Vec<String>,
         pull_error: Option<String>,
         init_exit: i64,
+        haproxy_missing: bool,
     }
+
+    const HAPROXY: &str = "cite-node-haproxy";
 
     // reqwest percent-encodes query values, so the fake must decode them to match names.
     fn percent_decode(s: &str) -> String {
@@ -1150,17 +1426,75 @@ mod tests {
             }
             ("POST", "/volumes/create") => {
                 let v: Value = serde_json::from_slice(body).unwrap_or_default();
-                f.volumes
-                    .insert(v["Name"].as_str().unwrap_or_default().to_string());
+                f.volumes.insert(
+                    v["Name"].as_str().unwrap_or_default().to_string(),
+                    v["Labels"].clone(),
+                );
                 (201, "{}".to_string())
             }
             ("POST", "/networks/create") => {
                 let v: Value = serde_json::from_slice(body).unwrap_or_default();
                 let name = v["Name"].as_str().unwrap_or_default().to_string();
-                if f.networks.insert(name) {
-                    (201, "{\"Id\":\"n\"}".to_string())
-                } else {
-                    (409, json!({ "message": "network exists" }).to_string())
+                if f.networks.contains_key(&name) {
+                    return (409, json!({ "message": "network exists" }).to_string());
+                }
+                f.networks.insert(
+                    name,
+                    Net {
+                        labels: v["Labels"].clone(),
+                        internal: v["Internal"] == json!(true),
+                        members: HashSet::new(),
+                    },
+                );
+                (201, "{\"Id\":\"n\"}".to_string())
+            }
+            ("GET", p) if p.starts_with("/volumes/") => {
+                match f.volumes.get(&p["/volumes/".len()..]) {
+                    Some(labels) => (200, json!({ "Labels": labels }).to_string()),
+                    None => not_found(),
+                }
+            }
+            ("GET", p) if p.starts_with("/networks/") => {
+                match f.networks.get(&p["/networks/".len()..]) {
+                    Some(n) => {
+                        let members: serde_json::Map<String, Value> = n
+                            .members
+                            .iter()
+                            .map(|m| (format!("id-{m}"), json!({ "Name": m })))
+                            .collect();
+                        (
+                            200,
+                            json!({ "Labels": n.labels, "Internal": n.internal, "Containers": members })
+                                .to_string(),
+                        )
+                    }
+                    None => not_found(),
+                }
+            }
+            ("POST", p) if p.starts_with("/networks/") => {
+                let rest = &p["/networks/".len()..];
+                let Some((name, action)) = rest.rsplit_once('/') else {
+                    return not_found();
+                };
+                let v: Value = serde_json::from_slice(body).unwrap_or_default();
+                let who = v["Container"].as_str().unwrap_or_default().to_string();
+                let missing = f.haproxy_missing;
+                let Some(net) = f.networks.get_mut(name) else {
+                    return not_found();
+                };
+                match action {
+                    "connect" if missing => {
+                        (404, json!({ "message": "no such container" }).to_string())
+                    }
+                    "connect" => {
+                        net.members.insert(who);
+                        (200, String::new())
+                    }
+                    "disconnect" => {
+                        net.members.remove(&who);
+                        (200, String::new())
+                    }
+                    _ => not_found(),
                 }
             }
             ("POST", "/containers/create") => {
@@ -1220,6 +1554,7 @@ mod tests {
                                 "Env": c.spec["Env"],
                                 "Labels": c.spec["Labels"],
                             },
+                            "HostConfig": { "NetworkMode": c.spec["HostConfig"]["NetworkMode"] },
                         })
                         .to_string(),
                     ),
@@ -1256,15 +1591,23 @@ mod tests {
                 }
             }
             ("DELETE", p) if p.starts_with("/networks/") => {
-                match f.networks.remove(&p["/networks/".len()..]) {
-                    true => (204, String::new()),
-                    false => not_found(),
+                let name = &p["/networks/".len()..];
+                match f.networks.get(name) {
+                    Some(n) if !n.members.is_empty() => (
+                        403,
+                        json!({ "message": "network has active endpoints" }).to_string(),
+                    ),
+                    Some(_) => {
+                        f.networks.remove(name);
+                        (204, String::new())
+                    }
+                    None => not_found(),
                 }
             }
             ("DELETE", p) if p.starts_with("/volumes/") => {
                 match f.volumes.remove(&p["/volumes/".len()..]) {
-                    true => (204, String::new()),
-                    false => not_found(),
+                    Some(_) => (204, String::new()),
+                    None => not_found(),
                 }
             }
             _ => not_found(),
@@ -1272,6 +1615,10 @@ mod tests {
     }
 
     async fn start_fake() -> (Orchestrator, Arc<Mutex<Fake>>) {
+        start_fake_with(HAPROXY).await
+    }
+
+    async fn start_fake_with(haproxy: &str) -> (Orchestrator, Arc<Mutex<Fake>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let fake = Arc::new(Mutex::new(Fake::default()));
@@ -1322,6 +1669,8 @@ mod tests {
             "0.2.0",
             "ghcr.io/seggys116",
         )
+        .unwrap()
+        .with_haproxy_container(haproxy)
         .unwrap();
         (orch, fake)
     }
@@ -1359,16 +1708,27 @@ mod tests {
         }
     }
 
-    fn plan(runtime: Option<&str>, git_ref: Option<&str>) -> Result<Plan> {
+    fn stack_env<'a>(registry: &'a str, version: &'a str, isolate: bool) -> StackEnv<'a> {
+        StackEnv {
+            registry,
+            version,
+            edge_network: "cite_edge",
+            isolate,
+        }
+    }
+
+    fn plan_with(runtime: Option<&str>, git_ref: Option<&str>, isolate: bool) -> Result<Plan> {
         plan_stack(
             &site("shop", runtime),
             Slot::Blue,
             git_ref,
             TOKEN,
-            "ghcr.io/seggys116",
-            "0.2.0",
-            "cite_edge",
+            &stack_env("ghcr.io/seggys116", "0.2.0", isolate),
         )
+    }
+
+    fn plan(runtime: Option<&str>, git_ref: Option<&str>) -> Result<Plan> {
+        plan_with(runtime, git_ref, false)
     }
 
     #[test]
@@ -1645,9 +2005,7 @@ mod tests {
             Slot::Green,
             Some("release/1"),
             TOKEN,
-            "r.io/o",
-            "1.0.0",
-            "edge",
+            &stack_env("r.io/o", "1.0.0", false),
         )
         .unwrap();
         let env: Vec<&str> = p.manager["Env"]
@@ -1677,18 +2035,54 @@ mod tests {
     fn plan_rejects_bad_site_inputs() {
         let mut s = site("shop", None);
         s.id = "Bad Id".to_string();
-        assert!(plan_stack(&s, Slot::Blue, None, TOKEN, "r.io/o", "1", "edge").is_err());
+        assert!(
+            plan_stack(
+                &s,
+                Slot::Blue,
+                None,
+                TOKEN,
+                &stack_env("r.io/o", "1", false)
+            )
+            .is_err()
+        );
         let mut s = site("shop", None);
         s.source = None;
-        assert!(plan_stack(&s, Slot::Blue, None, TOKEN, "r.io/o", "1", "edge").is_err());
+        assert!(
+            plan_stack(
+                &s,
+                Slot::Blue,
+                None,
+                TOKEN,
+                &stack_env("r.io/o", "1", false)
+            )
+            .is_err()
+        );
         let mut s = site("shop", None);
         if let Some(src) = s.source.as_mut() {
             src.repo = "acme/shop; rm".to_string();
         }
-        assert!(plan_stack(&s, Slot::Blue, None, TOKEN, "r.io/o", "1", "edge").is_err());
+        assert!(
+            plan_stack(
+                &s,
+                Slot::Blue,
+                None,
+                TOKEN,
+                &stack_env("r.io/o", "1", false)
+            )
+            .is_err()
+        );
         let s = site("shop", None);
-        assert!(plan_stack(&s, Slot::Blue, None, "tok en", "r.io/o", "1", "edge").is_err());
-        assert!(plan_stack(&s, Slot::Blue, None, "", "r.io/o", "1", "edge").is_err());
+        assert!(
+            plan_stack(
+                &s,
+                Slot::Blue,
+                None,
+                "tok en",
+                &stack_env("r.io/o", "1", false)
+            )
+            .is_err()
+        );
+        assert!(plan_stack(&s, Slot::Blue, None, "", &stack_env("r.io/o", "1", false)).is_err());
     }
 
     #[test]
@@ -1770,7 +2164,7 @@ mod tests {
             f.images
                 .contains("ghcr.io/seggys116/cite-executor-node:0.2.0-node22")
         );
-        let volumes: HashSet<&str> = f.volumes.iter().map(String::as_str).collect();
+        let volumes: HashSet<&str> = f.volumes.keys().map(String::as_str).collect();
         assert_eq!(
             volumes,
             HashSet::from([
@@ -1779,7 +2173,8 @@ mod tests {
                 "cite-shop-blue-cache"
             ])
         );
-        assert!(f.networks.contains("cite-shop-blue-egress"));
+        assert!(f.networks.contains_key("cite-shop-blue-egress"));
+        assert!(f.networks.contains_key("cite-shop-blue-net"));
         let names: Vec<&str> = f.containers.keys().map(String::as_str).collect();
         assert_eq!(
             names,
@@ -2048,5 +2443,320 @@ mod tests {
         assert_eq!(docs.slot, Slot::Green);
         let json = serde_json::to_value(shop).unwrap();
         assert_eq!(json["slot"], json!("blue"));
+    }
+
+    fn members(fake: &Arc<Mutex<Fake>>, net: &str) -> HashSet<String> {
+        fake.lock().unwrap().networks[net].members.clone()
+    }
+
+    fn unmanaged_ctr() -> Ctr {
+        Ctr {
+            spec: json!({ "Image": "evil", "Env": [], "Labels": {} }),
+            running: true,
+        }
+    }
+
+    #[test]
+    fn isolated_executor_gets_its_own_network() {
+        let p = plan_with(None, None, true).unwrap();
+        let hc = &p.executor["HostConfig"];
+        assert_eq!(hc["NetworkMode"], json!("cite-shop-blue-net"));
+        let endpoints = p.executor["NetworkingConfig"]["EndpointsConfig"]
+            .as_object()
+            .unwrap();
+        assert_eq!(endpoints.len(), 1);
+        assert_eq!(
+            endpoints["cite-shop-blue-net"]["Aliases"],
+            json!(["cite-shop-blue-executor"])
+        );
+        assert!(!p.executor.to_string().contains("cite_edge"));
+        assert_eq!(
+            p.manager["HostConfig"]["NetworkMode"],
+            json!("cite-shop-blue-egress")
+        );
+    }
+
+    #[test]
+    fn stack_specs_list_every_resource() {
+        let s = site("shop", Some("rust"));
+        let specs = stack_specs(
+            &s,
+            Slot::Green,
+            None,
+            TOKEN,
+            &stack_env("r.io/o", "1.0.0", true),
+        )
+        .unwrap();
+        assert_eq!(specs.manager_name, "cite-shop-green-manager");
+        assert_eq!(specs.init_name, "cite-shop-green-init");
+        assert_eq!(
+            specs.networks,
+            vec!["cite-shop-green-egress", "cite-shop-green-net"]
+        );
+        assert_eq!(specs.volumes.len(), 3);
+        assert_eq!(specs.executor_image, "r.io/o/cite-executor-rust:1.0.0");
+        let edge = stack_specs(
+            &s,
+            Slot::Green,
+            None,
+            TOKEN,
+            &stack_env("r.io/o", "1.0.0", false),
+        )
+        .unwrap();
+        assert_eq!(edge.networks, vec!["cite-shop-green-egress"]);
+    }
+
+    #[test]
+    fn haproxy_container_name_is_validated() {
+        let orch = Orchestrator::new("tcp://p:1", "cite_edge", "0.2.0", "ghcr.io/x").unwrap();
+        assert!(orch.with_haproxy_container("a b").is_err());
+        let orch = Orchestrator::new("tcp://p:1", "cite_edge", "0.2.0", "ghcr.io/x").unwrap();
+        assert!(!orch.with_haproxy_container("").unwrap().isolated());
+    }
+
+    #[tokio::test]
+    async fn isolated_stack_attaches_haproxy_to_an_internal_network() {
+        let (orch, fake) = start_fake().await;
+        orch.ensure_stack(&site("shop", None), Slot::Blue, None, TOKEN)
+            .await
+            .unwrap();
+        let f = fake.lock().unwrap();
+        assert!(f.networks["cite-shop-blue-net"].internal);
+        assert!(!f.networks["cite-shop-blue-egress"].internal);
+        assert_eq!(
+            f.networks["cite-shop-blue-net"].labels["cite.managed"],
+            json!("true")
+        );
+        assert!(f.networks["cite-shop-blue-net"].members.contains(HAPROXY));
+        assert_eq!(
+            f.containers["cite-shop-blue-executor"].spec["HostConfig"]["NetworkMode"],
+            json!("cite-shop-blue-net")
+        );
+        let connect = f
+            .log
+            .iter()
+            .position(|l| l == "POST /networks/cite-shop-blue-net/connect")
+            .unwrap();
+        let exec = f
+            .log
+            .iter()
+            .position(|l| l == "CREATE cite-shop-blue-executor")
+            .unwrap();
+        assert!(connect < exec);
+    }
+
+    #[tokio::test]
+    async fn sites_do_not_share_a_network() {
+        let (orch, fake) = start_fake().await;
+        for id in ["shop", "docs"] {
+            orch.ensure_stack(&site(id, None), Slot::Blue, None, TOKEN)
+                .await
+                .unwrap();
+        }
+        let f = fake.lock().unwrap();
+        let mode = |n: &str| f.containers[n].spec["HostConfig"]["NetworkMode"].clone();
+        assert_ne!(
+            mode("cite-shop-blue-executor"),
+            mode("cite-docs-blue-executor")
+        );
+        assert!(
+            f.networks["cite-shop-blue-net"]
+                .members
+                .is_subset(&HashSet::from([HAPROXY.to_string()]))
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_haproxy_name_falls_back_to_the_edge_network() {
+        let (orch, fake) = start_fake_with("").await;
+        orch.ensure_stack(&site("shop", None), Slot::Blue, None, TOKEN)
+            .await
+            .unwrap();
+        let f = fake.lock().unwrap();
+        assert!(!f.networks.contains_key("cite-shop-blue-net"));
+        assert_eq!(
+            f.containers["cite-shop-blue-executor"].spec["HostConfig"]["NetworkMode"],
+            json!("cite_edge")
+        );
+        assert!(!f.log.iter().any(|l| l.contains("/connect")));
+    }
+
+    #[tokio::test]
+    async fn stop_cuts_haproxy_off_but_keeps_the_network() {
+        let (orch, fake) = start_fake().await;
+        orch.ensure_stack(&site("shop", None), Slot::Blue, None, TOKEN)
+            .await
+            .unwrap();
+        orch.stop_stack("shop", Slot::Blue).await.unwrap();
+        assert!(members(&fake, "cite-shop-blue-net").is_empty());
+        orch.ensure_stack(&site("shop", None), Slot::Blue, None, TOKEN)
+            .await
+            .unwrap();
+        assert!(members(&fake, "cite-shop-blue-net").contains(HAPROXY));
+        assert_eq!(count(&fake, "CREATE cite-shop-blue-executor"), 1);
+    }
+
+    #[tokio::test]
+    async fn remove_detaches_haproxy_before_deleting_the_network() {
+        let (orch, fake) = start_fake().await;
+        orch.ensure_stack(&site("shop", None), Slot::Blue, None, TOKEN)
+            .await
+            .unwrap();
+        orch.remove_stack("shop", false).await.unwrap();
+        let f = fake.lock().unwrap();
+        assert!(f.networks.is_empty());
+        let detach = f
+            .log
+            .iter()
+            .position(|l| l == "POST /networks/cite-shop-blue-net/disconnect")
+            .unwrap();
+        let delete = f
+            .log
+            .iter()
+            .position(|l| l == "DELETE /networks/cite-shop-blue-net")
+            .unwrap();
+        assert!(detach < delete);
+    }
+
+    #[tokio::test]
+    async fn reconcile_reattaches_running_stacks_only() {
+        let (orch, fake) = start_fake().await;
+        for id in ["shop", "docs"] {
+            orch.ensure_stack(&site(id, None), Slot::Blue, None, TOKEN)
+                .await
+                .unwrap();
+        }
+        orch.stop_stack("docs", Slot::Blue).await.unwrap();
+        for net in fake.lock().unwrap().networks.values_mut() {
+            net.members.clear();
+        }
+        orch.reconcile_networks().await.unwrap();
+        assert!(members(&fake, "cite-shop-blue-net").contains(HAPROXY));
+        assert!(members(&fake, "cite-docs-blue-net").is_empty());
+    }
+
+    #[tokio::test]
+    async fn reconcile_runs_lazily_and_only_once() {
+        let (orch, fake) = start_fake().await;
+        orch.ensure_stack(&site("shop", None), Slot::Blue, None, TOKEN)
+            .await
+            .unwrap();
+        fake.lock()
+            .unwrap()
+            .networks
+            .get_mut("cite-shop-blue-net")
+            .unwrap()
+            .members
+            .clear();
+        orch.reconciled.store(false, Ordering::Release);
+        assert!(orch.stack_running("shop", Slot::Blue).await.unwrap());
+        assert!(members(&fake, "cite-shop-blue-net").contains(HAPROXY));
+        let listings = count(&fake, "GET /containers/json");
+        orch.stack_running("shop", Slot::Blue).await.unwrap();
+        assert_eq!(count(&fake, "GET /containers/json"), listings);
+    }
+
+    #[tokio::test]
+    async fn reconcile_is_a_no_op_without_isolation() {
+        let (orch, fake) = start_fake_with("").await;
+        orch.reconcile_networks().await.unwrap();
+        assert!(fake.lock().unwrap().log.is_empty());
+    }
+
+    #[tokio::test]
+    async fn missing_haproxy_container_is_reported() {
+        let (orch, fake) = start_fake().await;
+        fake.lock().unwrap().haproxy_missing = true;
+        let err = orch
+            .ensure_stack(&site("shop", None), Slot::Blue, None, TOKEN)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ConnectorError::Unavailable(_)), "{err}");
+        assert!(err.to_string().contains("CITE_HAPROXY_CONTAINER"));
+    }
+
+    #[tokio::test]
+    async fn foreign_volume_is_a_conflict() {
+        let (orch, fake) = start_fake().await;
+        fake.lock()
+            .unwrap()
+            .volumes
+            .insert("cite-shop-blue-data".to_string(), json!({}));
+        let err = orch
+            .ensure_stack(&site("shop", None), Slot::Blue, None, TOKEN)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ConnectorError::Conflict(_)), "{err}");
+        assert!(fake.lock().unwrap().containers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn foreign_network_is_a_conflict() {
+        let (orch, fake) = start_fake().await;
+        fake.lock().unwrap().networks.insert(
+            "cite-shop-blue-egress".to_string(),
+            Net {
+                labels: json!({}),
+                internal: false,
+                members: HashSet::new(),
+            },
+        );
+        let err = orch
+            .ensure_stack(&site("shop", None), Slot::Blue, None, TOKEN)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ConnectorError::Conflict(_)), "{err}");
+    }
+
+    #[tokio::test]
+    async fn remove_refuses_foreign_containers() {
+        let (orch, fake) = start_fake().await;
+        fake.lock()
+            .unwrap()
+            .containers
+            .insert("cite-shop-blue-executor".to_string(), unmanaged_ctr());
+        let err = orch.remove_stack("shop", true).await.unwrap_err();
+        assert!(matches!(err, ConnectorError::Conflict(_)), "{err}");
+        let f = fake.lock().unwrap();
+        assert!(f.containers.contains_key("cite-shop-blue-executor"));
+        assert!(!f.log.iter().any(|l| l.starts_with("DELETE /containers")));
+    }
+
+    #[tokio::test]
+    async fn init_cleanup_refuses_a_foreign_container() {
+        let (orch, fake) = start_fake().await;
+        fake.lock()
+            .unwrap()
+            .containers
+            .insert("cite-shop-blue-init".to_string(), unmanaged_ctr());
+        let err = orch
+            .ensure_stack(&site("shop", None), Slot::Blue, None, TOKEN)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ConnectorError::Conflict(_)), "{err}");
+        assert!(
+            fake.lock()
+                .unwrap()
+                .containers
+                .contains_key("cite-shop-blue-init")
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_edge_executor_moves_to_the_stack_network() {
+        let (orch, fake) = start_fake().await;
+        let s = site("shop", None);
+        let legacy = orch.with_haproxy_container("").unwrap();
+        legacy
+            .ensure_stack(&s, Slot::Blue, None, TOKEN)
+            .await
+            .unwrap();
+        let orch = legacy.with_haproxy_container(HAPROXY).unwrap();
+        orch.ensure_stack(&s, Slot::Blue, None, TOKEN)
+            .await
+            .unwrap();
+        assert_eq!(count(&fake, "CREATE cite-shop-blue-executor"), 2);
+        assert_eq!(count(&fake, "CREATE cite-shop-blue-manager"), 1);
+        assert!(members(&fake, "cite-shop-blue-net").contains(HAPROXY));
     }
 }

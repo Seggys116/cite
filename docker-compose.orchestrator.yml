@@ -1,37 +1,27 @@
 # Overlay for docker-compose.node.yml: docker compose -f docker-compose.node.yml -f docker-compose.orchestrator.yml up -d
+# Set DOCKER_GID in .env to the group id that owns /var/run/docker.sock (stat -c %g /var/run/docker.sock).
 
 services:
-  socketproxy:
-    image: docker.io/tecnativa/docker-socket-proxy:0.3.0
+  dockerproxy:
+    image: ghcr.io/seggys116/cite-dockerproxy:${CITE_VERSION:-0.2.0}
     restart: unless-stopped
+    init: true
+    user: "10001:10001"
+    group_add:
+      - "${DOCKER_GID:?set DOCKER_GID in .env to the group id of /var/run/docker.sock}"
     read_only: true
     security_opt:
       - no-new-privileges:true
+    cap_drop:
+      - ALL
     environment:
-      CONTAINERS: "1"
-      NETWORKS: "1"
-      VOLUMES: "1"
-      IMAGES: "1"
-      POST: "1"
-      EXEC: "0"
-      SERVICES: "0"
-      SWARM: "0"
-      SECRETS: "0"
-      BUILD: "0"
-      COMMIT: "0"
-      CONFIGS: "0"
-      DISTRIBUTION: "0"
-      PLUGINS: "0"
-      SYSTEM: "0"
-      AUTH: "0"
-      INFO: "0"
-      EVENTS: "0"
-      NODES: "0"
-      SESSION: "0"
-      TASKS: "0"
-    tmpfs:
-      - /run:size=8m,mode=0755
-      - /tmp:size=8m,mode=1777
+      CITE_PROXY_LISTEN: 0.0.0.0:2375
+      CITE_PROXY_SOCKET: /var/run/docker.sock
+      CITE_PROXY_REGISTRY: ${CITE_REGISTRY:-ghcr.io/seggys116}
+      CITE_PROXY_HAPROXY_CONTAINER: cite-node-haproxy
+      CITE_PROXY_EDGE_NETWORK: cite_edge
+      RUST_LOG: ${RUST_LOG:-info}
+    # A read-only bind does not restrict the API on a unix socket; the filter in the proxy does.
     volumes:
       - type: bind
         source: /var/run/docker.sock
@@ -39,9 +29,9 @@ services:
         read_only: true
     networks:
       - docker_api
-    mem_limit: ${CITE_SOCKETPROXY_MEM:-128m}
-    cpus: ${CITE_SOCKETPROXY_CPUS:-0.5}
-    pids_limit: ${CITE_SOCKETPROXY_PIDS:-128}
+    mem_limit: ${CITE_DOCKERPROXY_MEM:-128m}
+    cpus: ${CITE_DOCKERPROXY_CPUS:-0.5}
+    pids_limit: ${CITE_DOCKERPROXY_PIDS:-128}
     logging:
       driver: json-file
       options:
@@ -50,10 +40,12 @@ services:
 
   connector:
     depends_on:
-      socketproxy:
-        condition: service_started
+      dockerproxy:
+        condition: service_healthy
     environment:
-      CITE_DOCKER_HOST: tcp://socketproxy:2375
+      CITE_DOCKER_HOST: http://dockerproxy:2375
+      CITE_HAPROXY_CONTAINER: cite-node-haproxy
+      CITE_REGISTRY: ${CITE_REGISTRY:-ghcr.io/seggys116}
     networks:
       - docker_api
 
