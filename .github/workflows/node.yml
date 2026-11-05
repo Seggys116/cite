@@ -192,6 +192,54 @@ jobs:
       - name: Run the node end to end script
         run: bash scripts/e2e-node.sh
 
+  installer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      # The registry has no image for this version, so the installer falls back to these local builds.
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: images/connector/Dockerfile
+          load: true
+          tags: ghcr.io/seggys116/cite-connector:0.0.9
+          cache-from: type=gha,scope=connector
+          cache-to: type=gha,mode=max,scope=connector
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: images/dashboard/Dockerfile
+          load: true
+          tags: ghcr.io/seggys116/cite-dashboard:0.0.9
+          cache-from: type=gha,scope=dashboard
+          cache-to: type=gha,mode=max,scope=dashboard
+      - name: Install node and dashboard with the installer
+        run: |
+          sh scripts/setup.sh install --mode both --dir "$RUNNER_TEMP/cite" --allow 127.0.0.1 --bind 127.0.0.1 \
+            --port 17643 --http-port 18180 --https-port 18543 --dashboard-bind 127.0.0.1 --dashboard-port 18188 \
+            --version 0.0.9 --yes
+          grep -q '^CITE_CONNECTOR_ALLOW=127.0.0.1,' "$RUNNER_TEMP/cite/.env" || { echo "::error::the connector allowlist did not gain the Docker gateway"; exit 1; }
+          grep -q '^CITE_DASHBOARD_ALLOW=127.0.0.1,' "$RUNNER_TEMP/cite/.env" || { echo "::error::the dashboard allowlist did not gain the Docker gateway"; exit 1; }
+      - name: The console and the connector answer from the host
+        run: |
+          curl -fsS http://127.0.0.1:18188/ | grep -q '<title>Cite Console</title>'
+          curl -fsS --cacert "$RUNNER_TEMP/cite/cite-ca.pem" --resolve localhost:17643:127.0.0.1 https://localhost:17643/api/v1/healthz | grep -q '"ok":true'
+          code="$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18180/)"
+          [ "$code" = 404 ] || { echo "::error::HAProxy answered $code before any site exists"; exit 1; }
+          sh "$RUNNER_TEMP/cite/cite-setup.sh" status
+      - name: Uninstall removes everything
+        if: always()
+        run: |
+          sh "$RUNNER_TEMP/cite/cite-setup.sh" uninstall --purge --yes
+          [ -z "$(docker ps -aq)" ] || { echo "::error::containers left behind"; docker ps -a; exit 1; }
+          [ -z "$(docker volume ls -q | grep '^cite' || true)" ] || { echo "::error::volumes left behind"; exit 1; }
+
   e2e-orchestrator:
     # Builds six images, so pull requests opt in with the e2e-orchestrator label.
     if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'e2e-orchestrator')
