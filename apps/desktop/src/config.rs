@@ -2,8 +2,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use cite_client::NodeConfig;
-use cite_core::atomic::read_limited;
-use cite_core::write_atomic;
+use cite_client::fsio::{read_limited, write_atomic};
 use serde::{Deserialize, Serialize};
 
 pub const KEYCHAIN_SERVICE: &str = "dev.seggys116.cite";
@@ -133,7 +132,7 @@ impl DesktopConfig {
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
         let bytes = match read_limited(path, MAX_CONFIG_BYTES) {
             Ok(b) => b,
-            Err(cite_core::Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(Self::default());
             }
             Err(e) => return Err(ConfigError::Io(e.to_string())),

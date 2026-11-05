@@ -1,8 +1,7 @@
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 
-use cite_core::atomic::read_limited;
-use cite_core::write_atomic;
+use crate::fsio::{read_limited, write_atomic};
 use cite_edge::auth::Credentials;
 use cite_edge::validate::is_valid_id;
 use serde::{Deserialize, Serialize};

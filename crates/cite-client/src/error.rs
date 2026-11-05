@@ -11,8 +11,6 @@ pub enum ConfigError {
     Json(#[from] serde_json::Error),
     #[error("io error: {0}")]
     Io(#[from] io::Error),
-    #[error("{0}")]
-    Atomic(#[from] cite_core::Error),
 }
 
 pub type Result<T> = std::result::Result<T, ConfigError>;
@@ -24,9 +22,7 @@ impl ConfigError {
 
     pub fn is_missing(&self) -> bool {
         match self {
-            Self::Io(err) | Self::Atomic(cite_core::Error::Io(err)) => {
-                err.kind() == io::ErrorKind::NotFound
-            }
+            Self::Io(err) => err.kind() == io::ErrorKind::NotFound,
             _ => false,
         }
     }

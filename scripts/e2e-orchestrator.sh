@@ -26,6 +26,7 @@ CURL_IMAGE=docker.io/curlimages/curl:latest
 export CITE_VERSION="${CITE_VERSION:-0.0.1}"
 export CITE_STACK_VERSION="${CITE_STACK_VERSION:-$CITE_VERSION}"
 export CITE_PUBLIC_BIND=127.0.0.1
+export CITE_DEPLOY_BUILD_TIMEOUT=60
 export CITE_HTTP_PORT=18081
 export CITE_HTTPS_PORT=18445
 export CITE_CONNECTOR_BIND=127.0.0.1
@@ -514,6 +515,7 @@ docker run -d --name "$MOCK_NAME" -p "$MOCK_BIND:$MOCK_PORT:8080" "$MOCK_IMAGE" 
 wait_for "mock GitHub answers" 30 curl -fsS --max-time 3 -H "Authorization: Bearer $MOCK_TOKEN" "http://$MOCK_BIND:$MOCK_PORT/repos/acme/live"
 mock_push main e2e-live-v1
 export CITE_GITHUB_API_URL=$MOCK_API_URL
+export CITE_DEPLOY_BUILD_TIMEOUT=300
 compose up -d >"$WORK/up.log" 2>&1 || fail "compose up with the mock URL failed: $(<"$WORK/up.log")"
 wait_api
 wait_for "dockerproxy is healthy with the mock URL" 60 test "$(docker inspect -f '{{.State.Health.Status}}' "$(compose ps -q dockerproxy)")" = healthy

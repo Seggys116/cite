@@ -11,7 +11,6 @@ description = "Desktop console for Cite nodes"
 [dependencies]
 gpui = "0.2"
 cite-client = { path = "../../crates/cite-client" }
-cite-core = { path = "../../crates/cite-core" }
 cite-edge = { path = "../../crates/cite-edge" }
 keyring = { version = "3", features = ["apple-native", "linux-native-sync-persistent", "windows-native"] }
 serde = { version = "1", features = ["derive"] }

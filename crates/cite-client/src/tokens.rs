@@ -3,8 +3,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use cite_core::atomic::read_limited;
-use cite_core::write_atomic;
+use crate::fsio::{read_limited, write_atomic};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{ConfigError, Result};

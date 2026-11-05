@@ -91,7 +91,7 @@ impl Console {
 
     // A short random tail keeps generated rule ids unique per node.
     fn rule_suffix() -> String {
-        cite_core::new_id().chars().rev().take(6).collect()
+        cite_client::fsio::new_id().chars().rev().take(6).collect()
     }
 
     fn submit_rule(&mut self, cx: &mut Context<Self>) {

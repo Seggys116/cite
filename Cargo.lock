@@ -304,7 +304,6 @@ name = "cite-client"
 version = "0.2.0"
 dependencies = [
  "axum",
- "cite-core",
  "cite-edge",
  "futures-util",
  "reqwest",
@@ -313,6 +312,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "ulid",
 ]
 
 [[package]]

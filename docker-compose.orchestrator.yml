@@ -49,6 +49,7 @@ services:
       CITE_REGISTRY: ${CITE_REGISTRY:-ghcr.io/seggys116}
       CITE_STACK_VERSION: ${CITE_STACK_VERSION:-}
       CITE_STACK_GITHUB_API_URL: ${CITE_GITHUB_API_URL:-}
+      CITE_DEPLOY_BUILD_TIMEOUT: ${CITE_DEPLOY_BUILD_TIMEOUT:-600}
     networks:
       - docker_api
 

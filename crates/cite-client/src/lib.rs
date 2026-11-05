@@ -4,6 +4,7 @@ pub mod client;
 pub mod config;
 pub mod error;
 pub mod fleet;
+pub mod fsio;
 pub mod tokens;
 
 pub use client::{

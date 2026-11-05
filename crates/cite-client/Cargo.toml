@@ -12,13 +12,13 @@ publish = false
 unsafe_code = "forbid"
 
 [dependencies]
-cite-core.workspace = true
 cite-edge.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 reqwest.workspace = true
+ulid.workspace = true
 futures-util.workspace = true
 
 [dev-dependencies]
