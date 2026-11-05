@@ -172,6 +172,10 @@ traffic() {
 traffic_failures() {
   local n
   n=$(grep -vc ' 200$' "$1" || true)
+  if [ "$n" != 0 ]; then
+    echo "non-200 responses in $1:" >&2
+    grep -v ' 200$' "$1" | sort | uniq -c >&2
+  fi
   echo "$n"
 }
 
@@ -350,14 +354,65 @@ jq_ok "events are attributed to the site and slot" 'any(.[]; .site == "app" and 
 api GET /api/v1/analytics/timeseries?window=15m
 code_is "timeseries" 200
 
+echo "== bots, top lists, stats and export"
+api GET "/api/v1/analytics/bots?window=15m"
+code_is "bot summary" 200
+jq_ok "bot summary counts requests and bots" '.total_requests > 200 and .bot_requests > 0 and (.classes | length) > 0'
+jq_ok "curl traffic is scored as a tool or bot" 'any(.classes[]; (.key == "tool" or .key == "bot") and .count > 0)'
+jq_ok "bot signals are named" '(.signals | length) > 0 and all(.signals[]; .key | test("^[a-z0-9_]+$"))'
+api GET "/api/v1/analytics/top?kind=paths&window=15m&limit=10"
+code_is "top paths" 200
+jq_ok "top paths include the dropped dotfile" 'any(.items[]; .key == "/.env")'
+api GET "/api/v1/analytics/top?kind=nonsense&window=15m"
+code_is "unknown top kind is rejected" 400
+api GET /api/v1/analytics/stats
+code_is "store stats" 200
+jq_ok "store holds the requests" '.rows > 200 and .db_bytes > 0 and .write_errors == 0'
+api GET "/api/v1/analytics/requests?limit=50"
+jq_ok "events carry the captured headers and bot fields" 'any(.[]; (.http_version | startswith("HTTP/")) and (.bot_class | length) > 0 and .bot_score >= 0)'
+EXPORT_HEADERS="$WORK/export.headers"
+curl -sS --max-time 60 --cacert "$CA" --resolve "localhost:$API_PORT:127.0.0.1" -D "$EXPORT_HEADERS" -o "$WORK/export.csv" \
+  -H "Authorization: Bearer $TOKEN" "https://localhost:$API_PORT/api/v1/analytics/export?kind=requests&format=csv&limit=1000" || fail "csv export failed"
+grep -qi '^content-type: text/csv' "$EXPORT_HEADERS" || fail "export is not text/csv: $(<"$EXPORT_HEADERS")"
+grep -qi '^content-disposition: attachment; filename="cite-requests-' "$EXPORT_HEADERS" || fail "export has no attachment name"
+pass "csv export is a named attachment"
+HEADER_ROW=$(head -n 1 "$WORK/export.csv" | tr -d '\r')
+case $HEADER_ROW in
+  timestamp,ts_ms,*bot_score*bot_class*bot_signals*) pass "csv header lists the bot columns" ;;
+  *) fail "unexpected csv header: $HEADER_ROW" ;;
+esac
+[ "$(wc -l <"$WORK/export.csv" | tr -d ' ')" -gt 50 ] || fail "csv export has too few rows"
+pass "csv export holds the stored requests"
+grep -q '/.env' "$WORK/export.csv" || fail "the dropped dotfile is missing from the csv"
+pass "csv export includes the dropped request"
+
 echo "== settings and retention"
 api GET /api/v1/settings
 code_is "read settings" 200
-SETTINGS=$(printf '%s' "$BODY" | jq -c '.retention.recent_events = 5')
+SETTINGS=$(printf '%s' "$BODY" | jq -c '.retention.hour_buckets_days = 30')
 api PUT /api/v1/settings "$SETTINGS"
-code_is "shrink recent_events" 200
-api GET "/api/v1/analytics/requests?limit=100"
-jq_ok "event ring shrank to 5" 'length > 0 and length <= 5'
+code_is "shorten retention to 30 days" 200
+api GET /api/v1/analytics/stats
+jq_ok "shorter retention keeps recent rows" '.rows > 200'
+api GET /api/v1/settings
+SETTINGS=$(printf '%s' "$BODY" | jq -c '.retention.store_client_ips = false')
+api PUT /api/v1/settings "$SETTINGS"
+code_is "turn off client address storage" 200
+SCRUBBED=""
+for _ in $(seq 1 30); do
+  api GET "/api/v1/analytics/requests?limit=200"
+  if printf '%s' "$BODY" | jq -e 'length > 0 and all(.[]; .client_ip == "")' >/dev/null; then
+    SCRUBBED=1
+    break
+  fi
+  sleep 1
+done
+[ -n "$SCRUBBED" ] || fail "stored client addresses were not erased: $BODY"
+pass "turning off client addresses erased the stored ones"
+api GET /api/v1/settings
+SETTINGS=$(printf '%s' "$BODY" | jq -c '.retention.store_client_ips = true')
+api PUT /api/v1/settings "$SETTINGS"
+code_is "turn client address storage back on" 200
 
 echo "== api tokens"
 api POST /api/v1/tokens '{"name":"e2e"}'
@@ -394,9 +449,9 @@ jq_ok "site persisted" 'length == 1 and .[0].id == "app" and .[0].active == "gre
 api GET /api/v1/firewall/rules
 expect "firewall rules persisted" "$RULES_BEFORE" "$(printf '%s' "$BODY" | jq -r length)"
 api GET /api/v1/analytics/summary?window=15m
-jq_ok "analytics snapshot persisted" ".requests >= $REQUESTS_BEFORE"
+jq_ok "analytics survived the restart" ".requests >= $REQUESTS_BEFORE"
 api GET /api/v1/settings
-jq_ok "settings persisted" '.retention.recent_events == 5'
+jq_ok "settings persisted" '.retention.hour_buckets_days == 30'
 edge_dropped /.env "dotfile request after connector restart"
 
 echo "== haproxy restart"
