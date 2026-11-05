@@ -4,8 +4,8 @@ use std::time::Instant;
 
 use cite_client::ClientError;
 use cite_client::{
-    AnalyticsStats, CreatedToken, DeployRequest, NodeInfo, PresetInfo, RequestQuery, SiteDetail,
-    TokenMeta,
+    AnalyticsStats, ArchiveEntry, ArchiveKind, ArchiveList, CreatedToken, CutReport, DeployRequest,
+    NodeInfo, PresetInfo, RequestQuery, RestoreReport, SiteDetail, TokenMeta,
 };
 use cite_edge::analytics::{Point, SizeBucket, Summary, Timeseries, TopItem, window_from_str};
 use cite_edge::bot::BotSummary;
@@ -16,11 +16,15 @@ use cite_edge::model::{
 use cite_edge::presets::presets;
 use serde_json::{Map, Value, json};
 
+use crate::archive::{CutSpec, DAY_MS};
 use crate::config::{DesktopConfig, DesktopNode};
 
 type Res<T> = Result<T, ClientError>;
 
 pub const HOUR_MS: i64 = 3_600_000;
+const DEMO_ROWS: u64 = 1_284_906;
+const DEMO_DB_BYTES: u64 = 436_207_616;
+const DEMO_SPAN_DAYS: i64 = 29;
 
 fn status_err(code: u16, message: impl Into<String>) -> ClientError {
     ClientError::Status {
@@ -859,6 +863,64 @@ struct DemoState {
     settings: EdgeSettings,
     tokens: Vec<TokenMeta>,
     counter: u64,
+    rows: u64,
+    oldest_ms: i64,
+    archives: Vec<ArchiveEntry>,
+}
+
+// Short stable hex digest stand-in so demo archives show a plausible checksum column.
+fn demo_sha(seed: u64) -> String {
+    let mut x = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut out = String::with_capacity(64);
+    for _ in 0..4 {
+        x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = x;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        out.push_str(&format!("{:016x}", z ^ (z >> 31)));
+    }
+    out
+}
+
+fn file_stamp(ms: i64) -> String {
+    iso(ms)[..16].replace(['-', ':'], "").replace('T', "-")
+}
+
+// Rows are spread evenly over the stored span, which is enough for a believable preview.
+pub fn demo_rows_before(total: u64, oldest_ms: i64, now: i64, cutoff_ms: i64) -> u64 {
+    if cutoff_ms <= oldest_ms || now <= oldest_ms {
+        return 0;
+    }
+    let share = (cutoff_ms - oldest_ms) as f64 / (now - oldest_ms) as f64;
+    ((total as f64 * share.min(1.0)) as u64).min(total)
+}
+
+fn seed_archives(now: i64) -> Vec<ArchiveEntry> {
+    let from = now - 90 * DAY_MS;
+    let to = now - 60 * DAY_MS;
+    let (a, b) = (file_stamp(from), file_stamp(to));
+    vec![
+        ArchiveEntry {
+            name: format!("cite-archive-{}-{}.ndjson.gz", &a[..8], &b[..8]),
+            kind: ArchiveKind::Archive,
+            bytes: 38_421_907,
+            created_ms: now - 35 * DAY_MS,
+            sha256: demo_sha(1),
+            rows: Some(412_330),
+            from_ms: Some(from),
+            to_ms: Some(to),
+        },
+        ArchiveEntry {
+            name: format!("cite-backup-{}.db", file_stamp(now - 3 * DAY_MS)),
+            kind: ArchiveKind::Backup,
+            bytes: DEMO_DB_BYTES,
+            created_ms: now - 3 * DAY_MS,
+            sha256: demo_sha(2),
+            rows: None,
+            from_ms: None,
+            to_ms: None,
+        },
+    ]
 }
 
 pub struct DemoNode {
@@ -914,6 +976,9 @@ impl DemoNode {
                     token("t-2", "grafana-readonly", 12, None),
                 ],
                 counter: 0,
+                rows: DEMO_ROWS,
+                oldest_ms: now - DEMO_SPAN_DAYS * DAY_MS,
+                archives: seed_archives(now),
             }),
         }
     }
@@ -1175,15 +1240,131 @@ impl DemoNode {
         if self.index != 0 {
             return Err(status_err(404, "not found"));
         }
-        let now = now_ms();
+        let st = self.st();
         Ok(AnalyticsStats {
-            rows: 1_284_906,
-            db_bytes: 436_207_616,
-            oldest_ts_ms: Some(now - 29 * 24 * HOUR_MS),
-            newest_ts_ms: Some(now),
+            rows: st.rows,
+            db_bytes: DEMO_DB_BYTES,
+            oldest_ts_ms: Some(st.oldest_ms),
+            newest_ts_ms: Some(now_ms()),
             write_batches: 48_211,
             write_errors: 0,
         })
+    }
+
+    fn require_archives(&self) -> Res<()> {
+        if self.index == 0 {
+            Ok(())
+        } else {
+            Err(status_err(404, "not found"))
+        }
+    }
+
+    pub fn archives(&self) -> Res<ArchiveList> {
+        self.require_archives()?;
+        let mut items = self.st().archives.clone();
+        items.sort_by_key(|e| std::cmp::Reverse(e.created_ms));
+        let dir_bytes = items.iter().map(|e| e.bytes).sum();
+        Ok(ArchiveList { items, dir_bytes })
+    }
+
+    pub fn backup(&self) -> Res<ArchiveEntry> {
+        self.require_archives()?;
+        let now = now_ms();
+        let mut st = self.st();
+        st.counter += 1;
+        let entry = ArchiveEntry {
+            name: format!("cite-backup-{}-{}.db", file_stamp(now), st.counter),
+            kind: ArchiveKind::Backup,
+            bytes: DEMO_DB_BYTES,
+            created_ms: now,
+            sha256: demo_sha(now as u64 ^ st.counter),
+            rows: None,
+            from_ms: None,
+            to_ms: None,
+        };
+        st.archives.push(entry.clone());
+        Ok(entry)
+    }
+
+    pub fn cut(&self, spec: &CutSpec, dry_run: bool) -> Res<CutReport> {
+        self.require_archives()?;
+        let now = now_ms();
+        let cutoff = spec.cutoff_ms(now);
+        let mut st = self.st();
+        let oldest = st.oldest_ms;
+        let rows = demo_rows_before(st.rows, oldest, now, cutoff);
+        let mut report = CutReport {
+            dry_run,
+            cutoff_ms: cutoff,
+            rows,
+            oldest_ms: (rows > 0).then_some(oldest),
+            archived_rows: 0,
+            files: Vec::new(),
+            archive: spec.archive,
+        };
+        if dry_run || rows == 0 {
+            return Ok(report);
+        }
+        if spec.archive {
+            let name = format!(
+                "cite-archive-{}-{}.ndjson.gz",
+                &file_stamp(oldest)[..8],
+                &file_stamp(cutoff)[..8]
+            );
+            st.counter += 1;
+            let entry = ArchiveEntry {
+                name: name.clone(),
+                kind: ArchiveKind::Archive,
+                bytes: rows * 30,
+                created_ms: now,
+                sha256: demo_sha(cutoff as u64 ^ st.counter),
+                rows: Some(rows),
+                from_ms: Some(oldest),
+                to_ms: Some(cutoff),
+            };
+            st.archives.push(entry);
+            report.archived_rows = rows;
+            report.files.push(name);
+        }
+        st.rows -= rows;
+        st.oldest_ms = cutoff;
+        Ok(report)
+    }
+
+    pub fn restore(&self, name: &str) -> Res<RestoreReport> {
+        self.require_archives()?;
+        let mut st = self.st();
+        let Some(entry) = st.archives.iter().find(|e| e.name == name).cloned() else {
+            return Err(status_err(400, "no such archive"));
+        };
+        if entry.kind == ArchiveKind::Backup {
+            return Ok(RestoreReport { rows: st.rows });
+        }
+        let rows = entry.rows.unwrap_or(0);
+        st.rows += rows;
+        if let Some(from) = entry.from_ms {
+            st.oldest_ms = st.oldest_ms.min(from);
+        }
+        Ok(RestoreReport { rows })
+    }
+
+    pub fn delete_archive(&self, name: &str) -> Res<()> {
+        self.require_archives()?;
+        let mut st = self.st();
+        let before = st.archives.len();
+        st.archives.retain(|e| e.name != name);
+        if st.archives.len() == before {
+            return Err(status_err(400, "no such archive"));
+        }
+        Ok(())
+    }
+
+    pub fn archive_body(&self, name: &str) -> Res<String> {
+        self.require_archives()?;
+        if !self.st().archives.iter().any(|e| e.name == name) {
+            return Err(status_err(400, "no such archive"));
+        }
+        Ok(format!("demo file for {name}\n"))
     }
 
     pub fn export_body(&self, pairs: &[(&'static str, String)]) -> String {
@@ -1373,6 +1554,68 @@ mod tests {
         assert!(nodes[0].1.stats().expect("stats").rows > 0);
         let err = nodes[1].1.stats().expect_err("old node");
         assert_eq!(err.status_code(), Some(404));
+    }
+
+    #[test]
+    fn older_demo_node_has_no_archive_routes() {
+        let nodes = demo_nodes();
+        let old = &nodes[1].1;
+        assert_eq!(old.archives().expect_err("old").status_code(), Some(404));
+        assert_eq!(old.backup().expect_err("old").status_code(), Some(404));
+    }
+
+    #[test]
+    fn demo_rows_before_scales_with_the_cutoff() {
+        assert_eq!(demo_rows_before(1000, 100, 200, 100), 0);
+        assert_eq!(demo_rows_before(1000, 100, 200, 150), 500);
+        assert_eq!(demo_rows_before(1000, 100, 200, 900), 1000);
+        assert_eq!(demo_rows_before(1000, 200, 200, 300), 0);
+    }
+
+    #[test]
+    fn demo_archives_back_up_cut_restore_and_delete() {
+        let nodes = demo_nodes();
+        let node = &nodes[0].1;
+        let start = node.archives().expect("list").items.len();
+        let backup = node.backup().expect("backup");
+        assert_eq!(backup.kind, ArchiveKind::Backup);
+        assert_eq!(node.archives().expect("list").items.len(), start + 1);
+
+        let spec = CutSpec {
+            cutoff: crate::archive::Cutoff::Days(10),
+            archive: true,
+        };
+        let rows_before = node.stats().expect("stats").rows;
+        let preview = node.cut(&spec, true).expect("preview");
+        assert!(preview.dry_run && preview.rows > 0 && preview.files.is_empty());
+        assert_eq!(node.stats().expect("stats").rows, rows_before);
+
+        let done = node.cut(&spec, false).expect("cut");
+        assert_eq!(done.rows, done.archived_rows);
+        assert_eq!(done.files.len(), 1);
+        assert_eq!(node.stats().expect("stats").rows, rows_before - done.rows);
+
+        let restored = node.restore(&done.files[0]).expect("restore");
+        assert_eq!(restored.rows, done.rows);
+        assert_eq!(node.stats().expect("stats").rows, rows_before);
+
+        node.delete_archive(&done.files[0]).expect("delete");
+        assert!(node.delete_archive(&done.files[0]).is_err());
+        assert!(node.archive_body(&done.files[0]).is_err());
+    }
+
+    #[test]
+    fn a_demo_cut_without_archiving_keeps_no_file() {
+        let nodes = demo_nodes();
+        let node = &nodes[0].1;
+        let start = node.archives().expect("list").items.len();
+        let spec = CutSpec {
+            cutoff: crate::archive::Cutoff::Days(5),
+            archive: false,
+        };
+        let done = node.cut(&spec, false).expect("cut");
+        assert!(done.rows > 0 && done.files.is_empty() && done.archived_rows == 0);
+        assert_eq!(node.archives().expect("list").items.len(), start);
     }
 
     #[test]

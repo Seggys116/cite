@@ -1,5 +1,6 @@
 mod api;
 mod app;
+mod archive;
 mod bots;
 mod cli;
 mod config;

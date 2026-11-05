@@ -3,6 +3,7 @@ use cite_edge::model::EdgeSettings;
 use gpui::{AnyElement, ClipboardItem, Context, Entity, div, prelude::*, px};
 
 use crate::app::{Confirm, Console, Load, new_input};
+use crate::archive::retention_warning;
 use crate::config::KEYCHAIN_SERVICE;
 use crate::demo::now_ms;
 use crate::model::{SettingsDraft, parse_rfc3339_ms, rel_time};
@@ -10,8 +11,8 @@ use crate::theme::{DIM, Tone, c};
 use crate::ui::input::TextInput;
 use crate::ui::nodes::hostname;
 use crate::ui::widgets::{
-    BtnKind, Col, btn, card, empty_state, field, id, mono, notice, page_header, skeleton, strong,
-    table, text_dim, toggle,
+    BtnKind, Col, btn, card, empty_state, field, id, mono, notice, page_header, seg_item, seg_row,
+    skeleton, strong, table, text_dim, toggle,
 };
 
 pub struct Data {
@@ -24,6 +25,8 @@ pub struct State {
     pub error: Option<String>,
     pub store_ua: bool,
     pub store_ip: bool,
+    pub keep_forever: bool,
+    pub archive_before_delete: bool,
     pub created: Option<String>,
     pub recent: Entity<TextInput>,
     pub minutes: Entity<TextInput>,
@@ -41,10 +44,12 @@ impl State {
             error: None,
             store_ua: true,
             store_ip: true,
+            keep_forever: true,
+            archive_before_delete: true,
             created: None,
             recent: new_input(cx, "5000", |i| i.mono()),
             minutes: new_input(cx, "48", |i| i.mono()),
-            hours: new_input(cx, "90", |i| i.mono()),
+            hours: new_input(cx, "365", |i| i.mono()),
             audit: new_input(cx, "365", |i| i.mono()),
             persist: new_input(cx, "60", |i| i.mono()),
             rate: new_input(cx, "600 (empty disables the limit)", |i| i.mono()),
@@ -90,6 +95,8 @@ impl Console {
         }
         self.settings.store_ua = d.store_user_agents;
         self.settings.store_ip = d.store_client_ips;
+        self.settings.keep_forever = d.keep_forever;
+        self.settings.archive_before_delete = d.archive_before_delete;
     }
 
     fn current_draft(&self, cx: &Context<Self>) -> SettingsDraft {
@@ -98,7 +105,9 @@ impl Console {
         SettingsDraft {
             recent_events: t(&s.recent),
             minute_buckets_hours: t(&s.minutes),
+            keep_forever: s.keep_forever,
             hour_buckets_days: t(&s.hours),
+            archive_before_delete: s.archive_before_delete,
             audit_days: t(&s.audit),
             persist_interval_secs: t(&s.persist),
             per_ip_rate_limit: t(&s.rate),
@@ -242,10 +251,52 @@ impl Console {
                 .child(div().child(label.to_string()))
         };
         let (ua, ip) = (s.store_ua, s.store_ip);
+        let mut keep = Vec::new();
+        for (forever, label) in [(true, "Forever"), (false, "Delete data older than N days")] {
+            keep.push(
+                seg_item(id("ret-keep", label), label, s.keep_forever == forever)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.settings.keep_forever = forever;
+                        if !forever && this.settings.hours.read(cx).text().trim().is_empty() {
+                            this.settings
+                                .hours
+                                .update(cx, |i, cx| i.set_text("365", cx));
+                        }
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+            );
+        }
+        let mut history = div().flex().flex_col().gap(px(10.)).child(field(
+            "Keep data",
+            Some("Hourly history is kept forever unless you choose a limit."),
+            div().flex().child(seg_row(keep)),
+        ));
+        if !s.keep_forever {
+            history = history.child(div().w(px(220.)).child(field(
+                "Days to keep",
+                Some("1 to 3650"),
+                s.hours.clone(),
+            )));
+        }
+        history = history.child(switch(
+            "archive",
+            s.archive_before_delete,
+            "Archive old data before deleting it",
+            |c| &mut c.settings.archive_before_delete,
+            cx,
+        ));
+        let days_text = s.hours.read(cx).text().to_string();
+        if let Some(warning) =
+            retention_warning(s.keep_forever, s.archive_before_delete, &days_text)
+        {
+            history = history.child(notice(&warning, Tone::Bad));
+        }
         let mut body = div()
             .flex()
             .flex_col()
             .gap(px(12.))
+            .child(history)
             .child(
                 div()
                     .flex()
@@ -255,8 +306,7 @@ impl Console {
                         "Minute buckets (hours)",
                         "Fine-grained history",
                         &s.minutes,
-                    ))
-                    .child(cell("Hour buckets (days)", "Long-range history", &s.hours)),
+                    )),
             )
             .child(
                 div()
@@ -314,7 +364,9 @@ impl Console {
         );
         card(
             Some("Data retention and limits"),
-            Some("How much traffic history the node keeps and how hard it protects itself."),
+            Some(
+                "History is kept forever by default. Choose a limit only if old data may be removed, and keep archiving on to save a copy first.",
+            ),
             body,
         )
         .into_any_element()

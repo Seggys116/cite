@@ -20,7 +20,7 @@ use crate::theme::{
 use crate::ui::input::TextInput;
 use crate::ui::widgets::{BtnKind, btn, id, strong, text_dim};
 use crate::ui::{
-    bots, create, detail, firewall, maintenance, nodes, overview, settings, sites, traffic,
+    bots, create, detail, firewall, maintenance, nodes, overview, settings, sites, storage, traffic,
 };
 
 const TICK: Duration = Duration::from_millis(500);
@@ -166,6 +166,7 @@ pub struct Console {
     pub create: create::State,
     pub traffic: traffic::State,
     pub bots: bots::State,
+    pub archives: storage::State,
     pub firewall: firewall::State,
     pub maintenance: maintenance::State,
     pub settings: settings::State,
@@ -208,6 +209,7 @@ impl Console {
                 ..traffic::State::default()
             },
             bots: bots::State::new(cx),
+            archives: storage::State::new(cx),
             firewall: firewall::State::new(cx),
             maintenance: maintenance::State::new(cx),
             settings: settings::State::new(cx),

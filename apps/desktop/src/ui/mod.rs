@@ -10,6 +10,7 @@ pub mod nodes;
 pub mod overview;
 pub mod settings;
 pub mod sites;
+pub mod storage;
 pub mod traffic;
 pub mod widgets;
 

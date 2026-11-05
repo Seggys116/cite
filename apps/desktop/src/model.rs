@@ -641,7 +641,9 @@ pub fn matcher_summary(m: &Matchers) -> Vec<String> {
 pub struct SettingsDraft {
     pub recent_events: String,
     pub minute_buckets_hours: String,
+    pub keep_forever: bool,
     pub hour_buckets_days: String,
+    pub archive_before_delete: bool,
     pub audit_days: String,
     pub persist_interval_secs: String,
     pub per_ip_rate_limit: String,
@@ -655,7 +657,13 @@ impl SettingsDraft {
         Self {
             recent_events: r.recent_events.to_string(),
             minute_buckets_hours: r.minute_buckets_hours.to_string(),
-            hour_buckets_days: r.hour_buckets_days.to_string(),
+            keep_forever: r.hour_buckets_days == 0,
+            hour_buckets_days: if r.hour_buckets_days == 0 {
+                String::new()
+            } else {
+                r.hour_buckets_days.to_string()
+            },
+            archive_before_delete: r.archive_before_delete,
             audit_days: r.audit_days.to_string(),
             persist_interval_secs: r.persist_interval_secs.to_string(),
             per_ip_rate_limit: s
@@ -680,10 +688,16 @@ impl SettingsDraft {
         }
         let rate = self.per_ip_rate_limit.trim();
         let mut next = base.clone();
+        let keep_days = if self.keep_forever {
+            0
+        } else {
+            crate::archive::parse_keep_days(&self.hour_buckets_days)?
+        };
         next.retention = Retention {
             recent_events: num("Recent events", &self.recent_events)?,
             minute_buckets_hours: num("Minute buckets", &self.minute_buckets_hours)?,
-            hour_buckets_days: num("Hour buckets", &self.hour_buckets_days)?,
+            hour_buckets_days: keep_days,
+            archive_before_delete: self.archive_before_delete,
             audit_days: num("Audit days", &self.audit_days)?,
             persist_interval_secs: num("Persist interval", &self.persist_interval_secs)?,
             store_user_agents: self.store_user_agents,
@@ -1159,6 +1173,39 @@ mod tests {
         let mut zero = draft;
         zero.persist_interval_secs = "0".into();
         assert!(zero.apply(&base).is_err());
+    }
+
+    #[test]
+    fn retention_is_unlimited_unless_a_limit_is_chosen() {
+        let base = EdgeSettings::default();
+        let draft = SettingsDraft::from_settings(&base);
+        assert!(draft.keep_forever);
+        assert!(draft.archive_before_delete);
+        assert_eq!(draft.hour_buckets_days, "");
+        let mut limited = draft.clone();
+        limited.keep_forever = false;
+        limited.hour_buckets_days = "365".into();
+        limited.archive_before_delete = false;
+        let next = limited.apply(&base).expect("limited");
+        assert_eq!(next.retention.hour_buckets_days, 365);
+        assert!(!next.retention.archive_before_delete);
+        let back = SettingsDraft::from_settings(&next);
+        assert!(!back.keep_forever);
+        assert_eq!(back.hour_buckets_days, "365");
+        limited.hour_buckets_days = "3651".into();
+        assert!(limited.apply(&base).is_err());
+        limited.hour_buckets_days = String::new();
+        assert!(limited.apply(&base).is_err());
+        let mut forever = limited;
+        forever.keep_forever = true;
+        assert_eq!(
+            forever
+                .apply(&base)
+                .expect("forever")
+                .retention
+                .hour_buckets_days,
+            0
+        );
     }
 
     #[test]

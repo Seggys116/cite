@@ -68,6 +68,49 @@ pub fn btn(key: ElementId, label: &str, kind: BtnKind) -> Stateful<Div> {
         .child(label.to_string())
 }
 
+// A button that cannot be pressed: same footprint as btn, muted, and without a click target.
+pub fn btn_off(label: &str) -> Div {
+    div()
+        .flex()
+        .items_center()
+        .justify_center()
+        .flex_none()
+        .h(px(28.))
+        .px(px(12.))
+        .rounded(px(CHIP_RADIUS))
+        .border_1()
+        .border_color(c(BORDER))
+        .bg(c(INPUT))
+        .text_color(c(DIM))
+        .text_size(px(12.))
+        .font_weight(FontWeight::MEDIUM)
+        .whitespace_nowrap()
+        .child(label.to_string())
+}
+
+// A square tick box: the chip fill and an inner square mark the checked state.
+pub fn checkbox(key: ElementId, on: bool) -> Stateful<Div> {
+    let mut boxed = div()
+        .id(key)
+        .flex()
+        .items_center()
+        .justify_center()
+        .flex_none()
+        .size(px(18.))
+        .rounded(px(5.))
+        .border_1()
+        .cursor_pointer();
+    boxed = if on {
+        boxed
+            .bg(chip_fill())
+            .border_color(chip_stroke())
+            .child(div().size(px(8.)).rounded(px(2.)).bg(c(0xffffff)))
+    } else {
+        boxed.bg(c(INPUT)).border_color(c(BORDER))
+    };
+    boxed
+}
+
 pub fn pill(text: &str, tone: Tone) -> Div {
     pill_color(text, tone.color())
 }

@@ -49,6 +49,14 @@ Traffic has four tabs that share the window picker. Requests lists recent reques
 
 Export streams a file from the node (requests, hourly rollups, the bot summary or a top list) as CSV or NDJSON, for the current window or a custom UTC range, with optional site, status, bot class, score, host, path, client IP, method and row limit filters. The app has no native save dialog, so the file goes to the `Downloads` folder under your home directory, named by the node, and an existing file is never replaced: a number is added to the name instead. With "All nodes" selected the export comes from the first node, as on the other single-node screens.
 
+## Retention, backups and archives
+
+Analytics history is kept forever by default. Settings has a "Keep data" choice: Forever, or "Delete data older than N days" with a limit from 1 to 3650. "Archive old data before deleting it" is on by default, and choosing a limit with archiving off shows a warning that the deleted data cannot be recovered.
+
+The Explore tab has a Backups and archives card for the selected node (the first node when "All nodes" is selected). Back up now writes a copy of the analytics database on the node. Cut old data removes everything older than a number of days or a UTC date: Preview shows how many rows would go and the oldest date, and Cut stays disabled until a preview of exactly those settings has succeeded. With archiving on, the rows are written to an archive file before they are deleted. With it off, Cut also needs the "I understand this deletes data permanently" box and a confirmation dialog.
+
+The list shows each file's name, kind, size, creation time, short SHA-256 and row count. Download saves the file into the `Downloads` folder, never replacing an existing file, with an extension chosen by the app from the file kind (`.db` for backups, `.ndjson.gz` or `.csv.gz` for archives) rather than taken from the node. Restore and Delete ask for confirmation first. A node that predates these endpoints shows as "needs an update".
+
 ## Adding a node
 
 Open Nodes and fill in a name, the connector URL and, when the node uses the CA from `init`, the CA certificate. The CA field takes either the PEM text or the path of a PEM file, for example the `cite-ca.pem` that `scripts/setup.sh` copies into its install directory. Compare the fingerprint printed by `init` before trusting it.

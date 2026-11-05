@@ -210,6 +210,7 @@ impl Console {
     pub fn load_explore(&mut self, cx: &mut Context<Self>) {
         self.load_top(cx);
         self.load_storage(cx);
+        self.load_archives(cx);
     }
 
     fn export_form(&self, cx: &Context<Self>) -> ExportForm {
@@ -365,6 +366,7 @@ impl Console {
             Load::Failed(msg) => col.child(notice(msg, Tone::Bad)),
             Load::Ready(nodes) => col.child(storage_card(nodes)),
         };
+        col = col.child(self.archive_card(cx));
         col.into_any_element()
     }
 

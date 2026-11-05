@@ -4,8 +4,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use cite_client::{
-    AnalyticsStats, ClientError, CreatedToken, DeployRequest, ExportQuery, ExportReport,
-    NodeClient, NodeConfig, NodeInfo, PresetInfo, RequestQuery, SiteDetail, TokenMeta,
+    AnalyticsStats, ArchiveEntry, ArchiveList, ClientError, CreatedToken, CutReport, DeployRequest,
+    ExportQuery, ExportReport, NodeClient, NodeConfig, NodeInfo, PresetInfo, RequestQuery,
+    RestoreReport, SiteDetail, TokenMeta,
 };
 use cite_edge::analytics::{Summary, Timeseries, TopItem};
 use cite_edge::bot::BotSummary;
@@ -13,6 +14,7 @@ use cite_edge::model::{
     Deployment, EdgeSettings, FirewallRule, LogEvent, MaintenancePage, Site, Slot,
 };
 
+use crate::archive::CutSpec;
 use crate::demo::DemoNode;
 
 pub type Res<T> = Result<T, ClientError>;
@@ -278,6 +280,71 @@ impl NodeHandle {
         }
     }
 
+    pub async fn archives(&self) -> Res<ArchiveList> {
+        match self {
+            Self::Live(c) => c.analytics_archives().await,
+            Self::Demo(_, d) => d.archives(),
+        }
+    }
+
+    pub async fn backup(&self) -> Res<ArchiveEntry> {
+        match self {
+            Self::Live(c) => c.analytics_backup().await,
+            Self::Demo(_, d) => d.backup(),
+        }
+    }
+
+    // Demo nodes need the plain spec, so the request is built here for live nodes only.
+    pub async fn cut(&self, spec: &CutSpec, dry_run: bool) -> Res<CutReport> {
+        match self {
+            Self::Live(c) => {
+                let req = spec.request(dry_run).map_err(ClientError::Config)?;
+                c.analytics_cut(&req).await
+            }
+            Self::Demo(_, d) => d.cut(spec, dry_run),
+        }
+    }
+
+    pub async fn restore(&self, name: &str) -> Res<RestoreReport> {
+        match self {
+            Self::Live(c) => c.analytics_restore(name).await,
+            Self::Demo(_, d) => d.restore(name),
+        }
+    }
+
+    pub async fn delete_archive(&self, name: &str) -> Res<()> {
+        match self {
+            Self::Live(c) => c.analytics_archive_delete(name).await,
+            Self::Demo(_, d) => d.delete_archive(name),
+        }
+    }
+
+    pub async fn download_archive(
+        &self,
+        name: &str,
+        dest: &Path,
+        max_bytes: u64,
+    ) -> Res<ExportReport> {
+        match self {
+            Self::Live(c) => c.analytics_archive_download_to(name, dest, max_bytes).await,
+            Self::Demo(_, d) => {
+                let body = d.archive_body(name)?;
+                let written = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(dest)
+                    .and_then(|mut f| f.write_all(body.as_bytes()));
+                written.map_err(|e| ClientError::Config(format!("cannot write download: {e}")))?;
+                Ok(ExportReport {
+                    path: dest.to_path_buf(),
+                    bytes: body.len() as u64,
+                    content_type: None,
+                    suggested_name: None,
+                })
+            }
+        }
+    }
+
     pub async fn get_settings(&self) -> Res<EdgeSettings> {
         match self {
             Self::Live(c) => c.get_settings().await,
@@ -336,6 +403,21 @@ pub async fn run_export(
         }
     }
     Ok(report)
+}
+
+// The local name comes from the fixed extension list, and a free numeric suffix keeps existing files safe.
+pub async fn run_archive_download(
+    handle: NodeHandle,
+    name: String,
+    dir: PathBuf,
+    local_name: String,
+) -> Res<ExportReport> {
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| ClientError::Config(format!("cannot create {}: {e}", dir.display())))?;
+    let dest = crate::bots::unique_path(&dir, &local_name);
+    handle
+        .download_archive(&name, &dest, crate::archive::ARCHIVE_MAX_BYTES)
+        .await
 }
 
 #[derive(Clone)]
