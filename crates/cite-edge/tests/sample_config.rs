@@ -44,6 +44,14 @@ fn sample() -> EdgeConfig {
     cfg
 }
 
+fn opts_unix() -> RenderOptions {
+    RenderOptions {
+        runtime_addr: "unix@/conf/haproxy/admin.sock".into(),
+        log_addr: "/conf/haproxy/log.sock".into(),
+        ..opts()
+    }
+}
+
 fn opts() -> RenderOptions {
     RenderOptions {
         maps_dir: "/conf/haproxy/maps".into(),
@@ -59,11 +67,21 @@ fn sample_config_renders_and_optionally_dumps() {
     let rendered = render(&sample(), &opts()).expect("render");
     assert!(rendered.config.contains("be_shop_blue"));
     assert!(rendered.config.contains("be_api_green"));
+    let unix = render(&sample(), &opts_unix()).expect("render unix");
+    assert!(
+        unix.config
+            .contains("stats socket unix@/conf/haproxy/admin.sock mode 600 level admin")
+    );
+    assert!(
+        unix.config
+            .contains("log /conf/haproxy/log.sock len 8192 format rfc5424 local0")
+    );
     if let Ok(dir) = std::env::var("CITE_SAMPLE_OUT") {
         let dir = std::path::Path::new(&dir);
         std::fs::create_dir_all(dir.join("maps")).expect("maps dir");
         std::fs::create_dir_all(dir.join("pages")).expect("pages dir");
         std::fs::write(dir.join("haproxy.cfg"), &rendered.config).expect("cfg");
+        std::fs::write(dir.join("haproxy-unix.cfg"), &unix.config).expect("unix cfg");
         std::fs::write(dir.join("maps/active.map"), &rendered.active_map).expect("active");
         std::fs::write(dir.join("maps/maint.map"), &rendered.maint_map).expect("maint");
         for (name, html) in &rendered.pages {

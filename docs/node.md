@@ -6,13 +6,13 @@ This page covers installing, configuring and operating one Cite node: HAProxy pl
 
 | Service | Image | Role |
 |---|---|---|
-| `init` | `ghcr.io/seggys116/cite-connector:${CITE_VERSION:-0.2.0}` | One-shot. Creates `/conf/haproxy`, `/conf/certs` and `/conf/state` in the `cite_conf` volume owned by uid 10001, then exits. No network. |
+| `init` | `ghcr.io/seggys116/cite-connector:${CITE_VERSION:-0.2.0}` | One-shot. Creates `/conf/haproxy`, `/conf/certs` and `/conf/state` in the `cite_conf` volume owned by uid 10001, and sets the owner and mode of the `cite_run` volume at `/run/cite`, then exits. No network. |
 | `haproxy` | `docker.io/library/haproxy:3.0-bookworm` | Public listener on ports 80 and 443. Reads its config from the `haproxy` and `certs` subpaths of `cite_conf`, mounted read-only. It cannot see the connector's credentials, tokens, secrets or TLS keys. |
 | `connector` | `ghcr.io/seggys116/cite-connector:${CITE_VERSION:-0.2.0}` | Authenticated API on 7443, renders the HAProxy config, receives HAProxy's logs, runs the optional orchestrator. |
 
-The two containers do not share a process namespace. HAProxy runs with `-W` and a master CLI (`-S ipv4@172.30.250.3:9998,level,admin`), and the connector reloads it by connecting to that address, sending `reload` and reading the reply: `Success=1` or `Success=0` followed by the loader output. It then checks that `show info` on the runtime socket reports a new pid. If the master CLI is unreachable (HAProxy is not up yet at first boot), applying a config still succeeds with `reloaded` false and the reason in the status `last_error`. Both containers run as uid 10001 with a read-only root filesystem, `no-new-privileges` and all capabilities dropped.
+The two containers do not share a process namespace. They share one small volume, `cite_run`, mounted at `/run/cite` in both, which holds three unix sockets: HAProxy's admin socket (`admin.sock`), the master CLI (`master.sock`, from `-S /run/cite/master.sock,level,admin` on the HAProxy command) and the log datagram socket the connector binds (`log.sock`). The directory is owned by uid 10001 with mode 0750, the admin and log sockets are mode 0600, and no admin listener exists on any network. The connector reloads HAProxy by connecting to the master socket, sending `reload` and reading the reply: `Success=1` or `Success=0` followed by the loader output. It then checks that `show info` on the admin socket reports a new pid. If the master CLI is unreachable (HAProxy is not up yet at first boot), applying a config still succeeds with `reloaded` false and the reason in the status `last_error`. Both containers run as uid 10001 with a read-only root filesystem, `no-new-privileges` and all capabilities dropped.
 
-Three networks exist. `public` is a normal bridge. `cite_edge` is internal, so containers on it have no route out. Orchestrated site executors are on `cite_edge` only, and HAProxy is on it to reach them. `ctl` (`cite_ctl`, 172.30.250.0/29) is internal and carries only the HAProxy admin sockets and the log feed: HAProxy is 172.30.250.3, the connector is 172.30.250.2, and nothing else joins. The connector stays on `public` only because Docker cannot publish ports from an internal-only network; it is not on `cite_edge`.
+Two networks exist. `public` is a normal bridge. `cite_edge` is internal, so containers on it have no route out. Orchestrated site executors are on `cite_edge` only, and HAProxy is on it to reach them. The connector stays on `public` only because Docker cannot publish ports from an internal-only network; it is not on `cite_edge`.
 
 ## First start
 
@@ -66,13 +66,14 @@ Compose reads `docker-compose.override.yml` automatically only when you run `doc
 | `CITE_CONNECTOR_TLS` | `true` | Serve the API over TLS. When false the connector logs a warning and expects a trusted tunnel. |
 | `CITE_CONNECTOR_SANS` | empty | Extra host names or IPs for the server certificate, comma separated, up to 32. The certificate always covers `localhost`, `127.0.0.1`, `::1` and the node name. |
 | `CITE_SESSION_TTL` | `28800` (8 hours) | Session lifetime in seconds, from 60 to 2592000. Sessions also expire after 30 minutes idle. |
-| `CITE_HAPROXY_RUNTIME` | `haproxy:9999` | Address of HAProxy's runtime socket. Compose sets `172.30.250.3:9999`. |
-| `CITE_HAPROXY_MASTER` | runtime host, port `9998` | Address of HAProxy's master CLI, used for reloads. Compose sets `172.30.250.3:9998`. It must match the `-S` address in the `haproxy` command in `docker-compose.node.yml`. |
+| `CITE_HAPROXY_RUNTIME` | `haproxy:9999` | Where the connector reaches HAProxy's admin socket: `host:port`, or `unix:/path` for a unix socket. Compose sets `unix:/run/cite/admin.sock`, and the rendered config then declares `stats socket unix@/run/cite/admin.sock` with mode 600. |
+| `CITE_HAPROXY_MASTER` | next to the runtime address | Where the connector reaches HAProxy's master CLI, used for reloads. Defaults to port `9998` on the runtime host, or `master.sock` beside a unix runtime socket. Compose sets `unix:/run/cite/master.sock`. It must match the `-S` socket in the `haproxy` command in `docker-compose.node.yml`. |
 | `CITE_HAPROXY_BIN` | `haproxy` | Binary used for `haproxy -c` validation. |
 | `CITE_HAPROXY_VALIDATE` | `true` | Run `haproxy -c` on a staged copy before installing a config. |
-| `CITE_LOG_LISTEN` | `0.0.0.0:5140` | UDP address the log sink binds. Compose sets `172.30.250.2:5140`. |
-| `CITE_LOG_ADDR` | `connector:5140` | Address HAProxy sends logs to. It must be an IP literal because HAProxy does not resolve names there. Compose sets `172.30.250.2:5140`. |
-| `CITE_DOCKER_HOST` | unset | Enables the orchestrator. The overlay sets `tcp://socketproxy:2375`. |
+| `CITE_LOG_LISTEN` | `0.0.0.0:5140` | Where the log sink binds: a UDP `host:port`, or `unix:/path` for a unix datagram socket (any stale socket file is replaced and the new one is mode 0600). Compose sets `unix:/run/cite/log.sock`. The receive buffer is raised to 4 MiB so bursts are not dropped. |
+| `CITE_LOG_ADDR` | `connector:5140`, or the `CITE_LOG_LISTEN` path for a unix listener | Address HAProxy sends logs to. For a UDP sink it must be an IP literal because HAProxy does not resolve names there; for a unix sink it is the socket path. Compose sets `/run/cite/log.sock`. |
+| `CITE_ANALYTICS_MAX_BYTES` | `134217728` (128 MiB) | Memory budget for analytics, from 8 MiB to 64 GiB. See [analytics](analytics.md). Keep it well below the connector memory limit. |
+| `CITE_DOCKER_HOST` | unset | Enables the orchestrator. The overlay sets `http://dockerproxy:2375`. |
 | `CITE_EDGE_NETWORK` | `cite_edge` | Network that orchestrated executors join. |
 | `CITE_STACK_VERSION` | the connector's version | Image tag used for orchestrated stacks. |
 | `CITE_REGISTRY` | `ghcr.io/seggys116` | Registry prefix for orchestrated stack images. |

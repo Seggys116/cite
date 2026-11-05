@@ -6,13 +6,28 @@ This page covers the edge firewall rules, the built-in presets, the per-IP rate 
 
 For each request HAProxy applies these steps in order, and the first that answers ends the request:
 
-1. Set `X-Forwarded-Proto` to `http` or `https`.
-2. Per-IP rate limit. Over the limit answers 429.
-3. Maximum body size, when set. A larger `Content-Length` answers 413.
-4. Firewall rules, in list order.
-5. Maintenance pages, one check per site.
-6. Routing: the first site whose host (and path, if set) matches, through `active.map`.
-7. No site matched: the `be_notfound` backend answers 404 with the body `not found`.
+1. Normalise the request path (see below). Requests with more than one `Host` header, or a `Host` containing a comma, answer 400.
+2. Set `X-Forwarded-Proto` to `http` or `https`.
+3. Per-IP rate limit. Over the limit answers 429.
+4. Maximum body size, when set. A larger `Content-Length` answers 413.
+5. Firewall rules, in list order.
+6. Maintenance pages, one check per site.
+7. Routing: the first site whose host (and path, if set) matches, through `active.map`.
+8. No site matched: the `be_notfound` backend answers 404 with the body `not found`.
+
+### Path normalisation
+
+Before any rule runs, the edge rewrites the request path so that rules see what a plain origin would see. Without this, `/%2eenv`, `/%2Egit/config` or `/wp%2dlogin.php` would slip past a rule written for `/.env`. The steps, in order, are:
+
+- `percent-to-uppercase`: `%2f` becomes `%2F`.
+- `percent-decode-unreserved`: escapes of letters, digits, `-`, `.`, `_` and `~` are decoded, so `%6c` becomes `l` and `%2e` becomes `.`.
+- `path-merge-slashes`: `//` becomes `/`.
+- `path-strip-dot` and `path-strip-dotdot`: `/./` and `/a/../` segments are resolved.
+- `fragment-strip`: a `#fragment` is removed.
+
+This changes what your upstreams receive: they get the normalised path. Duplicate slashes are merged, dot segments are resolved, and unreserved characters are no longer percent-encoded. Reserved escapes such as `%2F`, `%20` and `%3B` are left alone, so `/a%20b` and `/a/b%2Fc` reach the upstream as sent. The query string is not changed.
+
+Escapes of reserved characters stay encoded, and some origins decode them. Path regexes and path prefixes are therefore tested twice, against the path and against the fully URL-decoded path, and a rule fires if either matches. `/x%2f..%2f.env` is caught this way. Requests containing `%2F` or `%5C` are not rejected, because some applications use them legitimately. The presets also tolerate `;param` suffixes on any segment, which servlet containers strip, so `/actuator;x/env` and `/.git;a=b/config` are caught.
 
 Firewall rules therefore run before maintenance and routing. A blocked request never reaches a backend, and it is counted in analytics with the rule id that fired.
 
@@ -44,12 +59,28 @@ The source address is the one HAProxy sees on the TCP connection. Behind another
 Values become words in the HAProxy config, so they are checked before rendering:
 
 - Rule, site and page ids match `^[a-z0-9][a-z0-9-]{0,39}$`.
-- Patterns are 1 to 256 printable ASCII characters. `#`, `"` and `'` are not allowed. Write a space as `\x20`.
+- Patterns are 1 to 256 printable ASCII characters. `#`, `"` and `'` are not allowed. Spaces cannot be written; use `\s` or `[[:space:]]` in a regex.
 - A pattern cannot start with `-`, equal a HAProxy keyword such as `if` or `or`, contain a doubled or trailing backslash, or contain `$` followed by a name.
 - Regexes must compile. Path prefixes must start with `/`.
+- Regexes cannot contain `\x` escapes. HAProxy turns `\xNN` into a raw byte before the regex is parsed, so `\x7d` becomes `}` and breaks the config. Write the character itself or a class.
+- Regexes run on PCRE2 in HAProxy, which backtracks. A group that contains a repeat or an alternation and is itself repeated with `*`, `+` or `{n,}` is refused, for example `^/(a|aa)+$` or `(a+)+`. Use a class (`[ab]+`) or an anchored literal instead. `?` on a group is fine.
 - A config holds at most 1000 sites, 1000 pages and 5000 rules.
 
 The connector also asks `haproxy -c` to check the final file, so a regex that HAProxy's engine rejects is refused with its error message.
+
+### Targets and health checks
+
+A site target is `host:port` or `[ipv6]:port`. The edge refuses targets that would point it at its own control plane or at local services:
+
+- Loopback (`127.0.0.0/8`, `::1`), unspecified (`0.0.0.0`, `::`), `0.0.0.0/8`, link-local (`169.254.0.0/16`, `fe80::/10`, which includes the cloud metadata address), multicast and the IPv4 broadcast address.
+- The control subnet `172.30.250.0/29`, where the HAProxy admin and master listeners sit. A request relayed to them would run as admin commands.
+- The IPv4-mapped (`::ffff:a.b.c.d`), IPv4-compatible and NAT64 (`64:ff9b::/96`) IPv6 forms of all of the above.
+- The names `localhost`, anything ending in `.localhost`, `haproxy`, `connector`, `dockerproxy` and `socketproxy`.
+- Decimal, octal, hex and short IPv4 spellings such as `2130706433`, `0177.0.0.1`, `0x7f.1` and `127.1`. A name whose last label is numeric must be a canonical dotted IPv4 address.
+
+Names ending in `.internal` are allowed because they are common for real services. A name is checked as written and not by where it resolves, so keep DNS you do not control out of target names.
+
+Health settings are bounded so a bad target cannot be kept up indefinitely: `interval_ms` 100 to 60000, `timeout_ms` 100 to 10000 and not above `interval_ms`, `rise` and `fall` 1 to 10.
 
 ### Scope
 
@@ -91,10 +122,12 @@ Maintenance mode is per site. While it is on, every request that matches the sit
 | Item | Detail |
 |---|---|
 | Default page | A built-in dark HTML page ("We will be right back"), self-contained with no external requests, served with status 503. |
-| Custom pages | Created with `POST /api/v1/pages`: an id, a name, the HTML (up to 256 KiB) and a status from 400 to 599, default 503. |
+| Custom pages | Created with `POST /api/v1/pages`: an id, a name, the HTML (up to 15000 bytes) and a status from 400 to 599, default 503. |
 | Choosing a page | `POST /api/v1/sites/{id}/maintenance` with `{"enabled": true, "page_id": "..."}`. Without a page the default is used. |
 | Headers | `Content-Type: text/html; charset=utf-8` and `Cache-Control: no-store`. |
 | Deleting | A page used by a site cannot be deleted. |
+
+The 15000 byte limit comes from HAProxy, which loads a page into one buffer (`tune.bufsize`, 16384 bytes by default) and refuses a larger file at the config check. The limit leaves room for headers. Raising `tune.bufsize` would lift it but costs memory on every connection, so it is not changed. Keep CSS inline, use small data URIs, and link large assets from elsewhere.
 
 Turning maintenance off without naming a page keeps the earlier page choice, so turning it on again restores it.
 

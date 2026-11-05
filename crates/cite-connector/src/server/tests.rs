@@ -911,6 +911,26 @@ async fn analytics_endpoints_reflect_recorded_events() {
 }
 
 #[tokio::test]
+async fn analytics_requests_honour_the_site_filter() {
+    let h = start().await;
+    let t = h.token().await;
+    {
+        let mut analytics = lock_std(&h.state.analytics);
+        analytics.record(event("10.0.0.1", 200));
+        let mut other = event("10.0.0.2", 200);
+        other.site = "shop".into();
+        analytics.record(other);
+    }
+    let (_, blog) = h.get(&t, "/analytics/requests?site=blog").await;
+    assert_eq!(blog.as_array().map(Vec::len), Some(1));
+    assert_eq!(blog[0]["site"], "blog");
+    let (_, ghost) = h.get(&t, "/analytics/requests?site=ghost").await;
+    assert_eq!(ghost, json!([]));
+    let (status, _) = h.get(&t, "/analytics/requests?site=Bad%20Id").await;
+    assert_eq!(status, 400);
+}
+
+#[tokio::test]
 async fn reload_and_config_endpoints_agree() {
     let h = start().await;
     let t = h.token().await;

@@ -1,4 +1,8 @@
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::io::{self, Write};
+use std::ops::Bound;
+use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
@@ -14,6 +18,21 @@ const MINUTE_MAX_WINDOW_SECS: u64 = 48 * 3600;
 const MAX_WINDOW_SECS: u64 = 400 * 86_400;
 const PRUNE_EVERY: u32 = 8192;
 const SNAPSHOT_VERSION: u32 = 1;
+const DEFAULT_BUDGET: usize = 128 * 1024 * 1024;
+const MIN_BUDGET: usize = 1024 * 1024;
+// Eviction frees down to this fraction of the budget so it runs once per ten percent of growth.
+const LOW_WATER_DIV: usize = 10;
+// Budget pressure never touches the newest minutes and hours until nothing older is left.
+const KEEP_MINUTES: i64 = 60;
+const KEEP_HOURS: i64 = 24;
+const MAX_CAP_SHIFT: u8 = 3;
+const SPARE_CANDIDATES: usize = 8;
+const MIN_CAP: usize = 2;
+// Allocator, hash table and String header overhead added to the key bytes of one retained entry.
+const ENTRY_OVERHEAD: usize = 96;
+const COUNT_OVERHEAD: usize = 48;
+// B-tree nodes are about two thirds full, so each bucket slot carries half again its inline size.
+const BUCKET_BASE: usize = std::mem::size_of::<Bucket>() * 3 / 2 + (LAT_LEN + SIZE_LEN) * 4 + 64;
 
 const LAT_LEN: usize = 128;
 const SIZE_LES: [u64; 9] = [
@@ -37,20 +56,20 @@ const KEY_RULE: usize = 64;
 const KEY_METHOD: usize = 16;
 const KEY_CTYPE: usize = 64;
 
-// Per-bucket key caps: minute buckets are numerous so they stay small, hour buckets are fewer.
+// Per-bucket key caps: minute buckets are numerous so they stay tiny, hour buckets carry the detail.
 const MINUTE_CAPS: Caps = Caps {
-    paths: 32,
-    ips: 24,
-    uas: 16,
-    hosts: 8,
-    rules: 8,
+    paths: 10,
+    ips: 6,
+    uas: 4,
+    hosts: 3,
+    rules: 3,
 };
 const HOUR_CAPS: Caps = Caps {
-    paths: 256,
-    ips: 128,
-    uas: 64,
-    hosts: 32,
-    rules: 32,
+    paths: 64,
+    ips: 32,
+    uas: 16,
+    hosts: 16,
+    rules: 16,
 };
 const METHOD_CAP: usize = 16;
 const CTYPE_CAP: usize = 32;
@@ -61,6 +80,24 @@ struct Caps {
     uas: usize,
     hosts: usize,
     rules: usize,
+}
+
+impl Caps {
+    // Budget pressure halves every cap per shift step, never below MIN_CAP.
+    fn shifted(&self, shift: u8) -> Caps {
+        let f = |n: usize| (n >> shift).max(MIN_CAP);
+        Caps {
+            paths: f(self.paths),
+            ips: f(self.ips),
+            uas: f(self.uas),
+            hosts: f(self.hosts),
+            rules: f(self.rules),
+        }
+    }
+}
+
+fn caps_for(hour: bool, shift: u8) -> Caps {
+    if hour { &HOUR_CAPS } else { &MINUTE_CAPS }.shifted(shift)
 }
 
 pub fn window_from_str(s: &str) -> Option<u64> {
@@ -134,11 +171,13 @@ pub struct RequestFilter {
     pub path_contains: Option<String>,
     pub ip: Option<String>,
     pub blocked_only: bool,
+    pub site: Option<String>,
 }
 
 impl RequestFilter {
     fn matches(&self, ev: &LogEvent) -> bool {
         self.status.is_none_or(|s| s == ev.status)
+            && self.site.as_deref().is_none_or(|s| s == ev.site)
             && self
                 .method
                 .as_deref()
@@ -225,6 +264,11 @@ fn bump32(v: &mut [u32], i: usize) {
 struct TopK {
     cap: usize,
     map: HashMap<String, (u64, u64)>,
+    // Eviction candidates at the minimum count `spare_min`; still minimal while that count holds.
+    #[serde(skip)]
+    spare: Vec<String>,
+    #[serde(skip)]
+    spare_min: u64,
 }
 
 impl TopK {
@@ -232,29 +276,81 @@ impl TopK {
         Self {
             cap,
             map: HashMap::new(),
+            spare: Vec::new(),
+            spare_min: 0,
         }
     }
 
-    fn add(&mut self, key: &str, bytes: u64) {
+    fn take_min(&mut self) -> Option<(String, u64)> {
+        while let Some(k) = self.spare.pop() {
+            if self.map.get(&k).is_some_and(|v| v.0 == self.spare_min) {
+                self.map.remove(&k);
+                return Some((k, self.spare_min));
+            }
+        }
+        let min = self.map.values().map(|v| v.0).min()?;
+        self.spare = self
+            .map
+            .iter()
+            .filter(|(_, v)| v.0 == min)
+            .take(SPARE_CANDIDATES)
+            .map(|(k, _)| k.clone())
+            .collect();
+        self.spare_min = min;
+        let k = self.spare.pop()?;
+        self.map.remove(&k);
+        Some((k, min))
+    }
+
+    // Releases the candidate cache once a bucket stops receiving events.
+    fn seal(&mut self) {
+        self.spare = Vec::new();
+    }
+
+    // Returns the change in retained bytes.
+    fn add(&mut self, key: &str, bytes: u64) -> isize {
         if let Some(e) = self.map.get_mut(key) {
             e.0 += 1;
             e.1 += bytes;
-            return;
+            return 0;
         }
-        if self.map.len() >= self.cap {
-            let victim = self
-                .map
-                .iter()
-                .min_by_key(|(_, v)| v.0)
-                .map(|(k, v)| (k.clone(), v.0));
-            if let Some((k, count)) = victim {
-                self.map.remove(&k);
-                self.map.insert(key.to_string(), (count + 1, bytes));
-                return;
-            }
+        if self.map.len() >= self.cap
+            && let Some((victim, count)) = self.take_min()
+        {
+            self.map.insert(key.to_string(), (count + 1, bytes));
+            return entry_cost(key) as isize - entry_cost(&victim) as isize;
         }
         self.map.insert(key.to_string(), (1, bytes));
+        entry_cost(key) as isize
     }
+
+    fn cost(&self) -> usize {
+        self.map.keys().map(|k| entry_cost(k)).sum()
+    }
+
+    // Re-applies a cap and key length to data that came from disk or from a larger cap.
+    fn conform(&mut self, cap: usize, key_max: usize) {
+        self.cap = cap;
+        self.spare = Vec::new();
+        let long = self.map.keys().any(|k| k.len() > key_max);
+        if self.map.len() <= cap && !long {
+            return;
+        }
+        let mut merged: HashMap<String, (u64, u64)> = HashMap::with_capacity(self.map.len());
+        for (k, v) in self.map.drain() {
+            let e = merged.entry(cut(&k, key_max).to_string()).or_insert((0, 0));
+            e.0 += v.0;
+            e.1 += v.1;
+        }
+        let mut ranked: Vec<(String, (u64, u64))> = merged.into_iter().collect();
+        ranked.sort_by(|a, b| b.1.0.cmp(&a.1.0).then_with(|| a.0.cmp(&b.0)));
+        ranked.truncate(cap);
+        self.map = ranked.into_iter().collect();
+    }
+}
+
+fn entry_cost(key: &str) -> usize {
+    key.len() + ENTRY_OVERHEAD
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -273,31 +369,55 @@ impl Counts {
         }
     }
 
-    fn add(&mut self, key: &str) {
+    // Returns the change in retained bytes.
+    fn add(&mut self, key: &str) -> isize {
         if let Some(it) = self
             .items
             .iter_mut()
             .find(|(k, _)| k.eq_ignore_ascii_case(key))
         {
             it.1 += 1;
-            return;
+            return 0;
         }
         if self.items.len() >= self.cap {
             let other = if self.upper { "OTHER" } else { "other" };
             if let Some(it) = self.items.iter_mut().find(|(k, _)| k == other) {
                 it.1 += 1;
-            } else {
-                self.items.push((other.to_string(), 1));
+                return 0;
             }
-            return;
+            self.items.push((other.to_string(), 1));
+            return item_cost(other);
         }
         let k = if self.upper {
             key.to_ascii_uppercase()
         } else {
             key.to_ascii_lowercase()
         };
+        let cost = item_cost(&k);
         self.items.push((k, 1));
+        cost
     }
+
+    fn cost(&self) -> usize {
+        self.items
+            .iter()
+            .map(|(k, _)| k.len() + COUNT_OVERHEAD)
+            .sum()
+    }
+
+    fn conform(&mut self, cap: usize, key_max: usize) {
+        self.cap = cap;
+        for (k, _) in self.items.iter_mut() {
+            if k.len() > key_max {
+                *k = cut(k, key_max).to_string();
+            }
+        }
+        self.items.truncate(cap);
+    }
+}
+
+fn item_cost(key: &str) -> isize {
+    (key.len() + COUNT_OVERHEAD) as isize
 }
 
 // Everything the hot path needs from one event, computed once and shared by all four buckets.
@@ -367,12 +487,16 @@ struct Bucket {
     uas: TopK,
     hosts: TopK,
     rules: TopK,
+    // Running estimate of the heap this bucket retains; rebuilt on load, never written out.
+    #[serde(skip)]
+    est: usize,
 }
 
 impl Bucket {
-    fn new(hour: bool) -> Self {
-        let caps = if hour { HOUR_CAPS } else { MINUTE_CAPS };
+    fn new(hour: bool, shift: u8) -> Self {
+        let caps = caps_for(hour, shift);
         Self {
+            est: BUCKET_BASE,
             requests: 0,
             bytes_in: 0,
             bytes_out: 0,
@@ -393,7 +517,8 @@ impl Bucket {
         }
     }
 
-    fn add(&mut self, p: &Prep) {
+    // Returns the change in retained bytes.
+    fn add(&mut self, p: &Prep) -> isize {
         self.requests += 1;
         self.bytes_in += p.bytes_in;
         self.bytes_out += p.bytes_out;
@@ -408,34 +533,69 @@ impl Bucket {
         }
         bump32(&mut self.lat, p.lat);
         bump32(&mut self.sizes, p.size);
+        let mut delta = 0;
         if !p.method.is_empty() {
-            self.methods.add(p.method);
+            delta += self.methods.add(p.method);
         }
         if !p.ctype.is_empty() {
-            self.ctypes.add(p.ctype);
+            delta += self.ctypes.add(p.ctype);
         }
         if !p.path.is_empty() {
-            self.paths.add(p.path, p.bytes_out);
+            delta += self.paths.add(p.path, p.bytes_out);
         }
         if !p.ip.is_empty() {
-            self.ips.add(p.ip, p.bytes_out);
+            delta += self.ips.add(p.ip, p.bytes_out);
         }
         if !p.ua.is_empty() {
-            self.uas.add(p.ua, p.bytes_out);
+            delta += self.uas.add(p.ua, p.bytes_out);
         }
         if !p.host.is_empty() {
-            self.hosts.add(p.host, p.bytes_out);
+            delta += self.hosts.add(p.host, p.bytes_out);
         }
         if let Some(rule) = p.blocked {
             self.blocked += 1;
-            self.rules.add(rule, p.bytes_out);
+            delta += self.rules.add(rule, p.bytes_out);
+        }
+        self.est = self.est.saturating_add_signed(delta);
+        delta
+    }
+
+    fn seal(&mut self) {
+        for t in [
+            &mut self.paths,
+            &mut self.ips,
+            &mut self.uas,
+            &mut self.hosts,
+            &mut self.rules,
+        ] {
+            t.seal();
         }
     }
 
-    // A restored snapshot may come from a build with different histogram sizes.
-    fn normalise(&mut self) {
+    fn measure(&self) -> usize {
+        BUCKET_BASE
+            + self.methods.cost()
+            + self.ctypes.cost()
+            + self.paths.cost()
+            + self.ips.cost()
+            + self.uas.cost()
+            + self.hosts.cost()
+            + self.rules.cost()
+    }
+
+    // Applies the current limits to a bucket that came from a snapshot or from larger caps.
+    fn conform(&mut self, hour: bool, shift: u8) {
         self.lat.resize(LAT_LEN, 0);
         self.sizes.resize(SIZE_LEN, 0);
+        let caps = caps_for(hour, shift);
+        self.methods.conform(METHOD_CAP, KEY_METHOD);
+        self.ctypes.conform(CTYPE_CAP, KEY_CTYPE);
+        self.paths.conform(caps.paths, KEY_PATH);
+        self.ips.conform(caps.ips, KEY_IP);
+        self.uas.conform(caps.uas, KEY_UA);
+        self.hosts.conform(caps.hosts, KEY_HOST);
+        self.rules.conform(caps.rules, KEY_RULE);
+        self.est = self.measure();
     }
 }
 
@@ -443,37 +603,103 @@ impl Bucket {
 struct Scope {
     minutes: BTreeMap<i64, Bucket>,
     hours: BTreeMap<i64, Bucket>,
+    // Buckets that last received an event; when it moves on they are sealed.
+    #[serde(skip)]
+    open_minute: i64,
+    #[serde(skip)]
+    open_hour: i64,
+}
+
+fn bucket_at<'a>(
+    map: &'a mut BTreeMap<i64, Bucket>,
+    key: i64,
+    hour: bool,
+    shift: u8,
+    delta: &mut isize,
+) -> &'a mut Bucket {
+    match map.entry(key) {
+        Entry::Occupied(o) => o.into_mut(),
+        Entry::Vacant(v) => {
+            *delta += BUCKET_BASE as isize;
+            v.insert(Bucket::new(hour, shift))
+        }
+    }
+}
+
+fn seal_previous(map: &mut BTreeMap<i64, Bucket>, open: &mut i64, now: i64) {
+    if *open != now {
+        if let Some(b) = map.get_mut(open) {
+            b.seal();
+        }
+        *open = now;
+    }
+}
+
+fn drop_before(map: &mut BTreeMap<i64, Bucket>, cut: i64) -> usize {
+    if map.first_key_value().is_none_or(|(k, _)| *k >= cut) {
+        return 0;
+    }
+    let kept = map.split_off(&cut);
+    let dropped = std::mem::replace(map, kept);
+    dropped.values().map(|b| b.est).sum()
+}
+
+fn drop_through(map: &mut BTreeMap<i64, Bucket>, upto: i64) -> usize {
+    let mut freed = 0;
+    while map.first_key_value().is_some_and(|(k, _)| *k <= upto) {
+        if let Some((_, b)) = map.pop_first() {
+            freed += b.est;
+        }
+    }
+    freed
 }
 
 impl Scope {
-    fn add(&mut self, p: &Prep) {
+    // Returns the change in retained bytes.
+    fn add(&mut self, p: &Prep, shift: u8) -> isize {
+        let mut delta = 0;
         let m = p.ts_ms.div_euclid(MINUTE_MS);
-        self.minutes
-            .entry(m)
-            .or_insert_with(|| Bucket::new(false))
-            .add(p);
+        seal_previous(&mut self.minutes, &mut self.open_minute, m);
+        let minute = bucket_at(&mut self.minutes, m, false, shift, &mut delta);
+        delta += minute.add(p);
         let h = p.ts_ms.div_euclid(HOUR_MS);
-        self.hours
-            .entry(h)
-            .or_insert_with(|| Bucket::new(true))
-            .add(p);
+        seal_previous(&mut self.hours, &mut self.open_hour, h);
+        let hour = bucket_at(&mut self.hours, h, true, shift, &mut delta);
+        delta += hour.add(p);
+        delta
     }
 
-    fn prune(&mut self, minute_cut: i64, hour_cut: i64) {
-        if self
-            .minutes
-            .first_key_value()
-            .is_some_and(|(k, _)| *k < minute_cut)
-        {
-            self.minutes = self.minutes.split_off(&minute_cut);
-        }
-        if self
-            .hours
-            .first_key_value()
-            .is_some_and(|(k, _)| *k < hour_cut)
-        {
-            self.hours = self.hours.split_off(&hour_cut);
-        }
+    // Returns the bytes released.
+    fn prune(&mut self, minute_cut: i64, hour_cut: i64) -> usize {
+        drop_before(&mut self.minutes, minute_cut) + drop_before(&mut self.hours, hour_cut)
+    }
+
+    fn oldest(&self, hours: bool) -> Option<i64> {
+        let map = if hours { &self.hours } else { &self.minutes };
+        map.first_key_value().map(|(k, _)| *k)
+    }
+
+    fn evict_through(&mut self, hours: bool, upto: i64) -> usize {
+        drop_through(
+            if hours {
+                &mut self.hours
+            } else {
+                &mut self.minutes
+            },
+            upto,
+        )
+    }
+
+    fn weight(&self) -> u64 {
+        self.hours.values().map(|b| b.requests).sum()
+    }
+
+    fn measure(&self) -> usize {
+        self.minutes
+            .values()
+            .chain(self.hours.values())
+            .map(|b| b.est)
+            .sum()
     }
 
     fn is_empty(&self) -> bool {
@@ -484,16 +710,22 @@ impl Scope {
         for b in self.minutes.values_mut().chain(self.hours.values_mut()) {
             if ips {
                 b.ips.map.clear();
+                b.ips.spare.clear();
             }
             if uas {
                 b.uas.map.clear();
+                b.uas.spare.clear();
             }
+            b.est = b.measure();
         }
     }
 
-    fn normalise(&mut self) {
-        for b in self.minutes.values_mut().chain(self.hours.values_mut()) {
-            b.normalise();
+    fn conform(&mut self, shift: u8) {
+        for b in self.minutes.values_mut() {
+            b.conform(false, shift);
+        }
+        for b in self.hours.values_mut() {
+            b.conform(true, shift);
         }
     }
 }
@@ -675,10 +907,36 @@ pub struct Analytics {
     recent: VecDeque<LogEvent>,
     latest_ms: i64,
     since_prune: u32,
+    budget: usize,
+    bytes: usize,
+    cap_shift: u8,
+}
+
+fn event_cost(ev: &LogEvent) -> usize {
+    std::mem::size_of::<LogEvent>()
+        + ev.client_ip.len()
+        + ev.host.len()
+        + ev.method.len()
+        + ev.path.len()
+        + ev.user_agent.len()
+        + ev.referer.len()
+        + ev.content_type.len()
+        + ev.backend.len()
+        + ev.server.len()
+        + ev.site.len()
+        + ev.blocked.as_ref().map_or(0, String::len)
+}
+
+fn locked(shared: &Mutex<Analytics>) -> std::sync::MutexGuard<'_, Analytics> {
+    shared.lock().unwrap_or_else(|p| p.into_inner())
 }
 
 impl Analytics {
     pub fn new(retention: Retention) -> Self {
+        Self::with_budget(retention, DEFAULT_BUDGET)
+    }
+
+    pub fn with_budget(retention: Retention, bytes: usize) -> Self {
         Self {
             retention,
             global: Scope::default(),
@@ -686,7 +944,88 @@ impl Analytics {
             recent: VecDeque::new(),
             latest_ms: 0,
             since_prune: 0,
+            budget: bytes.max(MIN_BUDGET),
+            bytes: 0,
+            cap_shift: 0,
         }
+    }
+
+    pub fn set_budget(&mut self, bytes: usize) {
+        self.budget = bytes.max(MIN_BUDGET);
+        self.enforce_budget();
+    }
+
+    pub fn budget(&self) -> usize {
+        self.budget
+    }
+
+    // Running estimate of the heap held by retained buckets and recent events.
+    pub fn retained_bytes(&self) -> usize {
+        self.bytes
+    }
+
+    fn recount(&mut self) {
+        let scopes = self.global.measure() + self.sites.values().map(Scope::measure).sum::<usize>();
+        self.bytes = scopes + self.recent.iter().map(event_cost).sum::<usize>();
+    }
+
+    fn adjust(&mut self, delta: isize) {
+        self.bytes = self.bytes.saturating_add_signed(delta);
+    }
+
+    fn release(&mut self, freed: usize) {
+        self.bytes = self.bytes.saturating_sub(freed);
+    }
+
+    fn scopes(&self) -> impl Iterator<Item = &Scope> {
+        std::iter::once(&self.global).chain(self.sites.values())
+    }
+
+    fn evict_oldest(&mut self, hours: bool, below: i64, low: usize) {
+        while self.bytes > low {
+            let oldest = self.scopes().filter_map(|s| s.oldest(hours)).min();
+            let Some(upto) = oldest.filter(|m| *m < below) else {
+                break;
+            };
+            let mut freed = self.global.evict_through(hours, upto);
+            for s in self.sites.values_mut() {
+                freed += s.evict_through(hours, upto);
+            }
+            self.release(freed);
+        }
+    }
+
+    fn conform_all(&mut self) {
+        self.global.conform(self.cap_shift);
+        for s in self.sites.values_mut() {
+            s.conform(self.cap_shift);
+        }
+        self.recount();
+    }
+
+    // Order of loss: old minute buckets, then top-K detail, then old hour buckets, then recent events.
+    fn enforce_budget(&mut self) {
+        if self.bytes <= self.budget {
+            return;
+        }
+        let low = self.budget - self.budget / LOW_WATER_DIV;
+        let minute_keep = self.latest_ms.div_euclid(MINUTE_MS) - KEEP_MINUTES;
+        let hour_keep = self.latest_ms.div_euclid(HOUR_MS) - KEEP_HOURS;
+        self.evict_oldest(false, minute_keep, low);
+        while self.bytes > low && self.cap_shift < MAX_CAP_SHIFT {
+            self.cap_shift += 1;
+            self.conform_all();
+        }
+        self.evict_oldest(true, hour_keep, low);
+        self.evict_oldest(false, i64::MAX, low);
+        self.evict_oldest(true, i64::MAX, low);
+        while self.bytes > low {
+            let Some(ev) = self.recent.pop_front() else {
+                break;
+            };
+            self.release(event_cost(&ev));
+        }
+        self.sites.retain(|_, s| !s.is_empty());
     }
 
     pub fn set_retention(&mut self, r: Retention) {
@@ -707,6 +1046,7 @@ impl Analytics {
                     ev.user_agent.clear();
                 }
             }
+            self.recount();
         }
         self.prune(self.latest_ms);
     }
@@ -719,31 +1059,43 @@ impl Analytics {
             ev.user_agent.clear();
         }
         self.latest_ms = self.latest_ms.max(ev.ts_ms);
+        let shift = self.cap_shift;
+        let mut delta = 0;
         {
             let p = Prep::new(&ev);
-            self.global.add(&p);
+            delta += self.global.add(&p, shift);
             if !ev.site.is_empty() {
                 if let Some(scope) = self.sites.get_mut(ev.site.as_str()) {
-                    scope.add(&p);
+                    delta += scope.add(&p, shift);
                 } else {
                     // site names come from the log stream, so the tracked set has a hard cap
                     let full = self.sites.len() >= MAX_SITES;
                     let key = if full { OTHER_SITE } else { ev.site.as_str() };
-                    self.sites.entry(key.to_string()).or_default().add(&p);
+                    delta += self
+                        .sites
+                        .entry(key.to_string())
+                        .or_default()
+                        .add(&p, shift);
                 }
             }
         }
+        self.adjust(delta);
         let cap = self.retention.recent_events;
         if cap > 0 {
             while self.recent.len() >= cap {
-                self.recent.pop_front();
+                if let Some(old) = self.recent.pop_front() {
+                    self.release(event_cost(&old));
+                }
             }
+            self.bytes += event_cost(&ev);
             self.recent.push_back(ev);
         }
         self.since_prune += 1;
         if self.since_prune >= PRUNE_EVERY {
             self.since_prune = 0;
             self.prune(self.latest_ms);
+        } else if self.bytes > self.budget {
+            self.enforce_budget();
         }
     }
 
@@ -753,15 +1105,23 @@ impl Analytics {
         let hour_span = i64::from(self.retention.hour_buckets_days) * DAY_MS;
         let minute_cut = now_ms.saturating_sub(minute_span).div_euclid(MINUTE_MS);
         let hour_cut = now_ms.saturating_sub(hour_span).div_euclid(HOUR_MS);
-        self.global.prune(minute_cut, hour_cut);
+        let mut freed = self.global.prune(minute_cut, hour_cut);
         for s in self.sites.values_mut() {
-            s.prune(minute_cut, hour_cut);
+            freed += s.prune(minute_cut, hour_cut);
         }
         self.sites.retain(|_, s| !s.is_empty());
+        self.release(freed);
         let cap = self.retention.recent_events;
         while self.recent.len() > cap {
-            self.recent.pop_front();
+            if let Some(old) = self.recent.pop_front() {
+                self.release(event_cost(&old));
+            }
         }
+        // Caps tightened under pressure relax again once usage falls well below the budget.
+        if self.cap_shift > 0 && self.bytes < self.budget / 2 {
+            self.cap_shift -= 1;
+        }
+        self.enforce_budget();
     }
 
     fn scope(&self, site: Option<&str>) -> Option<&Scope> {
@@ -858,15 +1218,25 @@ impl Analytics {
         }
     }
 
+    fn bucket_map(&self, site: Option<&str>, hours: bool) -> Option<&BTreeMap<i64, Bucket>> {
+        let scope = match site {
+            None => &self.global,
+            Some(name) => self.sites.get(name)?,
+        };
+        Some(if hours { &scope.hours } else { &scope.minutes })
+    }
+
     pub fn restore(retention: Retention, snap: Snapshot) -> Self {
-        let mut a = Self::new(retention);
+        Self::restore_with_budget(retention, DEFAULT_BUDGET, snap)
+    }
+
+    // Everything read from disk is re-limited: caps, key lengths, site count, retention and budget.
+    pub fn restore_with_budget(retention: Retention, budget: usize, snap: Snapshot) -> Self {
+        let mut a = Self::with_budget(retention, budget);
         a.latest_ms = snap.latest_ms;
         a.global = snap.global;
         a.sites = snap.sites;
-        a.global.normalise();
-        for s in a.sites.values_mut() {
-            s.normalise();
-        }
+        a.limit_sites();
         for mut ev in snap.recent {
             if !a.retention.store_client_ips {
                 ev.client_ip.clear();
@@ -886,9 +1256,108 @@ impl Analytics {
                 s.clear_identities(ips, uas);
             }
         }
+        a.conform_all();
         a.prune(a.latest_ms);
         a
     }
+
+    fn limit_sites(&mut self) {
+        if self.sites.len() <= MAX_SITES {
+            return;
+        }
+        let mut ranked: Vec<(String, u64)> = self
+            .sites
+            .iter()
+            .map(|(name, scope)| (name.clone(), scope.weight()))
+            .collect();
+        ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        for (name, _) in ranked.into_iter().skip(MAX_SITES) {
+            self.sites.remove(&name);
+        }
+    }
+}
+
+// Writes one bucket map as a JSON object, taking the lock only while a single bucket is encoded.
+fn stream_buckets<W: Write>(
+    shared: &Mutex<Analytics>,
+    out: &mut W,
+    site: Option<&str>,
+    hours: bool,
+    scratch: &mut Vec<u8>,
+) -> io::Result<()> {
+    out.write_all(b"{")?;
+    let mut cursor: Option<i64> = None;
+    let mut first = true;
+    loop {
+        scratch.clear();
+        let key = {
+            let guard = locked(shared);
+            let Some(map) = guard.bucket_map(site, hours) else {
+                break;
+            };
+            let lower = cursor.map_or(Bound::Unbounded, Bound::Excluded);
+            let Some((key, bucket)) = map.range((lower, Bound::Unbounded)).next() else {
+                break;
+            };
+            serde_json::to_writer(&mut *scratch, bucket)?;
+            *key
+        };
+        if !first {
+            out.write_all(b",")?;
+        }
+        first = false;
+        write!(out, "\"{key}\":")?;
+        out.write_all(scratch)?;
+        cursor = Some(key);
+    }
+    out.write_all(b"}")
+}
+
+fn stream_scope<W: Write>(
+    shared: &Mutex<Analytics>,
+    out: &mut W,
+    site: Option<&str>,
+    scratch: &mut Vec<u8>,
+) -> io::Result<()> {
+    out.write_all(b"{\"minutes\":")?;
+    stream_buckets(shared, out, site, false, scratch)?;
+    out.write_all(b",\"hours\":")?;
+    stream_buckets(shared, out, site, true, scratch)?;
+    out.write_all(b"}")
+}
+
+// Streams the Snapshot JSON one bucket at a time so the store is never copied under the lock.
+pub fn write_snapshot<W: Write>(shared: &Mutex<Analytics>, mut out: W) -> io::Result<()> {
+    let (latest_ms, names) = {
+        let guard = locked(shared);
+        let mut names: Vec<String> = guard.sites.keys().cloned().collect();
+        names.sort();
+        (guard.latest_ms, names)
+    };
+    let mut scratch = Vec::with_capacity(16 * 1024);
+    write!(
+        out,
+        "{{\"version\":{SNAPSHOT_VERSION},\"latest_ms\":{latest_ms},\"global\":"
+    )?;
+    stream_scope(shared, &mut out, None, &mut scratch)?;
+    out.write_all(b",\"sites\":{")?;
+    for (i, name) in names.iter().enumerate() {
+        if i > 0 {
+            out.write_all(b",")?;
+        }
+        serde_json::to_writer(&mut out, name)?;
+        out.write_all(b":")?;
+        stream_scope(shared, &mut out, Some(name), &mut scratch)?;
+    }
+    out.write_all(b"},\"recent\":")?;
+    scratch.clear();
+    {
+        let guard = locked(shared);
+        serde_json::to_writer(&mut scratch, &guard.recent)?;
+    }
+    out.write_all(&scratch)?;
+    out.write_all(b"}")?;
+    out.flush()
 }
 
 #[cfg(test)]
@@ -1487,5 +1956,162 @@ mod tests {
             a.requests(&RequestFilter::default(), usize::MAX).len(),
             5000
         );
+    }
+
+    #[test]
+    fn requests_can_be_filtered_by_site() {
+        let mut a = analytics();
+        for (i, site) in ["shop", "blog", "shop", ""].iter().enumerate() {
+            let mut e = ev(NOW - 4000 + 1000 * i as i64);
+            e.site = (*site).to_string();
+            a.record(e);
+        }
+        let only = |site: &str| RequestFilter {
+            site: Some(site.into()),
+            ..RequestFilter::default()
+        };
+        assert_eq!(a.requests(&only("shop"), 10).len(), 2);
+        assert_eq!(a.requests(&only("blog"), 10).len(), 1);
+        assert!(a.requests(&only("ghost"), 10).is_empty());
+        assert_eq!(a.requests(&RequestFilter::default(), 10).len(), 4);
+    }
+
+    // xorshift keeps the traffic generator dependency free and repeatable
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+    }
+
+    fn random_event(rng: &mut Rng, ts: i64) -> LogEvent {
+        let mut e = ev(ts);
+        e.site = format!("site{}", rng.next() % 8);
+        e.path = format!("/p/{}/{}", rng.next() % 100_000, rng.next() % 1000);
+        e.user_agent = format!("agent-{}/{}", rng.next() % 50_000, rng.next() % 100);
+        e.client_ip = format!(
+            "10.{}.{}.{}",
+            rng.next() % 250,
+            rng.next() % 250,
+            rng.next() % 250
+        );
+        e.host = format!("h{}.example.com", rng.next() % 500);
+        e.status = [200, 200, 404, 500][(rng.next() % 4) as usize];
+        e.bytes_out = rng.next() % 3_000_000;
+        e.total_ms = (rng.next() % 3000) as u32;
+        e
+    }
+
+    #[test]
+    fn random_traffic_stays_under_the_byte_budget() {
+        let budget = 2 * 1024 * 1024;
+        let mut a = Analytics::with_budget(Retention::default(), budget);
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        let mut peak = 0;
+        let mut last = NOW;
+        for i in 0..100_000i64 {
+            last = NOW + i * 20_000;
+            a.record(random_event(&mut rng, last));
+            if i % 1000 == 0 {
+                peak = peak.max(a.retained_bytes());
+            }
+        }
+        assert!(peak <= budget, "peak {peak} over {budget}");
+        assert!(a.retained_bytes() <= budget);
+        let before = a.retained_bytes();
+        a.recount();
+        assert_eq!(a.retained_bytes(), before, "running estimate drifted");
+        assert!(a.summary(3600, None, last).requests > 0);
+        let shared = Mutex::new(a);
+        let mut out = Vec::new();
+        write_snapshot(&shared, &mut out).expect("snapshot");
+        assert!(out.len() <= budget, "snapshot of {} bytes", out.len());
+        let snap: Snapshot = serde_json::from_slice(&out).expect("parse");
+        let restored = Analytics::restore_with_budget(Retention::default(), budget, snap);
+        assert!(restored.retained_bytes() <= budget);
+    }
+
+    #[test]
+    fn streamed_snapshot_matches_the_in_memory_one() {
+        let mut a = analytics();
+        for i in 0..200 {
+            let mut e = ev(NOW - 1000 * i);
+            e.site = ["a", "b\"quoted", "c"][(i % 3) as usize].into();
+            e.path = format!("/p{}", i % 7);
+            e.blocked = (i % 13 == 0).then(|| "r1".to_string());
+            a.record(e);
+        }
+        let direct = serde_json::to_value(a.snapshot()).expect("value");
+        let shared = Mutex::new(a);
+        let mut out = Vec::new();
+        write_snapshot(&shared, &mut out).expect("snapshot");
+        let streamed: serde_json::Value = serde_json::from_slice(&out).expect("valid json");
+        assert_eq!(streamed, direct);
+        let snap: Snapshot = serde_json::from_slice(&out).expect("typed");
+        let b = Analytics::restore(Retention::default(), snap);
+        let a = shared.into_inner().unwrap();
+        assert_eq!(a.summary(86_400, None, NOW), b.summary(86_400, None, NOW));
+    }
+
+    #[test]
+    fn restore_reapplies_caps_key_lengths_and_budget() {
+        let mut a = analytics();
+        for i in 0..10 {
+            let mut e = ev(NOW - 1000 * i);
+            e.site = "shop".into();
+            a.record(e);
+        }
+        let mut snap = a.snapshot();
+        let long = "x".repeat(4000);
+        for scope in std::iter::once(&mut snap.global).chain(snap.sites.values_mut()) {
+            for b in scope.hours.values_mut().chain(scope.minutes.values_mut()) {
+                for i in 0..500u64 {
+                    b.paths.map.insert(format!("/k{i}{long}"), (i + 1, 1));
+                }
+                b.paths.cap = 10_000;
+            }
+        }
+        for i in 0..400 {
+            snap.sites
+                .insert(format!("extra{i}"), snap.sites["shop"].clone());
+        }
+        let b = Analytics::restore_with_budget(Retention::default(), 2 * 1024 * 1024, snap);
+        assert!(b.sites.len() <= MAX_SITES);
+        let ok = |m: &BTreeMap<i64, Bucket>, cap: usize| {
+            m.values().all(|x| {
+                x.paths.map.len() <= cap && x.paths.map.keys().all(|k| k.len() <= KEY_PATH)
+            })
+        };
+        assert!(ok(&b.global.minutes, MINUTE_CAPS.paths));
+        assert!(ok(&b.global.hours, HOUR_CAPS.paths));
+        assert!(b.retained_bytes() <= b.budget());
+        let mut check = b;
+        let reported = check.retained_bytes();
+        check.recount();
+        assert_eq!(check.retained_bytes(), reported);
+    }
+
+    #[test]
+    fn shrinking_the_budget_evicts_old_minutes_before_recent_ones() {
+        let mut a = Analytics::with_budget(Retention::default(), 64 * 1024 * 1024);
+        let mut rng = Rng(7);
+        let end = NOW + 40 * 3_600_000;
+        let mut ts = NOW;
+        while ts < end {
+            a.record(random_event(&mut rng, ts));
+            ts += 20_000;
+        }
+        let full = a.retained_bytes();
+        a.set_budget(full / 2);
+        assert!(a.retained_bytes() <= a.budget());
+        let newest = a.latest_ms.div_euclid(MINUTE_MS);
+        let oldest = a.global.minutes.keys().next().copied().unwrap_or(newest);
+        assert!(oldest > NOW.div_euclid(MINUTE_MS));
+        assert!(a.global.minutes.contains_key(&newest));
+        assert!(a.summary(900, None, a.latest_ms).requests > 0);
     }
 }

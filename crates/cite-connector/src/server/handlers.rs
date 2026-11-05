@@ -235,7 +235,7 @@ pub(super) async fn reload(
     State(st): State<AppState>,
     Extension(p): Extension<Principal>,
 ) -> ApiResult<Response> {
-    let _gate = st.apply_lock.lock().await;
+    let _gate = st.deployer.config_lock().lock().await;
     let out = st
         .haproxy
         .apply(&st.store.config())
@@ -777,6 +777,10 @@ fn request_filter(q: &HashMap<String, String>) -> ApiResult<RequestFilter> {
             ));
         }
         filter.path_contains = Some(raw.clone());
+    }
+    if let Some(raw) = q.get("site").filter(|s| !s.is_empty()) {
+        check_id(raw)?;
+        filter.site = Some(raw.clone());
     }
     if let Some(raw) = q.get("ip").filter(|s| !s.is_empty()) {
         let ip: IpAddr = raw

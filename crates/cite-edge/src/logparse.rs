@@ -1,20 +1,24 @@
 use std::net::IpAddr;
 
 use crate::model::LogEvent;
+use crate::validate::is_valid_id;
 
 // Space separated fields; free text goes through url_enc so a raw space never appears inside one.
+// Fixed-size fields come first and the capped variable-size ones last, so a line that loses its tail keeps the verdict.
 pub const LOG_FORMAT: &str = concat!(
-    "%Ts%ms %ci %b %s ",
-    "%[var(txn.host),url_enc] %HM %[var(txn.path),url_enc] %[var(txn.qlen)] ",
-    "%ST %B %U %Tt ",
-    "%[var(txn.ua),url_enc] %[var(txn.ref),url_enc] ",
-    "%[var(txn.ct),url_enc] %[var(txn.blocked),url_enc]"
+    "%Ts%ms %ci %b %s %[method,bytes(0,16),url_enc] %ST %B %U %Tt %[var(txn.qlen)] ",
+    "%[var(txn.blocked),url_enc] %[var(txn.site),url_enc] ",
+    "%[var(txn.host),bytes(0,255),url_enc] %[var(txn.path),bytes(0,1024),url_enc] ",
+    "%[var(txn.ua),bytes(0,512),url_enc] %[var(txn.ref),bytes(0,512),url_enc] ",
+    "%[var(txn.ct),bytes(0,128),url_enc]"
 );
 
+const FIELD_COUNT: usize = 17;
+const FIRST_VARIABLE: usize = 12;
 const MAX_DATAGRAM: usize = 8192;
 const MAX_LINE: usize = 65536;
 const MAX_FUTURE_MS: i64 = 300_000;
-const MIN_FIELDS: usize = 12;
+const MIN_FIELDS: usize = FIRST_VARIABLE;
 const MAX_PATH: usize = 2048;
 const MAX_UA: usize = 512;
 const MAX_REFERER: usize = 1024;
@@ -41,6 +45,11 @@ pub fn parse_line(line: &str, now_ms: i64) -> Option<LogEvent> {
         return None;
     }
     let get = |i: usize| f.get(i).copied().unwrap_or("");
+    // a short line was cut by the log target, so its last variable field may be partial and is dropped
+    let cut = f.len() < FIELD_COUNT;
+    let tail = |i: usize| {
+        if cut && i + 1 >= f.len() { "" } else { get(i) }
+    };
     let ts: i64 = get(0).parse().ok()?;
     // an unusable clock on the sender must not push events outside the retention window
     let ts_ms = if ts <= 0 || ts > now_ms.saturating_add(MAX_FUTURE_MS) {
@@ -51,34 +60,42 @@ pub fn parse_line(line: &str, now_ms: i64) -> Option<LogEvent> {
     let client_ip = get(1);
     client_ip.parse::<IpAddr>().ok()?;
     let backend = sanitise(get(2), MAX_NAME);
-    let status: i32 = get(8).parse().ok()?;
-    let bytes_out: i64 = get(9).parse().ok()?;
-    let bytes_in: i64 = get(10).parse().ok()?;
-    let total: i64 = get(11).parse().ok()?;
+    let status: i32 = get(5).parse().ok()?;
+    let bytes_out: i64 = get(6).parse().ok()?;
+    let bytes_in: i64 = get(7).parse().ok()?;
+    let total: i64 = get(8).parse().ok()?;
     // HAProxy leaves the variable empty when no firewall rule matched
-    let blocked = decode(get(15), MAX_RULE);
+    let blocked = decode(get(10), MAX_RULE);
     let blocked = if blocked.is_empty() || blocked == "-" {
         None
     } else {
         Some(blocked)
     };
+    // blocked requests and maintenance pages never reach a site backend, so the frontend names the site
+    let mut site = site_of(&backend);
+    if site.is_empty() {
+        let named = decode(get(11), MAX_NAME);
+        if is_valid_id(&named) {
+            site = named;
+        }
+    }
     Some(LogEvent {
         ts_ms,
         client_ip: client_ip.to_string(),
-        host: decode(get(4), MAX_HOST),
-        method: sanitise(get(5), MAX_METHOD),
-        path: decode(get(6), MAX_PATH),
-        query_len: get(7)
+        host: decode(tail(FIRST_VARIABLE), MAX_HOST),
+        method: decode(get(4), MAX_METHOD),
+        path: decode(tail(FIRST_VARIABLE + 1), MAX_PATH),
+        query_len: get(9)
             .parse::<u64>()
             .map_or(0, |v| v.min(u32::MAX as u64) as u32),
         status: status.clamp(0, 999) as u16,
         bytes_in: bytes_in.max(0) as u64,
         bytes_out: bytes_out.max(0) as u64,
         total_ms: total.clamp(0, u32::MAX as i64) as u32,
-        user_agent: decode(get(12), MAX_UA),
-        referer: decode(get(13), MAX_REFERER),
-        content_type: decode(get(14), MAX_CTYPE),
-        site: site_of(&backend),
+        user_agent: decode(tail(FIRST_VARIABLE + 2), MAX_UA),
+        referer: decode(tail(FIRST_VARIABLE + 3), MAX_REFERER),
+        content_type: decode(tail(FIRST_VARIABLE + 4), MAX_CTYPE),
+        site,
         backend,
         server: sanitise(get(3), MAX_NAME),
         blocked,
@@ -201,26 +218,32 @@ mod tests {
 
     const NOW: i64 = 1_730_721_600_500;
 
-    fn body() -> String {
+    fn fields() -> Vec<String> {
         [
             "1730721600123",
             "203.0.113.9",
             "be_shop_blue",
             "app1",
-            "shop.example.com",
             "GET",
-            "/a%20b%2Fc",
-            "7",
             "200",
             "5120",
             "311",
             "12",
+            "7",
+            "",
+            "shop",
+            "shop.example.com",
+            "/a%20b%2Fc",
             "Mozilla%2F5.0+%28X11%29",
             "https%3A%2F%2Fexample.org%2F",
             "text%2Fhtml%3B+charset%3Dutf-8",
-            "",
         ]
-        .join(" ")
+        .map(String::from)
+        .to_vec()
+    }
+
+    fn body() -> String {
+        fields().join(" ")
     }
 
     #[test]
@@ -310,12 +333,45 @@ mod tests {
 
     #[test]
     fn tolerates_trimmed_trailing_fields() {
-        let short = "1730721600123 203.0.113.9 be_shop_green app1 h GET /x 0 404 10 20 3";
+        let short = "1730721600123 203.0.113.9 be_shop_green app1 GET 404 10 20 3 0  shop h /x";
         let ev = parse_line(short, NOW).expect("parsed");
         assert_eq!(ev.status, 404);
         assert_eq!(ev.site, "shop");
+        assert_eq!(ev.host, "h");
+        assert_eq!(ev.path, "");
         assert_eq!(ev.user_agent, "");
         assert_eq!(ev.blocked, None);
+    }
+
+    #[test]
+    fn line_cut_in_the_variable_tail_keeps_the_blocked_verdict() {
+        let mut f = fields();
+        f[2] = "fe_main".into();
+        f[10] = "preset-scanners-1".into();
+        for keep in FIRST_VARIABLE..FIELD_COUNT {
+            let line = f[..keep].join(" ");
+            let ev = parse_line(&line, NOW).expect("kept");
+            assert_eq!(ev.blocked.as_deref(), Some("preset-scanners-1"), "{keep}");
+            assert_eq!(ev.site, "shop");
+            assert_eq!(ev.status, 200);
+        }
+        let ev = parse_line(&f[..14].join(" "), NOW).expect("kept");
+        assert_eq!(ev.host, "shop.example.com");
+        assert_eq!(ev.path, "");
+    }
+
+    #[test]
+    fn site_label_is_used_when_the_backend_has_none() {
+        let mut f = fields();
+        f[2] = "fe_main".into();
+        assert_eq!(parse_line(&f.join(" "), NOW).expect("parsed").site, "shop");
+        f[11] = "Bad Site".into();
+        assert_eq!(parse_line(&f.join(" "), NOW).expect("parsed").site, "");
+        f[11] = String::new();
+        assert_eq!(parse_line(&f.join(" "), NOW).expect("parsed").site, "");
+        let mut g = fields();
+        g[11] = "other".into();
+        assert_eq!(parse_line(&g.join(" "), NOW).expect("parsed").site, "shop");
     }
 
     #[test]
@@ -357,20 +413,23 @@ mod tests {
 
     #[test]
     fn blocked_rule_is_extracted_and_dash_is_none() {
-        let with = body().trim_end().to_string() + " fw_deny_bots";
-        let ev = parse_line(&with, NOW).expect("parsed");
+        let mut f = fields();
+        f[10] = "fw_deny_bots".into();
+        let ev = parse_line(&f.join(" "), NOW).expect("parsed");
         assert_eq!(ev.blocked.as_deref(), Some("fw_deny_bots"));
-        let dash = body().trim_end().to_string() + " -";
-        assert_eq!(parse_line(&dash, NOW).expect("parsed").blocked, None);
+        assert_eq!(ev.path, "/a b/c");
+        f[10] = "-".into();
+        assert_eq!(parse_line(&f.join(" "), NOW).expect("parsed").blocked, None);
     }
 
     #[test]
     fn site_is_derived_from_backend_name() {
         let ev = parse_line(&body().replace("be_shop_blue", "be_my_site_green"), NOW);
         assert_eq!(ev.expect("parsed").site, "my_site");
-        let ev = parse_line(&body().replace("be_shop_blue", "be_maintenance"), NOW);
+        let bare = body().replace(" shop ", "  ");
+        let ev = parse_line(&bare.replace("be_shop_blue", "be_maintenance"), NOW);
         assert_eq!(ev.expect("parsed").site, "");
-        let ev = parse_line(&body().replace("be_shop_blue", "other"), NOW);
+        let ev = parse_line(&bare.replace("be_shop_blue", "other"), NOW);
         assert_eq!(ev.expect("parsed").site, "");
     }
 
@@ -407,7 +466,15 @@ mod tests {
     fn log_format_is_single_line_without_quotes() {
         assert!(!LOG_FORMAT.contains('\n'));
         assert!(!LOG_FORMAT.contains('"'));
-        assert_eq!(LOG_FORMAT.split(' ').count(), 16);
+        assert_eq!(LOG_FORMAT.split(' ').count(), FIELD_COUNT);
+        let fixed: Vec<&str> = LOG_FORMAT.split(' ').take(FIRST_VARIABLE).collect();
+        assert!(
+            fixed
+                .iter()
+                .all(|f| !f.contains("txn.path") && !f.contains("txn.ua"))
+        );
+        let tail: Vec<&str> = LOG_FORMAT.split(' ').skip(FIRST_VARIABLE).collect();
+        assert!(tail.iter().all(|f| f.contains("bytes(0,")), "{tail:?}");
     }
 
     proptest! {

@@ -68,7 +68,7 @@ All accept `window` (`15m`, `1h`, `24h`, `7d`, `30d`) and optional `site`.
 |---|---|
 | `GET /analytics/summary` | `{requests,bytes_in,bytes_out,blocked,errors_4xx,errors_5xx,avg_ms,p50_ms,p95_ms,p99_ms,status:{"2xx":n,...},methods:{GET:n},content_types:{...},sizes:[{le,count}],top_paths:[{key,count,bytes}],top_ips:[...],top_user_agents:[...],top_hosts:[...],top_blocked:[...]}` |
 | `GET /analytics/timeseries` | `{step_secs,points:[{ts,requests,bytes_out,errors,blocked,avg_ms}]}` |
-| `GET /analytics/requests?limit=&status=&method=&path=&ip=&blocked=` | `[LogEvent]` newest first |
+| `GET /analytics/requests?limit=&status=&method=&path=&ip=&blocked=&site=` | `[LogEvent]` newest first |
 
 ## Dashboard server
 

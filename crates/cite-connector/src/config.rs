@@ -12,6 +12,28 @@ const MAX_SESSION_TTL_SECS: u64 = 30 * 86_400;
 const DEFAULT_MASTER_PORT: u16 = 9998;
 const MAX_SANS: usize = 32;
 const MAX_NODE_NAME: usize = 64;
+const DEFAULT_ANALYTICS_BYTES: u64 = 128 * 1024 * 1024;
+const MIN_ANALYTICS_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_ANALYTICS_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+const UNIX_PREFIX: &str = "unix:";
+// sun_path is 104 bytes on the BSDs and 108 on Linux, one byte of which is the terminator.
+const MAX_SOCKET_PATH: usize = 103;
+
+// Where the connector receives HAProxy's syslog datagrams.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LogListen {
+    Udp(SocketAddr),
+    Unix(PathBuf),
+}
+
+impl std::fmt::Display for LogListen {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LogListen::Udp(addr) => write!(f, "{addr}"),
+            LogListen::Unix(path) => write!(f, "{UNIX_PREFIX}{}", path.display()),
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ConnectorConfig {
@@ -25,14 +47,16 @@ pub struct ConnectorConfig {
     pub haproxy_cfg: PathBuf,
     pub runtime_addr: String,
     pub master_addr: String,
-    pub log_listen: SocketAddr,
+    pub log_listen: LogListen,
     pub log_addr_for_haproxy: String,
+    pub analytics_max_bytes: usize,
     pub haproxy_bin: String,
     pub validate_with_haproxy: bool,
     pub tls: bool,
     pub tls_sans: Vec<String>,
     pub docker_host: Option<String>,
     pub edge_network: String,
+    pub haproxy_container: String,
     pub stack_version: String,
     pub registry: String,
     pub session_ttl_secs: u64,
@@ -64,11 +88,70 @@ fn parse_addr(key: &str, value: &str) -> Result<SocketAddr> {
 
 // The master CLI listens next to the runtime socket on the same host.
 fn default_master_addr(runtime_addr: &str) -> Result<String> {
+    if let Some(path) = runtime_addr.strip_prefix(UNIX_PREFIX) {
+        let dir = std::path::Path::new(path)
+            .parent()
+            .and_then(|d| d.to_str())
+            .ok_or_else(|| config_err("CITE_HAPROXY_RUNTIME has no directory".into()))?;
+        return Ok(format!(
+            "{UNIX_PREFIX}{}/master.sock",
+            dir.trim_end_matches('/')
+        ));
+    }
     let (host, _) = runtime_addr
         .rsplit_once(':')
         .filter(|(host, port)| !host.is_empty() && port.parse::<u16>().is_ok())
         .ok_or_else(|| config_err("CITE_HAPROXY_RUNTIME must be host:port".into()))?;
     Ok(format!("{host}:{DEFAULT_MASTER_PORT}"))
+}
+
+// A socket path must be absolute and short enough for sun_path, with plain characters only.
+fn check_socket_path(key: &str, path: &str) -> Result<()> {
+    let plain = path
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'-'));
+    let ok = path.starts_with('/')
+        && path.len() > 1
+        && path.len() <= MAX_SOCKET_PATH
+        && !path.ends_with('/')
+        && plain
+        && !path.split('/').any(|part| part == "..");
+    if ok {
+        Ok(())
+    } else {
+        Err(config_err(format!(
+            "{key} must be an absolute socket path of plain characters, at most {MAX_SOCKET_PATH} bytes"
+        )))
+    }
+}
+
+fn check_endpoint(key: &str, value: &str) -> Result<()> {
+    match value.strip_prefix(UNIX_PREFIX) {
+        Some(path) => check_socket_path(key, path),
+        None => check_host_port(key, value),
+    }
+}
+
+fn parse_log_listen(value: &str) -> Result<LogListen> {
+    match value.strip_prefix(UNIX_PREFIX) {
+        Some(path) => {
+            check_socket_path("CITE_LOG_LISTEN", path)?;
+            Ok(LogListen::Unix(PathBuf::from(path)))
+        }
+        None => parse_addr("CITE_LOG_LISTEN", value).map(LogListen::Udp),
+    }
+}
+
+fn parse_analytics_bytes(raw: &str) -> Result<usize> {
+    let bytes: u64 = raw
+        .parse()
+        .map_err(|_| config_err("CITE_ANALYTICS_MAX_BYTES must be a number of bytes".into()))?;
+    if !(MIN_ANALYTICS_BYTES..=MAX_ANALYTICS_BYTES).contains(&bytes) {
+        return Err(config_err(format!(
+            "CITE_ANALYTICS_MAX_BYTES must be between {MIN_ANALYTICS_BYTES} and {MAX_ANALYTICS_BYTES}"
+        )));
+    }
+    usize::try_from(bytes).map_err(|_| config_err("CITE_ANALYTICS_MAX_BYTES is too large".into()))
 }
 
 fn check_host_port(key: &str, value: &str) -> Result<()> {
@@ -154,10 +237,11 @@ impl ConnectorConfig {
             "CITE_CONNECTOR_LISTEN",
             get(env, "CITE_CONNECTOR_LISTEN").unwrap_or("0.0.0.0:7443"),
         )?;
-        let log_listen = parse_addr(
-            "CITE_LOG_LISTEN",
-            get(env, "CITE_LOG_LISTEN").unwrap_or("0.0.0.0:5140"),
-        )?;
+        let log_listen = parse_log_listen(get(env, "CITE_LOG_LISTEN").unwrap_or("0.0.0.0:5140"))?;
+        let analytics_max_bytes = match get(env, "CITE_ANALYTICS_MAX_BYTES") {
+            Some(raw) => parse_analytics_bytes(raw)?,
+            None => DEFAULT_ANALYTICS_BYTES as usize,
+        };
 
         let data_dir = PathBuf::from(get(env, "CITE_CONNECTOR_DATA").unwrap_or("/conf"));
         // An explicit name must be valid; an ambient HOSTNAME that is not falls back quietly.
@@ -187,13 +271,20 @@ impl ConnectorConfig {
         let runtime_addr = get(env, "CITE_HAPROXY_RUNTIME")
             .unwrap_or("haproxy:9999")
             .to_string();
-        check_host_port("CITE_HAPROXY_RUNTIME", &runtime_addr)?;
+        check_endpoint("CITE_HAPROXY_RUNTIME", &runtime_addr)?;
         let master_addr = match get(env, "CITE_HAPROXY_MASTER") {
             Some(addr) => {
-                check_host_port("CITE_HAPROXY_MASTER", addr)?;
+                check_endpoint("CITE_HAPROXY_MASTER", addr)?;
                 addr.to_string()
             }
             None => default_master_addr(&runtime_addr)?,
+        };
+        let log_addr_for_haproxy = match get(env, "CITE_LOG_ADDR") {
+            Some(addr) => addr.to_string(),
+            None => match &log_listen {
+                LogListen::Unix(path) => path.display().to_string(),
+                LogListen::Udp(_) => "connector:5140".to_string(),
+            },
         };
 
         // Everything HAProxy reads lives under one directory so it can be a single shared volume.
@@ -209,9 +300,8 @@ impl ConnectorConfig {
             runtime_addr,
             master_addr,
             log_listen,
-            log_addr_for_haproxy: get(env, "CITE_LOG_ADDR")
-                .unwrap_or("connector:5140")
-                .to_string(),
+            log_addr_for_haproxy,
+            analytics_max_bytes,
             haproxy_bin: get(env, "CITE_HAPROXY_BIN")
                 .unwrap_or("haproxy")
                 .to_string(),
@@ -221,6 +311,10 @@ impl ConnectorConfig {
             docker_host: get(env, "CITE_DOCKER_HOST").map(str::to_string),
             edge_network: get(env, "CITE_EDGE_NETWORK")
                 .unwrap_or("cite_edge")
+                .to_string(),
+            haproxy_container: env
+                .get("CITE_HAPROXY_CONTAINER")
+                .map_or("cite-node-haproxy", |v| v.trim())
                 .to_string(),
             stack_version: get(env, "CITE_STACK_VERSION")
                 .unwrap_or(env!("CARGO_PKG_VERSION"))
@@ -254,7 +348,11 @@ mod tests {
     fn defaults_apply_when_only_allowlist_is_set() {
         let cfg = ConnectorConfig::from_env_map(&base()).expect("config");
         assert_eq!(cfg.listen, "0.0.0.0:7443".parse().expect("addr"));
-        assert_eq!(cfg.log_listen, "0.0.0.0:5140".parse().expect("addr"));
+        assert_eq!(
+            cfg.log_listen,
+            LogListen::Udp("0.0.0.0:5140".parse().expect("addr"))
+        );
+        assert_eq!(cfg.analytics_max_bytes, 128 * 1024 * 1024);
         assert_eq!(cfg.data_dir, PathBuf::from("/conf"));
         assert_eq!(cfg.haproxy_dir, PathBuf::from("/conf/haproxy"));
         assert_eq!(cfg.maps_dir, PathBuf::from("/conf/haproxy/maps"));
@@ -270,6 +368,7 @@ mod tests {
         assert!(cfg.tls_sans.is_empty());
         assert_eq!(cfg.docker_host, None);
         assert_eq!(cfg.edge_network, "cite_edge");
+        assert_eq!(cfg.haproxy_container, "cite-node-haproxy");
         assert_eq!(cfg.registry, "ghcr.io/seggys116");
         assert_eq!(cfg.session_ttl_secs, 8 * 3600);
         assert_eq!(cfg.node_name, "node");
@@ -321,6 +420,17 @@ mod tests {
     }
 
     #[test]
+    fn haproxy_container_can_be_set_or_disabled() {
+        let mut e = base();
+        e.insert("CITE_HAPROXY_CONTAINER".into(), "edge-proxy".into());
+        let cfg = ConnectorConfig::from_env_map(&e).expect("config");
+        assert_eq!(cfg.haproxy_container, "edge-proxy");
+        e.insert("CITE_HAPROXY_CONTAINER".into(), " ".into());
+        let cfg = ConnectorConfig::from_env_map(&e).expect("config");
+        assert_eq!(cfg.haproxy_container, "");
+    }
+
+    #[test]
     fn master_address_follows_the_runtime_host_unless_set() {
         let mut e = base();
         e.insert("CITE_HAPROXY_RUNTIME".into(), "172.30.250.3:9999".into());
@@ -331,6 +441,61 @@ mod tests {
         assert_eq!(cfg.master_addr, "10.1.1.1:7000");
         e.insert("CITE_HAPROXY_MASTER".into(), "no-port".into());
         assert!(ConnectorConfig::from_env_map(&e).is_err());
+    }
+
+    #[test]
+    fn unix_socket_forms_are_accepted_and_derive_their_siblings() {
+        let mut e = base();
+        e.extend(env(&[
+            ("CITE_HAPROXY_RUNTIME", "unix:/run/cite/admin.sock"),
+            ("CITE_LOG_LISTEN", "unix:/run/cite/log.sock"),
+        ]));
+        let cfg = ConnectorConfig::from_env_map(&e).expect("config");
+        assert_eq!(cfg.runtime_addr, "unix:/run/cite/admin.sock");
+        assert_eq!(cfg.master_addr, "unix:/run/cite/master.sock");
+        assert_eq!(
+            cfg.log_listen,
+            LogListen::Unix(PathBuf::from("/run/cite/log.sock"))
+        );
+        assert_eq!(cfg.log_addr_for_haproxy, "/run/cite/log.sock");
+        e.extend(env(&[
+            ("CITE_HAPROXY_MASTER", "unix:/run/other/m.sock"),
+            ("CITE_LOG_ADDR", "/run/other/l.sock"),
+        ]));
+        let cfg = ConnectorConfig::from_env_map(&e).expect("config");
+        assert_eq!(cfg.master_addr, "unix:/run/other/m.sock");
+        assert_eq!(cfg.log_addr_for_haproxy, "/run/other/l.sock");
+    }
+
+    #[test]
+    fn unsafe_socket_paths_are_rejected() {
+        let long = format!("unix:/{}", "a".repeat(120));
+        for (key, value) in [
+            ("CITE_HAPROXY_RUNTIME", "unix:relative.sock"),
+            ("CITE_HAPROXY_RUNTIME", "unix:/run/../etc/x.sock"),
+            ("CITE_HAPROXY_RUNTIME", "unix:/run/cite dir/x.sock"),
+            ("CITE_HAPROXY_RUNTIME", "unix:/"),
+            ("CITE_HAPROXY_RUNTIME", "unix:/run/cite/"),
+            ("CITE_HAPROXY_RUNTIME", long.as_str()),
+            ("CITE_HAPROXY_MASTER", "unix:"),
+            ("CITE_LOG_LISTEN", "unix:/run/x\ny.sock"),
+        ] {
+            let mut e = base();
+            e.insert(key.into(), value.into());
+            assert!(ConnectorConfig::from_env_map(&e).is_err(), "{key}={value}");
+        }
+    }
+
+    #[test]
+    fn analytics_budget_is_configurable_and_bounded() {
+        let mut e = base();
+        e.insert("CITE_ANALYTICS_MAX_BYTES".into(), "33554432".into());
+        let cfg = ConnectorConfig::from_env_map(&e).expect("config");
+        assert_eq!(cfg.analytics_max_bytes, 32 * 1024 * 1024);
+        for bad in ["abc", "0", "1024", "-5", "99999999999999"] {
+            e.insert("CITE_ANALYTICS_MAX_BYTES".into(), bad.into());
+            assert!(ConnectorConfig::from_env_map(&e).is_err(), "{bad}");
+        }
     }
 
     #[test]

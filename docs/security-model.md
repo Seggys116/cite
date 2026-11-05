@@ -8,9 +8,9 @@ This page covers node mode: who can reach what, which secrets exist and where th
 |---|---|---|
 | HAProxy ports 80 and 443 | Anyone, on `CITE_PUBLIC_BIND` | Firewall rules, rate limit, body size limit |
 | Connector API, port 7443 | Host IP in `CITE_CONNECTOR_BIND` | Allowlist, then TLS, then token |
-| HAProxy runtime socket `172.30.250.3:9999` and master CLI `172.30.250.3:9998` | Containers on the internal `ctl` network: HAProxy and the connector only; not published to the host | Network isolation only. See below. |
-| Docker API through the socket proxy | The connector, on the internal `docker_api` network | Endpoint filter only |
-| Site executors, port 8080 | Containers on `cite_edge` | Network isolation only |
+| HAProxy admin socket `/run/cite/admin.sock` and master CLI `/run/cite/master.sock` | Processes that can open files in the `cite_run` volume: HAProxy and the connector only; no network listener | File ownership (uid 10001, directory mode 0750, socket mode 0600). See below. |
+| Docker API through `cite-dockerproxy` | The connector, on the internal `docker_api` network | Deny-by-default filter on method, path, query and body |
+| Site executors, port 8080 | HAProxy, over the stack's own internal network (or every container on `cite_edge` when per-stack networks are off) | Network isolation only |
 
 ### Connector API
 
@@ -60,9 +60,9 @@ The credential report from `init` is printed once and not stored. The debug outp
 
 ## The HAProxy admin sockets
 
-HAProxy exposes two admin-level TCP listeners with no authentication: the runtime socket on port 9999 (`stats socket`), which the connector uses to switch slots, toggle maintenance and read backend health, and the master CLI on port 9998 (`-S`), which the connector uses to reload. Both are bound to the HAProxy address on the `ctl` network (172.30.250.3) only, not to every interface.
+HAProxy exposes two admin-level control sockets with no authentication: the admin socket (`stats socket`), which the connector uses to switch slots, toggle maintenance and read backend health, and the master CLI (`-S`), which the connector uses to reload. Both are unix sockets in the `cite_run` volume, so there is no TCP listener to reach from any network, and a site target pointing at an HAProxy address cannot hit them.
 
-`ctl` is an internal network, and only HAProxy and the connector join it. Site executors, which run the site's own server code, are on `cite_edge` and cannot reach either socket. The ports are not published to the host. HAProxy is the internet-facing process and does sit on `ctl`, so a compromised HAProxy can also reach its own admin sockets and the connector's ports there. The connector API still applies its allowlist, which rejects the HAProxy address unless you list it, and the log sink only parses datagrams.
+The volume is mounted only in the HAProxy and connector containers, which both run as uid 10001. Site executors, which run the site's own server code, are on their own per-stack networks (or `cite_edge`) and cannot see the volume. HAProxy is the internet-facing process, so a compromised HAProxy can reach its own sockets, which it owns anyway. The log sink is a unix datagram socket (mode 0600) and only parses datagrams. The connector API still applies its allowlist.
 
 The master CLI address in the compose `command` and `CITE_HAPROXY_MASTER` must be kept in step. Reloading no longer needs signals or a shared process namespace.
 
@@ -86,22 +86,29 @@ The firewall removes known probe traffic. It does not replace a web application 
 
 ## The orchestrator overlay
 
-Single-site mode never mounts the Docker socket. That is a design rule, and the overlay breaks it on purpose so one connector can create site stacks.
+Single-site mode never mounts the Docker socket. That is a design rule, and the overlay breaks it on purpose so one connector can create site stacks. The overlay is built so that a compromised connector gains far less than the daemon's full power.
 
 What the overlay adds:
 
-- A `socketproxy` container is the only one with `/var/run/docker.sock`, mounted read-only. The connector reaches it over the internal `docker_api` network at `tcp://socketproxy:2375`.
-- The proxy allows containers, networks, volumes, images and POST requests, and denies exec, build, commit, swarm, secrets, system, info, events and the rest.
+- A `dockerproxy` container (`cite-dockerproxy`) is the only one with `/var/run/docker.sock`. The connector reaches it over the internal `docker_api` network at `http://dockerproxy:2375`. The socket bind is marked read-only, which does not restrict the API; the filter does.
+- The proxy forwards only the calls the orchestrator makes and rebuilds the expected body for each container, volume and network create, rejecting anything that differs. See [Orchestrator](orchestrator.md#the-docker-proxy) for the full list.
+- The proxy runs as uid 10001 with the socket's group added, a read-only root filesystem, no capabilities, `no-new-privileges`, and memory, CPU and pids limits.
 
-What it trades away:
+Why a generic socket proxy is not enough: tools such as `tecnativa/docker-socket-proxy` allow or deny whole API sections by path. With containers and POST enabled, a client may create a container with `Privileged`, a `/:/host` bind, host PID or network mode, all capabilities or raw devices, and then start it, which is root on the host. With volumes enabled, a local volume with bind options mounts the host's root. With images enabled, any image from any registry can be pulled. With networks enabled, any container can be attached to the control network. The purpose-built proxy blocks each of these because it checks the body, not just the path.
 
-- The proxy filters by URL path and method. It does not check what a request contains. A client allowed to create containers can create a privileged container or one that bind-mounts the host's root, so in effect the connector can become root on the host.
-- Anything that lets someone act through the connector (its API tokens, its sessions, a bypass of the allowlist) then comes close to host root. A stolen API token is close to a stolen host.
-- GitHub tokens sit in `secrets.json` and in the manager container's environment, readable by anyone who can inspect containers through the API.
+What the connector can still do through the proxy: create, start, stop and remove containers named `cite-<id>-<slot>-<role>` from Cite images in the configured registry with the fixed hardened specification, create and delete the matching `cite.managed` volumes and networks, and attach the HAProxy container to the per-stack networks. It cannot exec into or attach to a container, read logs, copy files, pull other images, bind host paths, use host namespaces, add capabilities, or touch a container, volume or network that lacks the `cite.managed=true` label.
 
-What stays in place: the connector itself builds each container with no host mounts, read-only root, all capabilities dropped except the few the manager and init need, memory, CPU and process limits, and no route out for executors. Those are checked by the connector's tests. They limit what site code does, not what the connector can ask Docker to do.
+Site isolation: every stack has its own internal network that only its executor and HAProxy join, so one site's code cannot reach another site's executor, the connector, or HAProxy's admin sockets. If `CITE_HAPROXY_CONTAINER` is set empty, executors share `cite_edge` and can reach each other. That is a weaker mode, for nodes whose sites are all trusted.
 
-The socket proxy is the only thing between the connector and the Docker daemon, and it filters by API path only. A compromised connector can ask Docker to create containers, including privileged ones, which is close to host root. That is why the orchestrator is opt-in.
+Residual risks:
+
+- The Docker socket is still the proxy's own privilege. A compromised proxy process, or anyone who can reach the socket from the host, has root on the host. The proxy is small, has no shell and no write access to its own filesystem, but it is the one component whose compromise is total.
+- The filter is only as strict as its tests. The proxy ships tests that feed every specification the orchestrator can emit through the validator and a set of hostile variants through the HTTP layer, so a change to the orchestrator that the proxy does not accept fails the build.
+- GitHub tokens sit in `secrets.json` and in the manager container's environment, readable by anyone who can inspect containers. The proxy allows inspecting stack containers, so a compromised connector can read the tokens it already holds.
+- Anything that lets someone act through the connector (its API tokens, its sessions, a bypass of the allowlist) can still create, stop and delete stacks, and so can disrupt or replace sites on the node, though it cannot reach the host through Docker.
+- Disk is not limited per stack. Docker's per-container storage quota and volume driver options are blocked by the proxy, so a site whose build fills its volumes can fill the host disk. Use an XFS data root with project quotas, or monitor disk use.
+- Images are trusted by tag from the configured registry. A compromised registry account or a moved tag changes what runs. Pin the registry to one you control.
+- Containers share the host kernel. A kernel or runtime escape from a site stack is out of scope, as it is in single-site mode.
 
 If you do not need GitHub builds on the node, leave the overlay off and give sites upstream addresses. The connector then has no Docker access at all.
 

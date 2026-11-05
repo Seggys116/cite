@@ -11,8 +11,8 @@ use cite_edge::runtime::{
     BackendStat, all_servers_up, cmd_set_active, cmd_set_maintenance, cmd_show_stat, parse_stat_csv,
 };
 use serde::Serialize;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::{TcpStream, UnixStream};
 use tokio::process::Command;
 use tokio::sync::Mutex;
 use tokio::time::{sleep, timeout};
@@ -83,7 +83,24 @@ fn path_str(path: &Path) -> Result<String> {
         .ok_or_else(|| internal(format!("path {} is not valid UTF-8", path.display())))
 }
 
-fn stats_listen(runtime_addr: &str) -> Result<String> {
+const UNIX_PREFIX: &str = "unix:";
+
+// The admin and master sockets are reached over TCP (host:port) or a unix socket (unix:/path).
+trait Duplex: AsyncRead + AsyncWrite + Unpin + Send {}
+
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> Duplex for T {}
+
+type Conn = Box<dyn Duplex>;
+
+pub(crate) fn stats_listen(runtime_addr: &str) -> Result<String> {
+    if let Some(path) = runtime_addr.strip_prefix(UNIX_PREFIX) {
+        if !path.starts_with('/') {
+            return Err(internal(format!(
+                "runtime socket path {path:?} must be absolute"
+            )));
+        }
+        return Ok(format!("unix@{path}"));
+    }
     let (host, port) = runtime_addr
         .rsplit_once(':')
         .and_then(|(host, port)| Some((host, port.parse::<u16>().ok().filter(|p| *p > 0)?)))
@@ -190,9 +207,16 @@ fn parse_info_pid(info: &str) -> Option<u64> {
         .and_then(|value| value.trim().parse().ok())
 }
 
-async fn open(addr: &str, label: &str) -> Result<TcpStream> {
+async fn connect(addr: &str) -> std::io::Result<Conn> {
+    match addr.strip_prefix(UNIX_PREFIX) {
+        Some(path) => Ok(Box::new(UnixStream::connect(path).await?)),
+        None => Ok(Box::new(TcpStream::connect(addr).await?)),
+    }
+}
+
+async fn open(addr: &str, label: &str) -> Result<Conn> {
     let fail = |why: String| ConnectorError::Unavailable(format!("haproxy {label} {addr}: {why}"));
-    match timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
+    match timeout(CONNECT_TIMEOUT, connect(addr)).await {
         Ok(Ok(stream)) => Ok(stream),
         Ok(Err(err)) => Err(fail(err.to_string())),
         Err(_) => Err(fail("connect timed out".into())),
@@ -201,7 +225,7 @@ async fn open(addr: &str, label: &str) -> Result<TcpStream> {
 
 // HAProxy answers one command per connection and closes it, so EOF marks the end of the reply.
 async fn converse(
-    mut stream: TcpStream,
+    mut stream: Conn,
     addr: &str,
     label: &str,
     cmd: &str,
@@ -240,7 +264,7 @@ fn parse_reload_reply(reply: &str) -> std::result::Result<(), String> {
     }
 }
 
-async fn send_reload(stream: TcpStream, addr: &str) -> std::result::Result<(), String> {
+async fn send_reload(stream: Conn, addr: &str) -> std::result::Result<(), String> {
     let reply = converse(stream, addr, MASTER_LABEL, "reload\n", RELOAD_REPLY)
         .await
         .map_err(|err| err.to_string())?;
@@ -524,7 +548,7 @@ mod tests {
     };
     use tempfile::TempDir;
     use tokio::io::{AsyncBufReadExt, BufReader};
-    use tokio::net::TcpListener;
+    use tokio::net::{TcpListener, UnixListener};
 
     const CSV_HEADER: &str = "# pxname,svname,status,scur,bin,bout,check_status\n";
 
@@ -606,6 +630,30 @@ mod tests {
         (addr, seen)
     }
 
+    // Same behaviour as fake_runtime but listening on a unix socket at `path`.
+    fn fake_unix(
+        path: &Path,
+        handler: impl Fn(&str) -> String + Send + Sync + 'static,
+    ) -> Arc<StdMutex<Vec<String>>> {
+        let listener = UnixListener::bind(path).unwrap();
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let log = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut line = String::new();
+                let mut reader = BufReader::new(&mut stream);
+                if reader.read_line(&mut line).await.is_err() {
+                    continue;
+                }
+                let reply = handler(&line);
+                log.lock().unwrap().push(line);
+                let _ = stream.write_all(reply.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        seen
+    }
+
     fn csv(rows: &[(&str, &str, &str)]) -> String {
         let mut out = CSV_HEADER.to_string();
         for (backend, server, status) in rows {
@@ -621,6 +669,63 @@ mod tests {
         for bad in ["haproxy", "haproxy:0", "haproxy:x", "haproxy:70000", ""] {
             assert!(stats_listen(bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn stats_listen_maps_unix_runtime_sockets() {
+        assert_eq!(
+            stats_listen("unix:/run/cite/admin.sock").unwrap(),
+            "unix@/run/cite/admin.sock"
+        );
+        assert!(stats_listen("unix:relative.sock").is_err());
+    }
+
+    #[tokio::test]
+    async fn unix_runtime_and_master_sockets_drive_a_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let (admin, master) = (dir.path().join("a.sock"), dir.path().join("m.sock"));
+        let reloads = Arc::new(AtomicU64::new(0));
+        let counter = reloads.clone();
+        let seen_master = fake_unix(&master, move |line| {
+            if line.trim() == "reload" {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
+            "Success=1\n--\nok\n".to_string()
+        });
+        let seen_admin = fake_unix(&admin, move |line| {
+            if line.starts_with("show info") {
+                format!("Pid: {}\n", 100 + reloads.load(Ordering::SeqCst))
+            } else {
+                "\n".to_string()
+            }
+        });
+        let state = tempfile::tempdir().unwrap();
+        let mut hp = haproxy_in(&state, &format!("{UNIX_PREFIX}{}", admin.display()));
+        hp.master_addr = format!("{UNIX_PREFIX}{}", master.display());
+        hp.log_addr = "/run/cite/log.sock".into();
+        let outcome = hp.apply(&edge(vec![site("shop")])).await.unwrap();
+        assert!(outcome.reloaded);
+        assert_eq!(seen_master.lock().unwrap().as_slice(), ["reload\n"]);
+        hp.set_active("shop", Slot::Green).await.unwrap();
+        let sent = seen_admin.lock().unwrap().clone();
+        assert!(sent.iter().any(|c| c.starts_with("set map")), "{sent:?}");
+        let text = hp.current_config_text().unwrap();
+        assert!(
+            text.contains(&format!("unix@{}", admin.display())),
+            "{text}"
+        );
+        assert!(text.contains("/run/cite/log.sock"));
+        assert!(!text.contains("ipv4@"));
+    }
+
+    #[tokio::test]
+    async fn missing_unix_socket_is_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let gone = dir.path().join("none.sock");
+        let hp = haproxy_in(&state, &format!("{UNIX_PREFIX}{}", gone.display()));
+        let err = hp.stats().await.unwrap_err();
+        assert!(matches!(err, ConnectorError::Unavailable(_)), "{err:?}");
     }
 
     #[test]

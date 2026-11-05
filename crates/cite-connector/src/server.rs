@@ -22,7 +22,7 @@ use hyper::service::service_fn;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use serde::de::DeserializeOwned;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::Semaphore;
 use tokio_rustls::TlsAcceptor;
 use tower::Service;
 
@@ -59,7 +59,6 @@ pub struct Inner {
     orchestrator: Option<Arc<Orchestrator>>,
     analytics: Arc<StdMutex<Analytics>>,
     limiter: StdMutex<LoginLimiter>,
-    apply_lock: Mutex<()>,
     render_opts: RenderOptions,
     started: Instant,
 }
@@ -76,7 +75,8 @@ impl Inner {
         let render_opts = RenderOptions {
             maps_dir: cfg.maps_dir.display().to_string(),
             pages_dir: cfg.pages_dir.display().to_string(),
-            runtime_addr: cfg.runtime_addr.clone(),
+            runtime_addr: crate::haproxy::stats_listen(&cfg.runtime_addr)
+                .unwrap_or_else(|_| cfg.runtime_addr.clone()),
             log_addr: cfg.log_addr_for_haproxy.clone(),
             tls_dir: None,
         };
@@ -88,7 +88,6 @@ impl Inner {
             orchestrator,
             analytics,
             limiter: StdMutex::new(LoginLimiter::new()),
-            apply_lock: Mutex::new(()),
             render_opts,
             started: Instant::now(),
         })
@@ -102,7 +101,7 @@ impl Inner {
         detail: &str,
         f: impl FnOnce(&mut EdgeConfig) -> Result<T>,
     ) -> Result<T> {
-        let _gate = self.apply_lock.lock().await;
+        let _gate = self.deployer.config_lock().lock().await;
         let previous = self.store.config();
         let opts = &self.render_opts;
         let out = self

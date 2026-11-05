@@ -326,7 +326,7 @@ echo "== analytics"
 SUMMARY_OK=""
 for _ in $(seq 1 30); do
   api GET "/api/v1/analytics/summary?window=15m"
-  if printf '%s' "$BODY" | jq -e '.blocked > 0 and .requests > 200' >/dev/null; then
+  if printf '%s' "$BODY" | jq -e '.blocked > 0 and .requests > 200 and (.status["5xx"] // 0) > 0' >/dev/null; then
     SUMMARY_OK=1
     break
   fi

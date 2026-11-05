@@ -1,16 +1,20 @@
+use std::fs::{self, OpenOptions};
+use std::io::{self, BufWriter};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use cite_core::atomic::{read_limited, write_atomic};
-use cite_edge::analytics::{Analytics, Snapshot};
+use cite_core::atomic::read_limited;
+use cite_edge::analytics::{Analytics, Snapshot, write_snapshot};
 use cite_edge::logparse::parse_datagram;
 use cite_edge::model::{LogEvent, Retention};
-use tokio::net::UdpSocket;
+use socket2::SockRef;
+use tokio::net::{UdpSocket, UnixDatagram};
 use tokio::task::JoinHandle;
 use tokio::time::{MissedTickBehavior, interval, sleep};
 
-use crate::config::ConnectorConfig;
+use crate::config::{ConnectorConfig, LogListen};
 use crate::store::Store;
 
 const DATAGRAM_BUF: usize = 16 * 1024;
@@ -20,7 +24,8 @@ const FLUSH_EVERY: Duration = Duration::from_millis(100);
 const RECV_BACKOFF: Duration = Duration::from_millis(50);
 const SNAPSHOT_FILE: &str = "analytics.json";
 const SNAPSHOT_MODE: u32 = 0o600;
-const MAX_SNAPSHOT_BYTES: u64 = 512 * 1024 * 1024;
+const RECV_BUFFER: usize = 4 * 1024 * 1024;
+const SOCKET_MODE: u32 = 0o600;
 
 fn now_ms() -> i64 {
     SystemTime::now()
@@ -36,29 +41,66 @@ fn snapshot_path(cfg: &ConnectorConfig) -> PathBuf {
     cfg.data_dir.join(SNAPSHOT_FILE)
 }
 
-fn read_snapshot(path: &Path) -> Result<Snapshot, String> {
-    let bytes = read_limited(path, MAX_SNAPSHOT_BYTES).map_err(|e| e.to_string())?;
+// A file the size of the whole budget already means a store that would not fit once parsed.
+fn read_snapshot(path: &Path, max_bytes: usize) -> Result<Snapshot, String> {
+    let bytes = read_limited(path, max_bytes as u64).map_err(|e| e.to_string())?;
     serde_json::from_slice(&bytes).map_err(|e| e.to_string())
 }
 
-fn load_from(path: &Path, retention: Retention) -> Analytics {
+fn load_from(path: &Path, retention: Retention, budget: usize) -> Analytics {
     if !path.exists() {
-        return Analytics::new(retention);
+        return Analytics::with_budget(retention, budget);
     }
-    match read_snapshot(path) {
-        Ok(snapshot) => Analytics::restore(retention, snapshot),
+    match read_snapshot(path, budget) {
+        Ok(snapshot) => Analytics::restore_with_budget(retention, budget, snapshot),
         Err(err) => {
             tracing::warn!(
                 "ignoring unreadable analytics snapshot {}: {err}",
                 path.display()
             );
-            Analytics::new(retention)
+            Analytics::with_budget(retention, budget)
         }
     }
 }
 
 pub fn load_snapshot(cfg: &ConnectorConfig, retention: Retention) -> Analytics {
-    load_from(&snapshot_path(cfg), retention)
+    load_from(&snapshot_path(cfg), retention, cfg.analytics_max_bytes)
+}
+
+// Streams into a private temp file next to the target, then renames it into place.
+fn write_streamed(path: &Path, analytics: &Mutex<Analytics>) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .ok_or_else(|| io::Error::other("snapshot path has no file name"))?;
+    let tmp = parent.join(format!(
+        ".{}.tmp.{}",
+        name.to_string_lossy(),
+        std::process::id()
+    ));
+    match fs::remove_file(&tmp) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
+    let written = (|| {
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(SNAPSHOT_MODE)
+            .open(&tmp)?;
+        let mut out = BufWriter::with_capacity(256 * 1024, file);
+        write_snapshot(analytics, &mut out)?;
+        let file = out.into_inner().map_err(|e| e.into_error())?;
+        file.sync_all()?;
+        fs::rename(&tmp, path)
+    })();
+    if written.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    written
 }
 
 fn persist_once(
@@ -67,15 +109,12 @@ fn persist_once(
     retention: &Retention,
     now: i64,
 ) -> Result<(), String> {
-    // The lock covers only the in-memory work; serialising and writing happen after it is released.
-    let snapshot = {
+    {
         let mut guard = lock(analytics);
         guard.set_retention(retention.clone());
         guard.prune(now);
-        guard.snapshot()
-    };
-    let bytes = serde_json::to_vec(&snapshot).map_err(|e| e.to_string())?;
-    write_atomic(path, &bytes, SNAPSHOT_MODE).map_err(|e| e.to_string())
+    }
+    write_streamed(path, analytics).map_err(|e| e.to_string())
 }
 
 fn enqueue(batch: &mut Vec<LogEvent>, event: LogEvent, dropped: &mut u64) {
@@ -102,7 +141,51 @@ fn flush(analytics: &Mutex<Analytics>, batch: &mut Vec<LogEvent>) -> bool {
     true
 }
 
-async fn receive_loop(socket: UdpSocket, analytics: Arc<Mutex<Analytics>>) {
+enum Sink {
+    Udp(UdpSocket),
+    Unix(UnixDatagram),
+}
+
+impl Sink {
+    async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Sink::Udp(socket) => socket.recv_from(buf).await.map(|(len, _)| len),
+            Sink::Unix(socket) => socket.recv(buf).await,
+        }
+    }
+
+    // The default kernel buffer drops bursts; failing to enlarge it only costs headroom.
+    fn grow_receive_buffer(&self) {
+        let grown = match self {
+            Sink::Udp(socket) => SockRef::from(socket).set_recv_buffer_size(RECV_BUFFER),
+            Sink::Unix(socket) => SockRef::from(socket).set_recv_buffer_size(RECV_BUFFER),
+        };
+        if let Err(err) = grown {
+            tracing::warn!("log sink could not enlarge its receive buffer: {err}");
+        }
+    }
+}
+
+// A stale socket file from a previous run would make the bind fail.
+fn bind_unix(path: &Path) -> io::Result<UnixDatagram> {
+    match fs::remove_file(path) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
+    let socket = UnixDatagram::bind(path)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(SOCKET_MODE))?;
+    Ok(socket)
+}
+
+async fn bind_sink(listen: &LogListen) -> io::Result<Sink> {
+    match listen {
+        LogListen::Udp(addr) => UdpSocket::bind(addr).await.map(Sink::Udp),
+        LogListen::Unix(path) => bind_unix(path).map(Sink::Unix),
+    }
+}
+
+async fn receive_loop(sink: Sink, analytics: Arc<Mutex<Analytics>>) {
+    sink.grow_receive_buffer();
     let mut buf = vec![0u8; DATAGRAM_BUF];
     let mut batch: Vec<LogEvent> = Vec::with_capacity(BATCH);
     let mut dropped = 0u64;
@@ -111,8 +194,8 @@ async fn receive_loop(socket: UdpSocket, analytics: Arc<Mutex<Analytics>>) {
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
         tokio::select! {
-            received = socket.recv_from(&mut buf) => match received {
-                Ok((len, _)) => {
+            received = sink.recv(&mut buf) => match received {
+                Ok(len) => {
                     if let Some(event) = parse_datagram(&buf[..len], now_ms()) {
                         enqueue(&mut batch, event, &mut dropped);
                     }
@@ -161,9 +244,8 @@ pub async fn persist_final(
 ) {
     let retention = store.config().settings.retention.clone();
     let (path, shared) = (snapshot_path(cfg), Arc::clone(analytics));
-    let task = tokio::task::spawn_blocking(move || {
-        persist_once(&path, &shared, &retention, now_ms())
-    });
+    let task =
+        tokio::task::spawn_blocking(move || persist_once(&path, &shared, &retention, now_ms()));
     match task.await {
         Ok(Ok(())) => {}
         Ok(Err(err)) => tracing::warn!("final analytics snapshot not written: {err}"),
@@ -176,11 +258,11 @@ pub fn spawn(
     analytics: Arc<Mutex<Analytics>>,
     store: Arc<Store>,
 ) -> JoinHandle<()> {
-    let listen = cfg.log_listen;
+    let listen = cfg.log_listen.clone();
     let path = snapshot_path(cfg);
     tokio::spawn(async move {
-        let socket = match UdpSocket::bind(listen).await {
-            Ok(socket) => socket,
+        let sink = match bind_sink(&listen).await {
+            Ok(sink) => sink,
             Err(err) => {
                 tracing::error!("log sink cannot bind {listen}: {err}");
                 return;
@@ -188,7 +270,7 @@ pub fn spawn(
         };
         tracing::info!("log sink listening on {listen}");
         tokio::join!(
-            receive_loop(socket, analytics.clone()),
+            receive_loop(sink, analytics.clone()),
             persist_loop(path, analytics, store)
         );
     })
@@ -207,18 +289,19 @@ mod tests {
             "203.0.113.9".into(),
             backend.into(),
             "t1".into(),
-            "shop.example.com".into(),
             "GET".into(),
-            path.into(),
-            "0".into(),
             status.to_string(),
             "2048".into(),
             "300".into(),
             "12".into(),
+            "0".into(),
+            String::new(),
+            String::new(),
+            "shop.example.com".into(),
+            path.into(),
             "curl%2F8".into(),
             "-".into(),
             "text%2Fhtml".into(),
-            String::new(),
         ];
         assert_eq!(list.len(), LOG_FORMAT.split(' ').count());
         list
@@ -228,6 +311,8 @@ mod tests {
         let body = fields(ts, backend, path, status).join(" ");
         format!("<134>Nov  4 12:00:00 edge haproxy[812]: {body}")
     }
+
+    const BUDGET: usize = 8 * 1024 * 1024;
 
     fn analytics() -> Arc<Mutex<Analytics>> {
         Arc::new(Mutex::new(Analytics::new(Retention::default())))
@@ -250,7 +335,10 @@ mod tests {
     async fn bound_sink(a: &Arc<Mutex<Analytics>>) -> (std::net::SocketAddr, JoinHandle<()>) {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let addr = socket.local_addr().unwrap();
-        (addr, tokio::spawn(receive_loop(socket, a.clone())))
+        (
+            addr,
+            tokio::spawn(receive_loop(Sink::Udp(socket), a.clone())),
+        )
     }
 
     async fn sender() -> UdpSocket {
@@ -375,7 +463,7 @@ mod tests {
             lock(&a).record(parse_datagram(text.as_bytes(), now).unwrap());
         }
         persist_once(&path, &a, &Retention::default(), now).unwrap();
-        let restored = load_from(&path, Retention::default());
+        let restored = load_from(&path, Retention::default(), BUDGET);
         let summary = restored.summary(3600, None, now);
         assert_eq!(summary.requests, 7);
         assert_eq!(summary.errors_5xx, 7);
@@ -397,10 +485,10 @@ mod tests {
     fn corrupt_or_missing_snapshot_yields_empty_analytics() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(SNAPSHOT_FILE);
-        let missing = load_from(&path, Retention::default());
+        let missing = load_from(&path, Retention::default(), BUDGET);
         assert_eq!(missing.summary(3600, None, now_ms()).requests, 0);
         std::fs::write(&path, b"{ not json").unwrap();
-        let loaded = load_from(&path, Retention::default());
+        let loaded = load_from(&path, Retention::default(), BUDGET);
         assert_eq!(loaded.summary(3600, None, now_ms()).requests, 0);
         assert!(loaded.requests(&Default::default(), 10).is_empty());
     }
@@ -421,7 +509,7 @@ mod tests {
             store_client_ips: false,
             ..Retention::default()
         };
-        let restored = load_from(&path, tight);
+        let restored = load_from(&path, tight, BUDGET);
         let recent = restored.requests(&Default::default(), 100);
         assert_eq!(recent.len(), 2);
         assert!(recent.iter().all(|e| e.client_ip.is_empty()));
@@ -432,7 +520,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = test_config(dir.path());
         let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        cfg.log_listen = probe.local_addr().unwrap();
+        let listen = probe.local_addr().unwrap();
+        cfg.log_listen = LogListen::Udp(listen);
         drop(probe);
         let store = Store::open(&cfg).await.unwrap();
         let a = analytics();
@@ -441,7 +530,7 @@ mod tests {
         let text = line(now_ms(), "be_shop_blue", "/spawned", 200);
         let mut seen = false;
         for _ in 0..60 {
-            tx.send_to(text.as_bytes(), cfg.log_listen).await.unwrap();
+            tx.send_to(text.as_bytes(), listen).await.unwrap();
             sleep(Duration::from_millis(50)).await;
             if requests(&a) > 0 {
                 seen = true;
@@ -452,9 +541,70 @@ mod tests {
         handle.abort();
 
         let taken = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        cfg.log_listen = taken.local_addr().unwrap();
+        cfg.log_listen = LogListen::Udp(taken.local_addr().unwrap());
         let failed = spawn(&cfg, analytics(), store);
         let finished = tokio::time::timeout(Duration::from_secs(5), failed).await;
         assert!(finished.is_ok(), "spawn must return when bind fails");
+    }
+
+    #[test]
+    fn oversized_snapshot_files_are_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SNAPSHOT_FILE);
+        let a = analytics();
+        let now = now_ms();
+        for i in 0..50 {
+            let text = line(now, "be_shop_blue", &format!("/big{i}"), 200);
+            lock(&a).record(parse_datagram(text.as_bytes(), now).unwrap());
+        }
+        persist_once(&path, &a, &Retention::default(), now).unwrap();
+        let size = std::fs::metadata(&path).unwrap().len() as usize;
+        let fits = load_from(&path, Retention::default(), size);
+        assert_eq!(fits.summary(3600, None, now).requests, 50);
+        let too_small = load_from(&path, Retention::default(), size - 1);
+        assert_eq!(too_small.summary(3600, None, now).requests, 0);
+    }
+
+    #[test]
+    fn streamed_persist_leaves_no_temp_file_and_replaces_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SNAPSHOT_FILE);
+        let a = analytics();
+        persist_once(&path, &a, &Retention::default(), now_ms()).unwrap();
+        persist_once(&path, &a, &Retention::default(), now_ms()).unwrap();
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec![SNAPSHOT_FILE.to_string()]);
+    }
+
+    #[tokio::test]
+    async fn unix_datagrams_reach_analytics_and_the_socket_is_private() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log.sock");
+        std::fs::write(&path, b"stale").unwrap();
+        let sink = bind_sink(&LogListen::Unix(path.clone())).await.unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let a = analytics();
+        let task = tokio::spawn(receive_loop(sink, a.clone()));
+        let tx = UnixDatagram::unbound().unwrap();
+        for i in 0..3 {
+            let text = line(now_ms(), "be_shop_blue", &format!("/u{i}"), 200);
+            tx.send_to(text.as_bytes(), &path).await.unwrap();
+        }
+        assert!(wait_for(&a, 3).await);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn receive_buffer_is_never_made_smaller() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let before = SockRef::from(&socket).recv_buffer_size().unwrap();
+        let sink = Sink::Udp(socket);
+        sink.grow_receive_buffer();
+        let Sink::Udp(socket) = &sink else { return };
+        assert!(SockRef::from(socket).recv_buffer_size().unwrap() >= before);
     }
 }

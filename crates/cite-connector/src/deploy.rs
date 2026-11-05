@@ -32,6 +32,7 @@ pub struct Deployer {
     haproxy: Arc<Haproxy>,
     orchestrator: Option<Arc<Orchestrator>>,
     locks: StdMutex<HashMap<String, Arc<Mutex<()>>>>,
+    config_lock: Mutex<()>,
     timing: Timing,
 }
 
@@ -102,6 +103,7 @@ impl Deployer {
             haproxy,
             orchestrator,
             locks: StdMutex::new(HashMap::new()),
+            config_lock: Mutex::new(()),
             timing: Timing {
                 create_health: CREATE_HEALTH,
                 deploy_health: DEPLOY_HEALTH,
@@ -122,6 +124,12 @@ impl Deployer {
             drain,
         };
         self
+    }
+
+    // Every change to the stored config, its apply and a restore after a failed apply runs under this
+    // one lock, so a restore can never wipe a change another operation made in the meantime.
+    pub fn config_lock(&self) -> &Mutex<()> {
+        &self.config_lock
     }
 
     fn site_lock(&self, id: &str) -> Arc<Mutex<()>> {
@@ -179,6 +187,7 @@ impl Deployer {
         action: &str,
         change: impl FnOnce(&mut EdgeConfig) -> Result<T>,
     ) -> Result<T> {
+        let _gate = self.config_lock.lock().await;
         let previous = self.store.config();
         let out = self.store.update(actor, action, change).await?;
         if let Err(err) = self.haproxy.apply(&self.store.config()).await {
@@ -191,6 +200,7 @@ impl Deployer {
     async fn record(&self, actor: &str, id: &str, entry: Deployment) {
         let action = audit_name(entry.action);
         let sid = id.to_string();
+        let _gate = self.config_lock.lock().await;
         let saved = self
             .store
             .update(actor, action, move |cfg| {
@@ -477,9 +487,11 @@ impl Deployer {
         action: DeployAction,
         note: String,
     ) -> Result<Deployment> {
+        let gate = self.config_lock.lock().await;
         if let Err(err) = self.haproxy.set_active(id, slot).await {
             // Put the map file back so a later reload cannot route to the slot that never went live.
             let _ = self.haproxy.set_active(id, old).await;
+            drop(gate);
             let reason = format!("switching traffic failed: {err}");
             self.record_failure(actor, id, slot, &note, &reason).await;
             return Err(err);
@@ -495,6 +507,7 @@ impl Deployer {
                 Ok(())
             })
             .await?;
+        drop(gate);
         Ok(entry)
     }
 
@@ -603,6 +616,7 @@ impl Deployer {
         let lock = self.site_lock(id);
         let _guard = lock.lock().await;
         let site = self.get_site(id)?;
+        let _gate = self.config_lock.lock().await;
         let previous = self.store.config();
         if let Some(pid) = &page_id
             && !previous.pages.iter().any(|p| &p.id == pid)
@@ -973,6 +987,78 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, ConnectorError::BadRequest(_)), "{err:?}");
         assert!(e.store.config().sites.is_empty());
+    }
+
+    // Rejects exactly one validation, and only after a delay, so a second mutation can overlap it.
+    fn one_shot_rejecting_haproxy(dir: &std::path::Path) -> (String, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let armed = dir.join("armed");
+        let script = dir.join("fake-haproxy");
+        let body = format!(
+            "#!/bin/sh\nif [ -e '{0}' ]; then rm -f '{0}'; sleep 0.4; echo rejected >&2; exit 1; fi\nexit 0\n",
+            armed.display()
+        );
+        std::fs::write(&script, body).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (script.display().to_string(), armed)
+    }
+
+    #[tokio::test]
+    async fn a_failed_apply_does_not_wipe_a_concurrent_change_to_another_site() {
+        let tools = tempfile::tempdir().unwrap();
+        let (bin, armed) = one_shot_rejecting_haproxy(tools.path());
+        let e = env_with(
+            move |cfg| {
+                cfg.validate_with_haproxy = true;
+                cfg.haproxy_bin = bin;
+            },
+            None,
+        )
+        .await;
+        created(&e).await;
+        std::fs::write(&armed, b"").unwrap();
+        let doomed = e.deployer.create_site("t", new_site("doomed"), None);
+        let survivor = async {
+            sleep(Duration::from_millis(100)).await;
+            e.deployer
+                .create_site("t", new_site("survivor"), None)
+                .await
+        };
+        let (failed, kept) = tokio::join!(doomed, survivor);
+        assert!(
+            matches!(failed, Err(ConnectorError::BadRequest(_))),
+            "{failed:?}"
+        );
+        assert!(kept.is_ok(), "{kept:?}");
+        let ids: Vec<String> = e
+            .store
+            .config()
+            .sites
+            .iter()
+            .map(|s| s.id.clone())
+            .collect();
+        assert!(ids.contains(&"shop".to_string()), "{ids:?}");
+        assert!(ids.contains(&"survivor".to_string()), "{ids:?}");
+        assert!(!ids.contains(&"doomed".to_string()), "{ids:?}");
+        let text = std::fs::read_to_string(&e.cfg.haproxy_cfg).unwrap();
+        assert!(text.contains("be_survivor_blue") && !text.contains("be_doomed_blue"));
+    }
+
+    #[tokio::test]
+    async fn the_config_lock_is_shared_with_callers() {
+        let e = env().await;
+        let held = e.deployer.config_lock().lock().await;
+        let blocked = tokio::time::timeout(
+            Duration::from_millis(200),
+            e.deployer.create_site("t", new_site("shop"), None),
+        )
+        .await;
+        assert!(
+            blocked.is_err(),
+            "mutation ran while the config lock was held"
+        );
+        drop(held);
+        created(&e).await;
     }
 
     #[tokio::test]

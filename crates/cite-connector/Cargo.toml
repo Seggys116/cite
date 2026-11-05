@@ -37,6 +37,7 @@ reqwest.workspace = true
 arc-swap.workspace = true
 clap.workspace = true
 rustix.workspace = true
+socket2 = "0.6"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rcgen = "0.13"

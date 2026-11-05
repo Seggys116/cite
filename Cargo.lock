@@ -340,6 +340,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "socket2",
  "subtle",
  "tempfile",
  "thiserror",
@@ -400,6 +401,26 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "cite-dockerproxy"
+version = "0.2.0"
+dependencies = [
+ "bytes",
+ "cite-connector",
+ "cite-edge",
+ "http",
+ "http-body",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "regex",
+ "serde_json",
+ "tempfile",
+ "tokio",
  "tracing",
  "tracing-subscriber",
 ]

@@ -46,6 +46,7 @@ fn sensitive_files() -> Preset {
     let drop = FirewallAction::Drop;
     let p = "sensitive-files";
     // (?i) keeps the match case-insensitive, which needs a PCRE-enabled haproxy build
+    // (;[^/]*)? tolerates path parameters, which servlet containers strip from every segment
     Preset {
         name: p,
         title: "Sensitive files",
@@ -56,35 +57,35 @@ fn sensitive_files() -> Preset {
                 1,
                 "Dotfiles",
                 drop,
-                r"(?i)(^|/)\.(env|git|svn|hg|htaccess|htpasswd|ds_store)(/|\.|$)",
+                r"(?i)(^|/)\.(env|git|svn|hg|htaccess|htpasswd|ds_store)(;[^/]*)?(/|\.|$)",
             ),
             path_rule(
                 p,
                 2,
                 "Private keys",
                 drop,
-                r"(?i)(^|/)id_(rsa|dsa|ecdsa|ed25519)(\.pub)?$",
+                r"(?i)(^|/)id_(rsa|dsa|ecdsa|ed25519)(\.pub)?(;[^/]*)?$",
             ),
             path_rule(
                 p,
                 3,
                 "WordPress config",
                 drop,
-                r"(?i)(^|/)wp-config(\.php)?(\.|~|$)",
+                r"(?i)(^|/)wp-config(\.php)?(\.|~|;|$)",
             ),
             path_rule(
                 p,
                 4,
                 "Database and backup files",
                 drop,
-                r"(?i)\.(sql|bak|swp|orig)$",
+                r"(?i)\.(sql|bak|swp|orig)(;[^/]*)?$",
             ),
             path_rule(
                 p,
                 5,
                 "Backup archives",
                 drop,
-                r"(?i)(^|/)(backup|backups|dump|dumps|db|database|www|site|public_html)[^/]*\.(zip|tar|tgz|gz|7z|rar)$",
+                r"(?i)(^|/)(backup|backups|dump|dumps|db|database|www|site|public_html)[^/]*\.(zip|tar|tgz|gz|7z|rar)(;[^/]*)?$",
             ),
         ],
     }
@@ -111,7 +112,7 @@ fn cms_probes() -> Preset {
                 2,
                 "Database admin tools",
                 drop,
-                r"(?i)/(phpmyadmin|pma|myadmin|mysqladmin)(/|$)",
+                r"(?i)/(phpmyadmin|pma|myadmin|mysqladmin)(;[^/]*)?(/|$)",
             ),
             path_rule(
                 p,
@@ -125,7 +126,7 @@ fn cms_probes() -> Preset {
                 4,
                 "Java and router consoles",
                 drop,
-                r"(?i)/(actuator|solr|manager/html)(/|$)",
+                r"(?i)/(actuator|solr|manager(;[^/]*)?/html)(;[^/]*)?(/|$)",
             ),
         ],
     }
@@ -247,6 +248,12 @@ mod tests {
             "/db/dump.sql",
             "/wp-config.php",
             "/backup-2024.zip",
+            "/.env;x",
+            "/.git;a=b/config",
+            "/id_rsa;x",
+            "/db/dump.sql;jsessionid=1",
+            "/backup.zip;x",
+            "/wp-config;x",
         ] {
             assert!(matches("sensitive-files", hit), "{hit} not matched");
         }
@@ -272,6 +279,10 @@ mod tests {
             "/pma",
             "/vendor/phpunit/x",
             "/actuator/env",
+            "/actuator;x/env",
+            "/phpmyadmin;x/",
+            "/manager;x/html",
+            "/pma;x",
         ] {
             assert!(matches("cms-probes", hit), "{hit} not matched");
         }

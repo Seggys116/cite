@@ -4,9 +4,20 @@ This page covers what a node records about traffic, the privacy settings, every 
 
 ## Where the data comes from
 
-HAProxy writes one log line per request and sends it as a UDP datagram in RFC 5424 format to the connector (`connector:5140` by default, on the internal `ctl` network). The connector parses the line and updates in-memory counters. There is no database.
+HAProxy writes one log line per request and sends it as a datagram in RFC 5424 format to the connector. In the compose file this is a unix datagram socket (`/run/cite/log.sock` on the shared `cite_run` volume); a UDP address such as `connector:5140` also works. The connector parses the line and updates in-memory counters. There is no database.
 
 Datagrams over 8192 bytes, lines that do not parse, and lines with an invalid client address are discarded. If the connector falls 4096 events behind, further events are dropped and a warning is logged.
+
+### Log format and truncation
+
+HAProxy cuts a log message at its `len` limit, 1024 bytes unless raised, and an attacker can send a long path to push the end of the line past it. Two measures keep the verdict of such a request from being lost:
+
+- The log target is rendered with `len 8192`, which is also the largest datagram the connector accepts.
+- The fields are ordered so the fixed-size ones come first: time, client address, backend, server, method, status, bytes out, bytes in, total time, query length, blocked rule and site. The variable-size ones come last: host, path, user agent, referer and content type. Each variable field is cut before encoding (host 255 bytes, path 1024, user agent 512, referer 512, content type 128), so the worst case line stays well under 8192 bytes.
+
+If a line still arrives short, the connector keeps the event. Fields that are missing are left empty, and the last field present is also emptied because it may be partial. A line that lacks any of the fixed fields is discarded.
+
+Requests that never reach a site backend, such as blocked requests and maintenance pages, are logged against `fe_main`. The site is then read from a separate field that HAProxy fills from the host and path match, so those events still count towards the right site.
 
 ## Fields collected
 
@@ -16,7 +27,7 @@ Datagrams over 8192 bytes, lines that do not parse, and lines with an invalid cl
 | Client IP | Source address of the TCP connection. Cleared when `store_client_ips` is off. |
 | Host | `Host` header, up to 255 characters. |
 | Method | Up to 16 characters. |
-| Path | Without the query string, up to 2048 characters. |
+| Path | Without the query string, as normalised by the edge (see the firewall page), up to 2048 characters after decoding. |
 | Query length | The length of the query string in bytes. The query string itself is never logged. |
 | Status | HTTP status. |
 | Bytes in, bytes out | Request and response sizes. |
@@ -24,7 +35,7 @@ Datagrams over 8192 bytes, lines that do not parse, and lines with an invalid cl
 | User agent | Up to 512 characters. Cleared when `store_user_agents` is off. |
 | Referer | Up to 1024 characters, kept only on the recent-request list. |
 | Content type | Response `Content-Type`, up to 128 characters. |
-| Backend, server | The HAProxy backend and server that answered. The site is taken from the backend name. |
+| Backend, server | The HAProxy backend and server that answered. The site is taken from the backend name, or from the site field when the request was answered by the frontend. |
 | Blocked | The id of the firewall rule that fired, when one did. |
 
 Request and response headers other than those listed, cookies and bodies are never logged.
@@ -79,14 +90,17 @@ The audit log is pruned of entries older than `audit_days` once an hour. Because
 
 ## Memory bounds
 
-Memory use does not grow with traffic volume. It is bounded by the settings above and by fixed caps.
+Memory use does not grow with traffic volume. It is bounded by the settings above, by fixed caps and by one global byte budget.
+
+The budget is `CITE_ANALYTICS_MAX_BYTES` (128 MiB by default). The collector keeps a running estimate of the memory held by buckets and recent requests. When the estimate passes the budget it frees memory in this order until it is about 10 percent under: the oldest minute buckets (never the newest hour), then it halves the top list sizes (up to three times), then the oldest hour buckets (never the newest day), and last the recent request list. The top list sizes relax again when usage falls below half of the budget. A snapshot file larger than the budget is ignored at start, and everything read from a snapshot is trimmed to the current caps and budget.
 
 | What | Bound |
 |---|---|
 | Recent requests | `recent_events` entries, 5000 by default. |
 | Buckets | One per minute for `minute_buckets_hours`, one per hour for `hour_buckets_days`, for the node and each tracked site. |
-| Top lists per minute bucket | 32 paths, 24 IPs, 16 user agents, 8 hosts, 8 rules. |
-| Top lists per hour bucket | 256 paths, 128 IPs, 64 user agents, 32 hosts, 32 rules. |
+| Top lists per minute bucket | 10 paths, 6 IPs, 4 user agents, 3 hosts, 3 rules. |
+| Top lists per hour bucket | 64 paths, 32 IPs, 16 user agents, 16 hosts, 16 rules. |
+| Total retained data | `CITE_ANALYTICS_MAX_BYTES`. |
 | Methods and content types per bucket | 16 and 32. |
 | Key length | Paths 128, IPs 45, user agents 96, hosts 64, rules 64, methods 16, content types 64 characters. |
 | Latency histogram | 128 slots per bucket. |
@@ -97,9 +111,9 @@ Old buckets are pruned automatically every 8192 requests and before each snapsho
 
 ## Persistence
 
-The connector writes a snapshot of the counters and the recent-request list to `analytics.json` in its data directory (`/conf`), mode 0600, every `persist_interval_secs`. It loads the file on start, so a restart keeps the history. A missing or corrupt file starts empty. The retention settings in force are applied when the snapshot loads, including the privacy flags.
+The connector writes a snapshot of the counters and the recent-request list to `analytics.json` in its data directory (`/conf`), mode 0600, every `persist_interval_secs`. The file is streamed to disk one bucket at a time, so writing it neither copies the store nor blocks recording for long. It loads the file on start, so a restart keeps the history. A missing or corrupt file starts empty. The retention settings in force are applied when the snapshot loads, including the privacy flags.
 
-Traffic that arrives while the connector is stopped is not counted, because the logs go to the connector over UDP and are not buffered. After a hard stop you lose up to one persist interval of counts.
+Traffic that arrives while the connector is stopped is not counted, because the logs go to the connector as datagrams and are not buffered. After a hard stop you lose up to one persist interval of counts.
 
 ## Reading it
 
@@ -107,6 +121,6 @@ Traffic that arrives while the connector is stopped is not counted, because the 
 |---|---|
 | `GET /api/v1/analytics/summary` | Totals, latency, status classes, methods, content types, size buckets and the top lists. |
 | `GET /api/v1/analytics/timeseries` | Points per minute (windows up to 48 hours) or per hour: requests, bytes out, errors, blocked and average latency. |
-| `GET /api/v1/analytics/requests` | Recent requests, newest first, filtered by `status`, `method`, `path`, `ip` or `blocked`. |
+| `GET /api/v1/analytics/requests` | Recent requests, newest first, filtered by `status`, `method`, `path`, `ip`, `blocked` or `site`. |
 
 All three take `window` and an optional `site`. See [Connector API](node-api.md) for the response shapes. The dashboard's Traffic view shows the same data and refreshes the live request list every 3 seconds.

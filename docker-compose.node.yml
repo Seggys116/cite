@@ -16,17 +16,21 @@ services:
       - CHOWN
       - FOWNER
     entrypoint: ["/bin/sh", "-c"]
-    # Children first, /conf last: once /conf is chowned the capability-less root cannot traverse it, so a finished volume is left alone.
+    # /run/cite is fixed on every start. Children of /conf first, /conf last: once /conf is chowned the capability-less root cannot traverse it, so a finished volume is left alone.
     command:
       - >-
+        chown 10001:10001 /run/cite && chmod 0750 /run/cite && (
         [ "$$(stat -c %u /conf)" = 10001 ] || (
         mkdir -p /conf/haproxy /conf/certs /conf/state &&
         chmod 0750 /conf/haproxy /conf/certs /conf/state /conf &&
-        chown 10001:10001 /conf/haproxy /conf/certs /conf/state /conf )
+        chown 10001:10001 /conf/haproxy /conf/certs /conf/state /conf ) )
     volumes:
       - type: volume
         source: cite_conf
         target: /conf
+      - type: volume
+        source: cite_run
+        target: /run/cite
     network_mode: none
     logging:
       driver: json-file
@@ -37,6 +41,7 @@ services:
   haproxy:
     image: docker.io/library/haproxy:3.0-bookworm
     restart: unless-stopped
+    container_name: cite-node-haproxy
     depends_on:
       init:
         condition: service_completed_successfully
@@ -49,8 +54,8 @@ services:
       - ALL
     sysctls:
       net.ipv4.ip_unprivileged_port_start: "0"
-    # The -S address must match CITE_HAPROXY_MASTER on the connector; the runtime socket address comes from the rendered config.
-    command: ["haproxy", "-W", "-db", "-S", "ipv4@172.30.250.3:9998,level,admin", "-f", "/conf/haproxy/haproxy.cfg"]
+    # The -S socket must match CITE_HAPROXY_MASTER on the connector; the admin socket path comes from the rendered config.
+    command: ["haproxy", "-W", "-db", "-S", "/run/cite/master.sock,level,admin", "-f", "/conf/haproxy/haproxy.cfg"]
     tmpfs:
       - /tmp:size=32m,mode=1777,noexec,nosuid,nodev
     volumes:
@@ -66,6 +71,9 @@ services:
         read_only: true
         volume:
           subpath: certs
+      - type: volume
+        source: cite_run
+        target: /run/cite
     ports:
       - target: 80
         published: ${CITE_HTTP_PORT:-80}
@@ -78,8 +86,6 @@ services:
     networks:
       public:
       cite_edge:
-      ctl:
-        ipv4_address: 172.30.250.3
     mem_limit: ${CITE_HAPROXY_MEM:-1g}
     cpus: ${CITE_HAPROXY_CPUS:-2.0}
     pids_limit: ${CITE_HAPROXY_PIDS:-512}
@@ -109,15 +115,18 @@ services:
     environment:
       CITE_CONNECTOR_ALLOW: ${CITE_CONNECTOR_ALLOW:?set CITE_CONNECTOR_ALLOW in .env}
       CITE_CONNECTOR_LISTEN: 0.0.0.0:7443
-      CITE_HAPROXY_RUNTIME: 172.30.250.3:9999
-      CITE_HAPROXY_MASTER: 172.30.250.3:9998
-      CITE_LOG_ADDR: 172.30.250.2:5140
-      CITE_LOG_LISTEN: 172.30.250.2:5140
+      CITE_HAPROXY_RUNTIME: unix:/run/cite/admin.sock
+      CITE_HAPROXY_MASTER: unix:/run/cite/master.sock
+      CITE_LOG_LISTEN: unix:/run/cite/log.sock
+      CITE_LOG_ADDR: /run/cite/log.sock
       RUST_LOG: ${RUST_LOG:-info}
     volumes:
       - type: volume
         source: cite_conf
         target: /conf
+      - type: volume
+        source: cite_run
+        target: /run/cite
     ports:
       - target: 7443
         published: ${CITE_CONNECTOR_PORT:-7443}
@@ -125,8 +134,6 @@ services:
         protocol: tcp
     networks:
       public:
-      ctl:
-        ipv4_address: 172.30.250.2
     mem_limit: ${CITE_CONNECTOR_MEM:-512m}
     cpus: ${CITE_CONNECTOR_CPUS:-1.0}
     pids_limit: ${CITE_CONNECTOR_PIDS:-256}
@@ -144,6 +151,8 @@ services:
 
 volumes:
   cite_conf:
+  # Unix sockets shared by HAProxy and the connector: admin, master CLI and the log datagram socket.
+  cite_run:
 
 networks:
   public:
@@ -152,11 +161,3 @@ networks:
     name: cite_edge
     driver: bridge
     internal: true
-  # Admin sockets of HAProxy; only HAProxy and the connector join, never site executors.
-  ctl:
-    name: cite_ctl
-    driver: bridge
-    internal: true
-    ipam:
-      config:
-        - subnet: 172.30.250.0/29

@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::net::{IpAddr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
 
 use ipnet::IpNet;
@@ -8,7 +8,8 @@ use thiserror::Error;
 
 use crate::model::{EdgeConfig, EdgeSettings, FirewallRule, HealthCheck, MaintenancePage, Site};
 
-pub const MAX_PAGE_BYTES: usize = 256 * 1024;
+// HAProxy loads a page file into one buffer (tune.bufsize 16384 by default), so larger pages fail the config check.
+pub const MAX_PAGE_BYTES: usize = 15_000;
 const MAX_TARGETS: usize = 32;
 const MAX_PATTERN_LEN: usize = 256;
 const MAX_TEXT_LEN: usize = 128;
@@ -65,7 +66,7 @@ pub(crate) fn validate_host(what: &str, host: &str) -> Result<(), ValidationErro
     Ok(())
 }
 
-// Values become bare haproxy words: printable ASCII only, no # or quotes; spell spaces as \x20.
+// Values become bare haproxy words: printable ASCII only, no # or quotes; use \s or [[:space:]] for spaces.
 pub(crate) fn validate_pattern(what: &str, s: &str, regex: bool) -> Result<(), ValidationError> {
     if s.is_empty() || s.len() > MAX_PATTERN_LEN {
         return invalid(format!("{what}: must be 1 to {MAX_PATTERN_LEN} characters"));
@@ -75,7 +76,7 @@ pub(crate) fn validate_pattern(what: &str, s: &str, regex: bool) -> Result<(), V
         .find(|c| !c.is_ascii_graphic() || matches!(*c, '#' | '"' | '\''))
     {
         return invalid(format!(
-            "{what}: character {c:?} is not allowed (use \\x20 style escapes for spaces)"
+            "{what}: character {c:?} is not allowed (use \\s or [[:space:]] for spaces)"
         ));
     }
     if s.starts_with('-') || is_reserved_token(s) {
@@ -84,6 +85,12 @@ pub(crate) fn validate_pattern(what: &str, s: &str, regex: bool) -> Result<(), V
     // haproxy collapses a doubled backslash and strips a trailing one, changing the pattern
     if s.contains("\\\\") || s.ends_with('\\') {
         return invalid(format!("{what}: dangling or doubled backslash in {s:?}"));
+    }
+    // haproxy turns \xNN into a raw byte before the regex engine sees it, which can produce { or }
+    if s.contains("\\x") {
+        return invalid(format!(
+            "{what}: \\x escapes are not allowed in {s:?}; write the character or a class instead"
+        ));
     }
     // haproxy expands $NAME and ${NAME} from the environment in unquoted words
     let bytes = s.as_bytes();
@@ -99,6 +106,11 @@ pub(crate) fn validate_pattern(what: &str, s: &str, regex: bool) -> Result<(), V
         if let Err(e) = Regex::new(s) {
             return invalid(format!("{what}: regex {s:?} does not compile: {e}"));
         }
+        if has_backtracking_risk(s) {
+            return invalid(format!(
+                "{what}: regex {s:?} repeats a group that contains a repeat or an alternation, which can backtrack without bound"
+            ));
+        }
     } else if !s.starts_with('/') || s.contains('\\') {
         return invalid(format!(
             "{what}: {s:?} must start with / and contain no backslash"
@@ -107,12 +119,188 @@ pub(crate) fn validate_pattern(what: &str, s: &str, regex: bool) -> Result<(), V
     Ok(())
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Quant {
+    None,
+    Bounded,
+    Unbounded,
+}
+
+// Reads a quantifier at the start of `b` and returns it with the bytes it spans.
+fn read_quant(b: &[u8]) -> (Quant, usize) {
+    let (quant, len) = match b.first() {
+        Some(b'*' | b'+') => (Quant::Unbounded, 1),
+        Some(b'?') => (Quant::None, 1),
+        Some(b'{') => match b.iter().position(|c| *c == b'}') {
+            Some(end) => {
+                let body = std::str::from_utf8(&b[1..end]).unwrap_or("");
+                let valid = !body.is_empty()
+                    && body.bytes().all(|c| c.is_ascii_digit() || c == b',')
+                    && body.bytes().filter(|c| *c == b',').count() <= 1
+                    && body.as_bytes()[0].is_ascii_digit();
+                if !valid {
+                    return (Quant::None, 0);
+                }
+                let max = body.split_once(',').map(|(_, m)| m);
+                let quant = match max {
+                    Some("") => Quant::Unbounded,
+                    Some(m) if m.parse::<u32>().is_ok_and(|m| m > 1) => Quant::Bounded,
+                    None if body.parse::<u32>().is_ok_and(|m| m > 1) => Quant::Bounded,
+                    _ => Quant::None,
+                };
+                (quant, end + 1)
+            }
+            None => return (Quant::None, 0),
+        },
+        _ => return (Quant::None, 0),
+    };
+    // a trailing ? makes the repeat lazy and + makes it possessive; neither changes its cost class
+    let extra = usize::from(len > 0 && matches!(b.get(len), Some(b'?' | b'+')));
+    (quant, len + extra)
+}
+
+#[derive(Default)]
+struct GroupState {
+    has_repeat: bool,
+    has_alt: bool,
+}
+
+// PCRE2 backtracks where the regex crate does not, so a repeated group holding a repeat or an alternation is refused.
+fn has_backtracking_risk(re: &str) -> bool {
+    let b = re.as_bytes();
+    let mut stack: Vec<GroupState> = vec![GroupState::default()];
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'(' => {
+                stack.push(GroupState::default());
+                i += 1;
+            }
+            b'|' => {
+                if let Some(top) = stack.last_mut() {
+                    top.has_alt = true;
+                }
+                i += 1;
+            }
+            b')' => {
+                let closed = if stack.len() > 1 { stack.pop() } else { None };
+                i += 1;
+                let (quant, used) = read_quant(&b[i.min(b.len())..]);
+                i += used;
+                if let Some(g) = closed {
+                    let risky = match quant {
+                        Quant::Unbounded => g.has_repeat || g.has_alt,
+                        Quant::Bounded => g.has_repeat,
+                        Quant::None => false,
+                    };
+                    if risky {
+                        return true;
+                    }
+                    if let Some(top) = stack.last_mut() {
+                        top.has_repeat |= g.has_repeat || quant == Quant::Unbounded;
+                    }
+                }
+            }
+            c => {
+                i = match c {
+                    b'\\' => i + 2,
+                    b'[' => skip_class(b, i),
+                    _ => i + 1,
+                };
+                let (quant, used) = read_quant(&b[i.min(b.len())..]);
+                i += used;
+                if quant == Quant::Unbounded
+                    && let Some(top) = stack.last_mut()
+                {
+                    top.has_repeat = true;
+                }
+            }
+        }
+    }
+    false
+}
+
+// Returns the index just past the closing bracket of the class that starts at `start`.
+fn skip_class(b: &[u8], start: usize) -> usize {
+    let mut i = start + 1;
+    if b.get(i) == Some(&b'^') {
+        i += 1;
+    }
+    if b.get(i) == Some(&b']') {
+        i += 1;
+    }
+    while i < b.len() {
+        match b[i] {
+            b'\\' => i += 2,
+            b'[' if b.get(i + 1) == Some(&b':') => {
+                i = match b[i..].windows(2).position(|w| w == b":]") {
+                    Some(p) => i + p + 2,
+                    None => b.len(),
+                };
+            }
+            b']' => return i + 1,
+            _ => i += 1,
+        }
+    }
+    b.len()
+}
+
 // Returns the normalised form so the rendered text never echoes raw user input.
 pub(crate) fn parse_cidr(s: &str) -> Option<String> {
     if let Ok(net) = IpNet::from_str(s) {
         return Some(net.to_string());
     }
     IpAddr::from_str(s).ok().map(|ip| ip.to_string())
+}
+
+// Names of the stack's own services; a target must never point the edge back at its control plane.
+const RESERVED_HOSTS: [&str; 5] = [
+    "localhost",
+    "haproxy",
+    "connector",
+    "dockerproxy",
+    "socketproxy",
+];
+
+// HAProxy admin and master sockets listen here; a target on this subnet would relay requests as CLI commands.
+const CONTROL_NET: [u8; 3] = [172, 30, 250];
+
+fn forbidden_v4(ip: Ipv4Addr) -> bool {
+    let o = ip.octets();
+    ip.is_loopback()
+        || ip.is_unspecified()
+        || ip.is_link_local()
+        || ip.is_multicast()
+        || ip.is_broadcast()
+        || o[0] == 0
+        || (o[..3] == CONTROL_NET && o[3] < 8)
+}
+
+fn forbidden_v6(ip: Ipv6Addr) -> bool {
+    let s = ip.segments();
+    let embedded = |hi: u16, lo: u16| {
+        let [a, b] = hi.to_be_bytes();
+        let [c, d] = lo.to_be_bytes();
+        Ipv4Addr::new(a, b, c, d)
+    };
+    let mapped = s[..5] == [0; 5] && s[5] == 0xffff;
+    let compat = s[..6] == [0; 6];
+    let nat64 = s[..6] == [0x64, 0xff9b, 0, 0, 0, 0];
+    ip.is_loopback()
+        || ip.is_unspecified()
+        || ip.is_multicast()
+        || s[0] & 0xffc0 == 0xfe80
+        || ((mapped || compat || nat64) && forbidden_v4(embedded(s[6], s[7])))
+}
+
+// A last label that is all digits or 0x-hex is how decimal, octal and hex IPv4 spellings look.
+fn looks_numeric(label: &str) -> bool {
+    let hex = label
+        .strip_prefix("0x")
+        .or_else(|| label.strip_prefix("0X"))
+        .unwrap_or("");
+    let digits = !label.is_empty() && label.bytes().all(|c| c.is_ascii_digit());
+    digits || (!hex.is_empty() && hex.bytes().all(|c| c.is_ascii_hexdigit()))
 }
 
 pub(crate) fn valid_target_addr(addr: &str) -> bool {
@@ -126,10 +314,21 @@ pub(crate) fn valid_target_addr(addr: &str) -> bool {
     if !port_ok {
         return false;
     }
-    match host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
-        Some(inner) => inner.parse::<Ipv6Addr>().is_ok(),
-        None => is_hostname(host, true),
+    if let Some(inner) = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+        return inner.parse::<Ipv6Addr>().is_ok_and(|ip| !forbidden_v6(ip));
     }
+    if !is_hostname(host, true) {
+        return false;
+    }
+    let lower = host.to_ascii_lowercase();
+    if RESERVED_HOSTS.contains(&lower.as_str()) || lower.ends_with(".localhost") {
+        return false;
+    }
+    let last = lower.rsplit('.').next().unwrap_or("");
+    if looks_numeric(last) {
+        return lower.parse::<Ipv4Addr>().is_ok_and(|ip| !forbidden_v4(ip));
+    }
+    true
 }
 
 fn validate_text(what: &str, s: &str) -> Result<(), ValidationError> {
@@ -169,20 +368,27 @@ fn validate_health(site_id: &str, h: &HealthCheck) -> Result<(), ValidationError
             "{what} path {p:?} must start with / and be plain printable ASCII"
         ));
     }
+    // a short interval and a long timeout would keep a dead target looking alive
     check_range(
         &format!("{what} interval_ms"),
         h.interval_ms.into(),
         100,
-        600_000,
+        60_000,
     )?;
     check_range(
         &format!("{what} timeout_ms"),
         h.timeout_ms.into(),
         100,
-        60_000,
+        10_000,
     )?;
-    check_range(&format!("{what} rise"), h.rise.into(), 1, 100)?;
-    check_range(&format!("{what} fall"), h.fall.into(), 1, 100)
+    if h.timeout_ms > h.interval_ms {
+        return invalid(format!(
+            "{what}: timeout_ms {} must not exceed interval_ms {}",
+            h.timeout_ms, h.interval_ms
+        ));
+    }
+    check_range(&format!("{what} rise"), h.rise.into(), 1, 10)?;
+    check_range(&format!("{what} fall"), h.fall.into(), 1, 10)
 }
 
 pub fn validate_site(site: &Site) -> Result<(), ValidationError> {
@@ -523,7 +729,7 @@ mod tests {
         for ok in [
             "10.0.0.1:80",
             "app.internal:8080",
-            "[::1]:3000",
+            "[2001:db8::1]:3000",
             "my_app:1",
             "h:65535",
         ] {
@@ -545,6 +751,71 @@ mod tests {
         ] {
             assert!(!valid_target_addr(bad), "{bad:?} accepted");
         }
+    }
+
+    #[test]
+    fn targets_cannot_reach_the_control_plane() {
+        for bad in [
+            "172.30.250.3:9999",
+            "172.30.250.3:9998",
+            "172.30.250.0:80",
+            "172.30.250.7:80",
+            "127.0.0.1:80",
+            "127.1.2.3:80",
+            "0.0.0.0:80",
+            "0.1.2.3:80",
+            "169.254.169.254:80",
+            "224.0.0.1:80",
+            "255.255.255.255:80",
+            "[::1]:80",
+            "[::]:80",
+            "[fe80::1]:80",
+            "[febf::1]:80",
+            "[ff02::1]:80",
+            "[::ffff:127.0.0.1]:80",
+            "[::ffff:7f00:1]:80",
+            "[::ffff:172.30.250.3]:80",
+            "[::ffff:169.254.169.254]:80",
+            "[::127.0.0.1]:80",
+            "[::172.30.250.3]:80",
+            "[64:ff9b::7f00:1]:80",
+            "2130706433:80",
+            "0x7f000001:80",
+            "0x7f.0.0.1:80",
+            "0177.0.0.1:80",
+            "127.1:80",
+            "127.0.1:80",
+            "017700000001:80",
+            "localhost:80",
+            "LocalHost:80",
+            "a.localhost:80",
+            "haproxy:9999",
+            "connector:80",
+            "dockerproxy:2375",
+            "socketproxy:2375",
+        ] {
+            assert!(!valid_target_addr(bad), "{bad:?} accepted");
+        }
+        for ok in [
+            "172.30.249.3:80",
+            "172.30.250.8:80",
+            "172.31.250.3:80",
+            "8.8.8.8:53",
+            "[2001:db8::1]:80",
+            "[fec0::1]:80",
+            "haproxy-app:80",
+            "myconnector:80",
+            "app1.example.com:443",
+        ] {
+            assert!(valid_target_addr(ok), "{ok:?} rejected");
+        }
+    }
+
+    #[test]
+    fn site_rejects_admin_socket_target() {
+        let mut s = site("s", "a.com");
+        s.blue.targets[0].addr = "172.30.250.3:9999".into();
+        assert!(validate_site(&s).is_err());
     }
 
     #[test]
@@ -572,6 +843,82 @@ mod tests {
         assert!(validate_site(&s).is_err());
         s.health.path = "/healthz?x=1".into();
         assert!(validate_site(&s).is_ok());
+    }
+
+    #[test]
+    fn health_ranges_and_timeout_order() {
+        let check = |f: &dyn Fn(&mut crate::model::HealthCheck)| {
+            let mut s = site("s", "a.com");
+            f(&mut s.health);
+            validate_site(&s).is_ok()
+        };
+        assert!(check(&|_| {}));
+        assert!(!check(&|h| h.interval_ms = 99));
+        assert!(!check(&|h| h.interval_ms = 60_001));
+        assert!(check(&|h| {
+            h.interval_ms = 60_000;
+            h.timeout_ms = 10_000;
+        }));
+        assert!(!check(&|h| {
+            h.interval_ms = 60_000;
+            h.timeout_ms = 10_001;
+        }));
+        assert!(!check(&|h| h.timeout_ms = 99));
+        assert!(!check(&|h| {
+            h.interval_ms = 1000;
+            h.timeout_ms = 1001;
+        }));
+        assert!(!check(&|h| h.rise = 0));
+        assert!(!check(&|h| h.rise = 11));
+        assert!(!check(&|h| h.fall = 0));
+        assert!(!check(&|h| h.fall = 11));
+        assert!(check(&|h| {
+            h.rise = 10;
+            h.fall = 10;
+        }));
+    }
+
+    #[test]
+    fn regex_rejects_hex_escapes() {
+        for bad in ["^/a\\x7d", "\\x20", "^/\\x{7d}"] {
+            assert!(validate_pattern("t", bad, true).is_err(), "{bad:?}");
+        }
+        assert!(validate_pattern("t", "^/a\\s", true).is_ok());
+    }
+
+    #[test]
+    fn regex_rejects_catastrophic_shapes() {
+        for bad in [
+            "^/(a|aa)+$",
+            "^/(a|b)*c",
+            "(a+)+",
+            "(x*)*",
+            "(?:a+)*b",
+            "((a+)b)+",
+            "(a+){2,}",
+            "(a|b){3,}",
+            "(a*)+?",
+            "([a-z]+\\.)+x",
+        ] {
+            assert!(
+                validate_pattern("t", bad, true).is_err(),
+                "{bad:?} accepted"
+            );
+        }
+        for ok in [
+            "^/api/v[0-9]+/\\.well-known$",
+            "(?i)(^|/)\\.env(/|$)",
+            "(a|b)?c",
+            "(a+)?c",
+            "(ab)+",
+            "[(a|b]+",
+            "^/[a-z]+(;[^/]*)?(/|$)",
+            "a{2}b+",
+            "[[:alpha:]]+(x|y)",
+            "\\(a+\\)+",
+        ] {
+            assert!(validate_pattern("t", ok, true).is_ok(), "{ok:?} rejected");
+        }
     }
 
     #[test]
