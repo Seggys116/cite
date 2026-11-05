@@ -211,21 +211,18 @@ Maintenance mode serves an HTML page with status 503 by default for one site whi
 
 ## Analytics and retention
 
-HAProxy sends one log line per request to the connector. The connector keeps counters and a bounded list of recent requests, saves a snapshot to `analytics.json` every 60 seconds and restores it on restart.
+HAProxy sends one log line per request to the connector. The connector writes every request to an embedded SQLite database under `/conf/analytics/`, with header-first bot scoring, and nothing is discarded before its retention age. Data can be exported as CSV or NDJSON.
 
 Retention is the `retention` object in the node's settings. The dashboard edits it under Settings, and the API under `GET` and `PUT /api/v1/settings`.
 
 | Field | Default | Meaning |
 |---|---|---|
-| `recent_events` | 5000 | Recent requests kept in full for the live request list (0 to 200000). |
-| `minute_buckets_hours` | 48 | How long one-minute buckets are kept (1 to 8760 hours). |
-| `hour_buckets_days` | 90 | How long one-hour buckets are kept (1 to 3650 days). |
+| `hour_buckets_days` | 90 | How many days of requests are kept before age-based removal (1 to 3650 days). |
 | `audit_days` | 365 | How long audit log entries are kept (1 to 3650 days). |
-| `persist_interval_secs` | 60 | How often the snapshot is written to `analytics.json` (5 to 3600 seconds). |
 | `store_user_agents` | `true` | Record user agents. |
 | `store_client_ips` | `true` | Record client addresses. |
 
-Turning off client IPs or user agents also erases what was collected. Query strings are never stored, only their length. Memory is capped by one budget, `CITE_ANALYTICS_MAX_BYTES`, 128 MiB by default (8 MiB to 64 GiB); when the estimate passes it, the collector drops the oldest buckets first. Queries take a time window of 15 minutes to 30 days and can be limited to one site. See [docs/analytics.md](docs/analytics.md).
+Turning off client IPs or user agents also erases what was already stored. Query strings are never stored, only their length. There is no size cap unless you set `CITE_ANALYTICS_MAX_BYTES` (8 MiB to 1 TiB), in which case the oldest rows go first. Queries take a time window of 15 minutes to 30 days and can be limited to one site. See [docs/analytics.md](docs/analytics.md).
 
 <p align="center"><img src="./.github/assets/divider.svg" alt="" width="880"></p>
 

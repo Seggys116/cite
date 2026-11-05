@@ -1,7 +1,6 @@
 // Run with: cargo test -p cite-connector --release perf_api -- --ignored --nocapture
 use std::time::Instant;
 
-use cite_edge::analytics::Analytics;
 use cite_edge::auth::{Credentials, hash_password};
 use cite_edge::model::LogEvent;
 use cite_edge::totp;
@@ -45,8 +44,7 @@ async fn perf_api_500_sites() {
         Arc::clone(&haproxy),
         None,
     ));
-    let retention = store.config().settings.retention.clone();
-    let analytics = Arc::new(StdMutex::new(Analytics::new(retention)));
+    let analytics = crate::logsink::open_store(&cfg, 30).expect("analytics store");
     let state = Inner::new(
         cfg,
         Arc::clone(&store),
@@ -54,6 +52,7 @@ async fn perf_api_500_sites() {
         deployer,
         None,
         analytics.clone(),
+        Arc::new(IngestStats::default()),
     );
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
@@ -109,11 +108,11 @@ async fn perf_api_500_sites() {
     report("PUT /sites/s7 (validate, render, persist, apply)", put);
 
     {
-        let mut a = analytics.lock().expect("lock");
+        let writer = analytics.writer();
         // Timestamps spread over 50 minutes so the windowed queries have to read many buckets.
         let now = now_ms();
         for i in 0..300_000i64 {
-            a.record(LogEvent {
+            let event = LogEvent {
                 ts_ms: now - (i % 3_000_000),
                 client_ip: format!("203.0.{}.{}", (i / 250) % 250, i % 250),
                 host: format!("s{}.example.com", i % 500),
@@ -131,8 +130,11 @@ async fn perf_api_500_sites() {
                 server: "t1".into(),
                 site: format!("s{}", i % 500),
                 blocked: None,
-            });
+                ..LogEvent::default()
+            };
+            writer.send(event).expect("send");
         }
+        writer.flush().expect("flush");
     }
     for path in [
         "/sites",
@@ -140,6 +142,9 @@ async fn perf_api_500_sites() {
         "/analytics/summary?window=7d",
         "/analytics/timeseries?window=24h",
         "/analytics/requests?limit=100",
+        "/analytics/bots?window=24h",
+        "/analytics/top?kind=paths&window=24h",
+        "/analytics/stats",
     ] {
         let mut v = Vec::new();
         for _ in 0..200 {
@@ -158,8 +163,8 @@ async fn perf_api_500_sites() {
         report(&format!("GET {path}"), v);
     }
     println!(
-        "analytics retained: {} MiB",
-        analytics.lock().expect("lock").retained_bytes() >> 20
+        "analytics database: {} MiB",
+        analytics.stats().expect("stats").db_bytes >> 20
     );
     task.abort();
 }

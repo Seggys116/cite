@@ -10,14 +10,15 @@ use cite_edge::analytics::{RequestFilter, window_from_str};
 use cite_edge::model::{EdgeSettings, FirewallRule, MaintenancePage, Site, Slot, Target};
 use cite_edge::presets::{preset, presets};
 use cite_edge::validate::{is_valid_id, validate_page, validate_rule, validate_site};
+use cite_store::TopKind;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::{
     ApiError, ApiResult, AppState, JsonBody, MaybeJson, Params, Peer, Principal, lock_std,
 };
-use crate::ConnectorError;
 use crate::store::{LoginOutcome, now_unix, unix_to_rfc3339};
+use crate::{ConnectorError, logsink};
 
 const DEFAULT_LIST_LIMIT: usize = 100;
 const MAX_LIST_LIMIT: usize = 1000;
@@ -40,7 +41,7 @@ fn missing(what: impl Display) -> ApiError {
     ConnectorError::NotFound(format!("{what} not found")).into()
 }
 
-fn check_id(id: &str) -> ApiResult<()> {
+pub(super) fn check_id(id: &str) -> ApiResult<()> {
     if is_valid_id(id) {
         Ok(())
     } else {
@@ -59,7 +60,7 @@ fn clean_text(what: &str, raw: &str, max_chars: usize) -> ApiResult<String> {
 }
 
 // Oversized limits are clamped rather than rejected; zero and non-numbers are errors.
-fn parse_limit(q: &HashMap<String, String>) -> ApiResult<usize> {
+pub(super) fn parse_limit(q: &HashMap<String, String>) -> ApiResult<usize> {
     match q.get("limit") {
         None => Ok(DEFAULT_LIST_LIMIT),
         Some(raw) => raw
@@ -219,6 +220,8 @@ pub(super) async fn node(State(st): State<AppState>) -> ApiResult<Response> {
         None => false,
     };
     let haproxy = serde_json::to_value(st.haproxy.status())?;
+    // A store that cannot be read yields null here; the failure is logged by the call.
+    let analytics = analytics_overview(&st).await.ok();
     Ok(Json(json!({
         "name": st.cfg.node_name,
         "version": env!("CARGO_PKG_VERSION"),
@@ -227,6 +230,7 @@ pub(super) async fn node(State(st): State<AppState>) -> ApiResult<Response> {
         "sites": cfg.sites.len(),
         "firewall_rules": cfg.firewall.len(),
         "orchestrator": { "enabled": st.orchestrator.is_some(), "reachable": reachable },
+        "analytics": analytics,
     }))
     .into_response())
 }
@@ -278,14 +282,41 @@ pub(super) async fn put_settings(
     Extension(p): Extension<Principal>,
     JsonBody(settings): JsonBody<EdgeSettings>,
 ) -> ApiResult<Response> {
-    // Retention reaches the live analytics only once the new settings were applied.
-    let retention = settings.retention.clone();
+    // Retention reaches the analytics store only once the new settings were applied.
+    let days = logsink::retention_days(&settings.retention);
+    let before = st.store.config().settings.retention.clone();
+    let (drop_ips, drop_agents) = (
+        before.store_client_ips && !settings.retention.store_client_ips,
+        before.store_user_agents && !settings.retention.store_user_agents,
+    );
     st.mutate(&p.actor(), "settings.update", "", move |cfg| {
         cfg.settings = settings;
         Ok(())
     })
     .await?;
-    lock_std(&st.analytics).set_retention(retention);
+    st.analytics.set_retention_days(days);
+    let now_kept = st.store.config().settings.retention.clone();
+    // Applied before the scrub so events still queued are stripped when they commit instead of re-creating the text.
+    st.analytics
+        .set_privacy(now_kept.store_client_ips, now_kept.store_user_agents);
+    // Turning a field off also erases what was already stored, as the setting promises.
+    if drop_ips || drop_agents {
+        let store = st.analytics.clone();
+        tokio::task::spawn_blocking(move || match store.scrub_fields(drop_ips, drop_agents) {
+            Ok(rows) => tracing::info!(rows, "scrubbed stored analytics fields"),
+            Err(e @ cite_store::Error::Incomplete(_)) => {
+                tracing::warn!(error = %e, "scrubbed analytics fields; the log fold is retried by the next retention pass");
+            }
+            Err(e) => tracing::warn!(error = %e, "scrubbing analytics fields failed"),
+        });
+    }
+    // A shorter retention takes effect now instead of at the next scheduled prune.
+    let store = st.analytics.clone();
+    tokio::task::spawn_blocking(move || {
+        if let Err(e) = store.prune(now_ms()) {
+            tracing::warn!(error = %e, "analytics prune after a settings change failed");
+        }
+    });
     let cfg = st.store.config();
     json_ok(&cfg.settings)
 }
@@ -707,7 +738,7 @@ pub(super) async fn apply_preset(
     json_ok(&added)
 }
 
-fn now_ms() -> i64 {
+pub(super) fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
@@ -731,18 +762,35 @@ fn join_failure(e: tokio::task::JoinError) -> ApiError {
     ConnectorError::Internal(format!("analytics task failed: {e}")).into()
 }
 
+// The detail is logged by the Internal mapping and the client only sees a generic 500.
+fn store_failure(e: cite_store::Error) -> ApiError {
+    if matches!(e, cite_store::Error::Timeout) {
+        return ConnectorError::Unavailable(
+            "the analytics query took too long and was cancelled; try a shorter window".into(),
+        )
+        .into();
+    }
+    ConnectorError::Internal(format!("analytics store: {e}")).into()
+}
+
+// Queries run off the async workers so a large window cannot stall other requests.
+async fn with_store<T: Send + 'static>(
+    st: &AppState,
+    f: impl FnOnce(&cite_store::Store) -> cite_store::Result<T> + Send + 'static,
+) -> ApiResult<T> {
+    let store = st.analytics.clone();
+    tokio::task::spawn_blocking(move || f(store.as_ref()))
+        .await
+        .map_err(join_failure)?
+        .map_err(store_failure)
+}
+
 pub(super) async fn analytics_summary(
     State(st): State<AppState>,
     Params(q): Params,
 ) -> ApiResult<Response> {
     let (secs, site) = window_and_site(&q)?;
-    // Aggregation runs off the async workers so a large window cannot stall other requests.
-    let analytics = st.analytics.clone();
-    let summary = tokio::task::spawn_blocking(move || {
-        lock_std(&analytics).summary(secs, site.as_deref(), now_ms())
-    })
-    .await
-    .map_err(join_failure)?;
+    let summary = with_store(&st, move |s| s.summary(secs, site.as_deref(), now_ms())).await?;
     json_ok(&summary)
 }
 
@@ -751,13 +799,89 @@ pub(super) async fn analytics_timeseries(
     Params(q): Params,
 ) -> ApiResult<Response> {
     let (secs, site) = window_and_site(&q)?;
-    let analytics = st.analytics.clone();
-    let series = tokio::task::spawn_blocking(move || {
-        lock_std(&analytics).timeseries(secs, site.as_deref(), now_ms())
-    })
-    .await
-    .map_err(join_failure)?;
+    let series = with_store(&st, move |s| s.timeseries(secs, site.as_deref(), now_ms())).await?;
     json_ok(&series)
+}
+
+pub(super) async fn analytics_bots(
+    State(st): State<AppState>,
+    Params(q): Params,
+) -> ApiResult<Response> {
+    let (secs, site) = window_and_site(&q)?;
+    let bots = with_store(&st, move |s| s.bots(secs, site.as_deref(), now_ms())).await?;
+    json_ok(&bots)
+}
+
+pub(super) fn parse_top_kind(raw: &str) -> ApiResult<TopKind> {
+    Ok(match raw {
+        "paths" => TopKind::Paths,
+        "hosts" => TopKind::Hosts,
+        "referers" => TopKind::Referers,
+        "agents" => TopKind::UserAgents,
+        "content_types" => TopKind::ContentTypes,
+        "statuses" => TopKind::StatusCodes,
+        "ips" => TopKind::ClientIps,
+        "languages" => TopKind::Languages,
+        _ => {
+            return Err(ApiError::bad(
+                "kind must be one of paths, hosts, referers, agents, content_types, statuses, ips, languages",
+            ));
+        }
+    })
+}
+
+pub(super) async fn analytics_top(
+    State(st): State<AppState>,
+    Params(q): Params,
+) -> ApiResult<Response> {
+    let (secs, site) = window_and_site(&q)?;
+    let kind = match q.get("kind") {
+        Some(raw) => parse_top_kind(raw)?,
+        None => return Err(ApiError::bad("kind is required")),
+    };
+    let limit = parse_limit(&q)?;
+    let items = with_store(&st, move |s| {
+        s.top(kind, secs, site.as_deref(), now_ms(), limit)
+    })
+    .await?;
+    json_ok(&json!({ "items": items }))
+}
+
+// Store counters plus the settings that shape them; fields only ever get added.
+#[derive(Serialize)]
+struct AnalyticsOverview {
+    #[serde(flatten)]
+    store: cite_store::StoreStats,
+    retention_days: u32,
+    max_bytes: Option<u64>,
+    ingest_stalls: u64,
+}
+
+async fn analytics_overview(st: &AppState) -> ApiResult<AnalyticsOverview> {
+    let store = with_store(st, |s| {
+        let stats = s.stats()?;
+        Ok((stats, s.retention_days(), s.max_bytes()))
+    })
+    .await?;
+    Ok(AnalyticsOverview {
+        store: store.0,
+        retention_days: store.1,
+        max_bytes: store.2,
+        ingest_stalls: st.ingest.stalls(),
+    })
+}
+
+pub(super) async fn analytics_stats(State(st): State<AppState>) -> ApiResult<Response> {
+    json_ok(&analytics_overview(&st).await?)
+}
+
+pub(super) fn parse_method(raw: &str) -> ApiResult<String> {
+    let ok = raw.len() <= 16 && raw.bytes().all(|b| b.is_ascii_alphabetic() || b == b'-');
+    if ok {
+        Ok(raw.to_ascii_uppercase())
+    } else {
+        Err(ApiError::bad("method must be an HTTP method token"))
+    }
 }
 
 fn request_filter(q: &HashMap<String, String>) -> ApiResult<RequestFilter> {
@@ -771,11 +895,7 @@ fn request_filter(q: &HashMap<String, String>) -> ApiResult<RequestFilter> {
         filter.status = Some(status);
     }
     if let Some(raw) = q.get("method").filter(|s| !s.is_empty()) {
-        let ok = raw.len() <= 16 && raw.bytes().all(|b| b.is_ascii_alphabetic() || b == b'-');
-        if !ok {
-            return Err(ApiError::bad("method must be an HTTP method token"));
-        }
-        filter.method = Some(raw.to_ascii_uppercase());
+        filter.method = Some(parse_method(raw)?);
     }
     if let Some(raw) = q.get("path").filter(|s| !s.is_empty()) {
         if raw.len() > 256 || raw.chars().any(char::is_control) {
@@ -809,9 +929,6 @@ pub(super) async fn analytics_requests(
 ) -> ApiResult<Response> {
     let limit = parse_limit(&q)?;
     let filter = request_filter(&q)?;
-    let analytics = st.analytics.clone();
-    let events = tokio::task::spawn_blocking(move || lock_std(&analytics).requests(&filter, limit))
-        .await
-        .map_err(join_failure)?;
+    let events = with_store(&st, move |s| s.requests(&filter, limit)).await?;
     json_ok(&events)
 }

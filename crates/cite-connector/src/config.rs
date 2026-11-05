@@ -13,9 +13,9 @@ const MAX_SESSION_TTL_SECS: u64 = 30 * 86_400;
 const DEFAULT_MASTER_PORT: u16 = 9998;
 const MAX_SANS: usize = 32;
 const MAX_NODE_NAME: usize = 64;
-const DEFAULT_ANALYTICS_BYTES: u64 = 128 * 1024 * 1024;
 const MIN_ANALYTICS_BYTES: u64 = 8 * 1024 * 1024;
-const MAX_ANALYTICS_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+const MAX_ANALYTICS_BYTES: u64 = 1 << 40;
+const MAX_DB_PATH: usize = 4096;
 const UNIX_PREFIX: &str = "unix:";
 // sun_path is 104 bytes on the BSDs and 108 on Linux, one byte of which is the terminator.
 const MAX_SOCKET_PATH: usize = 103;
@@ -50,7 +50,9 @@ pub struct ConnectorConfig {
     pub master_addr: String,
     pub log_listen: LogListen,
     pub log_addr_for_haproxy: String,
-    pub analytics_max_bytes: usize,
+    pub analytics_db: PathBuf,
+    // None keeps every row until age retention removes it.
+    pub analytics_max_bytes: Option<u64>,
     pub haproxy_bin: String,
     pub validate_with_haproxy: bool,
     pub tls: bool,
@@ -145,7 +147,7 @@ fn parse_log_listen(value: &str) -> Result<LogListen> {
     }
 }
 
-fn parse_analytics_bytes(raw: &str) -> Result<usize> {
+fn parse_analytics_bytes(raw: &str) -> Result<u64> {
     let bytes: u64 = raw
         .parse()
         .map_err(|_| config_err("CITE_ANALYTICS_MAX_BYTES must be a number of bytes".into()))?;
@@ -154,7 +156,28 @@ fn parse_analytics_bytes(raw: &str) -> Result<usize> {
             "CITE_ANALYTICS_MAX_BYTES must be between {MIN_ANALYTICS_BYTES} and {MAX_ANALYTICS_BYTES}"
         )));
     }
-    usize::try_from(bytes).map_err(|_| config_err("CITE_ANALYTICS_MAX_BYTES is too large".into()))
+    Ok(bytes)
+}
+
+// The database sits next to other private state, so only an absolute path to a file is accepted.
+fn parse_analytics_db(raw: &str) -> Result<PathBuf> {
+    let path = PathBuf::from(raw);
+    let ok = path.is_absolute()
+        && path.file_name().is_some()
+        && !raw.ends_with('/')
+        && raw.len() <= MAX_DB_PATH
+        && !raw.chars().any(char::is_control)
+        && !path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir));
+    if ok {
+        Ok(path)
+    } else {
+        Err(config_err(
+            "CITE_ANALYTICS_DB must be an absolute path to a file, without '..' or control characters"
+                .into(),
+        ))
+    }
 }
 
 fn check_host_port(key: &str, value: &str) -> Result<()> {
@@ -242,11 +265,15 @@ impl ConnectorConfig {
         )?;
         let log_listen = parse_log_listen(get(env, "CITE_LOG_LISTEN").unwrap_or("0.0.0.0:5140"))?;
         let analytics_max_bytes = match get(env, "CITE_ANALYTICS_MAX_BYTES") {
-            Some(raw) => parse_analytics_bytes(raw)?,
-            None => DEFAULT_ANALYTICS_BYTES as usize,
+            Some(raw) => Some(parse_analytics_bytes(raw)?),
+            None => None,
         };
 
         let data_dir = PathBuf::from(get(env, "CITE_CONNECTOR_DATA").unwrap_or("/conf"));
+        let analytics_db = match get(env, "CITE_ANALYTICS_DB") {
+            Some(raw) => parse_analytics_db(raw)?,
+            None => data_dir.join("analytics").join("analytics.db"),
+        };
         // An explicit name must be valid; an ambient HOSTNAME that is not falls back quietly.
         let node_name = match get(env, "CITE_NODE_NAME") {
             Some(name) if valid_node_name(name) => name.to_string(),
@@ -325,6 +352,7 @@ impl ConnectorConfig {
             master_addr,
             log_listen,
             log_addr_for_haproxy,
+            analytics_db,
             analytics_max_bytes,
             haproxy_bin: get(env, "CITE_HAPROXY_BIN")
                 .unwrap_or("haproxy")
@@ -395,7 +423,11 @@ mod tests {
             cfg.log_listen,
             LogListen::Udp("0.0.0.0:5140".parse().expect("addr"))
         );
-        assert_eq!(cfg.analytics_max_bytes, 128 * 1024 * 1024);
+        assert_eq!(cfg.analytics_max_bytes, None);
+        assert_eq!(
+            cfg.analytics_db,
+            PathBuf::from("/conf/analytics/analytics.db")
+        );
         assert_eq!(cfg.data_dir, PathBuf::from("/conf"));
         assert_eq!(cfg.haproxy_dir, PathBuf::from("/conf/haproxy"));
         assert_eq!(cfg.maps_dir, PathBuf::from("/conf/haproxy/maps"));
@@ -559,14 +591,42 @@ mod tests {
     }
 
     #[test]
-    fn analytics_budget_is_configurable_and_bounded() {
+    fn analytics_size_cap_is_optional_and_bounded() {
         let mut e = base();
         e.insert("CITE_ANALYTICS_MAX_BYTES".into(), "33554432".into());
         let cfg = ConnectorConfig::from_env_map(&e).expect("config");
-        assert_eq!(cfg.analytics_max_bytes, 32 * 1024 * 1024);
+        assert_eq!(cfg.analytics_max_bytes, Some(32 * 1024 * 1024));
+        e.insert("CITE_ANALYTICS_MAX_BYTES".into(), "  ".into());
+        let cfg = ConnectorConfig::from_env_map(&e).expect("config");
+        assert_eq!(cfg.analytics_max_bytes, None);
         for bad in ["abc", "0", "1024", "-5", "99999999999999"] {
             e.insert("CITE_ANALYTICS_MAX_BYTES".into(), bad.into());
             assert!(ConnectorConfig::from_env_map(&e).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn analytics_database_path_follows_the_data_dir_unless_set() {
+        let mut e = base();
+        e.insert("CITE_CONNECTOR_DATA".into(), "/srv/cite".into());
+        let cfg = ConnectorConfig::from_env_map(&e).expect("config");
+        assert_eq!(
+            cfg.analytics_db,
+            PathBuf::from("/srv/cite/analytics/analytics.db")
+        );
+        e.insert("CITE_ANALYTICS_DB".into(), "/var/lib/cite/a.db".into());
+        let cfg = ConnectorConfig::from_env_map(&e).expect("config");
+        assert_eq!(cfg.analytics_db, PathBuf::from("/var/lib/cite/a.db"));
+        for bad in [
+            "relative/a.db",
+            "/var/lib/",
+            "/",
+            "/var/../etc/a.db",
+            "/a\nb.db",
+        ] {
+            e.insert("CITE_ANALYTICS_DB".into(), bad.into());
+            let err = ConnectorConfig::from_env_map(&e).expect_err(bad);
+            assert!(err.to_string().contains("CITE_ANALYTICS_DB"), "{bad}");
         }
     }
 

@@ -75,7 +75,8 @@ Compose reads `docker-compose.override.yml` automatically only when you run `doc
 | `CITE_HAPROXY_VALIDATE` | `true` | Run `haproxy -c` on a staged copy before installing a config. |
 | `CITE_LOG_LISTEN` | `0.0.0.0:5140` | Where the log sink binds: a UDP `host:port`, or `unix:/path` for a unix datagram socket (any stale socket file is replaced and the new one is mode 0600). Compose sets `unix:/run/cite/log.sock`. The receive buffer is raised to 4 MiB so bursts are not dropped. |
 | `CITE_LOG_ADDR` | `connector:5140`, or the `CITE_LOG_LISTEN` path for a unix listener | Address HAProxy sends logs to. For a UDP sink it must be an IP literal because HAProxy does not resolve names there; for a unix sink it is the socket path. Compose sets `/run/cite/log.sock`. |
-| `CITE_ANALYTICS_MAX_BYTES` | `134217728` (128 MiB) | Memory budget for analytics, from 8 MiB to 64 GiB. See [analytics](analytics.md). Keep it well below the connector memory limit. |
+| `CITE_ANALYTICS_DB` | `<data dir>/analytics/analytics.db` | Absolute path of the SQLite analytics database. See [analytics](analytics.md). |
+| `CITE_ANALYTICS_MAX_BYTES` | unset | Optional size cap for the analytics database, 8 MiB to 1 TiB. Unset keeps everything until its retention age; when set, the oldest rows are removed first. |
 | `CITE_DOCKER_HOST` | unset | Enables the orchestrator. The overlay sets `http://dockerproxy:2375`. |
 | `CITE_HAPROXY_CONTAINER` | `cite-node-haproxy` | Name of the HAProxy container, which the connector attaches to each stack's network. The overlay sets it. An empty value turns per-stack networks off. |
 | `CITE_EDGE_NETWORK` | `cite_edge` | Shared network that executors join when per-stack networks are off. |
@@ -112,7 +113,7 @@ Everything lives in the `cite_conf` volume, mounted at `/conf`.
 | `tokens.json` | 0600 | API token hashes, names and last-used times. At most 64 tokens. |
 | `secrets.json` | 0600 | GitHub tokens for orchestrated sites. |
 | `audit.jsonl`, `audit.jsonl.1` | 0600 | Audit log of changes and logins. |
-| `analytics.json` | 0600 | Analytics snapshot. |
+| `analytics/analytics.db` | 0600 | SQLite analytics database, with its `-wal` and `-shm` files. An old `analytics.json` is imported once and renamed to `analytics.json.migrated`. |
 | `tls/` | 0700 | `ca.pem`, `ca.key`, `server.pem` and the server key. |
 | `haproxy/haproxy.cfg` | 0644 | Rendered config. Overwritten on every change, do not edit it. |
 | `haproxy/maps/active.map`, `maint.map` | 0644 | Active slot and maintenance flag per site. `active.map` also carries `<host>@<run>` keys that route runs of four or more plain sites (exact hosts, no path regex) with one lookup. |

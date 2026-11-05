@@ -14,6 +14,8 @@ path = "src/main.rs"
 [dependencies]
 cite-edge.workspace = true
 cite-core.workspace = true
+cite-store.workspace = true
+futures-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

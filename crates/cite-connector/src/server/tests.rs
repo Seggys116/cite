@@ -66,15 +66,15 @@ async fn start_with(tweak: impl FnOnce(&mut ConnectorConfig)) -> Harness {
         Arc::clone(&haproxy),
         None,
     ));
-    let retention = store.config().settings.retention.clone();
-    let analytics = Arc::new(StdMutex::new(Analytics::new(retention)));
+    let analytics = logsink::open_store(&cfg, 30).expect("analytics store");
     let acceptor = if cfg.tls {
         tls::ensure(&cfg).expect("tls material");
         Some(tls::load_acceptor(&cfg.tls_dir).expect("acceptor"))
     } else {
         None
     };
-    let state = Inner::new(cfg, store, haproxy, deployer, None, analytics);
+    let ingest = Arc::new(IngestStats::default());
+    let state = Inner::new(cfg, store, haproxy, deployer, None, analytics, ingest);
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
     let task = tokio::spawn(serve(listener, Arc::clone(&state), acceptor));
@@ -160,6 +160,24 @@ impl Harness {
         self.call(Method::DELETE, Some(token), path, None).await
     }
 
+    // Goes through the real writer, so the events are durable and visible when this returns.
+    fn ingest(&self, events: impl IntoIterator<Item = LogEvent>) {
+        let writer = self.state.analytics.writer();
+        for event in events {
+            writer.send(event).expect("send");
+        }
+        writer.flush().expect("flush");
+    }
+
+    async fn get_raw(&self, token: &str, path: &str) -> reqwest::Response {
+        self.http
+            .get(self.url(path))
+            .bearer_auth(token)
+            .send()
+            .await
+            .expect("request")
+    }
+
     async fn seed_site(&self, id: &str) {
         let site: Site =
             serde_json::from_value(site_json(id, &format!("{id}.example.com"))).expect("site");
@@ -218,6 +236,7 @@ fn event(ip: &str, status: u16) -> LogEvent {
         server: "s".into(),
         site: "blog".into(),
         blocked: None,
+        ..LogEvent::default()
     }
 }
 
@@ -826,18 +845,74 @@ async fn settings_round_trip_and_validation() {
 }
 
 #[tokio::test]
-async fn settings_update_pushes_retention_into_analytics() {
+async fn settings_update_pushes_retention_days_into_the_store() {
     let h = start().await;
     let t = h.token().await;
-    lock_std(&h.state.analytics).record(event("10.1.2.3", 200));
-    let (_, before) = h.get(&t, "/analytics/requests").await;
-    assert_eq!(before[0]["client_ip"], "10.1.2.3");
+    assert_eq!(h.state.analytics.retention_days(), 30);
+    let (_, mut settings) = h.get(&t, "/settings").await;
+    settings["retention"]["hour_buckets_days"] = json!(7);
+    settings["retention"]["recent_events"] = json!(10);
+    let (status, saved) = h.put(&t, "/settings", settings).await;
+    assert_eq!(status, 200, "{saved}");
+    assert_eq!(h.state.analytics.retention_days(), 7);
+    // settings that no longer size anything are still accepted and returned unchanged
+    assert_eq!(saved["retention"]["recent_events"], 10);
+    assert_eq!(saved["retention"]["hour_buckets_days"], 7);
+}
+
+#[tokio::test]
+async fn a_shorter_retention_removes_old_rows_without_a_restart() {
+    let h = start().await;
+    let t = h.token().await;
+    let day = 86_400_000;
+    let mut old = event("10.0.0.1", 200);
+    old.ts_ms = now_ms() - 10 * day;
+    h.ingest([old, event("10.0.0.2", 200)]);
+    assert_eq!(h.state.analytics.stats().expect("stats").rows, 2);
+
+    let (_, mut settings) = h.get(&t, "/settings").await;
+    settings["retention"]["hour_buckets_days"] = json!(2);
+    assert_eq!(h.put(&t, "/settings", settings).await.0, 200);
+    let mut rows = 2;
+    for _ in 0..100 {
+        rows = h.state.analytics.stats().expect("stats").rows;
+        if rows == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(rows, 1);
+}
+
+#[tokio::test]
+async fn turning_off_ip_storage_erases_stored_addresses() {
+    let h = start().await;
+    let t = h.token().await;
+    h.ingest([event("10.9.8.7", 200), event("10.9.8.6", 200)]);
+    let ips = |h: &Harness| {
+        h.state
+            .analytics
+            .requests(&Default::default(), 10)
+            .expect("requests")
+            .iter()
+            .filter(|e| !e.client_ip.is_empty())
+            .count()
+    };
+    assert_eq!(ips(&h), 2);
 
     let (_, mut settings) = h.get(&t, "/settings").await;
     settings["retention"]["store_client_ips"] = json!(false);
     assert_eq!(h.put(&t, "/settings", settings).await.0, 200);
-    let (_, after) = h.get(&t, "/analytics/requests").await;
-    assert_eq!(after[0]["client_ip"], "");
+    let mut left = 2;
+    for _ in 0..100 {
+        left = ips(&h);
+        if left == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(left, 0);
+    assert_eq!(h.state.analytics.stats().expect("stats").rows, 2);
 }
 
 #[tokio::test]
@@ -880,6 +955,14 @@ async fn analytics_parameters_are_validated() {
         "/analytics/requests?ip=nope",
         "/analytics/requests?method=GE%20T",
         "/analytics/requests?limit=0",
+        "/analytics/bots?window=2w",
+        "/analytics/bots?site=Bad%20Site",
+        "/analytics/top",
+        "/analytics/top?kind=nope",
+        "/analytics/top?kind=paths&limit=0",
+        "/analytics/top?kind=paths&limit=abc",
+        "/analytics/top?kind=paths&window=2w",
+        "/analytics/top?kind=paths&site=Bad%20Site",
     ] {
         assert_eq!(h.get(&t, query).await.0, 400, "{query}");
     }
@@ -889,12 +972,11 @@ async fn analytics_parameters_are_validated() {
 async fn analytics_endpoints_reflect_recorded_events() {
     let h = start().await;
     let t = h.token().await;
-    {
-        let mut analytics = lock_std(&h.state.analytics);
-        analytics.record(event("10.0.0.1", 200));
-        analytics.record(event("10.0.0.2", 404));
-        analytics.record(event("10.0.0.2", 500));
-    }
+    h.ingest([
+        event("10.0.0.1", 200),
+        event("10.0.0.2", 404),
+        event("10.0.0.2", 500),
+    ]);
     let (status, summary) = h.get(&t, "/analytics/summary?window=1h").await;
     assert_eq!(status, 200);
     assert_eq!(summary["requests"], 3);
@@ -921,13 +1003,9 @@ async fn analytics_endpoints_reflect_recorded_events() {
 async fn analytics_requests_honour_the_site_filter() {
     let h = start().await;
     let t = h.token().await;
-    {
-        let mut analytics = lock_std(&h.state.analytics);
-        analytics.record(event("10.0.0.1", 200));
-        let mut other = event("10.0.0.2", 200);
-        other.site = "shop".into();
-        analytics.record(other);
-    }
+    let mut other = event("10.0.0.2", 200);
+    other.site = "shop".into();
+    h.ingest([event("10.0.0.1", 200), other]);
     let (_, blog) = h.get(&t, "/analytics/requests?site=blog").await;
     assert_eq!(blog.as_array().map(Vec::len), Some(1));
     assert_eq!(blog[0]["site"], "blog");
@@ -935,6 +1013,574 @@ async fn analytics_requests_honour_the_site_filter() {
     assert_eq!(ghost, json!([]));
     let (status, _) = h.get(&t, "/analytics/requests?site=Bad%20Id").await;
     assert_eq!(status, 400);
+}
+
+fn bot_event(ip: &str, class: &str, score: u8, signals: &str, ua: &str) -> LogEvent {
+    LogEvent {
+        bot_class: class.into(),
+        bot_score: score,
+        bot_signals: signals.into(),
+        user_agent: ua.into(),
+        ..event(ip, 200)
+    }
+}
+
+// Events a millisecond apart and oldest first, each padded so the table grows quickly.
+fn bulk(n: usize, pad: usize) -> impl Iterator<Item = LogEvent> {
+    let start = now_ms() - 3_600_000;
+    (0..n).map(move |i| LogEvent {
+        ts_ms: start + i as i64,
+        path: format!("/bulk/{i}/{}", "x".repeat(pad)),
+        ..event("10.0.0.1", 200)
+    })
+}
+
+fn parse_csv(text: &str) -> Vec<Vec<String>> {
+    let (mut rows, mut row, mut field) = (Vec::new(), Vec::new(), String::new());
+    let mut quoted = false;
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match (quoted, c) {
+            (true, '"') if chars.peek() == Some(&'"') => {
+                chars.next();
+                field.push('"');
+            }
+            (true, '"') => quoted = false,
+            (true, _) => field.push(c),
+            (false, '"') => quoted = true,
+            (false, ',') => row.push(std::mem::take(&mut field)),
+            (false, '\r') => {}
+            (false, '\n') => {
+                row.push(std::mem::take(&mut field));
+                rows.push(std::mem::take(&mut row));
+            }
+            (false, _) => field.push(c),
+        }
+    }
+    if !field.is_empty() || !row.is_empty() {
+        row.push(field);
+        rows.push(row);
+    }
+    rows
+}
+
+// Data rows only; the header is checked separately by the tests that care about it.
+async fn export_rows(h: &Harness, token: &str, query: &str) -> Vec<Vec<String>> {
+    let res = h
+        .get_raw(token, &format!("/analytics/export?{query}"))
+        .await;
+    assert_eq!(res.status().as_u16(), 200, "{query}");
+    let mut rows = parse_csv(&res.text().await.expect("body"));
+    assert!(!rows.is_empty(), "{query}");
+    rows.remove(0);
+    rows
+}
+
+fn count_of(section: &Value, key: &str) -> Option<u64> {
+    section
+        .as_array()?
+        .iter()
+        .find(|item| item["key"] == key)
+        .and_then(|item| item["count"].as_u64())
+}
+
+#[tokio::test]
+async fn bots_endpoint_reports_classes_signals_and_agents() {
+    let h = start().await;
+    let t = h.token().await;
+    h.ingest([
+        bot_event("10.0.0.1", "human", 0, "", "Mozilla/5.0"),
+        bot_event("10.0.0.2", "human", 10, "", "Mozilla/5.0"),
+        bot_event("10.0.0.3", "crawler", 70, "ua_googlebot", "Googlebot/2.1"),
+        bot_event(
+            "10.0.0.4",
+            "tool",
+            85,
+            "ua_curl,missing_accept_language",
+            "curl/8",
+        ),
+    ]);
+    let (status, bots) = h.get(&t, "/analytics/bots?window=1h").await;
+    assert_eq!(status, 200, "{bots}");
+    assert_eq!(bots["total_requests"], 4);
+    assert_eq!(bots["bot_requests"], 2);
+    assert_eq!(bots["bot_share_pct"].as_f64(), Some(50.0));
+    assert_eq!(count_of(&bots["classes"], "human"), Some(2));
+    assert_eq!(count_of(&bots["classes"], "crawler"), Some(1));
+    assert_eq!(count_of(&bots["classes"], "tool"), Some(1));
+    assert_eq!(count_of(&bots["signals"], "ua_curl"), Some(1));
+    assert_eq!(
+        count_of(&bots["signals"], "missing_accept_language"),
+        Some(1)
+    );
+    assert_eq!(count_of(&bots["agents"], "curl/8"), Some(1));
+    assert!(bots["score_buckets"].is_array());
+
+    let (_, none) = h.get(&t, "/analytics/bots?site=ghost").await;
+    assert_eq!(none["total_requests"], 0);
+}
+
+#[tokio::test]
+async fn top_endpoint_ranks_every_kind() {
+    let h = start().await;
+    let t = h.token().await;
+    let paths = ["/a", "/a", "/a", "/b"];
+    h.ingest(paths.iter().map(|p| LogEvent {
+        path: (*p).into(),
+        ..event("10.0.0.1", 200)
+    }));
+    let (status, top) = h.get(&t, "/analytics/top?kind=paths&window=1h").await;
+    assert_eq!(status, 200, "{top}");
+    assert_eq!(top["items"][0]["key"], "/a");
+    assert_eq!(top["items"][0]["count"], 3);
+    assert_eq!(top["items"][1]["key"], "/b");
+    let (_, hosts) = h.get(&t, "/analytics/top?kind=hosts").await;
+    assert_eq!(hosts["items"][0]["key"], "a.example.com");
+    assert_eq!(hosts["items"][0]["count"], 4);
+    for kind in [
+        "paths",
+        "hosts",
+        "referers",
+        "agents",
+        "content_types",
+        "statuses",
+        "ips",
+        "languages",
+    ] {
+        let (status, body) = h.get(&t, &format!("/analytics/top?kind={kind}")).await;
+        assert_eq!(status, 200, "{kind}");
+        assert!(body["items"].is_array(), "{kind}");
+    }
+    let (_, one) = h.get(&t, "/analytics/top?kind=paths&limit=1").await;
+    assert_eq!(one["items"].as_array().map(Vec::len), Some(1));
+    assert_eq!(
+        h.get(&t, "/analytics/top?kind=paths&limit=5000").await.0,
+        200
+    );
+    let (_, ghost) = h.get(&t, "/analytics/top?kind=paths&site=ghost").await;
+    assert_eq!(ghost["items"], json!([]));
+}
+
+#[tokio::test]
+async fn stats_endpoint_and_node_report_the_store() {
+    let h = start().await;
+    let t = h.token().await;
+    let (_, empty) = h.get(&t, "/analytics/stats").await;
+    assert_eq!(empty["rows"], 0);
+    assert!(empty["oldest_ts_ms"].is_null());
+    h.ingest([event("10.0.0.1", 200), event("10.0.0.2", 404)]);
+    let (status, stats) = h.get(&t, "/analytics/stats").await;
+    assert_eq!(status, 200, "{stats}");
+    assert_eq!(stats["rows"], 2);
+    assert!(stats["db_bytes"].as_u64().is_some_and(|n| n > 0));
+    assert!(stats["oldest_ts_ms"].is_i64() && stats["newest_ts_ms"].is_i64());
+    assert_eq!(stats["write_errors"], 0);
+    assert_eq!(stats["retention_days"], 30);
+    assert!(stats["max_bytes"].is_null());
+    assert_eq!(stats["ingest_stalls"], 0);
+
+    let (_, node) = h.get(&t, "/node").await;
+    assert_eq!(node["analytics"]["rows"], 2);
+    assert_eq!(node["name"], "test-node");
+}
+
+#[tokio::test]
+async fn nothing_is_dropped_when_ingest_outpaces_the_writer() {
+    let h = start().await;
+    let t = h.token().await;
+    let total = 50_000;
+    h.ingest(bulk(total, 0));
+    let (_, stats) = h.get(&t, "/analytics/stats").await;
+    assert_eq!(stats["rows"], total);
+    assert_eq!(stats["write_errors"], 0);
+    let (_, summary) = h.get(&t, "/analytics/summary?window=24h").await;
+    assert_eq!(summary["requests"], total);
+}
+
+#[tokio::test]
+async fn without_a_size_cap_nothing_is_evicted() {
+    let h = start().await;
+    let total = 30_000;
+    h.ingest(bulk(total, 500));
+    h.state.analytics.prune(now_ms()).expect("prune");
+    assert_eq!(h.state.analytics.stats().expect("stats").rows, total as u64);
+}
+
+#[tokio::test]
+async fn with_a_size_cap_the_oldest_rows_go_first() {
+    let h = start_with(|cfg| cfg.analytics_max_bytes = Some(8 * 1024 * 1024)).await;
+    let total = 30_000;
+    let mut first = i64::MAX;
+    let mut last = 0;
+    h.ingest(bulk(total, 500).inspect(|e| {
+        first = first.min(e.ts_ms);
+        last = last.max(e.ts_ms);
+    }));
+    h.state.analytics.prune(now_ms()).expect("prune");
+    let stats = h.state.analytics.stats().expect("stats");
+    assert!(stats.rows > 0 && stats.rows < total as u64, "{stats:?}");
+    assert_eq!(stats.newest_ts_ms, Some(last));
+    assert!(stats.oldest_ts_ms > Some(first), "{stats:?}");
+}
+
+#[tokio::test]
+async fn export_csv_has_a_header_quoting_and_formula_protection() {
+    let h = start().await;
+    let t = h.token().await;
+    let risky = LogEvent {
+        path: "/a,b\"c".into(),
+        user_agent: "=cmd|' /C calc'!A0".into(),
+        referer: "line1\nline2".into(),
+        ..event("10.0.0.1", 200)
+    };
+    h.ingest([risky, event("10.0.0.2", 404), event("10.0.0.3", 500)]);
+
+    let res = h.get_raw(&t, "/analytics/export?kind=requests").await;
+    assert_eq!(res.status().as_u16(), 200);
+    let headers = res.headers().clone();
+    assert_eq!(headers["content-type"], "text/csv; charset=utf-8");
+    assert_eq!(headers["x-content-type-options"], "nosniff");
+    assert_eq!(headers["cache-control"], "no-store");
+    let disposition = headers["content-disposition"].to_str().expect("ascii");
+    assert!(
+        disposition.starts_with("attachment; filename=\"cite-requests-all-")
+            && disposition.ends_with(".csv\""),
+        "{disposition}"
+    );
+    let body = res.text().await.expect("body");
+    assert!(body.starts_with("timestamp,ts_ms,client_ip,"));
+    assert!(body.contains("\r\n"));
+
+    let rows = parse_csv(&body);
+    assert_eq!(rows.len(), 4);
+    let header = &rows[0];
+    let names: Vec<&str> = header.iter().map(String::as_str).collect();
+    assert_eq!(names, cite_store::REQUEST_COLUMNS.to_vec());
+    assert!(rows[1..].iter().all(|r| r.len() == header.len()));
+    let col = |name: &str| header.iter().position(|c| c == name).expect(name);
+    assert_eq!(rows[1][col("path")], "/a,b\"c");
+    assert_eq!(rows[1][col("user_agent")], "'=cmd|' /C calc'!A0");
+    assert_eq!(rows[1][col("referer")], "line1\nline2");
+    assert_eq!(rows[2][col("status")], "404");
+    assert_eq!(rows[3][col("client_ip")], "10.0.0.3");
+    assert_eq!(rows[1][col("site")], "blog");
+}
+
+#[tokio::test]
+async fn export_file_names_carry_the_site_and_the_format() {
+    let h = start().await;
+    let t = h.token().await;
+    h.ingest([event("10.0.0.1", 200)]);
+    let res = h
+        .get_raw(
+            &t,
+            "/analytics/export?format=ndjson&site=blog&kind=top&top=ips",
+        )
+        .await;
+    assert_eq!(res.status().as_u16(), 200);
+    assert_eq!(res.headers()["content-type"], "application/x-ndjson");
+    let disposition = res.headers()["content-disposition"]
+        .to_str()
+        .expect("ascii");
+    assert!(
+        disposition.starts_with("attachment; filename=\"cite-top-ips-blog-")
+            && disposition.ends_with(".ndjson\""),
+        "{disposition}"
+    );
+}
+
+#[tokio::test]
+async fn export_ndjson_has_one_json_object_per_row() {
+    let h = start().await;
+    let t = h.token().await;
+    h.ingest([
+        bot_event("10.0.0.1", "crawler", 70, "ua_googlebot", "Googlebot/2.1"),
+        event("10.0.0.2", 404),
+        event("10.0.0.3", 500),
+    ]);
+    let res = h
+        .get_raw(&t, "/analytics/export?kind=requests&format=ndjson")
+        .await;
+    assert_eq!(res.status().as_u16(), 200);
+    assert_eq!(res.headers()["x-content-type-options"], "nosniff");
+    let body = res.text().await.expect("body");
+    let lines: Vec<Value> = body
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("json line"))
+        .collect();
+    assert_eq!(lines.len(), 3);
+    assert_eq!(lines[0]["bot_class"], "crawler");
+    assert_eq!(lines[0]["bot_score"], 70);
+    assert_eq!(lines[0]["bot_signals"], "ua_googlebot");
+    assert_eq!(lines[1]["status"], 404);
+    assert_eq!(lines[2]["client_ip"], "10.0.0.3");
+}
+
+#[tokio::test]
+async fn export_filters_narrow_the_rows() {
+    let h = start().await;
+    let t = h.token().await;
+    let mk =
+        |ip: &str, status: u16, host: &str, method: &str, path: &str, class: &str, score: u8| {
+            LogEvent {
+                host: host.into(),
+                method: method.into(),
+                path: path.into(),
+                bot_class: class.into(),
+                bot_score: score,
+                ..event(ip, status)
+            }
+        };
+    let mut shop = mk(
+        "10.0.0.3",
+        500,
+        "a.example.com",
+        "GET",
+        "/static/x.css",
+        "crawler",
+        70,
+    );
+    shop.site = "shop".into();
+    h.ingest([
+        mk(
+            "10.0.0.1",
+            200,
+            "a.example.com",
+            "GET",
+            "/api/users",
+            "human",
+            0,
+        ),
+        mk(
+            "10.0.0.2",
+            404,
+            "b.example.com",
+            "POST",
+            "/api/orders",
+            "tool",
+            80,
+        ),
+        shop,
+        mk("10.0.0.4", 301, "b.example.com", "GET", "/old", "human", 5),
+    ]);
+    let soon = now_ms() + 60_000;
+    let cases: [(String, usize); 20] = [
+        ("".into(), 4),
+        ("status_min=400".into(), 2),
+        ("status_min=400&status_max=499".into(), 1),
+        ("status_max=299".into(), 1),
+        ("bot_class=crawler".into(), 1),
+        ("bot_class=human".into(), 2),
+        ("min_bot_score=70".into(), 2),
+        ("host=a.example.com".into(), 2),
+        ("path_prefix=/api".into(), 2),
+        ("client_ip=10.0.0.2".into(), 1),
+        ("method=post".into(), 1),
+        ("site=shop".into(), 1),
+        ("site=ghost".into(), 0),
+        ("limit=2".into(), 2),
+        ("status_min=400&bot_class=tool".into(), 1),
+        (format!("from={soon}"), 0),
+        (format!("to={}", now_ms() - 60_000), 0),
+        (format!("from={}&to={soon}", now_ms() - 60_000), 4),
+        (
+            "from=1970-01-01T00:00:00Z&to=1970-01-01T00:00:01Z".into(),
+            0,
+        ),
+        ("from=1970-01-01T00:00:00Z".into(), 4),
+    ];
+    for (query, want) in cases {
+        let rows = export_rows(&h, &t, &query).await;
+        assert_eq!(rows.len(), want, "{query}");
+    }
+}
+
+#[tokio::test]
+async fn export_supports_hourly_bots_and_top_kinds() {
+    let h = start().await;
+    let t = h.token().await;
+    let paths = ["/a", "/a", "/b"];
+    h.ingest(paths.iter().map(|p| LogEvent {
+        path: (*p).into(),
+        bot_class: "human".into(),
+        ..event("10.0.0.1", 200)
+    }));
+
+    let hourly = export_rows(&h, &t, "kind=hourly").await;
+    assert!(!hourly.is_empty());
+    assert!(
+        hourly
+            .iter()
+            .all(|r| r.len() == cite_store::HOURLY_COLUMNS.len())
+    );
+    let requests: u64 = hourly
+        .iter()
+        .map(|r| r[3].parse::<u64>().expect("count"))
+        .sum();
+    assert_eq!(requests, 3);
+
+    let bots = export_rows(&h, &t, "kind=bots").await;
+    assert!(
+        bots.iter()
+            .any(|r| r[..3] == ["summary", "total_requests", "3"]),
+        "{bots:?}"
+    );
+
+    let top = export_rows(&h, &t, "kind=top&top=paths").await;
+    assert_eq!(top[0][..2], ["/a", "2"]);
+    assert_eq!(top[1][..2], ["/b", "1"]);
+}
+
+#[tokio::test]
+async fn export_parameters_are_validated() {
+    let h = start().await;
+    let t = h.token().await;
+    for query in [
+        "kind=everything",
+        "kind=top",
+        "kind=top&top=nope",
+        "kind=bots&top=paths",
+        "format=xml",
+        "from=yesterday",
+        "from=2000&to=1000",
+        "site=Bad%20Site",
+        "status_min=abc",
+        "status_min=99",
+        "status_max=600",
+        "status_min=500&status_max=400",
+        "bot_class=robot",
+        "min_bot_score=101",
+        "min_bot_score=abc",
+        "client_ip=nope",
+        "method=GE%20T",
+        "limit=0",
+        "limit=-3",
+        "limit=1000001",
+        "limit=many",
+    ] {
+        let (status, body) = h
+            .call(
+                Method::GET,
+                Some(&t),
+                &format!("/analytics/export?{query}"),
+                None,
+            )
+            .await;
+        assert_eq!(status, 400, "{query}");
+        assert!(
+            body["error"].as_str().is_some_and(|m| !m.is_empty()),
+            "{query}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn at_most_two_exports_run_at_once() {
+    let h = start().await;
+    let t = h.token().await;
+    h.ingest([event("10.0.0.1", 200)]);
+    let held = Arc::clone(&h.state.exports)
+        .try_acquire_many_owned(2)
+        .expect("both permits");
+    let (status, body) = h
+        .call(Method::GET, Some(&t), "/analytics/export", None)
+        .await;
+    assert_eq!(status, 429);
+    assert!(body["error"].is_string());
+    drop(held);
+    assert_eq!(export_rows(&h, &t, "").await.len(), 1);
+
+    let one = Arc::clone(&h.state.exports)
+        .try_acquire_owned()
+        .expect("one permit");
+    assert_eq!(export_rows(&h, &t, "").await.len(), 1);
+    drop(one);
+    for _ in 0..3 {
+        assert_eq!(export_rows(&h, &t, "").await.len(), 1);
+    }
+    for _ in 0..100 {
+        if h.state.exports.available_permits() == MAX_EXPORTS {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("finished exports did not return their permits");
+}
+
+#[tokio::test]
+async fn abandoning_a_download_stops_the_export_and_frees_its_slot() {
+    let h = start().await;
+    let t = h.token().await;
+    h.ingest(bulk(50_000, 200));
+    let res = h.get_raw(&t, "/analytics/export?kind=requests").await;
+    assert_eq!(res.status().as_u16(), 200);
+    drop(res);
+    for _ in 0..200 {
+        if h.state.exports.available_permits() == MAX_EXPORTS {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("an abandoned export kept its slot");
+}
+
+#[tokio::test]
+async fn exports_are_audited_with_the_filters_used() {
+    let h = start().await;
+    let t = h.token().await;
+    h.ingest([event("10.0.0.1", 500)]);
+    export_rows(&h, &t, "site=blog&status_min=500&bot_class=human").await;
+    let rejected = h.get_raw(&t, "/analytics/export?status_min=abc").await;
+    assert_eq!(rejected.status().as_u16(), 400);
+    let (_, entries) = h.get(&t, "/audit?limit=50").await;
+    let exports: Vec<&Value> = entries
+        .as_array()
+        .expect("array")
+        .iter()
+        .filter(|e| e["action"] == "analytics.export")
+        .collect();
+    assert_eq!(exports.len(), 1);
+    assert_eq!(exports[0]["actor"], "admin");
+    let detail = exports[0]["detail"].as_str().expect("detail");
+    for part in [
+        "kind=requests",
+        "format=csv",
+        "site=\"blog\"",
+        "bot_class=\"human\"",
+        "status_min=500",
+    ] {
+        assert!(detail.contains(part), "{detail}");
+    }
+}
+
+#[tokio::test]
+async fn analytics_routes_share_the_same_auth_rules() {
+    let h = start().await;
+    let session = h.token().await;
+    let (_, created) = h.post(&session, "/tokens", json!({ "name": "ci" })).await;
+    let api = created["token"].as_str().expect("token").to_string();
+    h.ingest([event("10.0.0.1", 200)]);
+    for path in [
+        "/analytics/summary",
+        "/analytics/timeseries",
+        "/analytics/requests",
+        "/analytics/bots",
+        "/analytics/top?kind=paths",
+        "/analytics/stats",
+        "/analytics/export",
+    ] {
+        let anonymous = h.http.get(h.url(path)).send().await.expect("request");
+        assert_eq!(anonymous.status().as_u16(), 401, "{path}");
+        assert_eq!(anonymous.headers()["www-authenticate"], "Bearer");
+        let (garbage, _) = h.get("not-a-token", path).await;
+        assert_eq!(garbage, 401, "{path}");
+        assert_eq!(
+            h.get_raw(&session, path).await.status().as_u16(),
+            200,
+            "{path}"
+        );
+        assert_eq!(h.get_raw(&api, path).await.status().as_u16(), 200, "{path}");
+    }
 }
 
 #[tokio::test]

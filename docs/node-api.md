@@ -22,7 +22,7 @@ The three `/tokens` routes need a session token from login. An API token gets 40
 | Route | Response |
 |---|---|
 | `GET /healthz` | `{ok:true}` |
-| `GET /node` | `{name,version,uptime_secs,haproxy:{running,config_hash,last_reload_at,last_reload_ok,last_error},sites,firewall_rules}` |
+| `GET /node` | `{name,version,uptime_secs,haproxy:{running,config_hash,last_reload_at,last_reload_ok,last_error},sites,firewall_rules,orchestrator:{enabled,reachable},analytics}` where `analytics` has the fields of `GET /analytics/stats`, or is `null` when the database cannot be read |
 | `POST /haproxy/reload` | `{ok,config_hash,reloaded}` |
 | `GET /haproxy/config` | `text/plain` rendered haproxy.cfg |
 | `GET /haproxy/stats` | `{backends:[{name,status,sessions,bytes_in,bytes_out,servers:[{name,status,check}]}]}` |
@@ -72,13 +72,41 @@ Deploys, switches, rollbacks, site changes and every other change that touches t
 
 ## Analytics
 
-All accept `window` (`15m`, `1h`, `24h`, `7d`, `30d`; the default is `1h`) and optional `site`.
+`summary`, `timeseries`, `bots` and `top` accept `window` (`15m`, `1h`, `24h`, `7d`, `30d`; the default is `1h`) and optional `site`. Every route needs the bearer token, and a session token and an API token are both accepted. Storage, retention, bot scoring and the export format are described in [Analytics](analytics.md).
 
 | Route | Response |
 |---|---|
 | `GET /analytics/summary` | `{requests,bytes_in,bytes_out,blocked,errors_4xx,errors_5xx,avg_ms,p50_ms,p95_ms,p99_ms,status:{"2xx":n,...},methods:{GET:n},content_types:{...},sizes:[{le,count}],top_paths:[{key,count,bytes}],top_ips:[...],top_user_agents:[...],top_hosts:[...],top_blocked:[...]}` |
 | `GET /analytics/timeseries` | `{step_secs,points:[{ts,requests,bytes_out,errors,blocked,avg_ms}]}` |
-| `GET /analytics/requests?limit=&status=&method=&path=&ip=&blocked=&site=` | `[LogEvent]` newest first |
+| `GET /analytics/requests?limit=&status=&method=&path=&ip=&blocked=&site=` | `[LogEvent]` newest first, `limit` 1 to 1000 (default 100) |
+| `GET /analytics/bots?window=&site=` | `{total_requests,bot_requests,bot_share_pct,classes:[{key,count,bytes}],signals:[...],agents:[...],score_buckets:[...]}`. `classes` keys are `human`, `suspect`, `crawler`, `tool`, `bot`; `score_buckets` keys are `0-19`, `20-39`, `40-59`, `60-79`, `80-100`. |
+| `GET /analytics/top?kind=&window=&site=&limit=` | `{items:[{key,count,bytes}]}`. `kind` is required: `paths`, `hosts`, `referers`, `agents`, `content_types`, `statuses`, `ips` or `languages`. `limit` 1 to 1000 (default 100). An unknown `kind` is a 400. |
+| `GET /analytics/stats` | `{rows,db_bytes,oldest_ts_ms,newest_ts_ms,write_batches,write_errors,retention_days,max_bytes,ingest_stalls}`. The two timestamps are `null` for an empty database, and `max_bytes` is `null` when no size cap is set. `ingest_stalls` counts the times the log receiver waited on the database writer. |
+| `GET /analytics/export?kind=&top=&format=&from=&to=&site=&status_min=&status_max=&bot_class=&min_bot_score=&host=&path_prefix=&client_ip=&method=&limit=` | A streamed file download, not JSON. See below. |
+
+### Export
+
+| Parameter | Values |
+|---|---|
+| `kind` | `requests` (default), `hourly`, `bots`, `top` |
+| `top` | Required with `kind=top`, rejected otherwise; the same names as `/analytics/top` |
+| `format` | `csv` (default), `ndjson` |
+| `from`, `to` | Milliseconds since the epoch or RFC 3339. `from` inclusive, `to` exclusive, `from` must be earlier |
+| `site` | A site id |
+| `status_min`, `status_max` | 100 to 599, inclusive; `status_min` must not exceed `status_max` |
+| `bot_class` | `human`, `suspect`, `crawler`, `tool`, `bot` |
+| `min_bot_score` | 0 to 100 |
+| `host`, `path_prefix`, `client_ip`, `method` | Exact host (255 bytes at most), path prefix (1024 bytes at most), IP address, HTTP method token |
+| `limit` | 1 to 1,000,000; default 1,000,000 |
+
+The response is 200 with `Content-Type: text/csv; charset=utf-8` or `application/x-ndjson`, `Content-Disposition: attachment; filename="cite-<kind>-<site|all>-<UTC date>.<csv|ndjson>"`, `X-Content-Type-Options: nosniff` and `Cache-Control: no-store`. A bad parameter is a 400 `{error}` naming it. A third simultaneous export on one node is a 429. A failure after the download has started cannot change the status, so the connection is aborted instead of ending the body normally. Each export is recorded in the audit log as `analytics.export` with the kind, format and filters.
+
+```sh
+curl -H "Authorization: Bearer $TOKEN" -OJ \
+  "https://node:7443/api/v1/analytics/export?kind=requests&bot_class=crawler&from=2026-11-01T00:00:00Z"
+```
+
+Analytics read failures return 500 `{error:"internal error"}`; the cause is in the connector log.
 
 The `sizes` buckets are cumulative: `count` is the number of responses up to and including `le` bytes, and the final bucket (`le` null) equals the total, so clients subtract the previous bucket to draw a histogram.
 

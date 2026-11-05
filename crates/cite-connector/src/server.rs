@@ -11,7 +11,6 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use cite_edge::allow::IpAllowlist;
-use cite_edge::analytics::Analytics;
 use cite_edge::model::EdgeConfig;
 use cite_edge::ratelimit::LoginLimiter;
 use cite_edge::render::{RenderOptions, render};
@@ -29,10 +28,12 @@ use tower::Service;
 use crate::config::ConnectorConfig;
 use crate::deploy::{Deployer, detach};
 use crate::haproxy::Haproxy;
+use crate::logsink::{self, IngestStats};
 use crate::orchestrator::Orchestrator;
 use crate::store::{Store, now_unix, unix_to_rfc3339};
-use crate::{ConnectorError, Result, logsink, tls};
+use crate::{ConnectorError, Result, tls};
 
+mod export;
 mod handlers;
 mod health;
 #[cfg(test)]
@@ -51,6 +52,8 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(700);
 const CONNECTION_MAX_AGE: Duration = Duration::from_secs(15 * 60);
 const MAX_HEADER_BUF: usize = 32 * 1024;
 const MAX_BEARER_LEN: usize = 200;
+// Exports hold a database reader and a blocking thread each for as long as the client reads.
+const MAX_EXPORTS: usize = 2;
 
 pub type AppState = Arc<Inner>;
 
@@ -60,7 +63,9 @@ pub struct Inner {
     haproxy: Arc<Haproxy>,
     deployer: Arc<Deployer>,
     orchestrator: Option<Arc<Orchestrator>>,
-    analytics: Arc<StdMutex<Analytics>>,
+    analytics: Arc<cite_store::Store>,
+    ingest: Arc<IngestStats>,
+    exports: Arc<Semaphore>,
     limiter: StdMutex<LoginLimiter>,
     render_opts: RenderOptions,
     started: Instant,
@@ -73,7 +78,8 @@ impl Inner {
         haproxy: Arc<Haproxy>,
         deployer: Arc<Deployer>,
         orchestrator: Option<Arc<Orchestrator>>,
-        analytics: Arc<StdMutex<Analytics>>,
+        analytics: Arc<cite_store::Store>,
+        ingest: Arc<IngestStats>,
     ) -> AppState {
         let render_opts = RenderOptions {
             maps_dir: cfg.maps_dir.display().to_string(),
@@ -90,6 +96,8 @@ impl Inner {
             deployer,
             orchestrator,
             analytics,
+            ingest,
+            exports: Arc::new(Semaphore::new(MAX_EXPORTS)),
             limiter: StdMutex::new(LoginLimiter::new()),
             render_opts,
             started: Instant::now(),
@@ -468,6 +476,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/analytics/summary", get(h::analytics_summary))
         .route("/api/v1/analytics/timeseries", get(h::analytics_timeseries))
         .route("/api/v1/analytics/requests", get(h::analytics_requests))
+        .route("/api/v1/analytics/bots", get(h::analytics_bots))
+        .route("/api/v1/analytics/top", get(h::analytics_top))
+        .route("/api/v1/analytics/stats", get(h::analytics_stats))
+        .route("/api/v1/analytics/export", get(export::analytics_export))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
     Router::new()
         .merge(public)
@@ -595,8 +607,15 @@ pub async fn run(cfg: ConnectorConfig) -> Result<()> {
         return Err(ConnectorError::Unavailable(MISSING.into()));
     }
     let retention = store.config().settings.retention.clone();
-    let analytics = Arc::new(StdMutex::new(logsink::load_snapshot(&cfg, retention)));
-    let _log_task = logsink::spawn(&cfg, Arc::clone(&analytics), Arc::clone(&store));
+    let days = logsink::retention_days(&retention);
+    let analytics = open_analytics(&cfg, days, retention).await?;
+    let ingest = Arc::new(IngestStats::default());
+    let log_sink = logsink::spawn(
+        &cfg,
+        Arc::clone(&analytics),
+        Arc::clone(&store),
+        Arc::clone(&ingest),
+    );
     let orchestrator = match Orchestrator::from_config(&cfg)? {
         Some(o) => {
             match o.ping().await {
@@ -628,13 +647,42 @@ pub async fn run(cfg: ConnectorConfig) -> Result<()> {
         .map_err(|e| ConnectorError::Internal(format!("cannot bind {}: {e}", cfg.listen)))?;
     let (listen, node, secure) = (cfg.listen, &cfg.node_name, cfg.tls);
     tracing::info!(%listen, %node, tls = secure, "connector api listening");
-    let (final_cfg, final_store, final_analytics) =
-        (cfg.clone(), Arc::clone(&store), Arc::clone(&analytics));
-    let state = Inner::new(cfg, store, haproxy, deployer, orchestrator, analytics);
+    let final_analytics = Arc::clone(&analytics);
+    let state = Inner::new(
+        cfg,
+        store,
+        haproxy,
+        deployer,
+        orchestrator,
+        analytics,
+        ingest,
+    );
     tokio::select! {
         () = serve(listener, state, acceptor) => {}
         () = shutdown_signal() => tracing::info!("shutting down"),
     }
-    logsink::persist_final(&final_cfg, &final_analytics, &final_store).await;
+    log_sink.shutdown().await;
+    let folded = tokio::task::spawn_blocking(move || final_analytics.checkpoint()).await;
+    match folded {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::warn!(error = %e, "analytics database checkpoint failed"),
+        Err(e) => tracing::warn!(error = %e, "analytics checkpoint task failed"),
+    }
     Ok(())
+}
+
+// Opening may migrate the schema or import an old snapshot, so it stays off the async workers.
+async fn open_analytics(
+    cfg: &ConnectorConfig,
+    retention_days: u32,
+    retention: cite_edge::model::Retention,
+) -> Result<Arc<cite_store::Store>> {
+    let cfg = cfg.clone();
+    tokio::task::spawn_blocking(move || {
+        let analytics = logsink::open_store(&cfg, retention_days)?;
+        logsink::migrate_snapshot(&cfg.data_dir, &analytics, &retention);
+        Ok(analytics)
+    })
+    .await
+    .map_err(|e| ConnectorError::Internal(format!("analytics open task failed: {e}")))?
 }
