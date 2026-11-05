@@ -300,6 +300,8 @@ impl Deployer {
         let Some(orch) = self.orchestrator.clone() else {
             return;
         };
+        // A recreated HAProxy reaches no stack until it is reattached, so health below cannot pass before this.
+        orch.ensure_reconciled().await;
         let ids: Vec<String> = self
             .store
             .config()
@@ -1702,6 +1704,23 @@ mod tests {
         e.deployer.reconcile_idle_stacks().await;
         assert!(!orch.stack_running("shop", Slot::Blue).await.unwrap());
         assert!(orch.stack_running("shop", Slot::Green).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn startup_reconcile_reattaches_haproxy_even_when_the_site_is_unhealthy() {
+        use crate::orchestrator::tests::{HAPROXY, members, recreate_haproxy};
+        let (orch, fake) = crate::orchestrator::tests::start_fake().await;
+        let orch = Arc::new(orch);
+        let e = env_full(|_| {}, Some(orch.clone()), Duration::from_secs(600)).await;
+        e.deployer
+            .create_site("t", orchestrated_site("shop"), Some("ghp_testtoken".into()))
+            .await
+            .unwrap();
+        recreate_haproxy(&orch, &fake);
+        set_down(&e, "be_shop_blue");
+        assert!(!members(&fake, "cite-shop-blue-net").contains(HAPROXY));
+        e.deployer.reconcile_idle_stacks().await;
+        assert!(members(&fake, "cite-shop-blue-net").contains(HAPROXY));
     }
 
     #[tokio::test]

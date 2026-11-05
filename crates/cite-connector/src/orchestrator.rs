@@ -452,7 +452,7 @@ impl Orchestrator {
     }
 
     // A failed attempt is retried on the next call, so a restart while Docker is down heals later.
-    async fn ensure_reconciled(&self) {
+    pub async fn ensure_reconciled(&self) {
         if self.reconciled.load(Ordering::Acquire) {
             return;
         }
@@ -1378,7 +1378,7 @@ pub(crate) mod tests {
         haproxy_missing: bool,
     }
 
-    const HAPROXY: &str = "cite-node-haproxy";
+    pub(crate) const HAPROXY: &str = "cite-node-haproxy";
 
     // reqwest percent-encodes query values, so the fake must decode them to match names.
     fn percent_decode(s: &str) -> String {
@@ -2471,7 +2471,15 @@ pub(crate) mod tests {
         assert_eq!(json["slot"], json!("blue"));
     }
 
-    fn members(fake: &Arc<Mutex<Fake>>, net: &str) -> HashSet<String> {
+    // Stands in for a recreated HAProxy: it sits on no network and the connector has not yet reconciled.
+    pub(crate) fn recreate_haproxy(orch: &Orchestrator, fake: &Arc<Mutex<Fake>>) {
+        for net in fake.lock().unwrap().networks.values_mut() {
+            net.members.clear();
+        }
+        orch.reconciled.store(false, Ordering::Release);
+    }
+
+    pub(crate) fn members(fake: &Arc<Mutex<Fake>>, net: &str) -> HashSet<String> {
         fake.lock().unwrap().networks[net].members.clone()
     }
 

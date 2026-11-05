@@ -45,6 +45,7 @@ services:
       CITE_DOCKER_HOST: http://dockerproxy:2375
       CITE_HAPROXY_CONTAINER: cite-node-haproxy
       CITE_REGISTRY: ${CITE_REGISTRY:-ghcr.io/seggys116}
+      CITE_STACK_VERSION: ${CITE_STACK_VERSION:-}
     networks:
       - docker_api
 

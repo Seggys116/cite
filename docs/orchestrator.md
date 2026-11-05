@@ -55,7 +55,7 @@ Proxy settings, all on the `dockerproxy` service:
 | `CITE_PROXY_EDGE_NETWORK` | `cite_edge` | Shared network executors may join when per-stack networks are off. |
 | `CITE_PROXY_MAX_CONNS` | `64` | Concurrent connections. |
 
-Because the stack version becomes an image tag, `CITE_STACK_VERSION` must be a plain `x.y.z` version. The connector uses Docker Engine API v1.45, which is why Docker Engine 26 or newer is required.
+Because the stack version becomes an image tag, `CITE_STACK_VERSION` must be a plain `x.y.z` version. The overlay passes it from `.env` to the connector; when it is unset the connector uses its own version. The connector uses Docker Engine API v1.45, which is why Docker Engine 26 or newer is required.
 
 ## What a site stack is
 
@@ -75,7 +75,7 @@ These specifications mirror the `manager` and `executor` services in `docker-com
 
 Each stack gets its own internal network, `cite-<id>-<slot>-net`, and its executor is the only container on it besides HAProxy. The connector creates the network, then asks Docker (through the proxy) to connect the HAProxy container, named by `CITE_HAPROXY_CONTAINER` (default `cite-node-haproxy`). HAProxy reaches the executor at `cite-<id>-<slot>-executor:8080` over that network, and the connector writes the address into the slot's targets. Because the network is internal and unshared, site A's code cannot reach site B's executor, neither HAProxy's admin sockets nor the connector can be reached from an executor, and an executor has no route out.
 
-On stop, HAProxy is disconnected from the stack's network. The network itself stays so the stopped executor can start again. Removing a stack disconnects HAProxy and deletes both networks. If HAProxy is recreated, it loses its attachments; the connector re-attaches it to every running stack's network the first time it uses the orchestrator after start. A container, volume or network that already has the expected name but lacks the `cite.managed=true` label is never adopted, changed or deleted; the connector reports a conflict.
+On stop, HAProxy is disconnected from the stack's network. The network itself stays so the stopped executor can start again. Removing a stack disconnects HAProxy and deletes both networks. If HAProxy is recreated, it loses its attachments; the connector re-attaches it to every running stack's network when it starts, before it waits for any site to turn healthy, and again the first time it uses the orchestrator. A container, volume or network that already has the expected name but lacks the `cite.managed=true` label is never adopted, changed or deleted; the connector reports a conflict.
 
 If `CITE_HAPROXY_CONTAINER` is set to an empty value, per-stack networks are off and executors join the shared `cite_edge` network as before. That mode is weaker: all executors on the node can reach each other directly, so one site's code can talk to another site's executor. Use it only for a node whose sites you fully trust. Stacks created in that mode move to their own network the next time they are ensured, because the executor is recreated when its network differs.
 
