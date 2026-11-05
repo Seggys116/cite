@@ -170,6 +170,35 @@ async fn export(
     resp
 }
 
+// Serves a gzip file with a hostile file name the proxy must replace, or a 404 for the name `missing.db`.
+async fn archive_file(
+    State(f): State<Shared>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Response {
+    if !authorized(&f, &headers) {
+        return err(StatusCode::UNAUTHORIZED, "unauthorized");
+    }
+    if name == "missing.db" {
+        return err(StatusCode::NOT_FOUND, "no such archive");
+    }
+    let mut resp = Response::new(Body::from(vec![b'z'; 4096]));
+    let h = resp.headers_mut();
+    h.insert(header::CONTENT_TYPE, "text/html".parse().expect("ct"));
+    h.insert(
+        header::CONTENT_DISPOSITION,
+        "attachment; filename=\"../x y.exe\"".parse().expect("cd"),
+    );
+    resp
+}
+
+async fn archive_delete(State(f): State<Shared>, headers: HeaderMap) -> Response {
+    if !authorized(&f, &headers) {
+        return err(StatusCode::UNAUTHORIZED, "unauthorized");
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
 async fn list_sites(State(f): State<Shared>, headers: HeaderMap) -> Response {
     if !authorized(&f, &headers) {
         return err(StatusCode::UNAUTHORIZED, "unauthorized");
@@ -242,6 +271,14 @@ async fn spawn_fake(fake: Shared) -> String {
         .route("/api/v1/analytics/top", get(summary))
         .route("/api/v1/analytics/stats", get(summary))
         .route("/api/v1/analytics/export", get(export))
+        .route("/api/v1/analytics/archives", get(echo))
+        .route(
+            "/api/v1/analytics/archives/{name}",
+            get(archive_file).delete(archive_delete),
+        )
+        .route("/api/v1/analytics/backup", any(echo))
+        .route("/api/v1/analytics/cut", any(echo))
+        .route("/api/v1/analytics/restore", any(echo))
         .route("/api/v1/settings", any(echo))
         .route("/api/v1/haproxy/stats", get(big))
         .route("/api/v1/sites", get(list_sites).post(create_site))
@@ -1291,6 +1328,128 @@ async fn new_analytics_reads_are_proxied_and_other_analytics_routes_are_not() {
     )
     .await;
     assert_eq!(post.status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn archive_downloads_stream_with_rebuilt_headers() {
+    let url = spawn_fake(new_fake(NODE_TOKEN)).await;
+    let h = harness_with_nodes(&[("edge-1", url.as_str(), NODE_TOKEN)]);
+    let s = login(&h).await;
+    let uri = "/api/v1/nodes/edge-1/analytics/archives/requests-2026-11-05.ndjson.gz";
+    let reply = get_path(&h.app, uri, &s.headers()).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(reply.body.len(), 4096);
+    assert_eq!(reply.header("content-type"), "application/octet-stream");
+    assert_eq!(
+        reply.header("content-disposition"),
+        "attachment; filename=\"requests-2026-11-05.ndjson.gz\""
+    );
+    assert_eq!(reply.header("x-content-type-options"), "nosniff");
+    assert_eq!(reply.header("cache-control"), "no-store");
+
+    let backup = get_path(
+        &h.app,
+        "/api/v1/nodes/edge-1/analytics/archives/analytics-20261105-101500.db",
+        &s.headers(),
+    )
+    .await;
+    assert_eq!(
+        backup.header("content-disposition"),
+        "attachment; filename=\"analytics-20261105-101500.db\""
+    );
+
+    let missing = get_path(
+        &h.app,
+        "/api/v1/nodes/edge-1/analytics/archives/missing.db",
+        &s.headers(),
+    )
+    .await;
+    assert_eq!(missing.status, StatusCode::NOT_FOUND);
+    assert_eq!(missing.json()["error"], "no such archive");
+
+    let anonymous = get_path(&h.app, uri, &[]).await;
+    assert_eq!(anonymous.status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn archive_writes_need_csrf_and_reach_the_node_unchanged() {
+    let url = spawn_fake(new_fake(NODE_TOKEN)).await;
+    let h = harness_with_nodes(&[("edge-1", url.as_str(), NODE_TOKEN)]);
+    let s = login(&h).await;
+    let cookie_only = [("cookie", s.cookie.as_str())];
+    let cut_uri = "/api/v1/nodes/edge-1/analytics/cut";
+    let body = json!({ "before_days": 30, "archive": true, "dry_run": true });
+
+    let no_csrf = send_json(&h.app, Method::POST, cut_uri, &cookie_only, body.clone()).await;
+    assert_eq!(no_csrf.status, StatusCode::FORBIDDEN);
+    let no_csrf = send_json(
+        &h.app,
+        Method::POST,
+        "/api/v1/nodes/edge-1/analytics/restore",
+        &cookie_only,
+        json!({ "name": "a.db" }),
+    )
+    .await;
+    assert_eq!(no_csrf.status, StatusCode::FORBIDDEN);
+    let delete_uri = "/api/v1/nodes/edge-1/analytics/archives/a.db";
+    let no_csrf = call(&h.app, Method::DELETE, delete_uri, &cookie_only, None).await;
+    assert_eq!(no_csrf.status, StatusCode::FORBIDDEN);
+
+    let cut = send_json(&h.app, Method::POST, cut_uri, &s.headers(), body.clone()).await;
+    assert_eq!(cut.status, StatusCode::OK);
+    let seen = cut.json();
+    assert_eq!(seen["method"], "POST");
+    let relayed: Value = serde_json::from_str(seen["body"].as_str().expect("body")).expect("json");
+    assert_eq!(relayed, body);
+    assert!(seen["headers"].get("x-cite-csrf").is_none());
+
+    let backup = send_json(
+        &h.app,
+        Method::POST,
+        "/api/v1/nodes/edge-1/analytics/backup",
+        &s.headers(),
+        json!({}),
+    )
+    .await;
+    assert_eq!(backup.status, StatusCode::OK);
+
+    let deleted = call(&h.app, Method::DELETE, delete_uri, &s.headers(), None).await;
+    assert_eq!(deleted.status, StatusCode::NO_CONTENT);
+
+    let listed = get_path(
+        &h.app,
+        "/api/v1/nodes/edge-1/analytics/archives",
+        &s.headers(),
+    )
+    .await;
+    assert_eq!(listed.status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn unlisted_archive_routes_and_methods_stay_hidden() {
+    let url = spawn_fake(new_fake(NODE_TOKEN)).await;
+    let h = harness_with_nodes(&[("edge-1", url.as_str(), NODE_TOKEN)]);
+    let s = login(&h).await;
+    let base = "/api/v1/nodes/edge-1/analytics";
+    for uri in [
+        format!("{base}/cut"),
+        format!("{base}/backup"),
+        format!("{base}/archives/.hidden"),
+        format!("{base}/archives/a.db/extra"),
+        format!("{base}/archives/a%2Fb"),
+    ] {
+        let reply = get_path(&h.app, &uri, &s.headers()).await;
+        assert_eq!(reply.status, StatusCode::NOT_FOUND, "GET {uri}");
+    }
+    for (method, uri) in [
+        (Method::POST, format!("{base}/archives")),
+        (Method::PUT, format!("{base}/archives/a.db")),
+        (Method::DELETE, format!("{base}/cut")),
+        (Method::POST, format!("{base}/purge")),
+    ] {
+        let reply = send_json(&h.app, method.clone(), &uri, &s.headers(), json!({})).await;
+        assert_eq!(reply.status, StatusCode::NOT_FOUND, "{method} {uri}");
+    }
 }
 
 #[tokio::test]

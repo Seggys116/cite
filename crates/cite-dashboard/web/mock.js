@@ -104,6 +104,83 @@ function seedPresets() {
   ];
 }
 
+const DAY = 86400000;
+
+function fakeSha(seed) {
+  const rnd = mulberry32(hashString(seed));
+  return Array.from({ length: 64 }, () => Math.floor(rnd() * 16).toString(16)).join('');
+}
+
+function archiveStamp(ms) {
+  return new Date(ms).toISOString().slice(0, 19).replace(/[-:]/g, '').replace('T', '-');
+}
+
+function archiveEntry(kind, name, ms, rows, from, to) {
+  return { name, kind, bytes: kind === 'backup' ? 480000 + (rows || 400) * 612 : 9000 + (rows || 0) * 70, created_ms: ms, sha256: fakeSha(name), rows: rows ?? null, from_ms: from ?? null, to_ms: to ?? null };
+}
+
+function seedArchives(now, idx) {
+  if (idx === 1) return [];
+  const day = (ago) => new Date(now - ago * DAY).toISOString().slice(0, 10);
+  return [
+    archiveEntry('archive', `requests-${day(40)}.ndjson.gz`, now - 38 * DAY, 18200, now - 41 * DAY, now - 40 * DAY),
+    archiveEntry('archive', `requests-${day(39)}.ndjson.gz`, now - 38 * DAY, 21400, now - 40 * DAY, now - 39 * DAY),
+    archiveEntry('backup', `analytics-${archiveStamp(now - 7 * DAY)}.db`, now - 7 * DAY, null, null, null),
+  ];
+}
+
+function archiveRoute(node, method, b, c, body) {
+  if (b === 'archives') {
+    if (method === 'GET' && !c) return { items: clone(node.archives), dir_bytes: node.archives.reduce((t, e) => t + e.bytes, 0) };
+    if (method === 'GET' || method === 'DELETE') {
+      const found = node.archives.find((e) => e.name === c);
+      if (!found) throw new ApiError(404, 'no such archive');
+      if (method === 'GET') return `mock contents of ${found.name}\n`;
+      node.archives = node.archives.filter((e) => e !== found);
+      audit(node, 'analytics.archive.delete', `${found.name} deleted`);
+      return '';
+    }
+  }
+  if (method !== 'POST') throw new ApiError(404, 'not found');
+  if (b === 'backup') {
+    const entry = archiveEntry('backup', `analytics-${archiveStamp(Date.now())}.db`, Date.now(), null, null, null);
+    node.archives.push(entry);
+    audit(node, 'analytics.backup', `${entry.name} created`);
+    return clone(entry);
+  }
+  if (b === 'cut') return cutRoute(node, body);
+  if (b === 'restore') {
+    const found = node.archives.find((e) => e.name === body.name);
+    if (!found) throw new ApiError(404, 'no such archive');
+    audit(node, 'analytics.restore', `${found.name} restored`);
+    return { rows: found.rows ?? node.events.length };
+  }
+  throw new ApiError(404, 'not found');
+}
+
+function cutRoute(node, body) {
+  const hasMs = body.before_ms !== undefined && body.before_ms !== null;
+  const hasDays = body.before_days !== undefined && body.before_days !== null;
+  if (hasMs === hasDays) throw new ApiError(422, 'set exactly one of before_ms and before_days');
+  const cutoff = hasMs ? Number(body.before_ms) : Date.now() - Number(body.before_days) * DAY;
+  if (!Number.isFinite(cutoff) || cutoff < 0) throw new ApiError(422, 'invalid cutoff');
+  if (hasDays && !(Number.isInteger(body.before_days) && body.before_days >= 1 && body.before_days <= 3650)) throw new ApiError(422, 'before_days must be between 1 and 3650');
+  const archive = body.archive !== false;
+  const old = node.events.filter((e) => e.ts_ms < cutoff);
+  const oldest = old.length ? Math.min(...old.map((e) => e.ts_ms)) : null;
+  const report = { dry_run: body.dry_run === true, cutoff_ms: cutoff, rows: old.length, oldest_ms: oldest, archived_rows: 0, files: [], archive };
+  if (report.dry_run || !old.length) return report;
+  if (archive) {
+    const name = `requests-${new Date(cutoff).toISOString().slice(0, 10)}-${archiveStamp(Date.now()).slice(9)}.ndjson.gz`;
+    node.archives.push(archiveEntry('archive', name, Date.now(), old.length, oldest, cutoff));
+    report.archived_rows = old.length;
+    report.files = [name];
+  }
+  node.events = node.events.filter((e) => e.ts_ms >= cutoff);
+  audit(node, 'analytics.cut', `${old.length} rows cut${archive ? ' and archived' : ' without an archive'}`);
+  return report;
+}
+
 function seedNode(name, url, idx) {
   const now = Date.now();
   const node = {
@@ -116,8 +193,9 @@ function seedNode(name, url, idx) {
     settings: {
       http_port: 80, https_port: 443, max_conn: 20000, client_timeout_ms: 30000, server_timeout_ms: 60000, connect_timeout_ms: 3000,
       per_ip_rate_limit: 600, max_body_bytes: null,
-      retention: { recent_events: 5000, minute_buckets_hours: 48, hour_buckets_days: 90, audit_days: 365, persist_interval_secs: 60, store_user_agents: true, store_client_ips: true },
+      retention: { recent_events: 5000, minute_buckets_hours: 48, hour_buckets_days: 0, archive_before_delete: true, audit_days: 365, persist_interval_secs: 60, store_user_agents: true, store_client_ips: true },
     },
+    archives: seedArchives(now, idx),
     tokens: [
       { id: 't-1', name: 'ci-deploy', created_at: iso(now - 40 * 86400 * 1000), last_used_at: iso(now - 3 * 3600 * 1000) },
       { id: 't-2', name: 'grafana-readonly', created_at: iso(now - 12 * 86400 * 1000), last_used_at: null },
@@ -670,6 +748,8 @@ async function nodeRoute(node, method, seg, q, body) {
       };
     }
     if (b === 'export') return exportBody(node, q);
+    if (node.idx === 1 && ['archives', 'backup', 'cut', 'restore'].includes(b)) throw new ApiError(404, 'Not Found');
+    if (['archives', 'backup', 'cut', 'restore'].includes(b)) return archiveRoute(node, method, b, seg[2], body);
   }
   if (a === 'settings') {
     if (method === 'PUT') {

@@ -66,6 +66,9 @@ test('bot data presence and retention text', () => {
   assert.equal(hasBotData({ path: '/' }), false);
   assert.equal(hasBotData(null), false);
   assert.equal(retentionText(null), 'not reported');
+  assert.equal(retentionText({ retention: { hour_buckets_days: 0, recent_events: 100 } }), 'hourly data kept forever, last 100 requests');
+  assert.equal(retentionText({ retention: { hour_buckets_days: 30, archive_before_delete: true } }), '30 days of hourly data, archived before deletion');
+  assert.equal(retentionText({ retention: { hour_buckets_days: 30, archive_before_delete: false } }), '30 days of hourly data, then deleted');
   assert.equal(retentionText({ retention: { minute_buckets_hours: 48, hour_buckets_days: 90, recent_events: 5000 } }), '48 h of minute data, 90 days of hourly data, last 5,000 requests');
 });
 

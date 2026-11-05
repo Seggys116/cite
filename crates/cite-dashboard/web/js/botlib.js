@@ -140,7 +140,11 @@ export function retentionText(settings) {
   if (!r) return 'not reported';
   const parts = [];
   if (r.minute_buckets_hours) parts.push(`${r.minute_buckets_hours} h of minute data`);
-  if (r.hour_buckets_days) parts.push(`${r.hour_buckets_days} days of hourly data`);
+  if (r.hour_buckets_days === 0) parts.push('hourly data kept forever');
+  else if (r.hour_buckets_days) {
+    const fate = r.archive_before_delete === true ? ', archived before deletion' : r.archive_before_delete === false ? ', then deleted' : '';
+    parts.push(`${r.hour_buckets_days} days of hourly data${fate}`);
+  }
   if (r.recent_events) parts.push(`last ${Number(r.recent_events).toLocaleString('en')} requests`);
   return parts.length ? parts.join(', ') : 'not reported';
 }

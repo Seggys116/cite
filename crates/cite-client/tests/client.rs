@@ -9,8 +9,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use cite_client::{
-    ClientError, ExportFormat, ExportKind, ExportQuery, NodeClient, NodeConfig, NodeTargets,
-    ReplicationMode, ReplicationPlan, apply_site_to_nodes, fan_out,
+    ArchiveKind, ClientError, CutRequest, ExportFormat, ExportKind, ExportQuery, NodeClient,
+    NodeConfig, NodeTargets, ReplicationMode, ReplicationPlan, apply_site_to_nodes, fan_out,
 };
 use cite_edge::analytics::Summary;
 use cite_edge::model::{HealthCheck, Maintenance, Site, SiteKind, Slot, Source, Target, Upstream};
@@ -251,6 +251,101 @@ async fn export(
     resp
 }
 
+fn archive_item(name: &str, kind: &str) -> Value {
+    json!({
+        "name": name, "kind": kind, "bytes": 2048, "created_ms": 1_700_000_000_000_i64,
+        "sha256": "ab".repeat(32), "rows": 7, "from_ms": 1, "to_ms": 2
+    })
+}
+
+async fn archives(State(s): State<Shared>, headers: HeaderMap) -> Response {
+    if let Err(resp) = check(&s, &headers) {
+        return resp;
+    }
+    Json(json!({
+        "items": [archive_item("requests-2026-11-05.ndjson.gz", "archive")],
+        "dir_bytes": 2048
+    }))
+    .into_response()
+}
+
+async fn backup(State(s): State<Shared>, headers: HeaderMap, Json(body): Json<Value>) -> Response {
+    if let Err(resp) = check(&s, &headers) {
+        return resp;
+    }
+    s.created_bodies.lock().expect("lock").push(body);
+    Json(archive_item("analytics-20261105-101500.db", "backup")).into_response()
+}
+
+async fn cut(State(s): State<Shared>, headers: HeaderMap, Json(body): Json<Value>) -> Response {
+    if let Err(resp) = check(&s, &headers) {
+        return resp;
+    }
+    s.created_bodies.lock().expect("lock").push(body.clone());
+    if body["before_days"] == 99 {
+        return error_response(StatusCode::CONFLICT, "a cut is already running");
+    }
+    let dry = body["dry_run"] == true;
+    let archived: u64 = if dry { 0 } else { 5 };
+    let files: Vec<&str> = if dry {
+        Vec::new()
+    } else {
+        vec!["requests-2026-11-05.ndjson.gz"]
+    };
+    Json(json!({
+        "dry_run": dry, "cutoff_ms": 1_000, "rows": 5, "oldest_ms": 10,
+        "archived_rows": archived, "files": files, "archive": body["archive"]
+    }))
+    .into_response()
+}
+
+async fn restore(State(s): State<Shared>, headers: HeaderMap, Json(body): Json<Value>) -> Response {
+    if let Err(resp) = check(&s, &headers) {
+        return resp;
+    }
+    s.created_bodies.lock().expect("lock").push(body);
+    Json(json!({ "rows": 7 })).into_response()
+}
+
+async fn archive_file(
+    State(s): State<Shared>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Response {
+    if let Err(resp) = check(&s, &headers) {
+        return resp;
+    }
+    if name == "missing.db" {
+        return error_response(StatusCode::NOT_FOUND, "no such archive");
+    }
+    let mut resp = Response::new(Body::from(vec![0x1f, 0x8b, 8, 0]));
+    let h = resp.headers_mut();
+    h.insert(
+        header::CONTENT_TYPE,
+        "application/gzip".parse().expect("ct"),
+    );
+    h.insert(
+        header::CONTENT_DISPOSITION,
+        "attachment; filename=\"evil.exe\"".parse().expect("cd"),
+    );
+    resp
+}
+
+async fn archive_delete(
+    State(s): State<Shared>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Response {
+    if let Err(resp) = check(&s, &headers) {
+        return resp;
+    }
+    s.created_bodies
+        .lock()
+        .expect("lock")
+        .push(json!({ "deleted": name }));
+    StatusCode::NO_CONTENT.into_response()
+}
+
 async fn haproxy_config() -> Response {
     ([(header::CONTENT_TYPE, "text/plain")], "global\n  daemon\n").into_response()
 }
@@ -284,6 +379,14 @@ async fn spawn(state: Shared) -> String {
         .route("/api/v1/analytics/top", get(top))
         .route("/api/v1/analytics/stats", get(stats))
         .route("/api/v1/analytics/export", get(export))
+        .route("/api/v1/analytics/archives", get(archives))
+        .route(
+            "/api/v1/analytics/archives/{name}",
+            get(archive_file).delete(archive_delete),
+        )
+        .route("/api/v1/analytics/backup", post(backup))
+        .route("/api/v1/analytics/cut", post(cut))
+        .route("/api/v1/analytics/restore", post(restore))
         .route("/api/v1/haproxy/config", get(haproxy_config))
         .route("/api/v1/pages", get(redirect))
         .route("/api/v1/settings", get(garbage))
@@ -628,6 +731,134 @@ async fn export_stream_exposes_headers_and_body() {
         body.extend_from_slice(&chunk.expect("chunk"));
     }
     assert_eq!(body, b"ts,path\n1,/\n");
+}
+
+#[tokio::test]
+async fn archive_routes_round_trip() {
+    let state = fake("cite_good", 0);
+    let url = spawn(state.clone()).await;
+    let c = client("n1", &url, "cite_good");
+
+    let list = c.analytics_archives().await.expect("list");
+    assert_eq!(list.dir_bytes, 2048);
+    assert_eq!(list.items[0].kind, ArchiveKind::Archive);
+    assert_eq!(list.items[0].rows, Some(7));
+
+    let made = c.analytics_backup().await.expect("backup");
+    assert_eq!(made.kind, ArchiveKind::Backup);
+    assert_eq!(made.download_name(), "analytics-20261105-101500.db");
+
+    let dry = c
+        .analytics_cut(&CutRequest::before_days(30).dry_run(true))
+        .await
+        .expect("dry run");
+    assert!(dry.dry_run && dry.archive);
+    assert_eq!(
+        (dry.rows, dry.oldest_ms, dry.archived_rows),
+        (5, Some(10), 0)
+    );
+    let real = c
+        .analytics_cut(&CutRequest::before_ms(5_000).archive(false))
+        .await
+        .expect("cut");
+    assert!(!real.archive);
+    assert_eq!(real.files, ["requests-2026-11-05.ndjson.gz"]);
+
+    let restored = c
+        .analytics_restore("requests-2026-11-05.ndjson.gz")
+        .await
+        .expect("restore");
+    assert_eq!(restored.rows, 7);
+    c.analytics_archive_delete("analytics-20261105-101500.db")
+        .await
+        .expect("delete");
+
+    let bodies = state.created_bodies.lock().expect("lock").clone();
+    assert_eq!(bodies[0], json!({}));
+    assert_eq!(
+        bodies[1],
+        json!({ "before_days": 30, "archive": true, "dry_run": true })
+    );
+    assert_eq!(
+        bodies[2],
+        json!({ "before_ms": 5000, "archive": false, "dry_run": false })
+    );
+    assert_eq!(
+        bodies[3],
+        json!({ "name": "requests-2026-11-05.ndjson.gz" })
+    );
+    assert_eq!(
+        bodies[4],
+        json!({ "deleted": "analytics-20261105-101500.db" })
+    );
+}
+
+#[tokio::test]
+async fn archive_calls_validate_before_any_request() {
+    let state = fake("cite_good", 0);
+    let url = spawn(state.clone()).await;
+    let c = client("n1", &url, "cite_good");
+    let cut = c.analytics_cut(&CutRequest::before_days(0)).await;
+    assert!(matches!(cut, Err(ClientError::Config(_))));
+    for bad in ["../etc/passwd", ".hidden", "a/b", "", "a b"] {
+        let restore = c.analytics_restore(bad).await;
+        assert!(matches!(restore, Err(ClientError::Config(_))), "{bad:?}");
+        let delete = c.analytics_archive_delete(bad).await;
+        assert!(matches!(delete, Err(ClientError::Config(_))), "{bad:?}");
+        let stream = c.analytics_archive_stream(bad).await;
+        assert!(matches!(stream, Err(ClientError::Config(_))), "{bad:?}");
+    }
+    assert!(state.seen_auth.lock().expect("lock").is_empty());
+}
+
+#[tokio::test]
+async fn archive_errors_keep_the_node_status() {
+    let url = spawn(fake("cite_good", 0)).await;
+    let c = client("n1", &url, "cite_good");
+    let busy = c
+        .analytics_cut(&CutRequest::before_days(99))
+        .await
+        .expect_err("conflict");
+    assert_eq!(busy.status_code(), Some(409));
+    let dir = tempfile::tempdir().expect("dir");
+    let dest = dir.path().join("out.db");
+    let missing = c
+        .analytics_archive_download_to("missing.db", &dest, 1 << 20)
+        .await
+        .expect_err("missing");
+    assert_eq!(missing.status_code(), Some(404));
+    assert_eq!(std::fs::read_dir(dir.path()).expect("ls").count(), 0);
+}
+
+#[tokio::test]
+async fn archive_downloads_save_atomically_with_a_safe_suggested_name() {
+    let url = spawn(fake("cite_good", 0)).await;
+    let c = client("n1", &url, "cite_good");
+    let dir = tempfile::tempdir().expect("dir");
+    let dest = dir.path().join("out.ndjson.gz");
+    let report = c
+        .analytics_archive_download_to("requests-2026-11-05.ndjson.gz", &dest, 1 << 20)
+        .await
+        .expect("download");
+    assert_eq!(std::fs::read(&dest).expect("file"), [0x1f, 0x8b, 8, 0]);
+    assert_eq!(report.bytes, 4);
+    assert_eq!(
+        report.suggested_name.as_deref(),
+        Some("requests-2026-11-05.ndjson.gz")
+    );
+    let evil = c
+        .analytics_archive_download_to("evil.exe", &dest, 1 << 20)
+        .await
+        .expect("download");
+    assert_eq!(evil.suggested_name.as_deref(), Some("evil_exe.ndjson.gz"));
+    let small = dir.path().join("small.gz");
+    let over = c
+        .analytics_archive_download_to("requests-2026-11-05.ndjson.gz", &small, 2)
+        .await
+        .expect_err("over the cap");
+    assert!(matches!(over, ClientError::Decode(_)));
+    assert!(!small.exists());
+    assert_eq!(std::fs::read_dir(dir.path()).expect("ls").count(), 1);
 }
 
 #[tokio::test]

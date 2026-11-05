@@ -54,7 +54,7 @@ The connector's certificate comes from a self-signed authority created by `init`
 | Maintenance | Custom maintenance pages: a name, a status code and the HTML (up to 15000 bytes). A page that a site uses cannot be deleted. |
 | Settings | Data retention, connection limits, API tokens, the audit log (most recent 200 entries), the rendered `haproxy.cfg` with process and backend status, and dashboard appearance and session. |
 
-Connection limit changes apply on the next HAProxy reload. The retention form edits the settings described in [Analytics and retention](analytics.md): recent events, minute and hour history, audit days, the persist interval and the two privacy flags.
+Connection limit changes apply on the next HAProxy reload. The retention form edits the settings described in [Analytics and retention](analytics.md): recent events, minute history, how long hourly history is kept (forever by default) and whether old data is archived before it is deleted, audit days, the persist interval and the two privacy flags. See Retention, backup, cut and restore below.
 
 A command palette offers shortcuts to views, Create site, Add firewall rule, Add node, switching nodes, toggling the light or dark theme, reloading the view and signing out.
 
@@ -83,6 +83,20 @@ Export opens a dialog with the following choices.
 | Row limit | Defaults to 100000. Leave it empty for no limit. |
 
 The dialog checks every field first and then sends a one-row probe to the node, so an invalid request or an expired session is reported in the dialog instead of as a failed download. The file itself is then fetched by a same-origin download that carries your session cookie, so the browser streams it straight to disk and the console never holds the export in memory. The dashboard server relays the node's response without buffering it, keeps only the CSV or NDJSON content type, rebuilds the file name from safe characters and adds `nosniff` and `no-store`. An export comes from the one node selected in the header; it is not merged across nodes.
+
+## Retention, backup, cut and restore
+
+Analytics history is kept forever by default. In Settings, Retention, the Keep data choice offers Forever (stored as `hour_buckets_days` of 0) or Delete data older than a number of days from 1 to 3650. The checkbox Archive old data before deleting it is on by default, so a limit moves old rows into archive files on the node instead of discarding them. Choosing a limit with archiving off shows a warning and asks you to confirm before it saves, because that data is then deleted for good.
+
+The Analytics storage card on the Traffic view adds three things.
+
+| Action | What it does |
+|---|---|
+| Back up now | Asks the node for a consistent snapshot of the live analytics database. The backup is listed beside the archives. |
+| Cut old data | Opens a dialog. Pick Older than N days or Before a date, leave Archive the rows before deleting them ticked, and choose Preview to see how many rows would be cut and the oldest date. Cut stays disabled until a preview of the same settings has succeeded. With archiving on, the rows are written to archive files and verified before anything is deleted. With archiving off the cut is permanent, and you must tick I understand this deletes data permanently and confirm a second time. |
+| Archives and backups | A list of the files on the node with name, kind, size, creation time, a short SHA-256, and the row count and date range when known. Each row has Download, Restore and Delete. Restore imports the file back into the live database and Delete removes it from the node; both ask for confirmation. |
+
+Download is a same-origin download like an export, so large files stream to disk. The dashboard server relays the file without buffering it, keeps only the gzip, SQLite or octet-stream content type, rebuilds the file name from the stored name with one of the extensions `.ndjson.gz`, `.csv.gz` or `.db`, and adds `nosniff` and `no-store`. Back up, cut, restore and delete are write requests, so they need the session's CSRF token like any other change, and the connector records each in its audit log. A node that returns 404 for these routes predates them and shows a note that it needs a connector update.
 
 ## Creating a site
 

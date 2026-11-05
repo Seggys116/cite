@@ -297,6 +297,23 @@ export function copyText(text, okMessage = 'Copied to clipboard') {
 }
 
 
+// A same-origin navigation lets the browser stream the file to disk with the session cookie, so nothing is held in page memory
+export function startNavigation(href) {
+  const a = h('a', { href, download: '', class: 'sr-only', rel: 'noopener' });
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+}
+
+export function saveText(text, name, mime) {
+  const url = URL.createObjectURL(new Blob([text], { type: mime }));
+  const a = h('a', { href: url, download: name, class: 'sr-only' });
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 10000);
+}
+
 export function skeletonRows(n = 6) {
   return h('div', { class: 'skel-list', 'aria-busy': 'true', 'aria-label': 'Loading' },
     Array.from({ length: n }, () => h('div', { class: 'skeleton skel-row' })));

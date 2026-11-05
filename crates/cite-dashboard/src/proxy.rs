@@ -6,7 +6,10 @@ use axum::extract::{Request, State};
 use axum::http::{Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
-use cite_client::{ClientError, NodeClient, export_file_name};
+use cite_client::{
+    ClientError, NodeClient, archive_download_name, archive_kind_from_name, export_file_name,
+    validate_archive_name,
+};
 
 use crate::error::ApiError;
 use crate::state::AppState;
@@ -29,6 +32,8 @@ const ANALYTICS_ROUTES: [&str; 7] = [
     "stats",
     "export",
 ];
+const ANALYTICS_WRITE_ROUTES: [&str; 3] = ["backup", "cut", "restore"];
+const ARCHIVE_PREFIX: &str = "analytics/archives/";
 const ALLOWED_PREFIXES: [&str; 9] = [
     "node",
     "settings",
@@ -71,15 +76,66 @@ fn response_content_type(upstream: Option<&str>) -> &'static str {
     }
 }
 
-// Analytics is read only, so unlike the other prefixes it is limited to the routes the console uses.
+// Unlike the other prefixes, analytics is limited to the exact routes the console uses.
 fn analytics_route_ok(method: &Method, rest: &str) -> bool {
     let mut segments = rest.split('/');
     if segments.next() != Some("analytics") {
         return true;
     }
-    method == Method::GET
-        && matches!(segments.next(), Some(route) if ANALYTICS_ROUTES.contains(&route))
-        && segments.next().is_none()
+    let route = segments.next();
+    let name = segments.next();
+    if segments.next().is_some() {
+        return false;
+    }
+    match (route, name) {
+        (Some("archives"), None) => method == Method::GET,
+        (Some("archives"), Some(name)) => {
+            (method == Method::GET || method == Method::DELETE)
+                && validate_archive_name(name).is_ok()
+        }
+        (Some(route), None) if method == Method::GET => ANALYTICS_ROUTES.contains(&route),
+        (Some(route), None) => method == Method::POST && ANALYTICS_WRITE_ROUTES.contains(&route),
+        _ => false,
+    }
+}
+
+fn archive_download_target(rest: &str) -> Option<&str> {
+    rest.strip_prefix(ARCHIVE_PREFIX)
+        .filter(|name| validate_archive_name(name).is_ok())
+}
+
+fn archive_content_type(upstream: Option<&str>) -> &'static str {
+    match upstream {
+        Some(c) if c.starts_with("application/gzip") => "application/gzip",
+        Some(c) if c.starts_with("application/vnd.sqlite3") => "application/vnd.sqlite3",
+        _ => "application/octet-stream",
+    }
+}
+
+// The file name comes from the requested name, never from the node's header.
+fn archive_disposition(name: &str) -> String {
+    let safe = archive_download_name(name, archive_kind_from_name(name));
+    format!("attachment; filename=\"{safe}\"")
+}
+
+async fn stream_archive(client: &NodeClient, name: &str) -> Result<Response, ApiError> {
+    let stream = client
+        .analytics_archive_stream(name)
+        .await
+        .map_err(export_error)?;
+    let status = StatusCode::from_u16(stream.status())
+        .map_err(|_| ApiError::new(StatusCode::BAD_GATEWAY, "node sent an invalid status"))?;
+    Response::builder()
+        .status(status)
+        .header(
+            header::CONTENT_TYPE,
+            archive_content_type(stream.content_type()),
+        )
+        .header(header::CONTENT_DISPOSITION, archive_disposition(name))
+        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(Body::from_stream(stream.into_body_stream()))
+        .map_err(ApiError::internal)
 }
 
 fn export_content_type(upstream: Option<&str>) -> &'static str {
@@ -145,6 +201,9 @@ fn timeout_for(method: &Method, rest: &str) -> Duration {
     ) {
         (Some("sites"), None, ..) => method == Method::POST,
         (Some("sites"), Some(_), Some(action), None) => LONG_ACTIONS.contains(&action),
+        (Some("analytics"), Some(route), None, _) => {
+            method == Method::POST && ANALYTICS_WRITE_ROUTES.contains(&route)
+        }
         _ => false,
     };
     if long { LONG_TIMEOUT } else { PROXY_TIMEOUT }
@@ -185,6 +244,11 @@ async fn forward(state: &AppState, req: Request) -> Result<Response, ApiError> {
         .ok_or_else(|| ApiError::not_found("node is not configured"))?;
     if rest == EXPORT_ROUTE {
         return stream_export(&client, rest, parts.uri.query()).await;
+    }
+    if parts.method == Method::GET
+        && let Some(name) = archive_download_target(rest)
+    {
+        return stream_archive(&client, name).await;
     }
     let payload = if matches!(parts.method, Method::POST | Method::PUT) {
         to_bytes(body, MAX_REQUEST_BODY).await.map_err(|_| {
@@ -300,6 +364,80 @@ mod tests {
     }
 
     #[test]
+    fn archive_routes_are_allowed_with_their_exact_methods() {
+        let yes = [
+            (Method::GET, "analytics/archives"),
+            (
+                Method::GET,
+                "analytics/archives/requests-2026-11-05.ndjson.gz",
+            ),
+            (
+                Method::DELETE,
+                "analytics/archives/analytics-20261105-101500.db",
+            ),
+            (Method::POST, "analytics/backup"),
+            (Method::POST, "analytics/cut"),
+            (Method::POST, "analytics/restore"),
+        ];
+        for (method, rest) in yes {
+            assert!(analytics_route_ok(&method, rest), "{method} {rest}");
+        }
+        let no = [
+            (Method::POST, "analytics/archives"),
+            (Method::DELETE, "analytics/archives"),
+            (Method::PUT, "analytics/archives/x.db"),
+            (Method::POST, "analytics/archives/x.db"),
+            (Method::GET, "analytics/backup"),
+            (Method::GET, "analytics/cut"),
+            (Method::DELETE, "analytics/cut"),
+            (Method::PUT, "analytics/restore"),
+            (Method::POST, "analytics/restore/x"),
+            (Method::GET, "analytics/archives/.hidden"),
+            (Method::GET, "analytics/archives/x/y"),
+            (Method::GET, "analytics/archives/~tilde"),
+            (Method::POST, "analytics/purge"),
+        ];
+        for (method, rest) in no {
+            assert!(!analytics_route_ok(&method, rest), "{method} {rest}");
+        }
+    }
+
+    #[test]
+    fn archive_downloads_get_rebuilt_headers() {
+        assert_eq!(
+            archive_download_target("analytics/archives/a.db"),
+            Some("a.db")
+        );
+        assert_eq!(archive_download_target("analytics/archives/.a"), None);
+        assert_eq!(archive_download_target("analytics/archives"), None);
+        assert_eq!(archive_download_target("analytics/export"), None);
+        assert_eq!(
+            archive_content_type(Some("application/gzip")),
+            "application/gzip"
+        );
+        assert_eq!(
+            archive_content_type(Some("application/vnd.sqlite3")),
+            "application/vnd.sqlite3"
+        );
+        assert_eq!(
+            archive_content_type(Some("text/html")),
+            "application/octet-stream"
+        );
+        assert_eq!(
+            archive_disposition("requests-2026-11-05.ndjson.gz"),
+            "attachment; filename=\"requests-2026-11-05.ndjson.gz\""
+        );
+        assert_eq!(
+            archive_disposition("a.exe"),
+            "attachment; filename=\"a_exe.ndjson.gz\""
+        );
+        assert_eq!(
+            archive_disposition("analytics-1.db"),
+            "attachment; filename=\"analytics-1.db\""
+        );
+    }
+
+    #[test]
     fn export_headers_are_rebuilt_from_known_values() {
         assert_eq!(
             export_content_type(Some("text/csv; charset=utf-8")),
@@ -339,6 +477,9 @@ mod tests {
             (Method::POST, "sites/a/rollback"),
             (Method::PUT, "sites/a/maintenance"),
             (Method::DELETE, "sites/a/maintenance"),
+            (Method::POST, "analytics/backup"),
+            (Method::POST, "analytics/cut"),
+            (Method::POST, "analytics/restore"),
         ] {
             assert_eq!(timeout_for(&method, rest), LONG_TIMEOUT, "{method} {rest}");
         }
@@ -349,6 +490,8 @@ mod tests {
             (Method::DELETE, "sites/a"),
             (Method::POST, "firewall/rules"),
             (Method::POST, "sites/a/other"),
+            (Method::GET, "analytics/archives"),
+            (Method::DELETE, "analytics/archives/x.db"),
         ] {
             assert_eq!(timeout_for(&method, rest), PROXY_TIMEOUT, "{method} {rest}");
         }

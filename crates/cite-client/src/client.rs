@@ -12,6 +12,10 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
+use crate::archive::{
+    ArchiveEntry, ArchiveList, CutReport, CutRequest, RestoreReport, archive_download_name,
+    archive_kind_from_name, validate_archive_name,
+};
 use crate::config::{NodeConfig, parse_node_url};
 use crate::error::ClientError;
 use crate::export::{
@@ -168,6 +172,12 @@ const DEFAULT_OPTS: Opts = Opts {
 const ACTION_OPTS: Opts = Opts {
     auth: true,
     timeout: Some(ACTION_TIMEOUT),
+};
+
+// Backups, cuts and restores copy or rewrite the whole database, so they get the export timeout.
+const BULK_OPTS: Opts = Opts {
+    auth: true,
+    timeout: Some(EXPORT_TIMEOUT),
 };
 
 #[derive(Clone)]
@@ -648,6 +658,90 @@ impl NodeClient {
             .await?
             .save(dest, max_bytes)
             .await
+    }
+
+    pub async fn analytics_archives(&self) -> Res<ArchiveList> {
+        self.json(Method::GET, "/analytics/archives", &[], None)
+            .await
+    }
+
+    pub async fn analytics_backup(&self) -> Res<ArchiveEntry> {
+        let bytes = self
+            .exec(
+                Method::POST,
+                "/analytics/backup",
+                &[],
+                Some(json!({})),
+                BULK_OPTS,
+            )
+            .await?;
+        decode(&bytes)
+    }
+
+    pub async fn analytics_cut(&self, request: &CutRequest) -> Res<CutReport> {
+        request.validate()?;
+        let bytes = self
+            .exec(
+                Method::POST,
+                "/analytics/cut",
+                &[],
+                body_of(request)?,
+                BULK_OPTS,
+            )
+            .await?;
+        decode(&bytes)
+    }
+
+    pub async fn analytics_restore(&self, name: &str) -> Res<RestoreReport> {
+        let name = validate_archive_name(name)?;
+        let bytes = self
+            .exec(
+                Method::POST,
+                "/analytics/restore",
+                &[],
+                Some(json!({ "name": name })),
+                BULK_OPTS,
+            )
+            .await?;
+        decode(&bytes)
+    }
+
+    pub async fn analytics_archive_delete(&self, name: &str) -> Res<()> {
+        let name = validate_archive_name(name)?;
+        self.unit(
+            Method::DELETE,
+            &format!("/analytics/archives/{}", enc(name)),
+        )
+        .await
+    }
+
+    // The body is not read; the caller relays or saves it chunk by chunk.
+    pub async fn analytics_archive_stream(&self, name: &str) -> Res<ExportStream> {
+        let name = validate_archive_name(name)?;
+        let req = self
+            .authed_get(format!(
+                "{}/api/v1/analytics/archives/{}",
+                self.base,
+                enc(name)
+            ))
+            .timeout(EXPORT_TIMEOUT);
+        open_stream(req).await
+    }
+
+    // The suggested name is rebuilt from the requested name with an allowlisted extension.
+    pub async fn analytics_archive_download_to(
+        &self,
+        name: &str,
+        dest: &Path,
+        max_bytes: u64,
+    ) -> Res<ExportReport> {
+        let mut report = self
+            .analytics_archive_stream(name)
+            .await?
+            .save(dest, max_bytes)
+            .await?;
+        report.suggested_name = Some(archive_download_name(name, archive_kind_from_name(name)));
+        Ok(report)
     }
 
     // Callers must validate `rest`; the body is streamed back untouched.

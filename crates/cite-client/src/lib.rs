@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod archive;
 pub mod client;
 pub mod config;
 pub mod error;
@@ -8,6 +9,11 @@ pub mod fleet;
 pub mod fsio;
 pub mod tokens;
 
+pub use archive::{
+    ARCHIVE_EXTENSIONS, ArchiveEntry, ArchiveKind, ArchiveList, CutReport, CutRequest,
+    MAX_ARCHIVE_NAME_CHARS, MAX_CUT_DAYS, RestoreReport, archive_download_name,
+    archive_kind_from_name, validate_archive_name,
+};
 pub use client::{
     AuditEntry, CreatedToken, DeployRequest, Forwarded, LoginResponse, NodeClient, NodeInfo,
     PresetInfo, ReloadResult, RequestQuery, SiteDetail, TokenMeta,

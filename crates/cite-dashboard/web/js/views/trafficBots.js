@@ -2,9 +2,10 @@ import { h, icon } from '../dom.js';
 import { nodeApi, qs, isMock } from '../api.js';
 import { donut, hbars, histogram } from '../charts.js';
 import {
-  button, card, dataTable, field, kvList, loadInto, openModal, pill, segmented, skeletonBlock, skeletonCards, toast, withBusy,
-  fmtBytes, fmtDate, fmtInt, fmtMs, fmtNum,
+  button, card, dataTable, field, kvList, loadInto, openModal, pill, saveText, segmented, skeletonBlock, skeletonCards, startNavigation,
+  toast, withBusy, fmtBytes, fmtDate, fmtInt, fmtMs, fmtNum,
 } from '../ui.js';
+import { archivesPanel } from './archives.js';
 import {
   BOT_CLASSES, BOT_METHOD_HELP, DEFAULT_EXPORT_ROWS, EXPORT_FORMATS, EXPORT_KINDS, METHODS, TOP_KINDS,
   botClass, buildExportParams, classBreakdown, exportFileName, exportPath, fmtSharePct, hasBotData, parseSignals,
@@ -198,29 +199,18 @@ export function storageCard(node) {
       throw ex;
     }
   }, storageBody, { skeleton: () => skeletonBlock(120) });
-  const el = card({ title: 'Analytics storage', subtitle: 'What this node keeps on disk for analytics', body: host });
-  return { el, refresh: run };
+  const archives = archivesPanel(node, { onDataChanged: () => run() });
+  const el = card({
+    title: 'Analytics storage',
+    subtitle: 'What this node keeps on disk for analytics',
+    actions: archives.actions,
+    body: h('div', { class: 'stack' }, host, archives.el),
+  });
+  return { el, refresh: () => { run(); archives.refresh(); } };
 }
 
 function downloadHref(node, params) {
   return '/api/v1' + exportPath(node, params);
-}
-
-// A same-origin navigation lets the browser stream the file to disk with the session cookie, so nothing is held in page memory
-function startNavigation(href) {
-  const a = h('a', { href, download: '', class: 'sr-only', rel: 'noopener' });
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-}
-
-function saveText(text, name, mime) {
-  const url = URL.createObjectURL(new Blob([text], { type: mime }));
-  const a = h('a', { href: url, download: name, class: 'sr-only' });
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 10000);
 }
 
 export function openExportDialog({ node, win, sites = [], site = '' }) {

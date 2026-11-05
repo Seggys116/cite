@@ -6,6 +6,9 @@ import {
   openModal, confirmDialog, toast, withBusy, formatError, copyText, kvList, fmtInt, fmtBytes, fmtDate, relTime, skeletonRows,
 } from '../ui.js';
 import { noNodes, nodeNotice, healthKind, healthDots } from './common.js';
+import {
+  ARCHIVE_NOTE, DELETE_WARNING, FOREVER_NOTE, MAX_RETENTION_DAYS, applyRetentionForm, deletesWithoutArchive, retentionFormFrom,
+} from '../archivelib.js';
 
 const TABS = [
   { id: 'retention', label: 'Retention', icon: 'clock' },
@@ -27,15 +30,47 @@ function numberField(label, value, { hint, nullable = false, min = 0 } = {}) {
   };
 }
 
+// Forever or a day limit, with archiving on by default so a limit never deletes data without a copy
+function keepDataControl(retention) {
+  const form = retentionFormFrom(retention);
+  const forever = h('input', { type: 'radio', name: 'keep-data', value: 'forever', checked: form.mode === 'forever' });
+  const limit = h('input', { type: 'radio', name: 'keep-data', value: 'limit', checked: form.mode === 'limit' });
+  const days = h('input', { class: 'input mono', type: 'number', min: '1', max: String(MAX_RETENTION_DAYS), inputmode: 'numeric', 'aria-label': 'Days to keep data' });
+  days.value = form.days;
+  const archive = h('input', { type: 'checkbox', checked: form.archive });
+  const warn = h('p', { class: 'notice warn', role: 'status', 'aria-live': 'polite', hidden: true }, DELETE_WARNING);
+  const read = () => ({ mode: limit.checked ? 'limit' : 'forever', days: days.value, archive: archive.checked });
+  const sync = () => {
+    const now = read();
+    days.disabled = now.mode !== 'limit';
+    warn.hidden = !deletesWithoutArchive(now);
+  };
+  for (const el of [forever, limit, archive]) el.addEventListener('change', sync);
+  const option = (input, title, text, extra) => h('label', { class: 'radio-card' }, input,
+    h('div', { class: 'stack-sm' }, h('b', {}, title), h('p', { class: 'muted' }, text), extra || null));
+  const el = h('div', { class: 'stack-sm' },
+    h('div', { class: 'field-label', id: 'keep-data-label' }, 'Keep data'),
+    h('div', { class: 'stack-sm', role: 'radiogroup', 'aria-labelledby': 'keep-data-label' },
+      option(forever, 'Forever', FOREVER_NOTE),
+      option(limit, 'Delete data older than', 'Older hourly history is removed once it passes the limit.', days)),
+    h('label', { class: 'check-row' }, archive, h('span', {}, 'Archive old data before deleting it')),
+    h('p', { class: 'hint' }, ARCHIVE_NOTE),
+    warn);
+  sync();
+  return { el, read };
+}
+
 // Loads the current settings, lets the panel edit a copy and writes the whole object back
 function settingsForm(node, { title, subtitle, build }) {
   const body = h('div', {});
   loadInto(body, () => nodeApi(node).get('/settings'), (settings) => {
-    const { fields, collect } = build(settings);
+    const { fields, collect, beforeSave } = build(settings);
     const save = button('Save changes', { kind: 'primary', iconName: 'check' });
     save.addEventListener('click', async () => {
       try {
-        await withBusy(save, () => nodeApi(node).put('/settings', collect(settings)));
+        const body = collect(settings);
+        if (beforeSave && !(await beforeSave())) return;
+        await withBusy(save, () => nodeApi(node).put('/settings', body));
         toast('Settings saved', 'success');
       } catch (ex) {
         toast(formatError(ex), 'error');
@@ -54,31 +89,43 @@ function retentionPanel(node) {
       const r = settings.retention;
       const recent = numberField('Recent events kept in memory', r.recent_events, { hint: 'Powers the live request log.', min: 100 });
       const minutes = numberField('Minute buckets (hours)', r.minute_buckets_hours, { hint: 'Fine-grained history for short windows.', min: 1 });
-      const hours = numberField('Hour buckets (days)', r.hour_buckets_days, { hint: 'Coarse history for 7 and 30 day windows.', min: 1 });
+      const keep = keepDataControl(r);
       const audit = numberField('Audit log (days)', r.audit_days, { min: 1 });
       const persist = numberField('Persist interval (seconds)', r.persist_interval_secs, { hint: 'How often analytics are written to disk.', min: 1 });
       const ua = toggle({ checked: r.store_user_agents, label: 'Store user agents' });
       const ip = toggle({ checked: r.store_client_ips, label: 'Store client IPs' });
       const fields = [
         h('div', { class: 'two-col narrow' }, recent.el, persist.el),
-        h('div', { class: 'three-col' }, minutes.el, hours.el, audit.el),
+        h('div', { class: 'two-col narrow' }, minutes.el, audit.el),
+        keep.el,
         h('div', { class: 'switch-row' }, ua, h('div', {}, h('b', {}, 'Store user agents'), h('p', { class: 'muted' }, 'Needed for the user agent report and rules built from it.'))),
         h('div', { class: 'switch-row' }, ip, h('div', {}, h('b', {}, 'Store client IPs'), h('p', { class: 'muted' }, 'Needed for the top IP report and one-click IP blocking. Turn off to keep visitors anonymous.'))),
       ];
-      const collect = (current) => ({
-        ...current,
-        retention: {
-          ...current.retention,
-          recent_events: recent.read(),
-          minute_buckets_hours: minutes.read(),
-          hour_buckets_days: hours.read(),
-          audit_days: audit.read(),
-          persist_interval_secs: persist.read(),
-          store_user_agents: ua.isChecked(),
-          store_client_ips: ip.isChecked(),
-        },
-      });
-      return { fields, collect };
+      const collect = (current) => {
+        const kept = applyRetentionForm(current.retention, keep.read());
+        if (kept.error) throw new Error(kept.error);
+        return {
+          ...current,
+          retention: {
+            ...kept.retention,
+            recent_events: recent.read(),
+            minute_buckets_hours: minutes.read(),
+            audit_days: audit.read(),
+            persist_interval_secs: persist.read(),
+            store_user_agents: ua.isChecked(),
+            store_client_ips: ip.isChecked(),
+          },
+        };
+      };
+      const beforeSave = () => (deletesWithoutArchive(keep.read())
+        ? confirmDialog({
+          title: 'Delete old data permanently',
+          message: 'Archiving is off, so data older than the limit is deleted for good and cannot be recovered. Save anyway?',
+          confirmLabel: 'Save and delete old data',
+          danger: true,
+        })
+        : Promise.resolve(true));
+      return { fields, collect, beforeSave };
     },
   });
 }
