@@ -959,6 +959,99 @@ async fn reload_and_config_endpoints_agree() {
     }
 }
 
+// Counts reload attempts and confirmed loads; the runtime socket reports a new pid per confirmed load.
+struct FakeHaproxy {
+    master: String,
+    runtime: String,
+    attempts: Arc<std::sync::atomic::AtomicU64>,
+}
+
+async fn fake_haproxy(refuse_first: bool) -> FakeHaproxy {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let attempts = Arc::new(AtomicU64::new(0));
+    let loaded = Arc::new(AtomicU64::new(0));
+    let master = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let runtime = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addrs = (
+        master.local_addr().expect("addr").to_string(),
+        runtime.local_addr().expect("addr").to_string(),
+    );
+    let (count, ok) = (attempts.clone(), loaded.clone());
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = master.accept().await {
+            let mut line = String::new();
+            let _ = BufReader::new(&mut stream).read_line(&mut line).await;
+            let n = count.fetch_add(1, Ordering::SeqCst) + 1;
+            let reply = if refuse_first && n == 1 {
+                "Success=0\n--\n[ALERT] refused\n"
+            } else {
+                ok.fetch_add(1, Ordering::SeqCst);
+                "Success=1\n--\nok\n"
+            };
+            let _ = stream.write_all(reply.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        }
+    });
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = runtime.accept().await {
+            let mut line = String::new();
+            let _ = BufReader::new(&mut stream).read_line(&mut line).await;
+            let reply = format!("Pid: {}\n", 100 + loaded.load(Ordering::SeqCst));
+            let _ = stream.write_all(reply.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        }
+    });
+    FakeHaproxy {
+        master: addrs.0,
+        runtime: addrs.1,
+        attempts,
+    }
+}
+
+#[tokio::test]
+async fn every_reload_request_reaches_haproxy_even_for_an_unchanged_config() {
+    let fake = fake_haproxy(false).await;
+    let (master, runtime) = (fake.master.clone(), fake.runtime.clone());
+    let h = start_with(move |cfg| {
+        cfg.master_addr = master;
+        cfg.runtime_addr = runtime;
+    })
+    .await;
+    let t = h.token().await;
+    for expected in 1..=2u64 {
+        let (status, body) = h.post(&t, "/haproxy/reload", json!({})).await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["reloaded"], true);
+        let seen = fake.attempts.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(seen, expected);
+    }
+}
+
+#[tokio::test]
+async fn a_reload_of_an_absent_haproxy_is_reported_as_unavailable() {
+    let h = start().await;
+    let t = h.token().await;
+    let (status, body) = h.post(&t, "/haproxy/reload", json!({})).await;
+    assert_eq!(status, 503, "{body}");
+}
+
+#[tokio::test]
+async fn a_refused_change_is_a_400_and_the_old_config_is_loaded_again() {
+    let fake = fake_haproxy(true).await;
+    let (master, runtime) = (fake.master.clone(), fake.runtime.clone());
+    let h = start_with(move |cfg| {
+        cfg.master_addr = master;
+        cfg.runtime_addr = runtime;
+    })
+    .await;
+    let t = h.token().await;
+    let (status, body) = h.post(&t, "/pages", page_json("down")).await;
+    assert_eq!(status, 400, "{body}");
+    assert!(h.state.store.config().pages.is_empty());
+    assert_eq!(fake.attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
 #[tokio::test]
 async fn failed_apply_restores_the_previous_configuration() {
     if rustix::process::getuid().is_root() {

@@ -236,15 +236,18 @@ pub(super) async fn reload(
     Extension(p): Extension<Principal>,
 ) -> ApiResult<Response> {
     let _gate = st.deployer.config_lock().lock().await;
-    let out = st
-        .haproxy
-        .apply(&st.store.config())
-        .await
-        .map_err(|e| ConnectorError::Unavailable(e.to_string()))?;
+    // Forced, so certificates renewed on disk and an earlier failed reload are picked up.
+    let out = st.haproxy.reload(&st.store.config()).await?;
+    out.require_running()?;
     st.store
         .audit(&p.actor(), "haproxy.reload", &out.config_hash)
         .await;
-    Ok(Json(json!({ "ok": true, "config_hash": out.config_hash })).into_response())
+    Ok(Json(json!({
+        "ok": true,
+        "config_hash": out.config_hash,
+        "reloaded": out.reloaded,
+    }))
+    .into_response())
 }
 
 pub(super) async fn haproxy_config(State(st): State<AppState>) -> ApiResult<Response> {
@@ -566,7 +569,9 @@ pub(super) async fn delete_page(
 ) -> ApiResult<Response> {
     check_id(&id)?;
     // Config validation would catch a page in use too, but this names the site holding it.
-    st.mutate(&p.actor(), "page.delete", &id, |cfg| {
+    let page_id = id.clone();
+    st.mutate(&p.actor(), "page.delete", &id, move |cfg| {
+        let id = page_id;
         if let Some(site) = cfg
             .sites
             .iter()
@@ -646,7 +651,9 @@ pub(super) async fn delete_rule(
     Path(id): Path<String>,
 ) -> ApiResult<Response> {
     check_id(&id)?;
-    st.mutate(&p.actor(), "firewall.delete", &id, |cfg| {
+    let rule_id = id.clone();
+    st.mutate(&p.actor(), "firewall.delete", &id, move |cfg| {
+        let id = rule_id;
         let before = cfg.firewall.len();
         cfg.firewall.retain(|x| x.id != id);
         if cfg.firewall.len() == before {

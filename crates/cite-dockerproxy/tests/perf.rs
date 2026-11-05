@@ -15,14 +15,22 @@ use tokio::net::TcpStream;
 
 const MANAGED: &str = "cite-shop-blue-manager";
 
-async fn hammer(addr: SocketAddr, method: &str, path: &str, workers: usize, per_worker: usize) -> (f64, f64) {
+async fn hammer(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    workers: usize,
+    per_worker: usize,
+) -> (f64, f64) {
     let started = Instant::now();
     let mut tasks = Vec::new();
     for _ in 0..workers {
         let (method, path) = (method.to_string(), path.to_string());
         tasks.push(tokio::spawn(async move {
             let stream = TcpStream::connect(addr).await.expect("connect");
-            let (mut sender, conn) = http1::handshake(TokioIo::new(stream)).await.expect("handshake");
+            let (mut sender, conn) = http1::handshake(TokioIo::new(stream))
+                .await
+                .expect("handshake");
             tokio::spawn(async move {
                 let _ = conn.await;
             });

@@ -391,6 +391,7 @@ dependencies = [
  "include_dir",
  "qrcode",
  "reqwest",
+ "rustix",
  "rustls",
  "serde",
  "serde_json",

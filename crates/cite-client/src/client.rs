@@ -17,7 +17,9 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 pub const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
-const DEPLOY_TIMEOUT: Duration = Duration::from_secs(90);
+// The connector gives a deploy up to 180 s end to end; create, switch and rollback wait for health too.
+const DEPLOY_TIMEOUT: Duration = Duration::from_secs(180);
+const ACTION_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_ERROR_CHARS: usize = 512;
 
 type Res<T> = std::result::Result<T, ClientError>;
@@ -156,6 +158,11 @@ struct Opts {
 const DEFAULT_OPTS: Opts = Opts {
     auth: true,
     timeout: None,
+};
+
+const ACTION_OPTS: Opts = Opts {
+    auth: true,
+    timeout: Some(ACTION_TIMEOUT),
 };
 
 #[derive(Clone)]
@@ -436,13 +443,16 @@ impl NodeClient {
 
     // The connector reads the GitHub token from a top-level field and never from the Site itself.
     pub async fn create_site(&self, site: &Site, github_token: Option<&str>) -> Res<Site> {
-        self.json(
-            Method::POST,
-            "/sites",
-            &[],
-            create_site_body(site, github_token)?,
-        )
-        .await
+        let bytes = self
+            .exec(
+                Method::POST,
+                "/sites",
+                &[],
+                create_site_body(site, github_token)?,
+                ACTION_OPTS,
+            )
+            .await?;
+        decode(&bytes)
     }
 
     pub async fn update_site(&self, id: &str, site: &Site) -> Res<Site> {
@@ -457,7 +467,7 @@ impl NodeClient {
 
     pub async fn deploy(&self, id: &str, request: &DeployRequest) -> Res<Deployment> {
         let path = format!("/sites/{}/deploy", enc(id));
-        // The node waits up to 60 s for health checks, which exceeds the default request budget.
+        // The node waits for health checks and a reload, which exceeds the default request budget.
         let opts = Opts {
             auth: true,
             timeout: Some(DEPLOY_TIMEOUT),
@@ -471,12 +481,18 @@ impl NodeClient {
     pub async fn switch(&self, id: &str, slot: Slot) -> Res<Deployment> {
         let path = format!("/sites/{}/switch", enc(id));
         let body = Some(json!({ "slot": slot }));
-        self.json(Method::POST, &path, &[], body).await
+        let bytes = self
+            .exec(Method::POST, &path, &[], body, ACTION_OPTS)
+            .await?;
+        decode(&bytes)
     }
 
     pub async fn rollback(&self, id: &str) -> Res<Deployment> {
         let path = format!("/sites/{}/rollback", enc(id));
-        self.json(Method::POST, &path, &[], None).await
+        let bytes = self
+            .exec(Method::POST, &path, &[], None, ACTION_OPTS)
+            .await?;
+        decode(&bytes)
     }
 
     pub async fn maintenance(&self, id: &str, enabled: bool, page_id: Option<&str>) -> Res<Site> {
@@ -608,5 +624,22 @@ impl NodeClient {
 
     pub async fn haproxy_stats(&self) -> Res<Value> {
         self.json(Method::GET, "/haproxy/stats", &[], None).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn long_operations_get_budgets_beyond_the_read_timeout() {
+        assert!(DEPLOY_TIMEOUT >= Duration::from_secs(180));
+        assert!(ACTION_TIMEOUT >= Duration::from_secs(120));
+        assert!(ACTION_TIMEOUT > REQUEST_TIMEOUT);
+    }
+
+    #[test]
+    fn create_switch_and_rollback_use_the_action_budget() {
+        assert_eq!(ACTION_OPTS.timeout, Some(ACTION_TIMEOUT));
     }
 }

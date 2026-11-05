@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -32,8 +33,23 @@ pub struct Deployer {
     haproxy: Arc<Haproxy>,
     orchestrator: Option<Arc<Orchestrator>>,
     locks: StdMutex<HashMap<String, Arc<Mutex<()>>>>,
+    // Bumped by every drain schedule so an older timer can tell a later switch happened.
+    drain_gen: Arc<StdMutex<HashMap<String, u64>>>,
     config_lock: Mutex<()>,
     timing: Timing,
+}
+
+// Runs the operation to completion even when the caller is dropped, so a client disconnect or the
+// request timeout cannot stop a deploy between its steps.
+pub(crate) async fn detach<T: Send + 'static>(
+    op: impl Future<Output = Result<T>> + Send + 'static,
+) -> Result<T> {
+    match tokio::spawn(op).await {
+        Ok(result) => result,
+        Err(err) => Err(ConnectorError::Internal(format!(
+            "operation task failed: {err}"
+        ))),
+    }
 }
 
 fn upstream(site: &Site, slot: Slot) -> &Upstream {
@@ -103,6 +119,7 @@ impl Deployer {
             haproxy,
             orchestrator,
             locks: StdMutex::new(HashMap::new()),
+            drain_gen: Arc::default(),
             config_lock: Mutex::new(()),
             timing: Timing {
                 create_health: CREATE_HEALTH,
@@ -190,7 +207,12 @@ impl Deployer {
         let _gate = self.config_lock.lock().await;
         let previous = self.store.config();
         let out = self.store.update(actor, action, change).await?;
-        if let Err(err) = self.haproxy.apply(&self.store.config()).await {
+        let loaded = self
+            .haproxy
+            .apply(&self.store.config())
+            .await
+            .and_then(|applied| applied.require_loaded());
+        if let Err(err) = loaded {
             self.restore(actor, action, previous).await;
             return Err(err);
         }
@@ -237,22 +259,35 @@ impl Deployer {
         }
     }
 
-    // The old stack is stopped after the drain delay unless the site moved back in the meantime.
+    // The old stack is stopped after the drain delay unless the site moved again in the meantime.
     fn schedule_drain(&self, id: &str, old: Slot, promoted: Slot) {
         let Some(orch) = self.orchestrator.clone() else {
             return;
         };
+        let generation = {
+            let mut gens = self.drain_gen.lock().unwrap_or_else(|p| p.into_inner());
+            let next = gens.entry(id.to_string()).or_insert(0);
+            *next += 1;
+            *next
+        };
         let (store, lock, delay) = (self.store.clone(), self.site_lock(id), self.timing.drain);
+        let gens = Arc::clone(&self.drain_gen);
         let id = id.to_string();
         tokio::spawn(async move {
             sleep(delay).await;
             let _guard = lock.lock().await;
+            let latest = gens
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(&id)
+                .copied();
             let current = store.config();
-            let settled = current
-                .sites
-                .iter()
-                .find(|s| s.id == id)
-                .is_some_and(|s| s.active == promoted);
+            let settled = latest == Some(generation)
+                && current
+                    .sites
+                    .iter()
+                    .find(|s| s.id == id)
+                    .is_some_and(|s| s.active == promoted);
             if settled && let Err(err) = orch.stop_stack(&id, old).await {
                 tracing::warn!(
                     "drained stack {id}/{} could not be stopped: {err}",
@@ -262,7 +297,69 @@ impl Deployer {
         });
     }
 
+    // After a restart the drain timers are gone, so idle stacks of orchestrated sites are stopped
+    // once the active slot is confirmed healthy.
+    pub async fn reconcile_idle_stacks(&self) {
+        let Some(orch) = self.orchestrator.clone() else {
+            return;
+        };
+        let ids: Vec<String> = self
+            .store
+            .config()
+            .sites
+            .iter()
+            .filter(|s| s.source.is_some())
+            .map(|s| s.id.clone())
+            .collect();
+        for id in ids {
+            let Ok(seen) = self.get_site(&id) else {
+                continue;
+            };
+            // The wait happens outside the site lock so deploys are not held up by a slow health check.
+            let healthy = self
+                .haproxy
+                .wait_healthy(&id, seen.active, self.timing.deploy_health)
+                .await
+                .unwrap_or(false);
+            if !healthy {
+                tracing::warn!("site {id} active slot is not healthy, idle stack left running");
+                continue;
+            }
+            let lock = self.site_lock(&id);
+            let _guard = lock.lock().await;
+            let Ok(site) = self.get_site(&id) else {
+                continue;
+            };
+            if site.active != seen.active {
+                continue;
+            }
+            let idle = site.active.other();
+            match orch.stack_running(&id, idle).await {
+                Ok(true) => {
+                    if let Err(err) = orch.stop_stack(&id, idle).await {
+                        tracing::warn!(
+                            "idle stack {id}/{} could not be stopped: {err}",
+                            idle.as_str()
+                        );
+                    }
+                }
+                Ok(false) => {}
+                Err(err) => tracing::warn!("idle stack {id}/{} unreadable: {err}", idle.as_str()),
+            }
+        }
+    }
+
     pub async fn create_site(
+        self: &Arc<Self>,
+        actor: &str,
+        site: Site,
+        github_token: Option<String>,
+    ) -> Result<Site> {
+        let (this, actor) = (Arc::clone(self), actor.to_string());
+        detach(async move { this.create_site_inner(&actor, site, github_token).await }).await
+    }
+
+    async fn create_site_inner(
         &self,
         actor: &str,
         mut site: Site,
@@ -354,7 +451,14 @@ impl Deployer {
         self.get_site(&id)
     }
 
-    pub async fn update_site(&self, actor: &str, mut site: Site) -> Result<Site> {
+    pub async fn update_site(self: &Arc<Self>, actor: &str, site: Site) -> Result<Site> {
+        let (this, actor) = (Arc::clone(self), actor.to_string());
+        detach(async move { this.update_site_inner(&actor, site).await }).await
+    }
+
+    // Slots, the active choice and maintenance move only through their own endpoints, so a stale
+    // client copy of the site cannot undo a deploy.
+    async fn update_site_inner(&self, actor: &str, mut site: Site) -> Result<Site> {
         validate_site(&site)?;
         let id = site.id.clone();
         let lock = self.site_lock(&id);
@@ -366,6 +470,10 @@ impl Deployer {
             ));
         }
         site.history = existing.history;
+        site.active = existing.active;
+        site.blue = existing.blue;
+        site.green = existing.green;
+        site.maintenance = existing.maintenance;
         if let Some(source) = site.source.as_mut() {
             source.secret = existing.source.and_then(|s| s.secret);
         }
@@ -378,12 +486,29 @@ impl Deployer {
         self.get_site(&id)
     }
 
-    pub async fn delete_site(&self, actor: &str, id: &str) -> Result<()> {
+    pub async fn delete_site(self: &Arc<Self>, actor: &str, id: &str) -> Result<()> {
+        let (this, actor, id) = (Arc::clone(self), actor.to_string(), id.to_string());
+        detach(async move { this.delete_site_inner(&actor, &id).await }).await
+    }
+
+    async fn delete_site_inner(&self, actor: &str, id: &str) -> Result<()> {
         let lock = self.site_lock(id);
         let guard = lock.lock().await;
         let site = self.get_site(id)?;
         let sid = id.to_string();
         self.mutate_apply(actor, "site.delete", move |cfg| {
+            let scoped: Vec<&str> = cfg
+                .firewall
+                .iter()
+                .filter(|r| r.site.as_deref() == Some(sid.as_str()))
+                .map(|r| r.id.as_str())
+                .collect();
+            if !scoped.is_empty() {
+                return Err(ConnectorError::Conflict(format!(
+                    "site {sid} is used by firewall rules {}; delete or change them first",
+                    scoped.join(", ")
+                )));
+            }
             cfg.sites.retain(|s| s.id != sid);
             Ok(())
         })
@@ -405,6 +530,18 @@ impl Deployer {
     }
 
     pub async fn deploy(
+        self: &Arc<Self>,
+        actor: &str,
+        id: &str,
+        targets: Option<Vec<Target>>,
+        note: Option<String>,
+        git_ref: Option<String>,
+    ) -> Result<Deployment> {
+        let (this, actor, id) = (Arc::clone(self), actor.to_string(), id.to_string());
+        detach(async move { this.deploy_inner(&actor, &id, targets, note, git_ref).await }).await
+    }
+
+    async fn deploy_inner(
         &self,
         actor: &str,
         id: &str,
@@ -562,7 +699,11 @@ impl Deployer {
             return Ok(());
         }
         let token = self.token_for(site).await;
-        let started = orch.ensure_stack(site, slot, None, &token).await?;
+        // The slot comes back on the ref it last ran, not on the site's current branch.
+        let git_ref = orch.slot_ref(&site.id, slot).await?;
+        let started = orch
+            .ensure_stack(site, slot, git_ref.as_deref(), &token)
+            .await?;
         if started != upstream(site, slot).targets {
             let sid = site.id.clone();
             self.mutate_apply(actor, "site.switch.retarget", move |cfg| {
@@ -574,7 +715,12 @@ impl Deployer {
         Ok(())
     }
 
-    pub async fn switch(&self, actor: &str, id: &str, slot: Slot) -> Result<Deployment> {
+    pub async fn switch(self: &Arc<Self>, actor: &str, id: &str, slot: Slot) -> Result<Deployment> {
+        let (this, actor, id) = (Arc::clone(self), actor.to_string(), id.to_string());
+        detach(async move { this.switch_inner(&actor, &id, slot).await }).await
+    }
+
+    async fn switch_inner(&self, actor: &str, id: &str, slot: Slot) -> Result<Deployment> {
         let lock = self.site_lock(id);
         let _guard = lock.lock().await;
         let site = self.get_site(id)?;
@@ -583,7 +729,12 @@ impl Deployer {
             .await
     }
 
-    pub async fn rollback(&self, actor: &str, id: &str) -> Result<Deployment> {
+    pub async fn rollback(self: &Arc<Self>, actor: &str, id: &str) -> Result<Deployment> {
+        let (this, actor, id) = (Arc::clone(self), actor.to_string(), id.to_string());
+        detach(async move { this.rollback_inner(&actor, &id).await }).await
+    }
+
+    async fn rollback_inner(&self, actor: &str, id: &str) -> Result<Deployment> {
         let lock = self.site_lock(id);
         let _guard = lock.lock().await;
         let site = self.get_site(id)?;
@@ -607,6 +758,21 @@ impl Deployer {
     }
 
     pub async fn set_maintenance(
+        self: &Arc<Self>,
+        actor: &str,
+        id: &str,
+        enabled: bool,
+        page_id: Option<String>,
+    ) -> Result<Site> {
+        let (this, actor, id) = (Arc::clone(self), actor.to_string(), id.to_string());
+        detach(async move {
+            this.set_maintenance_inner(&actor, &id, enabled, page_id)
+                .await
+        })
+        .await
+    }
+
+    async fn set_maintenance_inner(
         &self,
         actor: &str,
         id: &str,
@@ -644,7 +810,10 @@ impl Deployer {
             })
             .await?;
         let pushed = if page_changed {
-            self.haproxy.apply(&self.store.config()).await.map(|_| ())
+            self.haproxy
+                .apply(&self.store.config())
+                .await
+                .and_then(|applied| applied.require_loaded())
         } else {
             match self.haproxy.set_maintenance(id, enabled).await {
                 Err(ConnectorError::Unavailable(why)) => {
@@ -762,7 +931,7 @@ mod tests {
 
     struct Env {
         _dir: TempDir,
-        deployer: Deployer,
+        deployer: Arc<Deployer>,
         store: Arc<Store>,
         fake: SharedFake,
         cfg: crate::config::ConnectorConfig,
@@ -772,6 +941,14 @@ mod tests {
         tweak: impl FnOnce(&mut crate::config::ConnectorConfig),
         orchestrator: Option<Arc<Orchestrator>>,
     ) -> Env {
+        env_full(tweak, orchestrator, Duration::from_millis(50)).await
+    }
+
+    async fn env_full(
+        tweak: impl FnOnce(&mut crate::config::ConnectorConfig),
+        orchestrator: Option<Arc<Orchestrator>>,
+        drain: Duration,
+    ) -> Env {
         let dir = tempfile::tempdir().unwrap();
         let (addr, fake) = start_fake().await;
         let mut cfg = test_config(dir.path());
@@ -780,10 +957,12 @@ mod tests {
         let store = Store::open(&cfg).await.unwrap();
         let haproxy = Arc::new(Haproxy::new(&cfg));
         let short = Duration::from_millis(600);
-        let deployer = Deployer::new(store.clone(), haproxy, orchestrator).with_timing(
-            Duration::from_millis(300),
-            short,
-            Duration::from_millis(50),
+        let deployer = Arc::new(
+            Deployer::new(store.clone(), haproxy, orchestrator).with_timing(
+                Duration::from_millis(300),
+                short,
+                drain,
+            ),
         );
         Env {
             _dir: dir,
@@ -1058,7 +1237,14 @@ mod tests {
             "mutation ran while the config lock was held"
         );
         drop(held);
-        created(&e).await;
+        // The abandoned create keeps running to completion once the lock is free.
+        for _ in 0..50 {
+            if e.store.config().sites.iter().any(|s| s.id == "shop") {
+                return;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+        panic!("the detached create never finished");
     }
 
     #[tokio::test]
@@ -1336,6 +1522,190 @@ mod tests {
         assert!(cfg_text.contains("renamed.example.com"));
         let ghost = e.deployer.update_site("t", new_site("ghost")).await;
         assert!(matches!(ghost, Err(ConnectorError::NotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn update_ignores_stale_slots_active_and_maintenance() {
+        let e = env().await;
+        created(&e).await;
+        e.deployer
+            .deploy("t", "shop", Some(green_targets()), None, None)
+            .await
+            .unwrap();
+        let mut stale = new_site("shop");
+        stale.name = "Renamed".into();
+        stale.maintenance.enabled = true;
+        let site = e.deployer.update_site("t", stale).await.unwrap();
+        assert_eq!(site.name, "Renamed");
+        assert_eq!(site.active, Slot::Green);
+        assert_eq!(site.green.targets, green_targets());
+        assert_eq!(site.blue.targets.len(), 2);
+        assert!(!site.maintenance.enabled);
+        let map = std::fs::read_to_string(e.cfg.maps_dir.join("active.map")).unwrap();
+        assert_eq!(map, "shop be_shop_green\n");
+    }
+
+    #[tokio::test]
+    async fn delete_is_refused_while_firewall_rules_name_the_site() {
+        let e = env().await;
+        created(&e).await;
+        let rule = serde_json::from_value(json!({
+            "id": "block-shop",
+            "name": "block",
+            "enabled": true,
+            "action": "deny",
+            "matchers": { "path_prefix": "/admin" },
+            "site": "shop"
+        }))
+        .unwrap();
+        e.store
+            .update("t", "seed", move |cfg| {
+                cfg.firewall.push(rule);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let err = e.deployer.delete_site("t", "shop").await.unwrap_err();
+        let ConnectorError::Conflict(msg) = &err else {
+            panic!("expected Conflict, got {err:?}");
+        };
+        assert!(msg.contains("block-shop"), "{msg}");
+        assert_eq!(e.store.config().sites.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_dropped_caller_does_not_cancel_a_deploy() {
+        let e = env().await;
+        created(&e).await;
+        let held = e.deployer.config_lock().lock().await;
+        let abandoned = tokio::time::timeout(
+            Duration::from_millis(100),
+            e.deployer
+                .deploy("t", "shop", Some(green_targets()), None, None),
+        )
+        .await;
+        assert!(abandoned.is_err());
+        drop(held);
+        for _ in 0..60 {
+            if current(&e, "shop").active == Slot::Green {
+                break;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+        let site = current(&e, "shop");
+        assert_eq!(site.active, Slot::Green);
+        assert_eq!(site.history.len(), 1);
+        let map = std::fs::read_to_string(e.cfg.maps_dir.join("active.map")).unwrap();
+        assert_eq!(map, "shop be_shop_green\n");
+    }
+
+    #[tokio::test]
+    async fn a_changed_config_that_haproxy_refuses_rolls_the_change_back() {
+        let reloads = Arc::new(StdMutex::new(0u32));
+        let counter = reloads.clone();
+        let master = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let master_addr = master.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = master.accept().await {
+                let counter = counter.clone();
+                tokio::spawn(async move {
+                    let mut line = String::new();
+                    let mut reader = BufReader::new(&mut stream);
+                    let _ = reader.read_line(&mut line).await;
+                    *counter.lock().unwrap() += 1;
+                    let _ = stream.write_all(b"Success=0\n--\n[ALERT] refused\n").await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        let e = env_with(move |cfg| cfg.master_addr = master_addr, None).await;
+        let err = e
+            .deployer
+            .create_site("t", new_site("shop"), None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ConnectorError::BadRequest(_)), "{err:?}");
+        assert!(e.store.config().sites.is_empty());
+        assert!(*reloads.lock().unwrap() >= 1);
+    }
+
+    #[tokio::test]
+    async fn rollback_restarts_a_drained_slot_on_the_ref_it_ran() {
+        let (orch, _fake) = crate::orchestrator::tests::start_fake().await;
+        let orch = Arc::new(orch);
+        let e = env_with(|_| {}, Some(orch.clone())).await;
+        e.deployer
+            .create_site("t", orchestrated_site("shop"), Some("ghp_testtoken".into()))
+            .await
+            .unwrap();
+        e.deployer
+            .deploy("t", "shop", None, None, Some("v1".into()))
+            .await
+            .unwrap();
+        e.deployer
+            .deploy("t", "shop", None, None, Some("v2".into()))
+            .await
+            .unwrap();
+        for _ in 0..60 {
+            if !orch.stack_running("shop", Slot::Green).await.unwrap() {
+                break;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+        assert!(!orch.stack_running("shop", Slot::Green).await.unwrap());
+        e.deployer.rollback("t", "shop").await.unwrap();
+        assert_eq!(current(&e, "shop").active, Slot::Green);
+        assert!(orch.stack_running("shop", Slot::Green).await.unwrap());
+        let green = orch.slot_ref("shop", Slot::Green).await.unwrap();
+        assert_eq!(green.as_deref(), Some("v1"));
+    }
+
+    #[tokio::test]
+    async fn an_older_drain_timer_does_not_stop_a_slot_that_went_idle_later() {
+        let (orch, _fake) = crate::orchestrator::tests::start_fake().await;
+        let orch = Arc::new(orch);
+        let drain = Duration::from_millis(600);
+        let e = env_full(|_| {}, Some(orch.clone()), drain).await;
+        e.deployer
+            .create_site("t", orchestrated_site("shop"), Some("ghp_testtoken".into()))
+            .await
+            .unwrap();
+        e.deployer
+            .deploy("t", "shop", None, None, None)
+            .await
+            .unwrap();
+        sleep(Duration::from_millis(200)).await;
+        e.deployer.switch("t", "shop", Slot::Blue).await.unwrap();
+        sleep(Duration::from_millis(200)).await;
+        e.deployer.switch("t", "shop", Slot::Green).await.unwrap();
+        // The first timer fires here, only 200 ms after blue went idle.
+        sleep(Duration::from_millis(400)).await;
+        assert!(orch.stack_running("shop", Slot::Blue).await.unwrap());
+        sleep(Duration::from_millis(900)).await;
+        assert!(!orch.stack_running("shop", Slot::Blue).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn startup_reconcile_stops_idle_stacks_once_the_active_slot_is_healthy() {
+        let (orch, _fake) = crate::orchestrator::tests::start_fake().await;
+        let orch = Arc::new(orch);
+        let e = env_full(|_| {}, Some(orch.clone()), Duration::from_secs(600)).await;
+        e.deployer
+            .create_site("t", orchestrated_site("shop"), Some("ghp_testtoken".into()))
+            .await
+            .unwrap();
+        e.deployer
+            .deploy("t", "shop", None, None, None)
+            .await
+            .unwrap();
+        assert!(orch.stack_running("shop", Slot::Blue).await.unwrap());
+        set_down(&e, "be_shop_green");
+        e.deployer.reconcile_idle_stacks().await;
+        assert!(orch.stack_running("shop", Slot::Blue).await.unwrap());
+        e.fake.lock().unwrap().down.clear();
+        e.deployer.reconcile_idle_stacks().await;
+        assert!(!orch.stack_running("shop", Slot::Blue).await.unwrap());
+        assert!(orch.stack_running("shop", Slot::Green).await.unwrap());
     }
 
     #[tokio::test]

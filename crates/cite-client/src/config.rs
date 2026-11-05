@@ -301,8 +301,10 @@ mod tests {
         let path = dir.path().join("dashboard.json");
         std::fs::write(&path, r#"{"version":1}"#).expect("write");
         assert_eq!(ConfigFile::load(&path).expect("load").generation, 0);
-        let mut cfg = DashboardConfig::default();
-        cfg.generation = 7;
+        let cfg = DashboardConfig {
+            generation: 7,
+            ..DashboardConfig::default()
+        };
         ConfigFile::save(&path, &cfg).expect("save");
         assert_eq!(ConfigFile::load(&path).expect("load").generation, 7);
     }

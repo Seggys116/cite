@@ -33,6 +33,7 @@ const RELOAD_POLL: Duration = Duration::from_millis(100);
 const HEALTH_POLL: Duration = Duration::from_millis(500);
 const MAX_REPLY: u64 = 16 * 1024 * 1024;
 const MAX_ERROR_TEXT: usize = 2000;
+const REFUSED_PREFIX: &str = "haproxy refused the reload";
 const STAGE_DIR: &str = ".stage";
 const PUBLIC_MODE: u32 = 0o644;
 const DIR_MODE: u32 = 0o755;
@@ -40,7 +41,42 @@ const DIR_MODE: u32 = 0o755;
 #[derive(Debug, Clone, Serialize)]
 pub struct ApplyOutcome {
     pub config_hash: String,
+    // True only when HAProxy confirmed a reload during this call.
     pub reloaded: bool,
+    // False when the master CLI could not be reached at all.
+    pub running: bool,
+    pub reload_error: Option<String>,
+    pub reload_refused: bool,
+}
+
+impl ApplyOutcome {
+    // A reachable HAProxy that did not take the new config is a failure; an absent one is the boot case.
+    pub fn require_loaded(&self) -> Result<()> {
+        match (&self.reload_error, self.running) {
+            (Some(msg), true) if self.reload_refused => Err(ConnectorError::BadRequest(format!(
+                "haproxy did not load the configuration: {msg}"
+            ))),
+            (Some(msg), true) => Err(ConnectorError::Unavailable(format!(
+                "haproxy did not load the configuration: {msg}"
+            ))),
+            _ => Ok(()),
+        }
+    }
+
+    // Used where the caller needs the config live, so an unreachable HAProxy counts as a failure too.
+    pub fn require_running(&self) -> Result<()> {
+        match &self.reload_error {
+            Some(msg) if !self.running => Err(ConnectorError::Unavailable(msg.clone())),
+            _ => self.require_loaded(),
+        }
+    }
+}
+
+struct ReloadResult {
+    reloaded: bool,
+    running: bool,
+    error: Option<String>,
+    refused: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -56,6 +92,9 @@ pub struct HaproxyStatus {
 struct State {
     status: HaproxyStatus,
     config_text: Option<String>,
+    // Hash whose files are on disk.
+    written: Option<String>,
+    // Hash HAProxy confirmed it loaded.
     applied: Option<String>,
 }
 
@@ -263,7 +302,7 @@ fn parse_reload_reply(reply: &str) -> std::result::Result<(), String> {
         Some("Success=0") => {
             let detail = text.split_once("--").map_or("", |(_, rest)| rest.trim());
             Err(format!(
-                "haproxy refused the reload: {}",
+                "{REFUSED_PREFIX}: {}",
                 truncate(detail, MAX_ERROR_TEXT)
             ))
         }
@@ -357,8 +396,8 @@ impl Haproxy {
     }
 
     // An equal hash is not enough on its own: a file deleted from disk has to be written again.
-    fn is_current(&self, hash: &str, rendered: &Rendered) -> bool {
-        let same = self.state().applied.as_deref() == Some(hash);
+    fn files_current(&self, hash: &str, rendered: &Rendered) -> bool {
+        let same = self.state().written.as_deref() == Some(hash);
         same && self.haproxy_cfg.is_file()
             && self.maps_dir.join("active.map").is_file()
             && self.maps_dir.join("maint.map").is_file()
@@ -368,31 +407,52 @@ impl Haproxy {
                 .all(|(name, _)| self.pages_dir.join(name).is_file())
     }
 
+    // Skips both the write and the reload only when HAProxy already confirmed this exact config.
     pub async fn apply(&self, edge: &EdgeConfig) -> Result<ApplyOutcome> {
+        self.apply_with(edge, false).await
+    }
+
+    // Reloads even when the hash is unchanged, so renewed certificates and a failed reload can be retried.
+    pub async fn reload(&self, edge: &EdgeConfig) -> Result<ApplyOutcome> {
+        self.apply_with(edge, true).await
+    }
+
+    async fn apply_with(&self, edge: &EdgeConfig, force: bool) -> Result<ApplyOutcome> {
         let _guard = self.apply_lock.lock().await;
         let options = self.render_options(&self.maps_dir, &self.pages_dir)?;
         let rendered = render(edge, &options)?;
         let hash = config_hash(&rendered);
-        if self.is_current(&hash, &rendered) {
+        let files_current = self.files_current(&hash, &rendered);
+        let loaded = self.state().applied.as_deref() == Some(hash.as_str());
+        if files_current && loaded && !force {
             return Ok(ApplyOutcome {
                 config_hash: hash,
                 reloaded: false,
+                running: self.state().status.running,
+                reload_error: None,
+                reload_refused: false,
             });
         }
-        if let Err(err) = self.validate_and_install(edge, &rendered).await {
-            self.state().status.last_error = Some(err.to_string());
-            return Err(err);
-        }
-        {
+        if !files_current {
+            if let Err(err) = self.validate_and_install(edge, &rendered).await {
+                self.state().status.last_error = Some(err.to_string());
+                return Err(err);
+            }
             let mut st = self.state();
             st.config_text = Some(rendered.config.clone());
-            st.applied = Some(hash.clone());
+            st.written = Some(hash.clone());
             st.status.config_hash = hash.clone();
         }
-        let reloaded = self.reload_master().await;
+        let result = self.reload_master().await;
+        if result.reloaded {
+            self.state().applied = Some(hash.clone());
+        }
         Ok(ApplyOutcome {
             config_hash: hash,
-            reloaded,
+            reloaded: result.reloaded,
+            running: result.running,
+            reload_error: result.error,
+            reload_refused: result.refused,
         })
     }
 
@@ -431,7 +491,7 @@ impl Haproxy {
         checked
     }
 
-    async fn reload_master(&self) -> bool {
+    async fn reload_master(&self) -> ReloadResult {
         let stream = match open(&self.master_addr, MASTER_LABEL).await {
             Ok(stream) => stream,
             Err(err) => {
@@ -440,7 +500,12 @@ impl Haproxy {
                 st.status.running = false;
                 st.status.last_reload_ok = false;
                 st.status.last_error = Some(err.to_string());
-                return false;
+                return ReloadResult {
+                    reloaded: false,
+                    running: false,
+                    error: Some(err.to_string()),
+                    refused: false,
+                };
             }
         };
         self.state().status.running = true;
@@ -451,18 +516,29 @@ impl Haproxy {
         };
         let mut st = self.state();
         st.status.last_reload_at = Some(now_rfc3339());
-        match &outcome {
+        match outcome {
             Ok(()) => {
                 st.status.last_reload_ok = true;
                 st.status.last_error = None;
+                ReloadResult {
+                    reloaded: true,
+                    running: true,
+                    error: None,
+                    refused: false,
+                }
             }
             Err(msg) => {
                 tracing::warn!("haproxy reload failed: {msg}");
                 st.status.last_reload_ok = false;
                 st.status.last_error = Some(msg.clone());
+                ReloadResult {
+                    reloaded: false,
+                    running: true,
+                    refused: msg.starts_with(REFUSED_PREFIX),
+                    error: Some(msg),
+                }
             }
         }
-        outcome.is_ok()
     }
 
     // A new worker answers with a different pid, which is what proves the reload took effect.
@@ -495,13 +571,13 @@ impl Haproxy {
     async fn set_map(&self, file: &str, key: &str, value: &str, cmd: &str) -> Result<()> {
         let _guard = self.apply_lock.lock().await;
         // The map on disk now differs from the last render, so the next apply must not be skipped.
-        self.state().applied = None;
+        self.state().written = None;
         let path = self.maps_dir.join(file);
         let (key_owned, value_owned) = (key.to_string(), value.to_string());
         tokio::task::spawn_blocking(move || rewrite_map_file(&path, &key_owned, &value_owned))
             .await
             .map_err(internal)??;
-        match self.runtime_command(cmd).await {
+        let live = match self.runtime_command(cmd).await {
             Ok(reply) => match reply_error(&reply) {
                 Some(text) => Err(internal(format!("haproxy rejected {file} update: {text}"))),
                 None => Ok(()),
@@ -510,7 +586,12 @@ impl Haproxy {
                 tracing::warn!("{file} updated on disk only: {err}");
                 Err(err)
             }
+        };
+        if live.is_err() {
+            // The running process never saw the change, so only a reload can bring it in line.
+            self.state().applied = None;
         }
+        live
     }
 
     pub async fn set_active(&self, site: &str, slot: Slot) -> Result<()> {
@@ -834,7 +915,10 @@ mod tests {
         let mut cfg = edge((0..500).map(|i| site(&format!("s{i}"))).collect());
         let started = Instant::now();
         hp.apply(&cfg).await.unwrap();
-        println!("first apply: {:.2} ms", started.elapsed().as_secs_f64() * 1e3);
+        println!(
+            "first apply: {:.2} ms",
+            started.elapsed().as_secs_f64() * 1e3
+        );
         let started = Instant::now();
         for _ in 0..20 {
             hp.apply(&cfg).await.unwrap();
@@ -930,6 +1014,64 @@ mod tests {
         let err = status.last_error.unwrap();
         assert!(err.contains("refused the reload"), "{err}");
         assert!(err.contains("unknown keyword 'bogus'"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_refused_reload_is_not_recorded_so_the_next_apply_retries_it() {
+        let reply = "Success=0\n--\n[ALERT] bad\n";
+        let (hp, seen, _dir) = reloading_haproxy(reply).await;
+        let cfg = edge(vec![site("shop")]);
+        let first = hp.apply(&cfg).await.unwrap();
+        assert!(!first.reloaded && first.running && first.reload_refused);
+        assert!(matches!(
+            first.require_loaded(),
+            Err(ConnectorError::BadRequest(_))
+        ));
+        let second = hp.apply(&cfg).await.unwrap();
+        assert!(!second.reloaded);
+        assert_eq!(seen.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn an_unconfirmed_reload_is_unavailable_and_retried() {
+        let (master, seen) = fake_runtime(|_| "Success=1\n--\nok\n".to_string()).await;
+        let (runtime, _) = fake_runtime(|_| "Pid: 7\n".to_string()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut hp = haproxy_in(&dir, &runtime);
+        hp.master_addr = master;
+        let cfg = edge(vec![site("shop")]);
+        let first = hp.apply(&cfg).await.unwrap();
+        assert!(!first.reloaded && first.running && !first.reload_refused);
+        assert!(matches!(
+            first.require_loaded(),
+            Err(ConnectorError::Unavailable(_))
+        ));
+        hp.apply(&cfg).await.unwrap();
+        assert_eq!(seen.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn an_absent_haproxy_is_tolerated_by_apply_but_not_by_a_forced_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let hp = haproxy_in(&dir, "127.0.0.1:9");
+        let out = hp.apply(&edge(vec![site("shop")])).await.unwrap();
+        assert!(!out.running && !out.reloaded);
+        assert!(out.require_loaded().is_ok());
+        assert!(matches!(
+            out.require_running(),
+            Err(ConnectorError::Unavailable(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn reload_forces_a_reload_of_an_already_confirmed_config() {
+        let (hp, seen, _dir) = reloading_haproxy("Success=1\n--\nok\n").await;
+        let cfg = edge(vec![site("shop")]);
+        assert!(hp.apply(&cfg).await.unwrap().reloaded);
+        assert!(!hp.apply(&cfg).await.unwrap().reloaded);
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        assert!(hp.reload(&cfg).await.unwrap().reloaded);
+        assert_eq!(seen.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]

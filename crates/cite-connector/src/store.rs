@@ -80,6 +80,7 @@ pub enum LoginOutcome {
 }
 
 struct Paths {
+    auth_lock: PathBuf,
     edge: PathBuf,
     credentials: PathBuf,
     secrets: PathBuf,
@@ -130,6 +131,12 @@ fn lock<T>(m: &StdMutex<T>) -> MutexGuard<'_, T> {
 }
 
 // Control characters become spaces so a hostile value cannot forge extra log lines.
+fn superseded(what: &str) -> ConnectorError {
+    ConnectorError::Conflict(format!(
+        "{what} were reset while this change was in flight; retry"
+    ))
+}
+
 fn clip(s: &str, max: usize) -> String {
     let mut out = String::with_capacity(s.len().min(max));
     for ch in s.chars() {
@@ -177,6 +184,34 @@ fn disk_generation(path: &Path) -> u64 {
         .ok()
         .flatten()
         .map_or(0, |g| g.generation)
+}
+
+// Held across a generation check and the rename that follows, in the server and the CLI alike, so a
+// reset can never be overwritten by a write that started from older state.
+fn lock_auth(path: &Path) -> io::Result<fs::File> {
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
+        .open(path)?;
+    rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive).map_err(io::Error::from)?;
+    Ok(file)
+}
+
+// Writes only while the file still carries the generation the caller started from.
+async fn guarded_write(lock: PathBuf, target: PathBuf, seen: u64, bytes: Vec<u8>) -> Result<bool> {
+    tokio::task::spawn_blocking(move || -> Result<bool> {
+        let _held = lock_auth(&lock).map_err(|e| internal("auth lock failed", e))?;
+        if disk_generation(&target) > seen {
+            return Ok(false);
+        }
+        write_atomic(&target, &bytes, 0o600).map_err(|e| internal("write failed", e))?;
+        Ok(true)
+    })
+    .await
+    .map_err(|e| internal("write task", e))?
 }
 
 fn make_dir(path: &Path, mode: u32) -> Result<()> {
@@ -291,6 +326,7 @@ impl Store {
         make_dir(&cfg.tls_dir, 0o700)?;
 
         let paths = Paths {
+            auth_lock: cfg.data_dir.join("auth.lock"),
             edge: cfg.data_dir.join("edge.json"),
             credentials: cfg.data_dir.join("credentials.json"),
             secrets: cfg.data_dir.join("secrets.json"),
@@ -524,53 +560,69 @@ impl Store {
     pub async fn set_credentials(&self, c: Credentials) -> Result<()> {
         let _guard = self.login_lock.lock().await;
         self.refresh_creds();
-        self.persist_credentials(c).await
+        if self.persist_credentials(c).await? {
+            Ok(())
+        } else {
+            Err(superseded("credentials"))
+        }
     }
 
-    async fn persist_credentials(&self, c: Credentials) -> Result<()> {
+    // False means a reset landed first: its state is adopted and nothing was written.
+    async fn persist_credentials(&self, c: Credentials) -> Result<bool> {
         let stamped = Stamped {
             generation: self.creds_generation(),
             value: c,
         };
         let bytes = serde_json::to_vec_pretty(&stamped)?;
-        write_file(self.paths.credentials.clone(), bytes, 0o600).await?;
+        let lock_path = self.paths.auth_lock.clone();
+        let target = self.paths.credentials.clone();
+        let written = guarded_write(lock_path, target, stamped.generation, bytes).await?;
         lock(&self.disk).creds_key = None;
-        self.creds.store(Some(Arc::new(stamped.value)));
-        Ok(())
+        if written {
+            self.creds.store(Some(Arc::new(stamped.value)));
+        } else {
+            self.refresh_creds();
+        }
+        Ok(written)
     }
 
     // Replaces credentials and empties the token list under a generation newer than any seen, so running connectors adopt it.
     pub async fn reset_credentials(&self, c: Credentials) -> Result<()> {
         let _login = self.login_lock.lock().await;
         let mut tokens = self.tokens.lock().await;
-        let generation = {
+        let floor = {
             let disk = lock(&self.disk);
-            disk.creds_gen
-                .max(disk.tokens_gen)
-                .max(disk_generation(&self.paths.credentials))
-                .max(disk_generation(&self.paths.tokens))
-                .saturating_add(1)
+            disk.creds_gen.max(disk.tokens_gen)
         };
-        let empty = Stamped {
-            generation,
-            value: ApiTokens::new(),
-        };
-        write_file(
+        let paths = (
+            self.paths.auth_lock.clone(),
             self.paths.tokens.clone(),
-            serde_json::to_vec_pretty(&empty)?,
-            0o600,
-        )
-        .await?;
-        let creds = Stamped {
-            generation,
-            value: c,
-        };
-        write_file(
             self.paths.credentials.clone(),
-            serde_json::to_vec_pretty(&creds)?,
-            0o600,
-        )
-        .await?;
+        );
+        let fresh = c.clone();
+        let generation = tokio::task::spawn_blocking(move || -> Result<u64> {
+            let (lock_path, tokens_path, creds_path) = paths;
+            let _held = lock_auth(&lock_path).map_err(|e| internal("auth lock failed", e))?;
+            let generation = floor
+                .max(disk_generation(&creds_path))
+                .max(disk_generation(&tokens_path))
+                .saturating_add(1);
+            let empty = Stamped {
+                generation,
+                value: ApiTokens::new(),
+            };
+            let creds = Stamped {
+                generation,
+                value: c,
+            };
+            write_atomic(&tokens_path, &serde_json::to_vec_pretty(&empty)?, 0o600)
+                .map_err(|e| internal("write failed", e))?;
+            write_atomic(&creds_path, &serde_json::to_vec_pretty(&creds)?, 0o600)
+                .map_err(|e| internal("write failed", e))?;
+            Ok(generation)
+        })
+        .await
+        .map_err(|e| internal("reset task", e))??;
         {
             let mut disk = lock(&self.disk);
             disk.creds_gen = generation;
@@ -578,8 +630,8 @@ impl Store {
             disk.creds_key = None;
             disk.tokens_key = None;
         }
-        *tokens = empty.value;
-        self.creds.store(Some(Arc::new(creds.value)));
+        *tokens = ApiTokens::new();
+        self.creds.store(Some(Arc::new(fresh)));
         self.clear_sessions();
         Ok(())
     }
@@ -645,10 +697,7 @@ impl Store {
             return Ok(false);
         }
         match outcome {
-            Some(updated) => {
-                self.persist_credentials(updated).await?;
-                Ok(true)
-            }
+            Some(updated) => self.persist_credentials(updated).await,
             None => Ok(false),
         }
     }
@@ -672,14 +721,23 @@ impl Store {
         *lock(&self.sessions) = SessionStore::new(self.session_ttl_secs, SESSION_IDLE_SECS);
     }
 
-    async fn persist_tokens(&self, tokens: &ApiTokens) -> Result<()> {
+    // Persists `next` and swaps it in, unless a reset replaced the token list since `tokens` was read.
+    async fn commit_tokens(&self, tokens: &mut ApiTokens, next: ApiTokens) -> Result<()> {
+        let seen = lock(&self.disk).tokens_gen;
         let stamped = Stamped {
-            generation: lock(&self.disk).tokens_gen,
-            value: tokens,
+            generation: seen,
+            value: &next,
         };
         let bytes = serde_json::to_vec_pretty(&stamped)?;
-        write_file(self.paths.tokens.clone(), bytes, 0o600).await?;
+        let lock_path = self.paths.auth_lock.clone();
+        let target = self.paths.tokens.clone();
+        let written = guarded_write(lock_path, target, seen, bytes).await?;
         lock(&self.disk).tokens_key = None;
+        if !written {
+            self.refresh_tokens(tokens);
+            return Err(superseded("api tokens"));
+        }
+        *tokens = next;
         Ok(())
     }
 
@@ -692,8 +750,7 @@ impl Store {
             AuthError::Weak(msg) => ConnectorError::Conflict(msg.to_string()),
             _ => ConnectorError::Internal("token generation failed".into()),
         })?;
-        self.persist_tokens(&next).await?;
-        *tokens = next;
+        self.commit_tokens(&mut tokens, next).await?;
         Ok(created)
     }
 
@@ -718,17 +775,14 @@ impl Store {
         if !next.revoke(id) {
             return Ok(false);
         }
-        self.persist_tokens(&next).await?;
-        *tokens = next;
+        self.commit_tokens(&mut tokens, next).await?;
         Ok(true)
     }
 
     pub async fn clear_api_tokens(&self) -> Result<()> {
         let mut tokens = self.tokens.lock().await;
         self.refresh_tokens(&mut tokens);
-        let empty = ApiTokens::new();
-        self.persist_tokens(&empty).await?;
-        *tokens = empty;
+        self.commit_tokens(&mut tokens, ApiTokens::new()).await?;
         Ok(())
     }
 }
@@ -994,6 +1048,81 @@ mod tests {
         reopened.clear_api_tokens().await.expect("clear");
         assert!(reopened.verify_api_token(&plain).await.is_none());
         assert!(!reopened.revoke_api_token("nothing").await.expect("revoke"));
+    }
+
+    // Stands in for the CLI: a reset written at a newer generation while the server holds older state.
+    fn write_reset(dir: &Path, generation: u64, secret: &str) {
+        let empty = Stamped {
+            generation,
+            value: ApiTokens::new(),
+        };
+        let mut reset = creds();
+        reset.totp_secret = secret.into();
+        let fresh = Stamped {
+            generation,
+            value: reset,
+        };
+        let tokens = serde_json::to_vec_pretty(&empty).expect("tokens");
+        let creds = serde_json::to_vec_pretty(&fresh).expect("creds");
+        write_atomic(&dir.join("tokens.json"), &tokens, 0o600).expect("write tokens");
+        write_atomic(&dir.join("credentials.json"), &creds, 0o600).expect("write creds");
+    }
+
+    #[tokio::test]
+    async fn a_server_token_write_cannot_undo_a_reset_that_landed_first() {
+        let (dir, running) = open_temp().await;
+        running.reset_credentials(creds()).await.expect("seed");
+        let held = lock_auth(&dir.path().join("auth.lock")).expect("lock");
+        let writer = Arc::clone(&running);
+        let task = tokio::spawn(async move { writer.create_api_token("backdoor").await });
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        write_reset(dir.path(), 5, "MFRGGZDFMZTWQ2LK");
+        drop(held);
+        let outcome = task.await.expect("join");
+        assert!(
+            matches!(outcome, Err(ConnectorError::Conflict(_))),
+            "{outcome:?}"
+        );
+        assert!(running.list_api_tokens().await.is_empty());
+        let disk = fs::read_to_string(dir.path().join("tokens.json")).expect("tokens");
+        assert!(!disk.contains("backdoor"), "{disk}");
+        assert_eq!(disk_generation(&dir.path().join("tokens.json")), 5);
+        let (_, fresh) = running.create_api_token("later").await.expect("token");
+        assert!(running.verify_api_token(&fresh).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_server_credential_write_cannot_undo_a_reset_that_landed_first() {
+        let (dir, running) = open_temp().await;
+        running.reset_credentials(creds()).await.expect("seed");
+        let held = lock_auth(&dir.path().join("auth.lock")).expect("lock");
+        let writer = Arc::clone(&running);
+        let task = tokio::spawn(async move { writer.set_credentials(creds()).await });
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        write_reset(dir.path(), 5, "MFRGGZDFMZTWQ2LK");
+        drop(held);
+        let outcome = task.await.expect("join");
+        assert!(
+            matches!(outcome, Err(ConnectorError::Conflict(_))),
+            "{outcome:?}"
+        );
+        let adopted = running.credentials().expect("credentials");
+        assert_eq!(adopted.totp_secret, "MFRGGZDFMZTWQ2LK");
+        assert_eq!(disk_generation(&dir.path().join("credentials.json")), 5);
+    }
+
+    #[tokio::test]
+    async fn a_reset_waits_for_a_write_that_holds_the_auth_lock() {
+        let (dir, store) = open_temp().await;
+        let held = lock_auth(&dir.path().join("auth.lock")).expect("lock");
+        let cli = Arc::clone(&store);
+        let reset = tokio::spawn(async move { cli.reset_credentials(creds()).await });
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(!reset.is_finished());
+        assert!(!dir.path().join("credentials.json").exists());
+        drop(held);
+        reset.await.expect("join").expect("reset");
+        assert!(dir.path().join("credentials.json").is_file());
     }
 
     #[tokio::test]

@@ -40,10 +40,21 @@ async fn perf_api_500_sites() {
     };
     store.set_credentials(creds).await.expect("credentials");
     let haproxy = Arc::new(Haproxy::new(&cfg));
-    let deployer = Arc::new(Deployer::new(Arc::clone(&store), Arc::clone(&haproxy), None));
+    let deployer = Arc::new(Deployer::new(
+        Arc::clone(&store),
+        Arc::clone(&haproxy),
+        None,
+    ));
     let retention = store.config().settings.retention.clone();
     let analytics = Arc::new(StdMutex::new(Analytics::new(retention)));
-    let state = Inner::new(cfg, Arc::clone(&store), haproxy, deployer, None, analytics.clone());
+    let state = Inner::new(
+        cfg,
+        Arc::clone(&store),
+        haproxy,
+        deployer,
+        None,
+        analytics.clone(),
+    );
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
     let task = tokio::spawn(serve(listener, state, None));
@@ -144,7 +155,10 @@ async fn perf_api_500_sites() {
         }
         report(&format!("GET {path}"), v);
     }
-    println!("analytics retained: {} MiB", analytics.lock().expect("lock").retained_bytes() >> 20);
+    println!(
+        "analytics retained: {} MiB",
+        analytics.lock().expect("lock").retained_bytes() >> 20
+    );
     task.abort();
 }
 

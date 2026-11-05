@@ -419,6 +419,17 @@ impl Orchestrator {
         Ok(manager.is_some_and(|c| c.running) && executor.is_some_and(|c| c.running))
     }
 
+    // The branch or tag the slot's manager was started with, if its container still exists.
+    pub async fn slot_ref(&self, site_id: &str, slot: Slot) -> Result<Option<String>> {
+        let names = StackNames::new(site_id, slot)?;
+        let manager = self.inspect_owned(&names.manager).await?;
+        Ok(manager.and_then(|c| {
+            c.env
+                .iter()
+                .find_map(|e| e.strip_prefix("CITE_BRANCH=").map(str::to_string))
+        }))
+    }
+
     pub async fn list_stacks(&self) -> Result<Vec<StackInfo>> {
         self.ensure_reconciled().await;
         self.list_stacks_raw().await
@@ -1326,7 +1337,7 @@ fn stream_error(line: &[u8]) -> Option<String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::{BTreeMap, HashSet};
     use std::convert::Infallible;
     use std::sync::{Arc, Mutex};
@@ -1344,7 +1355,7 @@ mod tests {
 
     const TOKEN: &str = "ghp_secrettoken123";
 
-    struct Ctr {
+    pub(crate) struct Ctr {
         spec: Value,
         running: bool,
     }
@@ -1356,7 +1367,7 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct Fake {
+    pub(crate) struct Fake {
         images: HashSet<String>,
         volumes: BTreeMap<String, Value>,
         networks: BTreeMap<String, Net>,
@@ -1614,7 +1625,7 @@ mod tests {
         }
     }
 
-    async fn start_fake() -> (Orchestrator, Arc<Mutex<Fake>>) {
+    pub(crate) async fn start_fake() -> (Orchestrator, Arc<Mutex<Fake>>) {
         start_fake_with(HAPROXY).await
     }
 
@@ -2270,6 +2281,21 @@ mod tests {
         let f = fake.lock().unwrap();
         let env = f.containers["cite-shop-blue-manager"].spec["Env"].to_string();
         assert!(env.contains("CITE_BRANCH=release/2"));
+    }
+
+    #[tokio::test]
+    async fn slot_ref_reports_the_branch_the_manager_runs() {
+        let (orch, _fake) = start_fake().await;
+        let s = site("shop", None);
+        assert_eq!(orch.slot_ref("shop", Slot::Green).await.unwrap(), None);
+        orch.ensure_stack(&s, Slot::Green, Some("v1"), TOKEN)
+            .await
+            .unwrap();
+        orch.stop_stack("shop", Slot::Green).await.unwrap();
+        assert_eq!(
+            orch.slot_ref("shop", Slot::Green).await.unwrap().as_deref(),
+            Some("v1")
+        );
     }
 
     #[tokio::test]

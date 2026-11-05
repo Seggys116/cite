@@ -27,7 +27,7 @@ use tokio_rustls::TlsAcceptor;
 use tower::Service;
 
 use crate::config::ConnectorConfig;
-use crate::deploy::Deployer;
+use crate::deploy::{Deployer, detach};
 use crate::haproxy::Haproxy;
 use crate::orchestrator::Orchestrator;
 use crate::store::{Store, now_unix, unix_to_rfc3339};
@@ -95,8 +95,22 @@ impl Inner {
         })
     }
 
-    // Validates and dry-renders before persisting, then applies; a failed apply restores the old config.
-    async fn mutate<T>(
+    // Runs to completion even when the caller goes away, so a half-applied change is never left behind.
+    async fn mutate<T: Send + 'static>(
+        self: &Arc<Self>,
+        actor: &str,
+        action: &str,
+        detail: &str,
+        f: impl FnOnce(&mut EdgeConfig) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let this = Arc::clone(self);
+        let (actor, action, detail) = (actor.to_string(), action.to_string(), detail.to_string());
+        detach(async move { this.mutate_now(&actor, &action, &detail, f).await }).await
+    }
+
+    // Validates and dry-renders before persisting, then applies; a failed apply restores the old config
+    // and puts it back into HAProxy.
+    async fn mutate_now<T>(
         &self,
         actor: &str,
         action: &str,
@@ -115,7 +129,12 @@ impl Inner {
                 Ok(value)
             })
             .await?;
-        if let Err(err) = self.haproxy.apply(&self.store.config()).await {
+        let loaded = self
+            .haproxy
+            .apply(&self.store.config())
+            .await
+            .and_then(|applied| applied.require_loaded());
+        if let Err(err) = loaded {
             let restored = Arc::clone(&previous);
             let undo = self
                 .store
@@ -124,12 +143,27 @@ impl Inner {
                     Ok(())
                 })
                 .await;
-            if let Err(e) = undo {
-                tracing::error!(error = %e, "could not restore the previous configuration");
+            match undo {
+                Ok(()) => {
+                    let again = self
+                        .haproxy
+                        .apply(&previous)
+                        .await
+                        .and_then(|applied| applied.require_loaded());
+                    if let Err(e) = again {
+                        tracing::warn!(error = %e, "haproxy could not re-apply the restored configuration");
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "could not restore the previous configuration")
+                }
             }
-            return Err(ConnectorError::Unavailable(format!(
-                "haproxy rejected the change: {err}"
-            )));
+            return Err(match err {
+                ConnectorError::BadRequest(msg) => ConnectorError::BadRequest(msg),
+                other => ConnectorError::Unavailable(format!(
+                    "haproxy could not apply the change: {other}"
+                )),
+            });
         }
         Ok(out)
     }
@@ -578,6 +612,8 @@ pub async fn run(cfg: ConnectorConfig) -> Result<()> {
         Arc::clone(&haproxy),
         orchestrator.clone(),
     ));
+    let reconciler = Arc::clone(&deployer);
+    tokio::spawn(async move { reconciler.reconcile_idle_stacks().await });
     let acceptor = if cfg.tls {
         Some(tls::load_acceptor(&cfg.tls_dir)?)
     } else {

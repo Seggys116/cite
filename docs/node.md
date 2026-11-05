@@ -10,7 +10,7 @@ This page covers installing, configuring and operating one Cite node: HAProxy pl
 | `haproxy` | `docker.io/library/haproxy:3.0-bookworm` | Public listener on ports 80 and 443. Reads its config from the `haproxy` and `certs` subpaths of `cite_conf`, mounted read-only. It cannot see the connector's credentials, tokens, secrets or TLS keys. |
 | `connector` | `ghcr.io/seggys116/cite-connector:${CITE_VERSION:-0.2.0}` | Authenticated API on 7443, renders the HAProxy config, receives HAProxy's logs, runs the optional orchestrator. |
 
-The two containers do not share a process namespace. They share one small volume, `cite_run`, mounted at `/run/cite` in both, which holds three unix sockets: HAProxy's admin socket (`admin.sock`), the master CLI (`master.sock`, from `-S /run/cite/master.sock,level,admin` on the HAProxy command) and the log datagram socket the connector binds (`log.sock`). The directory is owned by uid 10001 with mode 0750, the admin and log sockets are mode 0600, and no admin listener exists on any network. The connector reloads HAProxy by connecting to the master socket, sending `reload` and reading the reply: `Success=1` or `Success=0` followed by the loader output. It then checks that `show info` on the admin socket reports a new pid. If the master CLI is unreachable (HAProxy is not up yet at first boot), applying a config still succeeds with `reloaded` false and the reason in the status `last_error`. Both containers run as uid 10001 with a read-only root filesystem, `no-new-privileges` and all capabilities dropped.
+The two containers do not share a process namespace. They share one small volume, `cite_run`, mounted at `/run/cite` in both, which holds three unix sockets: HAProxy's admin socket (`admin.sock`), the master CLI (`master.sock`, from `-S /run/cite/master.sock,level,admin` on the HAProxy command) and the log datagram socket the connector binds (`log.sock`). The directory is owned by uid 10001 with mode 0750, the admin and log sockets are mode 0600, and no admin listener exists on any network. The connector reloads HAProxy by connecting to the master socket, sending `reload` and reading the reply: `Success=1` or `Success=0` followed by the loader output. It then checks that `show info` on the admin socket reports a new pid. A config counts as applied only after that check passes, so a refused or unconfirmed reload is retried on the next apply and fails the change that caused it. If the master CLI is unreachable (HAProxy is not up yet at first boot), applying a config still succeeds with `reloaded` false and the reason in the status `last_error`. Both containers run as uid 10001 with a read-only root filesystem, `no-new-privileges` and all capabilities dropped.
 
 Two networks exist. `public` is a normal bridge. `cite_edge` is internal, so containers on it have no route out. Orchestrated site executors are on `cite_edge` only, and HAProxy is on it to reach them. The connector stays on `public` only because Docker cannot publish ports from an internal-only network; it is not on `cite_edge`.
 
@@ -38,7 +38,7 @@ docker compose -f docker-compose.node.yml ps
 | TOTP key | Base32 key, `otpauth://` URI and a QR code. Codes are six digits with a 30 second step. |
 | CA certificate | Path and SHA-256 fingerprint of the node's certificate authority. |
 
-Save all of it. It cannot be shown again. `init` refuses to run when credentials exist and tells you to pass `--force` or use `reset-credentials`. A reset issues new credentials and revokes every API token. `reset-credentials` and `init --force` write a new generation number into `credentials.json` and `tokens.json`. A running connector notices the change on its next request, adopts the new credentials, drops the old API tokens and signs out every session, so no restart is needed.
+Save all of it. It cannot be shown again. `init` refuses to run when credentials exist and tells you to pass `--force` or use `reset-credentials`. A reset issues new credentials and revokes every API token. `reset-credentials` and `init --force` write a new generation number into `credentials.json` and `tokens.json`. A running connector notices the change on its next request, adopts the new credentials, drops the old API tokens and signs out every session, so no restart is needed. The CLI and the running connector take the same file lock (`auth.lock` in the data directory) around every credential and token write, and a connector write that started from older state is refused, so a reset cannot be undone by a request that was in flight.
 
 The connector API will not start without credentials, but it still writes the HAProxy config first so HAProxy can boot.
 
@@ -121,12 +121,14 @@ Back up the volume to keep sites, rules and credentials. Treat the backup as a s
 | Logs | `docker compose -f docker-compose.node.yml logs -f connector` |
 | Health | `docker compose -f docker-compose.node.yml ps` (the connector runs `cite-connector healthcheck` every 30 seconds) |
 | View the rendered config | `GET /api/v1/haproxy/config` |
-| Force a reload | `POST /api/v1/haproxy/reload` |
+| Force a reload | `POST /api/v1/haproxy/reload` (reloads even when the config is unchanged) |
 | Lost the password or TOTP device | Run the connector's `reset-credentials` subcommand the same way as `init`, then restart the connector |
 | Update | Set `CITE_VERSION`, `docker compose -f docker-compose.node.yml pull`, then `up -d` |
 
 The healthcheck requests `/api/v1/healthz` over the container's loopback address. The connector admits loopback peers for `/healthz` only, so the check works whatever the allowlist says.
 
-Every change is validated and dry-rendered before it is stored. If `haproxy -c` rejects the rendered config, or it cannot be installed, the change is refused and the previous stored configuration is restored. After a reload signal the connector waits up to five seconds for a new HAProxy worker. If none appears, `GET /api/v1/node` reports `haproxy.last_reload_ok` as false with the reason in `haproxy.last_error`.
+Every change is validated and dry-rendered before it is stored. If `haproxy -c` rejects the rendered config, it cannot be installed, or a running HAProxy refuses to load it, the change is refused and the previous stored configuration is restored and loaded again. After a reload signal the connector waits up to five seconds for a new HAProxy worker. If none appears, `GET /api/v1/node` reports `haproxy.last_reload_ok` as false with the reason in `haproxy.last_error`.
+
+After a connector restart the idle stack of each orchestrated site is stopped once its active slot passes health checks, since the drain timers do not survive a restart.
 
 See [Connector API](node-api.md) for every route, [Orchestrator](orchestrator.md) to build sites from GitHub, and [Security model](security-model.md) for what the node exposes.
