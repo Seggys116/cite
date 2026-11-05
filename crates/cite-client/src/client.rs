@@ -199,6 +199,16 @@ fn body_of<B: Serialize + ?Sized>(body: &B) -> Res<Option<Value>> {
         .map_err(|e| ClientError::Config(format!("cannot encode request: {e}")))
 }
 
+fn create_site_body(site: &Site, github_token: Option<&str>) -> Res<Option<Value>> {
+    let mut body = serde_json::to_value(site)
+        .map_err(|e| ClientError::Config(format!("cannot encode request: {e}")))?;
+    if let (Some(token), Some(obj)) = (github_token.filter(|t| !t.is_empty()), body.as_object_mut())
+    {
+        obj.insert("github_token".to_string(), Value::String(token.to_string()));
+    }
+    Ok(Some(body))
+}
+
 fn error_message(bytes: &[u8], status: reqwest::StatusCode) -> String {
     let parsed = serde_json::from_slice::<Value>(bytes).ok();
     let text = parsed
@@ -424,8 +434,15 @@ impl NodeClient {
         Ok(SiteDetail { site, live })
     }
 
-    pub async fn create_site(&self, site: &Site) -> Res<Site> {
-        self.json(Method::POST, "/sites", &[], body_of(site)?).await
+    // The connector reads the GitHub token from a top-level field and never from the Site itself.
+    pub async fn create_site(&self, site: &Site, github_token: Option<&str>) -> Res<Site> {
+        self.json(
+            Method::POST,
+            "/sites",
+            &[],
+            create_site_body(site, github_token)?,
+        )
+        .await
     }
 
     pub async fn update_site(&self, id: &str, site: &Site) -> Res<Site> {

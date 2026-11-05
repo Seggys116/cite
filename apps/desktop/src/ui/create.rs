@@ -6,7 +6,8 @@ use gpui::{AnyElement, Context, Entity, div, prelude::*, px};
 use crate::api::apply_to_handles;
 use crate::app::{Console, View, new_input};
 use crate::model::{
-    Placement, SiteDraft, build_site, plan_placement, regex_matches, regex_problem, slugify,
+    Placement, SiteDraft, build_site, draft_github_token, plan_placement, regex_matches,
+    regex_problem, slugify,
 };
 use crate::theme::{DIM, Tone, c};
 use crate::ui::input::{InputEvent, TextInput};
@@ -123,7 +124,9 @@ impl Console {
         if self.create.busy {
             return;
         }
-        let site = match build_site(&self.draft(cx)) {
+        let draft = self.draft(cx);
+        let github_token = draft_github_token(&draft);
+        let site = match build_site(&draft) {
             Ok(s) => s,
             Err(e) => {
                 self.create.error = Some(e);
@@ -138,6 +141,7 @@ impl Console {
             &selected,
             &all,
             &Default::default(),
+            github_token,
         );
         let (nodes, plan) = match planned {
             Ok(v) => v,

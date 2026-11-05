@@ -112,10 +112,10 @@ async fn setup_begin(
         return Err(ApiError::not_found("not found"));
     }
     let now = now_unix();
-    let key = format!("setup:{ip}");
+    let key = format!("setup:{}", security::limiter_key(ip));
     limiter_check(&s, &key, now)?;
     if !s.setup_token_matches(&body.setup_token) {
-        lock(&s.limiter).record_failure(&key, now);
+        lock(&s.limiter).record_failure_local(&key, now);
         return Err(ApiError::forbidden("the setup token is not valid"));
     }
     let username = body.username.trim().to_string();
@@ -164,13 +164,13 @@ async fn setup_confirm(
     PeerIp(ip): PeerIp,
     ApiJson(body): ApiJson<ConfirmBody>,
 ) -> Result<Json<Value>, ApiError> {
+    let now = now_unix();
+    let key = format!("setup:{}", security::limiter_key(ip));
+    limiter_check(&s, &key, now)?;
     let _gate = s.write_gate.lock().await;
     if !s.needs_onboarding().await {
         return Err(ApiError::not_found("not found"));
     }
-    let now = now_unix();
-    let key = format!("setup:{ip}");
-    limiter_check(&s, &key, now)?;
     let pending = lock(&s.pending).clone();
     let Some(pending) = pending.filter(|p| now.saturating_sub(p.created) <= SETUP_TTL_SECS) else {
         return Err(ApiError::bad_request(
@@ -179,7 +179,7 @@ async fn setup_confirm(
     };
     let mut step = 0u64;
     if !totp::verify(&pending.secret, body.code.trim(), now, &mut step) {
-        lock(&s.limiter).record_failure(&key, now);
+        lock(&s.limiter).record_failure_local(&key, now);
         return Err(ApiError::bad_request("that code is not valid"));
     }
     lock(&s.limiter).record_success(&key);
@@ -214,10 +214,8 @@ async fn session_login(
     PeerIp(ip): PeerIp,
     ApiJson(body): ApiJson<LoginBody>,
 ) -> Result<Response, ApiError> {
-    // Serializing logins also serializes the TOTP step, so one code cannot be replayed in parallel.
-    let _gate = s.write_gate.lock().await;
     let now = now_unix();
-    let key = ip.to_string();
+    let key = security::limiter_key(ip);
     limiter_check(&s, &key, now)?;
     let Some(mut creds) = s.config_snapshot().await.admin else {
         return Err(ApiError::conflict("onboarding is not complete"));
@@ -227,18 +225,42 @@ async fn session_login(
         password,
         totp: code,
     } = body;
+    // Only attempts naming the real account count toward the global lock, so a stranger cannot arm it.
+    let targets_admin = username == creds.username;
+    let verified = creds.clone();
+    // Argon2 runs without the write gate so slow logins never delay node changes.
     let (result, creds) = tokio::task::spawn_blocking(move || {
         let result = authenticate(&mut creds, &username, &password, &code, now);
         (result, creds)
     })
     .await
     .map_err(ApiError::internal)?;
+    let reject = |s: &AppState| {
+        let mut limiter = lock(&s.limiter);
+        if targets_admin {
+            limiter.record_failure(&key, now);
+        } else {
+            limiter.record_failure_local(&key, now);
+        }
+        ApiError::unauthorized("invalid credentials")
+    };
     if result.is_err() {
-        lock(&s.limiter).record_failure(&key, now);
-        return Err(ApiError::unauthorized("invalid credentials"));
+        return Err(reject(&s));
+    }
+    // The gate serializes the TOTP step, so one code cannot be replayed by parallel logins.
+    let _gate = s.write_gate.lock().await;
+    let mut cfg = s.config_snapshot().await;
+    let current = cfg.admin.as_ref();
+    let still_valid = current.is_some_and(|c| {
+        c.username == verified.username
+            && c.password_hash == verified.password_hash
+            && c.totp_secret == verified.totp_secret
+            && c.totp_last_step < creds.totp_last_step
+    });
+    if !still_valid {
+        return Err(reject(&s));
     }
     lock(&s.limiter).record_success(&key);
-    let mut cfg = s.config_snapshot().await;
     cfg.admin = Some(creds.clone());
     s.commit_config(cfg).await?;
     let (token, expires) = lock(&s.sessions)
@@ -468,15 +490,10 @@ async fn deployments(
         .github_token
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty());
-    if let Some(token) = token {
-        let Some(source) = site.source.as_mut() else {
-            return Err(ApiError::bad_request(
-                "github_token needs a site with a source",
-            ));
-        };
-        if source.secret.is_none() {
-            source.secret = Some(token);
-        }
+    if token.is_some() && site.source.is_none() {
+        return Err(ApiError::bad_request(
+            "github_token needs a site with a source",
+        ));
     }
     let mut clients = Vec::new();
     let mut outcomes: HashMap<String, NodeOutcome> = HashMap::new();
@@ -493,6 +510,7 @@ async fn deployments(
         site,
         mode: body.mode,
         per_node: body.per_node,
+        github_token: token,
     };
     for outcome in apply_plan(&clients, &plan).await {
         outcomes.insert(outcome.node.clone(), outcome);

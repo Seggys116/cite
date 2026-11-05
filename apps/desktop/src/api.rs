@@ -82,9 +82,9 @@ impl NodeHandle {
         }
     }
 
-    pub async fn create_site(&self, site: &Site) -> Res<Site> {
+    pub async fn create_site(&self, site: &Site, github_token: Option<&str>) -> Res<Site> {
         match self {
-            Self::Live(c) => c.create_site(site).await,
+            Self::Live(c) => c.create_site(site, github_token).await,
             Self::Demo(_, d) => d.create_site(site),
         }
     }
@@ -332,13 +332,15 @@ pub async fn apply_to_handles(
     for h in demo {
         let mut site = plan.site_for(h.name());
         let result = match plan.mode {
-            cite_client::ReplicationMode::Each => h.create_site(&site).await.map(|_| "created"),
+            cite_client::ReplicationMode::Each => {
+                h.create_site(&site, None).await.map(|_| "created")
+            }
             cite_client::ReplicationMode::Replicate => match h.get_site(&site.id).await {
                 Ok(existing) => {
                     site.history = existing.site.history;
                     h.update_site(&site.id, &site).await.map(|_| "updated")
                 }
-                Err(_) => h.create_site(&site).await.map(|_| "created"),
+                Err(_) => h.create_site(&site, None).await.map(|_| "created"),
             },
         };
         outcomes.push(match result {

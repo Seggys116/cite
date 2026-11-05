@@ -12,12 +12,13 @@ use cite_client::{
     apply_site_to_nodes, fan_out,
 };
 use cite_edge::analytics::Summary;
-use cite_edge::model::{HealthCheck, Maintenance, Site, SiteKind, Slot, Target, Upstream};
+use cite_edge::model::{HealthCheck, Maintenance, Site, SiteKind, Slot, Source, Target, Upstream};
 use serde_json::{Value, json};
 
 struct Fake {
     token: String,
     sites: Mutex<Vec<Value>>,
+    created_bodies: Mutex<Vec<Value>>,
     delay_ms: u64,
     in_flight: AtomicUsize,
     max_in_flight: AtomicUsize,
@@ -31,6 +32,7 @@ fn fake(token: &str, delay_ms: u64) -> Shared {
     Arc::new(Fake {
         token: token.to_string(),
         sites: Mutex::new(Vec::new()),
+        created_bodies: Mutex::new(Vec::new()),
         delay_ms,
         in_flight: AtomicUsize::new(0),
         max_in_flight: AtomicUsize::new(0),
@@ -107,10 +109,14 @@ async fn list_sites(State(s): State<Shared>, headers: HeaderMap) -> Response {
 async fn create_site(
     State(s): State<Shared>,
     headers: HeaderMap,
-    Json(body): Json<Value>,
+    Json(mut body): Json<Value>,
 ) -> Response {
     if let Err(resp) = check(&s, &headers) {
         return resp;
+    }
+    s.created_bodies.lock().expect("lock").push(body.clone());
+    if let Some(obj) = body.as_object_mut() {
+        obj.remove("github_token");
     }
     let mut sites = s.sites.lock().expect("lock");
     if sites.iter().any(|x| x["id"] == body["id"]) {
@@ -371,7 +377,7 @@ async fn site_routes_round_trip() {
     let url = spawn(fake("cite_good", 0)).await;
     let c = client("n1", &url, "cite_good");
     assert!(c.list_sites().await.expect("list").is_empty());
-    let created = c.create_site(&site("shop")).await.expect("create");
+    let created = c.create_site(&site("shop"), None).await.expect("create");
     assert_eq!(created.id, "shop");
     let detail = c.get_site("shop").await.expect("get");
     assert_eq!(detail.site, site("shop"));
@@ -575,4 +581,51 @@ fn each_mode_uses_the_per_node_targets_and_replicate_ignores_them() {
     let replicate = ReplicationPlan::new(seeded.clone(), ReplicationMode::Replicate)
         .with_node_targets("edge-a", override_targets);
     assert_eq!(replicate.site_for("edge-a"), seeded);
+}
+
+#[tokio::test]
+async fn create_site_sends_the_github_token_beside_the_site() {
+    let fake = fake("cite_good", 0);
+    let c = client("n1", &spawn(fake.clone()).await, "cite_good");
+    let mut with_source = site("shop");
+    with_source.source = Some(Source {
+        repo: "acme/shop".into(),
+        branch: None,
+        runtime: None,
+        node_major: None,
+        poll_interval: None,
+        secret: None,
+    });
+    c.create_site(&with_source, Some("ghp_example"))
+        .await
+        .expect("create");
+    let mut expected = serde_json::to_value(&with_source).expect("json");
+    expected["github_token"] = json!("ghp_example");
+    let stored = fake.created_bodies.lock().expect("lock")[0].clone();
+    assert_eq!(stored, expected);
+    assert!(stored["source"]["secret"].is_null());
+}
+
+#[tokio::test]
+async fn plans_pass_the_token_to_create_and_hide_it_from_debug() {
+    let fake = fake("cite_good", 0);
+    let clients = vec![client("n1", &spawn(fake.clone()).await, "cite_good")];
+    let plan = ReplicationPlan::new(site("shop"), ReplicationMode::Each)
+        .with_github_token(Some("ghp_example".into()));
+    assert!(!format!("{plan:?}").contains("ghp_example"));
+    let outcomes = cite_client::apply_plan(&clients, &plan).await;
+    assert!(outcomes[0].ok);
+    assert_eq!(
+        fake.created_bodies.lock().expect("lock")[0]["github_token"],
+        "ghp_example"
+    );
+    clients[0]
+        .create_site(&site("blog"), None)
+        .await
+        .expect("create");
+    assert!(
+        fake.created_bodies.lock().expect("lock")[1]
+            .get("github_token")
+            .is_none()
+    );
 }

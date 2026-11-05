@@ -18,6 +18,8 @@ The first visit shows a setup form. Until an account exists, the dashboard print
 
 The Sign out action in the top bar and the command palette ends the session.
 
+The session cookie is named `cite_session` over plain HTTP. When the cookie is Secure (TLS, or `CITE_DASHBOARD_COOKIE_SECURE=true`) it is named `__Host-cite_session` with `Path=/` and no `Domain`, so a sibling subdomain cannot plant a copy. A request that carries more than one cookie with the session name is treated as signed out. Failed sign-ins are rate limited per client address (IPv6 clients are grouped by /64), and only attempts that name the real account count toward the dashboard-wide lockout.
+
 ## Nodes
 
 A node is a connector. Add one with a name, its connector URL (for example `https://edge.example.com:8443`) and a connector API token. Create the token with `POST /api/v1/tokens` on the connector, using a session from `POST /api/v1/auth/login`. The token is shown once.
@@ -53,6 +55,7 @@ A command palette offers shortcuts to views, Create site, Add firewall rule, Add
 | Blue and green targets | `host:port` addresses for each slot. At least one blue target is required. |
 | Health check path | Must start with `/`. The form sends an interval of 2000 ms, a timeout of 1500 ms, 2 passes to be healthy and 3 failures to be down. |
 | Placement | Selected nodes, or Replicate to all nodes. |
+| GitHub token | Optional, for private repositories. It is sent to the connector beside the site definition, never stored in the site or on the dashboard, and never returned. |
 
 The new site starts with the blue slot active. The form sends one request to the dashboard server with the chosen nodes and the site definition. With Replicate to all nodes the same site is created on every connected node, each with its own targets, so use addresses that mean the same thing on each.
 

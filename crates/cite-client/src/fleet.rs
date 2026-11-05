@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::fmt;
 use std::future::Future;
 use std::time::Duration;
 
@@ -58,11 +59,27 @@ pub struct NodeTargets {
     pub green: Option<Vec<Target>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ReplicationPlan {
     pub site: Site,
     pub mode: ReplicationMode,
     pub per_node: BTreeMap<String, NodeTargets>,
+    pub github_token: Option<String>,
+}
+
+// The token is deliberately left out so a logged plan never reveals it.
+impl fmt::Debug for ReplicationPlan {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ReplicationPlan")
+            .field("site", &self.site)
+            .field("mode", &self.mode)
+            .field("per_node", &self.per_node)
+            .field(
+                "github_token",
+                &self.github_token.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 impl ReplicationPlan {
@@ -71,7 +88,13 @@ impl ReplicationPlan {
             site,
             mode,
             per_node: BTreeMap::new(),
+            github_token: None,
         }
+    }
+
+    pub fn with_github_token(mut self, token: Option<String>) -> Self {
+        self.github_token = token.filter(|t| !t.is_empty());
+        self
     }
 
     pub fn with_node_targets(mut self, node: impl Into<String>, targets: NodeTargets) -> Self {
@@ -122,10 +145,11 @@ async fn apply_one(
     client: NodeClient,
     mut site: Site,
     mode: ReplicationMode,
+    github_token: Option<&str>,
 ) -> Result<&'static str, ClientError> {
     match mode {
         ReplicationMode::Each => {
-            client.create_site(&site).await?;
+            client.create_site(&site, github_token).await?;
             Ok("created")
         }
         ReplicationMode::Replicate => match client.get_site(&site.id).await {
@@ -135,7 +159,7 @@ async fn apply_one(
                 Ok("updated")
             }
             Err(err) if err.status_code() == Some(404) => {
-                client.create_site(&site).await?;
+                client.create_site(&site, github_token).await?;
                 Ok("created")
             }
             Err(err) => Err(err),
@@ -146,7 +170,7 @@ async fn apply_one(
 pub async fn apply_plan(clients: &[NodeClient], plan: &ReplicationPlan) -> Vec<NodeOutcome> {
     let results = fan_out(clients, DEFAULT_FAN_OUT_LIMIT, None, |client| {
         let site = plan.site_for(client.name());
-        apply_one(client, site, plan.mode)
+        apply_one(client, site, plan.mode, plan.github_token.as_deref())
     })
     .await;
     results

@@ -41,6 +41,11 @@ impl LoginLimiter {
 
     pub fn record_failure(&mut self, key: &str, now: u64) {
         self.record_global(now);
+        self.record_failure_local(key, now);
+    }
+
+    // Counts against the key only, for failures that are cheap to forge and must not arm the global lock.
+    pub fn record_failure_local(&mut self, key: &str, now: u64) {
         if !self.keys.contains_key(key) && self.keys.len() >= MAX_KEYS {
             self.evict_oldest();
         }
@@ -141,6 +146,17 @@ mod tests {
         for _ in 0..n {
             l.record_failure(key, now);
         }
+    }
+
+    #[test]
+    fn local_failures_never_arm_the_global_lock() {
+        let mut l = LoginLimiter::new();
+        for i in 0..200 {
+            l.record_failure_local(&format!("k{i}"), 10);
+        }
+        assert_eq!(l.check("fresh", 10), Ok(()));
+        fail_n(&mut l, "ip", 5, 10);
+        assert_eq!(l.check("ip", 10), Err(30));
     }
 
     #[test]

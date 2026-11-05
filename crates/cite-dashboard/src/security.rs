@@ -14,6 +14,7 @@ use crate::error::ApiError;
 use crate::state::{AppState, lock, now_unix};
 
 pub const COOKIE_NAME: &str = "cite_session";
+pub const SECURE_COOKIE_NAME: &str = "__Host-cite_session";
 pub const CSRF_HEADER: &str = "x-cite-csrf";
 
 const CSP: &str = "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; \
@@ -53,30 +54,57 @@ impl<S: Send + Sync> FromRequestParts<S> for PeerIp {
     }
 }
 
+// IPv6 peers share one key per /64, since a single subscriber routinely controls the whole prefix.
+pub fn limiter_key(ip: IpAddr) -> String {
+    match ip.to_canonical() {
+        IpAddr::V4(v4) => v4.to_string(),
+        IpAddr::V6(v6) => {
+            let seg = v6.segments();
+            format!("{:x}:{:x}:{:x}:{:x}::/64", seg[0], seg[1], seg[2], seg[3])
+        }
+    }
+}
+
 // The token is derived from the session secret, so it needs no storage and dies with the session.
 pub fn csrf_for(session_token: &str) -> String {
     hash_token(&format!("cite-csrf:{session_token}"))
 }
 
+// The __Host- prefix makes browsers refuse a copy planted by a sibling subdomain (no Domain, Path=/, Secure).
+pub fn cookie_name(secure: bool) -> &'static str {
+    if secure {
+        SECURE_COOKIE_NAME
+    } else {
+        COOKIE_NAME
+    }
+}
+
 pub fn session_cookie(secure: bool, token: &str, max_age: u64) -> String {
+    let name = cookie_name(secure);
     let mut cookie =
-        format!("{COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={max_age}");
+        format!("{name}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={max_age}");
     if secure {
         cookie.push_str("; Secure");
     }
     cookie
 }
 
-pub fn cookie_token(headers: &HeaderMap) -> Option<&str> {
-    headers
+// More than one cookie with the session name is treated as unauthenticated, since a planted copy could shadow the real one.
+pub fn cookie_token(headers: &HeaderMap, secure: bool) -> Option<&str> {
+    let name = cookie_name(secure);
+    let mut matching = headers
         .get_all(header::COOKIE)
         .iter()
         .filter_map(|v| v.to_str().ok())
         .flat_map(|line| line.split(';'))
         .filter_map(|pair| pair.trim().split_once('='))
-        .find(|(name, _)| *name == COOKIE_NAME)
-        .map(|(_, value)| value)
-        .filter(|v| !v.is_empty() && v.len() <= 128)
+        .filter(|(n, _)| *n == name)
+        .map(|(_, value)| value);
+    let first = matching.next()?;
+    if matching.next().is_some() {
+        return None;
+    }
+    Some(first).filter(|v| !v.is_empty() && v.len() <= 128)
 }
 
 fn request_host(req: &Request) -> Option<String> {
@@ -151,7 +179,9 @@ pub async fn api_guard(
     if is_pre_auth(req.method(), req.uri().path()) {
         return next.run(req).await;
     }
-    let Some(token) = cookie_token(req.headers()).map(str::to_string) else {
+    let Some(token) =
+        cookie_token(req.headers(), state.settings.cookie_secure()).map(str::to_string)
+    else {
         return ApiError::unauthorized("not signed in").into_response();
     };
     let info = lock(&state.sessions).validate(&token, now_unix());
@@ -245,13 +275,56 @@ mod tests {
     #[test]
     fn cookie_token_finds_the_session_among_other_cookies() {
         let h = headers(&[("cookie", "theme=dark; cite_session=cite_abc; other=1")]);
-        assert_eq!(cookie_token(&h), Some("cite_abc"));
-        assert_eq!(cookie_token(&headers(&[("cookie", "cite_session=")])), None);
+        assert_eq!(cookie_token(&h, false), Some("cite_abc"));
         assert_eq!(
-            cookie_token(&headers(&[("cookie", "xcite_session=a")])),
+            cookie_token(&headers(&[("cookie", "cite_session=")]), false),
             None
         );
-        assert_eq!(cookie_token(&HeaderMap::new()), None);
+        assert_eq!(
+            cookie_token(&headers(&[("cookie", "xcite_session=a")]), false),
+            None
+        );
+        assert_eq!(cookie_token(&HeaderMap::new(), false), None);
+    }
+
+    #[test]
+    fn duplicate_session_cookies_are_unauthenticated() {
+        let same_line = headers(&[("cookie", "cite_session=cite_a; cite_session=cite_b")]);
+        assert_eq!(cookie_token(&same_line, false), None);
+        let two_lines = headers(&[
+            ("cookie", "cite_session=cite_a"),
+            ("cookie", "cite_session=cite_b"),
+        ]);
+        assert_eq!(cookie_token(&two_lines, false), None);
+        let secure = headers(&[(
+            "cookie",
+            "__Host-cite_session=cite_a; __Host-cite_session=cite_b",
+        )]);
+        assert_eq!(cookie_token(&secure, true), None);
+    }
+
+    #[test]
+    fn secure_cookies_use_the_host_prefix_and_ignore_the_plain_name() {
+        let h = headers(&[("cookie", "cite_session=cite_x; __Host-cite_session=cite_ok")]);
+        assert_eq!(cookie_token(&h, true), Some("cite_ok"));
+        assert_eq!(cookie_token(&h, false), Some("cite_x"));
+        let secure = session_cookie(true, "t", 60);
+        assert!(secure.starts_with("__Host-cite_session=t; Path=/;"));
+        assert!(!secure.contains("Domain"));
+        assert!(session_cookie(false, "t", 60).starts_with("cite_session=t;"));
+    }
+
+    #[test]
+    fn limiter_keys_group_ipv6_by_prefix() {
+        let key = |s: &str| limiter_key(s.parse().expect("ip"));
+        assert_eq!(key("203.0.113.9"), "203.0.113.9");
+        assert_ne!(key("203.0.113.9"), key("203.0.113.10"));
+        assert_eq!(
+            key("2001:db8:1:2::1"),
+            key("2001:db8:1:2:ffff:ffff:ffff:ffff")
+        );
+        assert_ne!(key("2001:db8:1:2::1"), key("2001:db8:1:3::1"));
+        assert_eq!(key("::ffff:203.0.113.9"), "203.0.113.9");
     }
 
     #[test]

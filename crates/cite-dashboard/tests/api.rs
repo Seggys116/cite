@@ -61,6 +61,7 @@ fn admin() -> Credentials {
 struct Fake {
     token: String,
     sites: Mutex<Vec<Value>>,
+    created_bodies: Mutex<Vec<Value>>,
     node_hits: AtomicUsize,
 }
 
@@ -70,6 +71,7 @@ fn new_fake(token: &str) -> Shared {
     Arc::new(Fake {
         token: token.to_string(),
         sites: Mutex::new(Vec::new()),
+        created_bodies: Mutex::new(Vec::new()),
         node_hits: AtomicUsize::new(0),
     })
 }
@@ -152,10 +154,14 @@ async fn list_sites(State(f): State<Shared>, headers: HeaderMap) -> Response {
 async fn create_site(
     State(f): State<Shared>,
     headers: HeaderMap,
-    Json(body): Json<Value>,
+    Json(mut body): Json<Value>,
 ) -> Response {
     if !authorized(&f, &headers) {
         return err(StatusCode::UNAUTHORIZED, "unauthorized");
+    }
+    f.created_bodies.lock().expect("lock").push(body.clone());
+    if let Some(obj) = body.as_object_mut() {
+        obj.remove("github_token");
     }
     let mut sites = f.sites.lock().expect("lock");
     if sites.iter().any(|s| s["id"] == body["id"]) {
@@ -1314,7 +1320,7 @@ async fn deployments_validate_their_input() {
 }
 
 #[tokio::test]
-async fn a_github_token_is_attached_to_the_site_source_and_not_echoed() {
+async fn a_github_token_is_sent_beside_the_site_and_not_echoed() {
     let fake = new_fake(NODE_TOKEN);
     let url = spawn_fake(fake.clone()).await;
     let h = harness_with_nodes(&[("edge-1", url.as_str(), NODE_TOKEN)]);
@@ -1344,8 +1350,11 @@ async fn a_github_token_is_attached_to_the_site_source_and_not_echoed() {
     .await;
     assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
     assert!(!reply.text().contains("ghp_example_token"));
-    let stored = fake.sites.lock().expect("lock")[0].clone();
-    assert_eq!(stored["source"]["secret"], "ghp_example_token");
+    let stored = fake.created_bodies.lock().expect("lock")[0].clone();
+    assert_eq!(stored["github_token"], "ghp_example_token");
+    assert!(stored["source"]["secret"].is_null());
+    let on_disk = std::fs::read_to_string(&h.config_path).expect("config");
+    assert!(!on_disk.contains("ghp_example_token"));
 }
 
 #[tokio::test]
@@ -1500,4 +1509,95 @@ async fn stored_previews_are_served_sandboxed_to_signed_in_users_only() {
     )
     .await;
     assert_eq!(missing.status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn secure_sessions_name_the_cookie_with_the_host_prefix() {
+    let h = harness_with(
+        onboarded(),
+        &[],
+        &[("CITE_DASHBOARD_COOKIE_SECURE", "true")],
+    );
+    let body = json!({ "username": "admin", "password": PASSWORD, "totp": code(0) });
+    let reply = send_json(&h.app, Method::POST, "/api/v1/session", &[], body).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+    let set_cookie = reply.header("set-cookie");
+    assert!(set_cookie.starts_with("__Host-cite_session=cite_"));
+    assert!(set_cookie.contains("Path=/") && set_cookie.contains("Secure"));
+    assert!(!set_cookie.contains("Domain"));
+    let pair = set_cookie.split(';').next().expect("pair").to_string();
+    let ok = get_path(&h.app, "/api/v1/session", &[("cookie", pair.as_str())]).await;
+    assert_eq!(ok.status, StatusCode::OK);
+    let planted = format!("{pair}; {pair}x");
+    let dup = get_path(&h.app, "/api/v1/session", &[("cookie", planted.as_str())]).await;
+    assert_eq!(dup.status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn a_planted_duplicate_session_cookie_is_unauthenticated() {
+    let h = harness();
+    let s = login(&h).await;
+    let planted = format!("cite_session=cite_planted; {}", s.cookie);
+    let reply = get_path(&h.app, "/api/v1/session", &[("cookie", planted.as_str())]).await;
+    assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn failures_for_unknown_usernames_never_lock_the_real_operator() {
+    let h = harness();
+    for i in 0..120 {
+        let body =
+            json!({ "username": format!("stranger{}", i % 3), "password": "x", "totp": "000000" });
+        let reply = call_from(&h.app, i, body).await;
+        assert_ne!(reply, StatusCode::TOO_MANY_REQUESTS, "attempt {i}");
+    }
+    let _ok = login(&h).await;
+}
+
+#[tokio::test]
+async fn ipv6_peers_in_one_prefix_share_a_limiter_key() {
+    let h = harness();
+    let body = || json!({ "username": "admin", "password": "wrong password", "totp": "000000" });
+    for i in 0..5u16 {
+        let peer = SocketAddr::from(([0x2001, 0xdb8, 1, 2, i, 0, 0, 1], 4000));
+        assert_eq!(
+            post_login_from(&h.app, peer, body()).await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    let sibling = SocketAddr::from(([0x2001, 0xdb8, 1, 2, 9, 9, 9, 9], 4000));
+    assert_eq!(
+        post_login_from(&h.app, sibling, body()).await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+}
+
+#[tokio::test]
+async fn a_slow_login_does_not_hold_the_write_gate() {
+    let h = harness();
+    let _held = h.state.write_gate.lock().await;
+    let body = json!({ "username": "stranger", "password": "x", "totp": "000000" });
+    let reply = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        post_login_from(&h.app, SocketAddr::from(([203, 0, 113, 50], 1)), body),
+    )
+    .await
+    .expect("a failing login must not wait on the write gate");
+    assert_eq!(reply, StatusCode::UNAUTHORIZED);
+}
+
+async fn post_login_from(app: &Router, peer: SocketAddr, body: Value) -> StatusCode {
+    let mut req = Request::builder()
+        .method(Method::POST)
+        .uri("/api/v1/session")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_vec(&body).expect("encode")))
+        .expect("request");
+    req.extensions_mut().insert(ConnectInfo(peer));
+    app.clone().oneshot(req).await.expect("response").status()
+}
+
+async fn call_from(app: &Router, i: u32, body: Value) -> StatusCode {
+    let peer = SocketAddr::from(([198, 51, (i / 250) as u8, (i % 250) as u8 + 1], 1));
+    post_login_from(app, peer, body).await
 }

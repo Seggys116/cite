@@ -484,7 +484,7 @@ pub fn build_site(draft: &SiteDraft) -> Result<Site, String> {
         runtime: None,
         node_major: None,
         poll_interval: None,
-        secret: Some(draft.github_token.trim().to_string()).filter(|t| !t.is_empty()),
+        secret: None,
     });
     let site = Site {
         id: draft.id.trim().to_string(),
@@ -523,6 +523,12 @@ pub enum Placement {
     ReplicateAll,
 }
 
+// The token travels beside the site, never inside it, and only applies when a repository is set.
+pub fn draft_github_token(draft: &SiteDraft) -> Option<String> {
+    let token = draft.github_token.trim();
+    (!token.is_empty() && !draft.repo.trim().is_empty()).then(|| token.to_string())
+}
+
 // Resolves which nodes receive the site and the plan that describes how each one gets it.
 pub fn plan_placement(
     site: &Site,
@@ -530,6 +536,7 @@ pub fn plan_placement(
     selected: &[String],
     all: &[String],
     overrides: &BTreeMap<String, NodeTargets>,
+    github_token: Option<String>,
 ) -> Result<(Vec<String>, ReplicationPlan), String> {
     let (nodes, mode) = match placement {
         Placement::Selected => (selected.to_vec(), ReplicationMode::Each),
@@ -538,7 +545,7 @@ pub fn plan_placement(
     if nodes.is_empty() {
         return Err("Pick at least one node.".into());
     }
-    let mut plan = ReplicationPlan::new(site.clone(), mode);
+    let mut plan = ReplicationPlan::new(site.clone(), mode).with_github_token(github_token);
     for (node, targets) in overrides {
         if nodes.contains(node) {
             plan = plan.with_node_targets(node.clone(), targets.clone());
@@ -891,7 +898,23 @@ mod tests {
         let site = build_site(&d).expect("valid");
         let source = site.source.expect("source");
         assert_eq!(source.branch.as_deref(), Some("main"));
-        assert_eq!(source.secret.as_deref(), Some("ghp_secret"));
+        assert_eq!(source.secret, None);
+        assert_eq!(draft_github_token(&d).as_deref(), Some("ghp_secret"));
+        let site = build_site(&d).expect("valid");
+        let all = vec!["a".to_string()];
+        let (_, plan) = plan_placement(
+            &site,
+            &Placement::Selected,
+            &["a".into()],
+            &all,
+            &BTreeMap::new(),
+            draft_github_token(&d),
+        )
+        .expect("plan");
+        assert_eq!(plan.github_token.as_deref(), Some("ghp_secret"));
+        assert!(!format!("{plan:?}").contains("ghp_secret"));
+        d.repo.clear();
+        assert_eq!(draft_github_token(&d), None);
     }
 
     #[test]
@@ -904,16 +927,33 @@ mod tests {
             &["b".into()],
             &all,
             &BTreeMap::new(),
+            None,
         )
         .expect("plan");
         assert_eq!(nodes, vec!["b".to_string()]);
         assert_eq!(plan.mode, ReplicationMode::Each);
-        let (nodes, plan) =
-            plan_placement(&site, &Placement::ReplicateAll, &[], &all, &BTreeMap::new())
-                .expect("plan");
+        let (nodes, plan) = plan_placement(
+            &site,
+            &Placement::ReplicateAll,
+            &[],
+            &all,
+            &BTreeMap::new(),
+            None,
+        )
+        .expect("plan");
         assert_eq!(nodes.len(), 2);
         assert_eq!(plan.mode, ReplicationMode::Replicate);
-        assert!(plan_placement(&site, &Placement::Selected, &[], &all, &BTreeMap::new()).is_err());
+        assert!(
+            plan_placement(
+                &site,
+                &Placement::Selected,
+                &[],
+                &all,
+                &BTreeMap::new(),
+                None
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -932,12 +972,19 @@ mod tests {
             },
         );
         let all = vec!["a".to_string(), "b".to_string()];
-        let (_, each) =
-            plan_placement(&site, &Placement::Selected, &["a".into()], &all, &over).expect("plan");
+        let (_, each) = plan_placement(
+            &site,
+            &Placement::Selected,
+            &["a".into()],
+            &all,
+            &over,
+            None,
+        )
+        .expect("plan");
         assert_eq!(each.site_for("a").blue.targets, custom);
         assert_eq!(each.site_for("b").blue.targets, site.blue.targets);
         let (_, rep) =
-            plan_placement(&site, &Placement::ReplicateAll, &[], &all, &over).expect("plan");
+            plan_placement(&site, &Placement::ReplicateAll, &[], &all, &over, None).expect("plan");
         assert_eq!(rep.site_for("a").blue.targets, site.blue.targets);
     }
 
