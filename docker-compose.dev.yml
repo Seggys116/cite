@@ -40,7 +40,7 @@ services:
       dockerfile: images/manager/Dockerfile
       args:
         NODE_MAJOR: ${CITE_NODE:-22}
-        NODE_IMAGE: ${CITE_MANAGER_NODE_IMAGE:-docker.io/library/node:22-bookworm-slim@sha256:de170b39439eb0e5a3444ad7d60b015614a381e10fecae2e30ec9e735122f38d}
+        NODE_IMAGE: ${CITE_MANAGER_NODE_IMAGE:-docker.io/library/node:22-bookworm-slim@sha256:43ac6c60b8f89723f746e8a92ce91abd5017e627ce1ddfe4238355d3a30b772c}
     image: ghcr.io/seggys116/cite-manager:dev
     restart: unless-stopped
     depends_on:
@@ -130,7 +130,7 @@ services:
       dockerfile: images/executor-node/Dockerfile
       args:
         NODE_MAJOR: ${CITE_NODE:-22}
-        EXECUTOR_IMAGE: ${CITE_EXECUTOR_NODE_IMAGE:-gcr.io/distroless/nodejs22-debian13:nonroot@sha256:10747a1323be68f206aed893599d43e6697ad67257e7c42703553f99fbce3d33}
+        EXECUTOR_IMAGE: ${CITE_EXECUTOR_NODE_IMAGE:-gcr.io/distroless/nodejs22-debian12:nonroot@sha256:13593b7570658e8477de39e2f4a1dd25db2f836d68a0ba771251572d23bb4f8e}
     image: ghcr.io/seggys116/cite-executor-node:dev
     restart: unless-stopped
     depends_on:
