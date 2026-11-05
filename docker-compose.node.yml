@@ -16,11 +16,13 @@ services:
       - CHOWN
       - FOWNER
     entrypoint: ["/bin/sh", "-c"]
+    # Children first, /conf last: once /conf is chowned the capability-less root cannot traverse it, so a finished volume is left alone.
     command:
       - >-
+        [ "$$(stat -c %u /conf)" = 10001 ] || (
         mkdir -p /conf/haproxy /conf/certs /conf/state &&
-        chown 10001:10001 /conf /conf/haproxy /conf/certs /conf/state &&
-        chmod 0750 /conf /conf/haproxy /conf/certs /conf/state
+        chmod 0750 /conf/haproxy /conf/certs /conf/state /conf &&
+        chown 10001:10001 /conf/haproxy /conf/certs /conf/state /conf )
     volumes:
       - type: volume
         source: cite_conf

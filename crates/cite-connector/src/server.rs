@@ -588,10 +588,13 @@ pub async fn run(cfg: ConnectorConfig) -> Result<()> {
         .map_err(|e| ConnectorError::Internal(format!("cannot bind {}: {e}", cfg.listen)))?;
     let (listen, node, secure) = (cfg.listen, &cfg.node_name, cfg.tls);
     tracing::info!(%listen, %node, tls = secure, "connector api listening");
+    let (final_cfg, final_store, final_analytics) =
+        (cfg.clone(), Arc::clone(&store), Arc::clone(&analytics));
     let state = Inner::new(cfg, store, haproxy, deployer, orchestrator, analytics);
     tokio::select! {
         () = serve(listener, state, acceptor) => {}
         () = shutdown_signal() => tracing::info!("shutting down"),
     }
+    logsink::persist_final(&final_cfg, &final_analytics, &final_store).await;
     Ok(())
 }

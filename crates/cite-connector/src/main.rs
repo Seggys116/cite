@@ -47,6 +47,8 @@ struct InitArgs {
         help = "Re-issue the server certificate under the existing CA and exit"
     )]
     renew_tls: bool,
+    #[arg(long, help = "Print the credentials as one JSON object")]
+    json: bool,
 }
 
 #[derive(Args)]
@@ -77,6 +79,7 @@ async fn dispatch(command: Command) -> Result<()> {
                 non_interactive: args.non_interactive,
                 force: args.force,
                 renew_tls: args.renew_tls,
+                json: args.json,
             };
             init::run_init(&cfg, opts).await
         }

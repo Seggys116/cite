@@ -164,10 +164,19 @@ pub fn parse_stat_csv(csv: &str) -> Vec<BackendStat> {
     out
 }
 
-// Statuses such as "UP 1/2" (a check is failing but the server is still up) count as up.
+// HAProxy starts every server as UP and reports check_status INI until its first check finishes,
+// so a server only counts as up once its latest check passed. A status such as "UP 1/2" (an
+// earlier check failed, the latest passed) still counts as up.
+fn check_passed(check: &str) -> bool {
+    matches!(check, "L4OK" | "L6OK" | "L7OK" | "L7OKC")
+}
+
 pub fn all_servers_up(stats: &[BackendStat], backend: &str) -> bool {
     let up = |b: &BackendStat| {
-        !b.servers.is_empty() && b.servers.iter().all(|s| s.status.starts_with("UP"))
+        !b.servers.is_empty()
+            && b.servers
+                .iter()
+                .all(|s| s.status.starts_with("UP") && check_passed(&s.check))
     };
     stats.iter().find(|b| b.name == backend).is_some_and(up)
 }
@@ -228,6 +237,24 @@ be_empty_blue,BACKEND,0,0,0,0,2000,0,0,0,0,0,,0,0,0,0,DOWN,0,0,0,,0,10,0,,1,5,0,
         let stats = parse_stat_csv(SAMPLE);
         assert!(!all_servers_up(&stats, "be_shop_blue"));
         assert!(all_servers_up(&stats, "be_shop_green"));
+    }
+
+    #[test]
+    fn all_up_waits_for_a_passing_check() {
+        let head = "# pxname,svname,status,check_status\n";
+        for (row, want) in [
+            ("be_a,s1,UP,L7OK\n", true),
+            ("be_a,s1,UP 1/2,L7OKC\n", true),
+            ("be_a,s1,UP,INI\n", false),
+            ("be_a,s1,UP,\n", false),
+            ("be_a,s1,UP 2/3,L4CON\n", false),
+            ("be_a,s1,UP 1/3,L7STS\n", false),
+            ("be_a,s1,DOWN,L7OK\n", false),
+            ("be_a,s1,UP,L7OK\nbe_a,s2,UP,INI\n", false),
+        ] {
+            let stats = parse_stat_csv(&format!("{head}{row}"));
+            assert_eq!(all_servers_up(&stats, "be_a"), want, "{row:?}");
+        }
     }
 
     #[test]

@@ -26,11 +26,11 @@ LABEL org.opencontainers.image.title="cite-connector" \
       org.opencontainers.image.created="${CREATED}" \
       org.opencontainers.image.vendor="Zak Noble-Clarke"
 
-COPY --from=build /src/target/release/cite-connector /usr/local/bin/cite-connector
-RUN chmod 0755 /usr/local/bin/cite-connector
+COPY --chmod=0755 --from=build /src/target/release/cite-connector /usr/local/bin/cite-connector
 
 ENV RUST_LOG=info
 
+USER root
 WORKDIR /conf
 USER 10001:10001
 

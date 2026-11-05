@@ -153,6 +153,24 @@ async fn persist_loop(path: PathBuf, analytics: Arc<Mutex<Analytics>>, store: Ar
     }
 }
 
+// Shutdown writes one last snapshot so a restart does not lose up to a full persist interval.
+pub async fn persist_final(
+    cfg: &ConnectorConfig,
+    analytics: &Arc<Mutex<Analytics>>,
+    store: &Store,
+) {
+    let retention = store.config().settings.retention.clone();
+    let (path, shared) = (snapshot_path(cfg), Arc::clone(analytics));
+    let task = tokio::task::spawn_blocking(move || {
+        persist_once(&path, &shared, &retention, now_ms())
+    });
+    match task.await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => tracing::warn!("final analytics snapshot not written: {err}"),
+        Err(err) => tracing::warn!("final analytics snapshot task failed: {err}"),
+    }
+}
+
 pub fn spawn(
     cfg: &ConnectorConfig,
     analytics: Arc<Mutex<Analytics>>,

@@ -22,6 +22,7 @@ pub struct InitOptions {
     pub non_interactive: bool,
     pub force: bool,
     pub renew_tls: bool,
+    pub json: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -176,6 +177,17 @@ pub fn format_report(p: &Provisioned) -> Result<String> {
     Ok(out)
 }
 
+pub fn format_json(p: &Provisioned) -> Result<String> {
+    let fingerprint = p.tls.as_ref().map(|t| t.fingerprint.as_str());
+    serde_json::to_string(&serde_json::json!({
+        "username": p.username,
+        "password": p.password,
+        "totp_secret": p.totp_secret,
+        "ca_fingerprint": fingerprint,
+    }))
+    .map_err(|e| ConnectorError::Internal(format!("JSON encoding failed: {e}")))
+}
+
 pub async fn run_init(cfg: &ConnectorConfig, opts: InitOptions) -> Result<()> {
     let store = Store::open(cfg).await?;
     if opts.renew_tls {
@@ -201,7 +213,11 @@ pub async fn run_init(cfg: &ConnectorConfig, opts: InitOptions) -> Result<()> {
     let existing = store.credentials().map(|c| c.username);
     let username = resolve_username(opts.username, opts.non_interactive, existing.as_deref())?;
     let provisioned = provision(cfg, &store, &username, Mode::Init { force: opts.force }).await?;
-    print!("{}", format_report(&provisioned)?);
+    if opts.json {
+        println!("{}", format_json(&provisioned)?);
+    } else {
+        print!("{}", format_report(&provisioned)?);
+    }
     Ok(())
 }
 
@@ -249,6 +265,20 @@ mod tests {
         assert!(p.otpauth_uri.starts_with("otpauth://totp/"));
         assert!(p.otpauth_uri.contains(&p.totp_secret));
         assert!(p.tls.is_none());
+    }
+
+    #[tokio::test]
+    async fn json_report_carries_the_credentials() {
+        let (_dir, cfg, store) = setup().await;
+        let p = provision(&cfg, &store, "admin", Mode::Init { force: false })
+            .await
+            .expect("provision");
+        let value: serde_json::Value =
+            serde_json::from_str(&format_json(&p).expect("json")).expect("parse");
+        assert_eq!(value["username"], "admin");
+        assert_eq!(value["password"], p.password.as_str());
+        assert_eq!(value["totp_secret"], p.totp_secret.as_str());
+        assert!(value["ca_fingerprint"].is_null());
     }
 
     #[tokio::test]
