@@ -4,7 +4,6 @@ import {
   state, bus, loadNodes, selectNode, applyTheme, toggleTheme, effectiveTheme,
 } from './js/state.js';
 import { toast, closeAllLayers, errorState, emptyState, formatError } from './js/ui.js';
-import { startDither } from './js/dither.js';
 import { openPalette } from './js/palette.js';
 import { loginScreen, onboardingScreen } from './js/views/auth.js';
 import { overviewView } from './js/views/overview.js';
@@ -170,7 +169,6 @@ function togglePalette() {
 }
 
 function buildShell() {
-  const canvas = h('canvas', { class: 'dither-canvas header-dither', 'aria-hidden': 'true' });
   const crumbs = h('nav', { class: 'crumbs', 'aria-label': 'Breadcrumb' });
   const nodeSelect = h('select', { class: 'select node-select', 'aria-label': 'Active node' });
   nodeSelect.addEventListener('change', () => selectNode(nodeSelect.value));
@@ -187,14 +185,14 @@ function buildShell() {
     h('span', { class: 'nav-label' + (n.navLabel ? ' nav-long' : '') }, n.label), n.navLabel ? h('span', { class: 'nav-label nav-short', 'aria-hidden': 'true' }, n.navLabel) : null)));
   const sidebar = h('aside', { class: 'sidebar' },
     h('a', { class: 'brand', href: '#/overview', 'aria-label': 'Cite console home' }, h('img', { src: '/assets/logo.svg', alt: 'Cite', width: '90', height: '30' })),
+    searchBtn,
     nav,
     h('div', { class: 'sidebar-foot' }, isMock ? h('span', { class: 'mock-tag' }, 'mock data') : null, h('span', { class: 'muted' }, 'v0.2')));
-  const topbar = h('header', { class: 'topbar' }, canvas, crumbs,
-    h('div', { class: 'top-actions' }, h('div', { class: 'node-switch' }, icon('server'), nodeSelect), searchBtn, themeBtn,
+  const topbar = h('header', { class: 'topbar' }, crumbs,
+    h('div', { class: 'top-actions' }, h('div', { class: 'node-switch' }, icon('server'), nodeSelect), themeBtn,
       h('button', { class: 'btn-icon', type: 'button', 'aria-label': 'Sign out', title: 'Sign out', onClick: signOut }, icon('logout'))));
   const root = h('div', { class: 'shell' }, sidebar, h('div', { class: 'main-col' }, topbar, content));
 
-  const stopDither = startDither(canvas, { cell: 3, alpha: 0.09 });
   const onNodes = () => fillNodeSelect();
   // Changing node on a site detail page makes no sense, so fall back to the list
   const onNode = () => {
@@ -210,7 +208,6 @@ function buildShell() {
   shell = {
     root, content, crumbs, nodeSelect, nav,
     stop() {
-      stopDither();
       bus.removeEventListener('nodes', onNodes);
       bus.removeEventListener('node', onNode);
       bus.removeEventListener('theme', syncTheme);

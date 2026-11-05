@@ -1,17 +1,14 @@
 import { h, icon, clear, sanitizeSvg } from '../dom.js';
 import { api } from '../api.js';
-import { startDither } from '../dither.js';
 import { button, field, withBusy, formatError, copyText } from '../ui.js';
 
 function authLayout(card) {
-  const canvas = h('canvas', { class: 'dither-canvas', 'aria-hidden': 'true' });
-  const root = h('main', { class: 'auth' }, canvas,
+  const root = h('main', { class: 'auth' },
     h('div', { class: 'auth-inner' },
       h('img', { class: 'auth-logo', src: '/assets/logo.svg', alt: 'Cite', width: '150', height: '50' }),
       card,
       h('p', { class: 'auth-foot muted' }, 'Cite blue/green edge console')));
-  const stop = startDither(canvas, { cell: 4, alpha: 0.2 });
-  return { el: root, cleanup: stop };
+  return { el: root, cleanup() {} };
 }
 
 // Six single-digit boxes with auto-advance, backspace navigation and paste support
