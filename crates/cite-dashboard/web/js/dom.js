@@ -30,7 +30,7 @@ function append(el, kids) {
     } else if (Array.isArray(kid)) {
       append(el, kid);
     } else if (kid instanceof Node) {
-      el.appendChild(kid);
+      el.append(kid);
     } else {
       el.appendChild(document.createTextNode(String(kid)));
     }

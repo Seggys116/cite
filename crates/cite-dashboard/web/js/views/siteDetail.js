@@ -330,14 +330,15 @@ export function siteDetailView(ctx) {
         }
       },
     });
-    const panels = new Map([
-      ['overview', () => overviewPanel(site)],
-      ['deployments', () => deploymentsPanel(c, site, reload)],
-      ['routing', () => routingPanel(c, site, reload)],
-      ['maintenance', () => maintenancePanel(c, site, pages, reload)],
-      ['danger', () => dangerPanel(c, site)],
-    ]);
-    const buildPanel = panels.get(tab) || panels.get('overview');
+    const buildPanel = () => {
+      switch (tab) {
+        case 'deployments': return deploymentsPanel(c, site, reload);
+        case 'routing': return routingPanel(c, site, reload);
+        case 'maintenance': return maintenancePanel(c, site, pages, reload);
+        case 'danger': return dangerPanel(c, site);
+        default: return overviewPanel(site);
+      }
+    };
     const pills = h('div', { class: 'pill-row' }, pill(site.kind === 'api' ? 'API' : 'Site', 'muted'), slotPill(site.active),
       site.maintenance && site.maintenance.enabled ? pill('Maintenance', 'warn', 'wrench') : pill('Serving', 'ok'), h('span', { class: 'mono muted' }, `${site.id} on ${node}`));
     return h('div', { class: 'stack' },

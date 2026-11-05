@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 
 class FakeNode {
   constructor(kind, value) { this.kind = kind; this.value = value; this.children = []; this.attrs = {}; }
+  append(kid) { this.children.push(kid); }
   appendChild(kid) { this.children.push(kid); return kid; }
   setAttribute(k, v) { this.attrs[k] = v; }
   addEventListener() {}
