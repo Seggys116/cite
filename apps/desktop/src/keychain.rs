@@ -198,4 +198,34 @@ mod tests {
         k.remove(&service, "node")
             .expect("removing a missing entry is fine");
     }
+    // Goes through the token policy and the real keychain, then asks the macOS security tool whether the item exists.
+    #[test]
+    #[ignore = "uses the real OS keychain"]
+    fn system_store_keeps_node_tokens_in_the_os_keychain() {
+        let node = format!("cite-test-node-{}", std::process::id());
+        let store = KeychainTokenStore::system();
+        assert!(store.set(&node, "has space").is_err());
+        assert!(store.set("", "cite_token").is_err());
+        store.set(&node, "cite_token_value").expect("set");
+        assert_eq!(
+            store.get(&node).expect("get").as_deref(),
+            Some("cite_token_value")
+        );
+        #[cfg(target_os = "macos")]
+        {
+            let found = |node: &str| {
+                std::process::Command::new("security")
+                    .args(["find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", node])
+                    .output()
+                    .expect("security tool")
+                    .status
+                    .success()
+            };
+            assert!(found(&node), "the item is not in the macOS keychain");
+            store.delete(&node).expect("delete");
+            assert!(!found(&node), "the item survived delete");
+        }
+        store.delete(&node).expect("delete is idempotent");
+        assert_eq!(store.get(&node).expect("get"), None);
+    }
 }
