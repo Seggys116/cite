@@ -2010,6 +2010,10 @@ s.listen(process.env.PORT,'127.0.0.1',()=>{setTimeout(()=>process.exit(1),3000);
 
 #[tokio::test]
 async fn connect_times_out_when_the_upstream_queue_is_full() {
+    if !cfg!(target_os = "linux") {
+        eprintln!("skipping connect-timeout test: needs Linux listen backlog semantics");
+        return;
+    }
     let node = Command::new("node").arg("-v").output();
     if node.is_err() || !node.unwrap().status.success() {
         eprintln!("skipping connect-timeout test: node not on PATH");
