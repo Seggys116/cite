@@ -32,6 +32,9 @@ pub enum Error {
     Rejected(String),
     #[error("{0} not found")]
     NotFound(String),
+    /// The request is valid but repeats work already done, such as restoring an archive twice.
+    #[error("{0}")]
+    Conflict(String),
     /// An archive or backup could not be written or did not verify; nothing was deleted because of it.
     #[error("archive failed: {0}")]
     Archive(String),

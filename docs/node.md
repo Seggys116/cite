@@ -6,9 +6,9 @@ This page covers installing, configuring and operating one Cite node: HAProxy pl
 
 | Service | Image | Role |
 |---|---|---|
-| `init` | `ghcr.io/seggys116/cite-connector:${CITE_VERSION:-0.2.0}` | One-shot. Creates `/conf/haproxy`, `/conf/certs` and `/conf/state` in the `cite_conf` volume owned by uid 10001, and sets the owner and mode of the `cite_run` volume at `/run/cite`, then exits. No network. |
+| `init` | `ghcr.io/seggys116/cite-connector:${CITE_VERSION:-0.3.0}` | One-shot. Creates `/conf/haproxy`, `/conf/certs` and `/conf/state` in the `cite_conf` volume owned by uid 10001, and sets the owner and mode of the `cite_run` volume at `/run/cite`, then exits. No network. |
 | `haproxy` | `docker.io/library/haproxy:3.0-bookworm` | Public listener on ports 80 and 443. Reads its config from the `haproxy` and `certs` subpaths of `cite_conf`, mounted read-only. It cannot see the connector's credentials, tokens, secrets or TLS keys. |
-| `connector` | `ghcr.io/seggys116/cite-connector:${CITE_VERSION:-0.2.0}` | Authenticated API on 7443, renders the HAProxy config, receives HAProxy's logs, runs the optional orchestrator. |
+| `connector` | `ghcr.io/seggys116/cite-connector:${CITE_VERSION:-0.3.0}` | Authenticated API on 7443, renders the HAProxy config, receives HAProxy's logs, runs the optional orchestrator. |
 
 The two containers do not share a process namespace. They share one small volume, `cite_run`, mounted at `/run/cite` in both, which holds three unix sockets: HAProxy's admin socket (`admin.sock`), the master CLI (`master.sock`, from `-S /run/cite/master.sock,level,admin` on the HAProxy command) and the log datagram socket the connector binds (`log.sock`). The directory is owned by uid 10001 with mode 0750, the admin and log sockets are mode 0600, and no admin listener exists on any network. The connector reloads HAProxy by connecting to the master socket, sending `reload` and reading the reply: `Success=1` or `Success=0` followed by the loader output. It then checks that `show info` on the admin socket reports a new pid. A config counts as applied only after that check passes, so a refused or unconfirmed reload is retried on the next apply and fails the change that caused it. If the master CLI is unreachable (HAProxy is not up yet at first boot), applying a config still succeeds with `reloaded` false and the reason in the status `last_error`. Both containers run as uid 10001 with a read-only root filesystem, `no-new-privileges` and all capabilities dropped.
 
@@ -75,7 +75,7 @@ Compose reads `docker-compose.override.yml` automatically only when you run `doc
 | `CITE_HAPROXY_MASTER` | next to the runtime address | Where the connector reaches HAProxy's master CLI, used for reloads. Defaults to port `9998` on the runtime host, or `master.sock` beside a unix runtime socket. Compose sets `unix:/run/cite/master.sock`. It must match the `-S` socket in the `haproxy` command in `docker-compose.node.yml`. |
 | `CITE_HAPROXY_BIN` | `haproxy` | Binary used for `haproxy -c` validation. |
 | `CITE_HAPROXY_VALIDATE` | `true` | Run `haproxy -c` on a staged copy before installing a config. |
-| `CITE_LOG_LISTEN` | `0.0.0.0:5140` | Where the log sink binds: a UDP `host:port`, or `unix:/path` for a unix datagram socket (any stale socket file is replaced and the new one is mode 0600). Compose sets `unix:/run/cite/log.sock`. The receive buffer is raised to 4 MiB so bursts are not dropped. |
+| `CITE_LOG_LISTEN` | `127.0.0.1:5140` | Where the log sink binds: a UDP `host:port`, or `unix:/path` for a unix datagram socket (any stale socket file is replaced and the new one is mode 0600). Compose sets `unix:/run/cite/log.sock`. The default is loopback-only because any host that can reach a UDP sink can forge log lines; bind a wider address only on a network you trust. The receive buffer is raised to 4 MiB so bursts are not dropped. |
 | `CITE_LOG_ADDR` | `connector:5140`, or the `CITE_LOG_LISTEN` path for a unix listener | Address HAProxy sends logs to. For a UDP sink it must be an IP literal because HAProxy does not resolve names there; for a unix sink it is the socket path. Compose sets `/run/cite/log.sock`. |
 | `CITE_ANALYTICS_DB` | `<data dir>/analytics/analytics.db` | Absolute path of the SQLite analytics database. See [analytics](analytics.md). |
 | `CITE_ANALYTICS_MAX_BYTES` | unset | Optional size cap for the analytics database, 8 MiB to 1 TiB. Unset keeps everything until its retention age; when set, the oldest rows are removed first. |
@@ -94,7 +94,7 @@ Boolean values accept `1`, `true`, `yes`, `on`, `0`, `false`, `no`, `off`. The c
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `CITE_VERSION` | `0.2.0` | Connector image tag. |
+| `CITE_VERSION` | `0.3.0` | Connector image tag. |
 | `CITE_HTTP_PORT` | `80` | Host port for HTTP. |
 | `CITE_HTTPS_PORT` | `443` | Host port for HTTPS. |
 | `CITE_PUBLIC_BIND` | `0.0.0.0` | Host IP for the two public ports. |

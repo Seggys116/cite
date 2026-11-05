@@ -43,6 +43,7 @@ struct CutPlan {
 #[serde(deny_unknown_fields)]
 pub(super) struct RestoreReq {
     name: String,
+    again: Option<bool>,
 }
 
 // A manual cut keeps a verified copy unless the caller says archive:false in so many words, and never reaches into the future.
@@ -122,8 +123,15 @@ pub(super) async fn restore(
     st.store
         .audit(&p.actor(), "analytics.restore", &audited(&req.name))
         .await;
-    let name = req.name;
-    let rows = with_store(&st, move |s| s.restore_archive(&name)).await?;
+    let (name, again) = (req.name, req.again.unwrap_or(false));
+    let rows = with_store(&st, move |s| {
+        if again {
+            s.restore_archive_again(&name)
+        } else {
+            s.restore_archive(&name)
+        }
+    })
+    .await?;
     Ok(Json(json!({ "rows": rows })).into_response())
 }
 

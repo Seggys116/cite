@@ -295,9 +295,17 @@ fn rule_cond(rule: &FirewallRule, cfg: &EdgeConfig) -> String {
         parts.push(format!("rp_{}", rule.id));
     }
     if let Some(re) = &m.user_agent_regex {
-        parts.push(format!("{{ req.hdr(user-agent) -m reg -- {re} }}"));
+        parts.push(ua_cond(re));
     }
     parts.join(" ")
+}
+
+// fhdr keeps the commas inside "(KHTML, like Gecko)" in one value. A request with no User-Agent yields no sample, so an empty-agent rule is written as the negation of "has any character", which also fires when the header is absent.
+fn ua_cond(re: &str) -> String {
+    if re == "^$" {
+        return "!{ req.fhdr(user-agent) -m reg . }".to_string();
+    }
+    format!("{{ req.fhdr(user-agent) -m reg -- {re} }}")
 }
 
 fn render_global(cfg: &EdgeConfig, opts: &RenderOptions, tls: bool, out: &mut String) {
@@ -951,7 +959,7 @@ mod tests {
         let r = render(&cfg, &opts()).unwrap();
         let line = lines_with(&r, "str(scoped) if { var(txn.site) -m str b }")[0];
         assert!(line.ends_with(
-            "if { var(txn.site) -m str b } { method TRACE DEBUG } { src 10.0.0.0/8 2001:db8::1 } { var(txn.host) -m end .a.com } { req.hdr(user-agent) -m reg -- (?i)bot }"
+            "if { var(txn.site) -m str b } { method TRACE DEBUG } { src 10.0.0.0/8 2001:db8::1 } { var(txn.host) -m end .a.com } { req.fhdr(user-agent) -m reg -- (?i)bot }"
         ));
         let global = lines_with(&r, "str(global) if rp_global");
         assert_eq!(global.len(), 1);
@@ -959,6 +967,39 @@ mod tests {
         assert_eq!(lines_with(&r, "acl rp_global path_reg -- ^/admin").len(), 1);
         assert_eq!(
             lines_with(&r, "acl rp_global var(txn.cpath) -m reg -- ^/admin").len(),
+            1
+        );
+    }
+
+    #[test]
+    fn user_agent_rules_read_the_whole_header_and_cover_a_missing_one() {
+        let mut cfg = config(vec![site("a", "a.com")]);
+        cfg.firewall.push(rule(
+            "chrome",
+            Matchers {
+                user_agent_regex: Some("KHTML,\\slike\\sGecko".into()),
+                ..Default::default()
+            },
+        ));
+        cfg.firewall.push(rule(
+            "empty",
+            Matchers {
+                user_agent_regex: Some("^$".into()),
+                ..Default::default()
+            },
+        ));
+        let r = render(&cfg, &opts()).unwrap();
+        assert!(!r.config.contains("req.hdr(user-agent)"));
+        assert_eq!(
+            lines_with(
+                &r,
+                "str(chrome) if { req.fhdr(user-agent) -m reg -- KHTML,\\slike\\sGecko }"
+            )
+            .len(),
+            1
+        );
+        assert_eq!(
+            lines_with(&r, "str(empty) if !{ req.fhdr(user-agent) -m reg . }").len(),
             1
         );
     }

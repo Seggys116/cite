@@ -301,22 +301,54 @@ pub(super) async fn put_settings(
     // Applied before the scrub so events still queued are stripped when they commit instead of re-creating the text.
     st.analytics
         .set_privacy(now_kept.store_client_ips, now_kept.store_user_agents);
-    // Turning a field off also erases what was already stored, as the setting promises.
-    if drop_ips || drop_agents {
-        let store = st.analytics.clone();
-        tokio::task::spawn_blocking(move || match store.scrub_fields(drop_ips, drop_agents) {
-            Ok(rows) => tracing::info!(rows, "scrubbed stored analytics fields"),
-            Err(e @ cite_store::Error::Incomplete(_)) => {
-                tracing::warn!(error = %e, "scrubbed analytics fields; the log fold is retried by the next retention pass");
-            }
-            Err(e) => tracing::warn!(error = %e, "scrubbing analytics fields failed"),
-        });
-    }
-    // A shorter retention takes effect now instead of at the next scheduled prune.
+    // Turning a field off also erases what was already stored, as the setting promises; the prune runs after it in the same task so no archive pass can read rows the scrub has not reached.
     let store = st.analytics.clone();
-    tokio::task::spawn_blocking(move || {
+    let scrub = tokio::task::spawn_blocking(move || {
+        let mut archives = None;
+        if drop_ips || drop_agents {
+            match store.scrub_fields(drop_ips, drop_agents) {
+                Ok(rows) => tracing::info!(rows, "scrubbed stored analytics fields"),
+                Err(e @ cite_store::Error::Incomplete(_)) => {
+                    tracing::warn!(error = %e, "scrubbed analytics fields; the log fold is retried by the next retention pass");
+                }
+                Err(e) => tracing::warn!(error = %e, "scrubbing analytics fields failed"),
+            }
+            archives = Some(store.scrub_archived_fields(drop_ips, drop_agents));
+        }
+        // A shorter retention takes effect now instead of at the next scheduled prune.
         if let Err(e) = store.prune(now_ms()) {
             tracing::warn!(error = %e, "analytics prune after a settings change failed");
+        }
+        archives
+    });
+    let (actor, audit_state) = (p.actor(), st.clone());
+    tokio::spawn(async move {
+        match scrub.await {
+            Ok(Some(Ok(done))) => {
+                tracing::info!(
+                    archives = done.archives,
+                    backups = done.backups,
+                    rows = done.rows,
+                    failed = done.failed.len(),
+                    "scrubbed archived analytics fields"
+                );
+                let detail = format!(
+                    "archives={} backups={} rows={} failed={}",
+                    done.archives,
+                    done.backups,
+                    done.rows,
+                    done.failed.len()
+                );
+                audit_state
+                    .store
+                    .audit(&actor, "analytics.archive.scrub", &detail)
+                    .await;
+            }
+            Ok(Some(Err(e))) => {
+                tracing::warn!(error = %e, "scrubbing archived analytics fields failed");
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!(error = %e, "analytics scrub task failed"),
         }
     });
     let cfg = st.store.config();
@@ -773,6 +805,7 @@ pub(super) fn store_failure(e: cite_store::Error) -> ApiError {
         .into(),
         cite_store::Error::Rejected(_) => ConnectorError::BadRequest(e.to_string()).into(),
         cite_store::Error::NotFound(_) => ConnectorError::NotFound(e.to_string()).into(),
+        cite_store::Error::Conflict(_) => ConnectorError::Conflict(e.to_string()).into(),
         // The archive messages are written for operators and hold no paths.
         cite_store::Error::Archive(_) => ConnectorError::Unavailable(e.to_string()).into(),
         _ => ConnectorError::Internal(format!("analytics store: {e}")).into(),

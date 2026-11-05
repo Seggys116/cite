@@ -284,7 +284,7 @@ impl ConnectorConfig {
             "CITE_CONNECTOR_LISTEN",
             get(env, "CITE_CONNECTOR_LISTEN").unwrap_or("0.0.0.0:7443"),
         )?;
-        let log_listen = parse_log_listen(get(env, "CITE_LOG_LISTEN").unwrap_or("0.0.0.0:5140"))?;
+        let log_listen = parse_log_listen(get(env, "CITE_LOG_LISTEN").unwrap_or("127.0.0.1:5140"))?;
         let analytics_max_bytes = match get(env, "CITE_ANALYTICS_MAX_BYTES") {
             Some(raw) => Some(parse_analytics_bytes(raw)?),
             None => None,
@@ -425,6 +425,16 @@ mod tests {
     }
 
     #[test]
+    fn the_log_sink_defaults_to_loopback_so_remote_hosts_cannot_forge_lines() {
+        let cfg = ConnectorConfig::from_env_map(&base()).expect("config");
+        let LogListen::Udp(addr) = cfg.log_listen else {
+            panic!("expected a udp sink");
+        };
+        assert!(addr.ip().is_loopback());
+        assert_eq!(addr.port(), 5140);
+    }
+
+    #[test]
     fn build_wait_defaults_to_ten_minutes_and_is_bounded() {
         let cfg = ConnectorConfig::from_env_map(&base()).expect("config");
         assert_eq!(cfg.deploy_build_timeout_secs, 600);
@@ -447,7 +457,7 @@ mod tests {
         assert_eq!(cfg.listen, "0.0.0.0:7443".parse().expect("addr"));
         assert_eq!(
             cfg.log_listen,
-            LogListen::Udp("0.0.0.0:5140".parse().expect("addr"))
+            LogListen::Udp("127.0.0.1:5140".parse().expect("addr"))
         );
         assert_eq!(cfg.analytics_max_bytes, None);
         assert_eq!(

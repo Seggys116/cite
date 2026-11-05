@@ -376,12 +376,12 @@ impl ExportStream {
         let tmp = dir.join(format!(".{}.{}.tmp", name.to_string_lossy(), new_id()));
         // Declared before the file so the handle closes first when the guard removes the path.
         let mut guard = TmpGuard(Some(tmp.clone()));
-        let mut file = tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)
-            .await
-            .map_err(io_error)?;
+        let mut options = tokio::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        // Backups hold visitor addresses, so the file must not follow a permissive umask.
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options.open(&tmp).await.map_err(io_error)?;
         let mut written: u64 = 0;
         while let Some(chunk) = self
             .response
