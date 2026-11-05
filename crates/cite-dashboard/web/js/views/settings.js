@@ -358,6 +358,11 @@ export function settingsView(ctx) {
     holder.appendChild(noNodes());
     return;
   }
-  const panels = { retention: retentionPanel, limits: limitsPanel, tokens: tokensPanel, audit: auditPanel, haproxy: haproxyPanel };
-  holder.appendChild(panels[tab](node));
+  switch (tab) {
+    case 'limits': holder.appendChild(limitsPanel(node)); break;
+    case 'tokens': holder.appendChild(tokensPanel(node)); break;
+    case 'audit': holder.appendChild(auditPanel(node)); break;
+    case 'haproxy': holder.appendChild(haproxyPanel(node)); break;
+    default: holder.appendChild(retentionPanel(node));
+  }
 }

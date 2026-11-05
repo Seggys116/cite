@@ -330,18 +330,20 @@ export function siteDetailView(ctx) {
         }
       },
     });
-    const panels = {
-      overview: () => overviewPanel(site),
-      deployments: () => deploymentsPanel(c, site, reload),
-      routing: () => routingPanel(c, site, reload),
-      maintenance: () => maintenancePanel(c, site, pages, reload),
-      danger: () => dangerPanel(c, site),
+    const buildPanel = () => {
+      switch (tab) {
+        case 'deployments': return deploymentsPanel(c, site, reload);
+        case 'routing': return routingPanel(c, site, reload);
+        case 'maintenance': return maintenancePanel(c, site, pages, reload);
+        case 'danger': return dangerPanel(c, site);
+        default: return overviewPanel(site);
+      }
     };
     const pills = h('div', { class: 'pill-row' }, pill(site.kind === 'api' ? 'API' : 'Site', 'muted'), slotPill(site.active),
       site.maintenance && site.maintenance.enabled ? pill('Maintenance', 'warn', 'wrench') : pill('Serving', 'ok'), h('span', { class: 'mono muted' }, `${site.id} on ${node}`));
     return h('div', { class: 'stack' },
       pageHeader({ title: site.name, subtitle: pills, actions: [h('a', { class: 'btn', href: '#/sites' }, 'Back'), swap] }),
       routeTabs(TABS, tab, (t) => siteHref(node, id, t)),
-      h('div', { class: 'tab-panel' }, panels[tab]()));
+      h('div', { class: 'tab-panel' }, buildPanel()));
   }, { skeleton: () => h('div', { class: 'stack' }, skeletonBlock(60), skeletonBlock(320)) });
 }

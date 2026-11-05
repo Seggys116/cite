@@ -1,7 +1,7 @@
 use std::os::unix::fs::PermissionsExt;
 use std::sync::OnceLock;
 
-use cite_edge::auth::{Credentials, hash_password};
+use cite_edge::auth::{Credentials, generate_password, hash_password};
 use cite_edge::model::{LogEvent, Site};
 use cite_edge::totp;
 use reqwest::{Client, Method};
@@ -13,11 +13,19 @@ use crate::store::testing::test_config;
 mod archive_api;
 
 const SECRET: &str = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
-const PASSWORD: &str = "correct horse battery";
+fn password() -> &'static str {
+    static PW: OnceLock<String> = OnceLock::new();
+    PW.get_or_init(|| generate_password().expect("rng"))
+}
+
+fn wrong_password() -> &'static str {
+    static PW: OnceLock<String> = OnceLock::new();
+    PW.get_or_init(|| generate_password().expect("rng"))
+}
 
 fn password_hash() -> &'static str {
     static HASH: OnceLock<String> = OnceLock::new();
-    HASH.get_or_init(|| hash_password(PASSWORD).expect("hash"))
+    HASH.get_or_init(|| hash_password(password()).expect("hash"))
 }
 
 fn creds() -> Credentials {
@@ -120,7 +128,7 @@ impl Harness {
             .set_credentials(creds())
             .await
             .expect("reset step");
-        let res = self.login_with("admin", PASSWORD, &current_code()).await;
+        let res = self.login_with("admin", password(), &current_code()).await;
         assert_eq!(res.status().as_u16(), 200);
         let body: Value = res.json().await.expect("login body");
         body["token"].as_str().expect("token").to_string()
@@ -366,7 +374,7 @@ async fn login_issues_a_session_token_that_works() {
 async fn failed_login_is_generic_and_audited_without_the_password() {
     let h = start().await;
     let code = current_code();
-    let res = h.login_with("admin", "wrong password here", &code).await;
+    let res = h.login_with("admin", wrong_password(), &code).await;
     assert_eq!(res.status().as_u16(), 401);
     let body: Value = res.json().await.expect("json");
     assert_eq!(body, json!({ "error": "invalid credentials" }));
@@ -376,7 +384,7 @@ async fn failed_login_is_generic_and_audited_without_the_password() {
         .find(|e| e.action == "login.failure")
         .expect("audit entry");
     assert!(entry.detail.contains("peer=127.0.0.1"));
-    assert!(!entry.detail.contains("wrong password here"));
+    assert!(!entry.detail.contains(wrong_password()));
 }
 
 // Unknown user, wrong password and wrong code return the same body, so the response cannot be used to enumerate accounts.
@@ -385,9 +393,9 @@ async fn every_credential_failure_looks_the_same() {
     let h = start().await;
     let code = current_code();
     let attempts = [
-        ("nobody", PASSWORD, code.as_str()),
-        ("admin", "not the password", code.as_str()),
-        ("admin", PASSWORD, "000000"),
+        ("nobody", password(), code.as_str()),
+        ("admin", wrong_password(), code.as_str()),
+        ("admin", password(), "000000"),
     ];
     for (user, password, otp) in attempts {
         let res = h.login_with(user, password, otp).await;
@@ -404,14 +412,14 @@ async fn totp_codes_cannot_be_replayed() {
     h.state.store.set_credentials(creds()).await.expect("reset");
     let code = current_code();
     assert_eq!(
-        h.login_with("admin", PASSWORD, &code)
+        h.login_with("admin", password(), &code)
             .await
             .status()
             .as_u16(),
         200
     );
     assert_eq!(
-        h.login_with("admin", PASSWORD, &code)
+        h.login_with("admin", password(), &code)
             .await
             .status()
             .as_u16(),
@@ -424,10 +432,10 @@ async fn totp_codes_cannot_be_replayed() {
 async fn repeated_failures_lock_the_client_out_with_retry_after() {
     let h = start().await;
     for _ in 0..5 {
-        let res = h.login_with("admin", "wrong password here", "000000").await;
+        let res = h.login_with("admin", wrong_password(), "000000").await;
         assert_eq!(res.status().as_u16(), 401);
     }
-    let res = h.login_with("admin", PASSWORD, &current_code()).await;
+    let res = h.login_with("admin", password(), &current_code()).await;
     assert_eq!(res.status().as_u16(), 429);
     assert!(res.headers().contains_key("retry-after"));
     let body: Value = res.json().await.expect("json");
@@ -1747,7 +1755,7 @@ async fn loopback_peers_outside_the_allowlist_reach_only_healthz() {
         .expect("request");
     assert_eq!(node.status().as_u16(), 404);
     assert_eq!(node.headers()["cache-control"], "no-store");
-    let login = h.login_with("admin", PASSWORD, &current_code()).await;
+    let login = h.login_with("admin", password(), &current_code()).await;
     assert_eq!(login.status().as_u16(), 404);
 }
 
@@ -1796,14 +1804,14 @@ async fn failed_login_audit_records_only_whether_the_username_matched() {
     let code = current_code();
     let pasted = "hunter2-pasted-into-the-username-field";
     assert_eq!(
-        h.login_with(pasted, "wrong password here", &code)
+        h.login_with(pasted, wrong_password(), &code)
             .await
             .status()
             .as_u16(),
         401
     );
     assert_eq!(
-        h.login_with("admin", "wrong password here", &code)
+        h.login_with("admin", wrong_password(), &code)
             .await
             .status()
             .as_u16(),
@@ -1830,7 +1838,7 @@ async fn concurrent_failed_logins_stop_at_the_per_client_limit() {
     for _ in 0..40 {
         let http = h.http.clone();
         let url = h.url("/auth/login");
-        let body = json!({ "username": "admin", "password": "wrong password here", "totp": code });
+        let body = json!({ "username": "admin", "password": wrong_password(), "totp": code });
         tasks.push(tokio::spawn(async move {
             http.post(url)
                 .json(&body)

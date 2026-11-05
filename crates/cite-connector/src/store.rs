@@ -1,12 +1,11 @@
 use std::collections::HashMap;
-use std::fs;
-use std::io::{self, Write};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-use std::path::{Path, PathBuf};
+use std::io;
+use std::path::Path;
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard};
 
 use arc_swap::{ArcSwap, ArcSwapOption};
-use cite_core::atomic::{ensure_dir, read_limited, write_atomic};
+use cite_core::atomic::{ensure_dir, write_atomic_in};
+use cite_core::confined::{FileKey, FileName, TrustedDir};
 use cite_edge::auth::{
     ApiToken, ApiTokens, AuthError, Credentials, SessionInfo, SessionStore, authenticate,
     dummy_verify,
@@ -62,8 +61,6 @@ struct GenerationOnly {
     generation: u64,
 }
 
-type FileKey = (i64, i64, u64, u64);
-
 // None for a key means the file must be read before it is trusted again.
 #[derive(Default)]
 struct AuthDisk {
@@ -79,13 +76,21 @@ pub enum LoginOutcome {
     Blocked(u64),
 }
 
+#[derive(Clone)]
+struct AuditFiles {
+    current: FileName,
+    rotated: FileName,
+}
+
+// Every file lives directly in the data directory, so each is a handle plus one validated name.
 struct Paths {
-    auth_lock: PathBuf,
-    edge: PathBuf,
-    credentials: PathBuf,
-    secrets: PathBuf,
-    tokens: PathBuf,
-    audit: PathBuf,
+    dir: Arc<TrustedDir>,
+    auth_lock: FileName,
+    edge: FileName,
+    credentials: FileName,
+    secrets: FileName,
+    tokens: FileName,
+    audit: AuditFiles,
 }
 
 pub struct Store {
@@ -148,65 +153,64 @@ fn clip(s: &str, max: usize) -> String {
     out
 }
 
-async fn write_file(path: PathBuf, bytes: Vec<u8>, mode: u32) -> Result<()> {
-    tokio::task::spawn_blocking(move || write_atomic(&path, &bytes, mode))
+fn fixed_name(name: &str) -> Result<FileName> {
+    FileName::new(name).map_err(|e| internal("invalid store file name", e))
+}
+
+async fn write_file(dir: Arc<TrustedDir>, name: FileName, bytes: Vec<u8>, mode: u32) -> Result<()> {
+    tokio::task::spawn_blocking(move || write_atomic_in(&dir, &name, &bytes, mode))
         .await
         .map_err(|e| internal("write task", e))?
         .map_err(|e| internal("write failed", e))
 }
 
-fn read_optional(path: &Path, max: u64) -> Result<Option<Vec<u8>>> {
-    match fs::symlink_metadata(path) {
-        Ok(_) => read_limited(path, max)
-            .map(Some)
-            .map_err(|e| internal(&format!("cannot read {}", path.display()), e)),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(internal(&format!("cannot stat {}", path.display()), e)),
+fn read_optional(dir: &TrustedDir, name: &FileName, max: u64) -> Result<Option<Vec<u8>>> {
+    match dir.read_limited(name, max) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(cite_core::Error::Io(e)) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(internal(&format!("cannot read {name}"), e)),
     }
 }
 
-fn load_json<T: serde::de::DeserializeOwned>(path: &Path, max: u64) -> Result<Option<T>> {
-    match read_optional(path, max)? {
+fn load_json<T: serde::de::DeserializeOwned>(
+    dir: &TrustedDir,
+    name: &FileName,
+    max: u64,
+) -> Result<Option<T>> {
+    match read_optional(dir, name, max)? {
         Some(bytes) => serde_json::from_slice(&bytes)
             .map(Some)
-            .map_err(|e| internal(&format!("{} is invalid", path.display()), e)),
+            .map_err(|e| internal(&format!("{name} is invalid"), e)),
         None => Ok(None),
     }
 }
 
-fn file_key(path: &Path) -> Option<FileKey> {
-    let meta = fs::symlink_metadata(path).ok()?;
-    Some((meta.mtime(), meta.mtime_nsec(), meta.size(), meta.ino()))
-}
-
-fn disk_generation(path: &Path) -> u64 {
-    load_json::<GenerationOnly>(path, MAX_SMALL_FILE_BYTES)
+fn disk_generation(dir: &TrustedDir, name: &FileName) -> u64 {
+    load_json::<GenerationOnly>(dir, name, MAX_SMALL_FILE_BYTES)
         .ok()
         .flatten()
         .map_or(0, |g| g.generation)
 }
 
 // Held across a generation check and the rename after it, in server and CLI alike, so a reset is never overwritten by older state.
-fn lock_auth(path: &Path) -> io::Result<fs::File> {
-    let file = fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .mode(0o600)
-        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
-        .open(path)?;
-    rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive).map_err(io::Error::from)?;
-    Ok(file)
+fn lock_auth(dir: &TrustedDir, name: &FileName) -> io::Result<std::fs::File> {
+    dir.lock_file(name, 0o600)
 }
 
 // Writes only while the file still carries the generation the caller started from.
-async fn guarded_write(lock: PathBuf, target: PathBuf, seen: u64, bytes: Vec<u8>) -> Result<bool> {
+async fn guarded_write(
+    dir: Arc<TrustedDir>,
+    lock: FileName,
+    target: FileName,
+    seen: u64,
+    bytes: Vec<u8>,
+) -> Result<bool> {
     tokio::task::spawn_blocking(move || -> Result<bool> {
-        let _held = lock_auth(&lock).map_err(|e| internal("auth lock failed", e))?;
-        if disk_generation(&target) > seen {
+        let _held = lock_auth(&dir, &lock).map_err(|e| internal("auth lock failed", e))?;
+        if disk_generation(&dir, &target) > seen {
             return Ok(false);
         }
-        write_atomic(&target, &bytes, 0o600).map_err(|e| internal("write failed", e))?;
+        write_atomic_in(&dir, &target, &bytes, 0o600).map_err(|e| internal("write failed", e))?;
         Ok(true)
     })
     .await
@@ -217,10 +221,6 @@ fn make_dir(path: &Path, mode: u32) -> Result<()> {
     ensure_dir(path, mode).map_err(|e| internal(&format!("cannot prepare {}", path.display()), e))
 }
 
-fn rotated_path(path: &Path) -> PathBuf {
-    path.with_extension("jsonl.1")
-}
-
 fn entry_unix(entry: &AuditEntry) -> Option<i64> {
     OffsetDateTime::parse(&entry.at, &Rfc3339)
         .ok()
@@ -228,8 +228,8 @@ fn entry_unix(entry: &AuditEntry) -> Option<i64> {
 }
 
 // Rewrites the log without entries older than the retention; returns the new size.
-fn prune_file(path: &Path, now: u64, audit_days: u32) -> io::Result<u64> {
-    let bytes = match read_limited(path, MAX_SMALL_FILE_BYTES * 2) {
+fn prune_file(dir: &TrustedDir, name: &FileName, now: u64, audit_days: u32) -> io::Result<u64> {
+    let bytes = match dir.read_limited(name, MAX_SMALL_FILE_BYTES * 2) {
         Ok(b) => b,
         Err(cite_core::Error::Io(e)) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
         Err(e) => return Err(io::Error::other(e.to_string())),
@@ -252,13 +252,14 @@ fn prune_file(path: &Path, now: u64, audit_days: u32) -> io::Result<u64> {
         }
     }
     if dropped {
-        write_atomic(path, &kept, 0o600).map_err(|e| io::Error::other(e.to_string()))?;
+        write_atomic_in(dir, name, &kept, 0o600).map_err(|e| io::Error::other(e.to_string()))?;
     }
     Ok(kept.len() as u64)
 }
 
 fn append_audit(
-    path: &Path,
+    dir: &TrustedDir,
+    files: &AuditFiles,
     line: &[u8],
     mut state: AuditState,
     now: u64,
@@ -266,7 +267,7 @@ fn append_audit(
 ) -> io::Result<AuditState> {
     // One previous generation is kept; anything older is dropped on the next rotation.
     if state.size + line.len() as u64 > AUDIT_MAX_BYTES {
-        match fs::rename(path, rotated_path(path)) {
+        match dir.rename(&files.current, &files.rotated) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
@@ -274,25 +275,19 @@ fn append_audit(
         state.size = 0;
     }
     if now.saturating_sub(state.last_prune) >= AUDIT_PRUNE_EVERY_SECS {
-        state.size = prune_file(path, now, audit_days)?;
-        prune_file(&rotated_path(path), now, audit_days)?;
+        state.size = prune_file(dir, &files.current, now, audit_days)?;
+        prune_file(dir, &files.rotated, now, audit_days)?;
         state.last_prune = now;
     }
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
-        .open(path)?;
-    file.write_all(line)?;
+    dir.append(&files.current, line, 0o600)?;
     state.size += line.len() as u64;
     Ok(state)
 }
 
-fn read_tail(path: &Path, limit: usize) -> Vec<AuditEntry> {
+fn read_tail(dir: &TrustedDir, files: &AuditFiles, limit: usize) -> Vec<AuditEntry> {
     let mut out = Vec::new();
-    for file in [path.to_path_buf(), rotated_path(path)] {
-        let Ok(bytes) = read_limited(&file, AUDIT_MAX_BYTES * 2) else {
+    for file in [&files.current, &files.rotated] {
+        let Ok(bytes) = dir.read_limited(file, AUDIT_MAX_BYTES * 2) else {
             continue;
         };
         for line in bytes.split(|b| *b == b'\n').rev() {
@@ -324,16 +319,22 @@ impl Store {
         }
         make_dir(&cfg.tls_dir, 0o700)?;
 
+        let dir = TrustedDir::open(&cfg.data_dir)
+            .map_err(|e| internal(&format!("cannot open {}", cfg.data_dir.display()), e))?;
         let paths = Paths {
-            auth_lock: cfg.data_dir.join("auth.lock"),
-            edge: cfg.data_dir.join("edge.json"),
-            credentials: cfg.data_dir.join("credentials.json"),
-            secrets: cfg.data_dir.join("secrets.json"),
-            tokens: cfg.data_dir.join("tokens.json"),
-            audit: cfg.data_dir.join("audit.jsonl"),
+            dir: Arc::new(dir),
+            auth_lock: fixed_name("auth.lock")?,
+            edge: fixed_name("edge.json")?,
+            credentials: fixed_name("credentials.json")?,
+            secrets: fixed_name("secrets.json")?,
+            tokens: fixed_name("tokens.json")?,
+            audit: AuditFiles {
+                current: fixed_name("audit.jsonl")?,
+                rotated: fixed_name("audit.jsonl.1")?,
+            },
         };
 
-        let config = match load_json::<EdgeConfig>(&paths.edge, MAX_EDGE_BYTES)? {
+        let config = match load_json::<EdgeConfig>(&paths.dir, &paths.edge, MAX_EDGE_BYTES)? {
             Some(c) => {
                 if c.version != CONFIG_VERSION {
                     return Err(ConnectorError::Internal(format!(
@@ -350,22 +351,28 @@ impl Store {
                     ..EdgeConfig::default()
                 };
                 let bytes = serde_json::to_vec_pretty(&c)?;
-                write_atomic(&paths.edge, &bytes, 0o600)
+                write_atomic_in(&paths.dir, &paths.edge, &bytes, 0o600)
                     .map_err(|e| internal("cannot write edge.json", e))?;
                 c
             }
         };
-        let creds = load_json::<Stamped<Credentials>>(&paths.credentials, MAX_SMALL_FILE_BYTES)?;
-        let secrets = load_json::<HashMap<String, String>>(&paths.secrets, MAX_SMALL_FILE_BYTES)?
-            .unwrap_or_default();
-        let tokens = load_json::<Stamped<ApiTokens>>(&paths.tokens, MAX_SMALL_FILE_BYTES)?;
+        let creds = load_json::<Stamped<Credentials>>(
+            &paths.dir,
+            &paths.credentials,
+            MAX_SMALL_FILE_BYTES,
+        )?;
+        let secrets =
+            load_json::<HashMap<String, String>>(&paths.dir, &paths.secrets, MAX_SMALL_FILE_BYTES)?
+                .unwrap_or_default();
+        let tokens =
+            load_json::<Stamped<ApiTokens>>(&paths.dir, &paths.tokens, MAX_SMALL_FILE_BYTES)?;
         let disk = AuthDisk {
             creds_gen: creds.as_ref().map_or(0, |c| c.generation),
             creds_key: None,
             tokens_gen: tokens.as_ref().map_or(0, |t| t.generation),
             tokens_key: None,
         };
-        let audit_size = fs::symlink_metadata(&paths.audit).map_or(0, |m| m.len());
+        let audit_size = paths.dir.len(&paths.audit.current).unwrap_or(0);
 
         Ok(Store {
             session_ttl_secs: cfg.session_ttl_secs,
@@ -412,7 +419,13 @@ impl Store {
         let out = f(&mut next)?;
         validate_config(&next)?;
         let bytes = serde_json::to_vec_pretty(&next)?;
-        write_file(self.paths.edge.clone(), bytes, 0o600).await?;
+        write_file(
+            self.paths.dir.clone(),
+            self.paths.edge.clone(),
+            bytes,
+            0o600,
+        )
+        .await?;
         self.config.store(Arc::new(next));
         self.audit(actor, action, detail).await;
         Ok(out)
@@ -435,11 +448,12 @@ impl Store {
         line.push(b'\n');
         let audit_days = self.config.load().settings.retention.audit_days;
         let mut state = self.audit.lock().await;
-        let path = self.paths.audit.clone();
+        let dir = self.paths.dir.clone();
+        let files = self.paths.audit.clone();
         let snapshot = *state;
         let now = now_unix();
         let result = tokio::task::spawn_blocking(move || {
-            append_audit(&path, &line, snapshot, now, audit_days)
+            append_audit(&dir, &files, &line, snapshot, now, audit_days)
         })
         .await;
         // An audit failure must not fail the action it records, so it is only logged.
@@ -453,8 +467,9 @@ impl Store {
     pub async fn audit_tail(&self, limit: usize) -> Vec<AuditEntry> {
         let limit = limit.clamp(1, AUDIT_TAIL_MAX);
         let _state = self.audit.lock().await;
-        let path = self.paths.audit.clone();
-        tokio::task::spawn_blocking(move || read_tail(&path, limit))
+        let dir = self.paths.dir.clone();
+        let files = self.paths.audit.clone();
+        tokio::task::spawn_blocking(move || read_tail(&dir, &files, limit))
             .await
             .unwrap_or_default()
     }
@@ -480,7 +495,13 @@ impl Store {
         let mut next = map.clone();
         next.insert(name.to_string(), value.to_string());
         let bytes = serde_json::to_vec(&next)?;
-        write_file(self.paths.secrets.clone(), bytes, 0o600).await?;
+        write_file(
+            self.paths.dir.clone(),
+            self.paths.secrets.clone(),
+            bytes,
+            0o600,
+        )
+        .await?;
         *map = next;
         Ok(())
     }
@@ -497,7 +518,15 @@ impl Store {
         let mut next = map.clone();
         next.remove(name);
         let written = match serde_json::to_vec(&next) {
-            Ok(bytes) => write_file(self.paths.secrets.clone(), bytes, 0o600).await,
+            Ok(bytes) => {
+                write_file(
+                    self.paths.dir.clone(),
+                    self.paths.secrets.clone(),
+                    bytes,
+                    0o600,
+                )
+                .await
+            }
             Err(e) => Err(ConnectorError::from(e)),
         };
         match written {
@@ -518,14 +547,18 @@ impl Store {
     // A newer generation on disk means a CLI reset: adopt it and drop every session.
     fn refresh_creds(&self) {
         let mut disk = lock(&self.disk);
-        let Some(key) = file_key(&self.paths.credentials) else {
+        let Some(key) = self.paths.dir.key(&self.paths.credentials) else {
             return;
         };
         if disk.creds_key == Some(key) {
             return;
         }
         disk.creds_key = Some(key);
-        match load_json::<Stamped<Credentials>>(&self.paths.credentials, MAX_SMALL_FILE_BYTES) {
+        match load_json::<Stamped<Credentials>>(
+            &self.paths.dir,
+            &self.paths.credentials,
+            MAX_SMALL_FILE_BYTES,
+        ) {
             Ok(Some(next)) if next.generation > disk.creds_gen => {
                 disk.creds_gen = next.generation;
                 self.creds.store(Some(Arc::new(next.value)));
@@ -538,14 +571,18 @@ impl Store {
 
     fn refresh_tokens(&self, tokens: &mut ApiTokens) {
         let mut disk = lock(&self.disk);
-        let Some(key) = file_key(&self.paths.tokens) else {
+        let Some(key) = self.paths.dir.key(&self.paths.tokens) else {
             return;
         };
         if disk.tokens_key == Some(key) {
             return;
         }
         disk.tokens_key = Some(key);
-        match load_json::<Stamped<ApiTokens>>(&self.paths.tokens, MAX_SMALL_FILE_BYTES) {
+        match load_json::<Stamped<ApiTokens>>(
+            &self.paths.dir,
+            &self.paths.tokens,
+            MAX_SMALL_FILE_BYTES,
+        ) {
             Ok(Some(next)) if next.generation > disk.tokens_gen => {
                 disk.tokens_gen = next.generation;
                 *tokens = next.value;
@@ -573,9 +610,10 @@ impl Store {
             value: c,
         };
         let bytes = serde_json::to_vec_pretty(&stamped)?;
-        let lock_path = self.paths.auth_lock.clone();
+        let dir = self.paths.dir.clone();
+        let lock_name = self.paths.auth_lock.clone();
         let target = self.paths.credentials.clone();
-        let written = guarded_write(lock_path, target, stamped.generation, bytes).await?;
+        let written = guarded_write(dir, lock_name, target, stamped.generation, bytes).await?;
         lock(&self.disk).creds_key = None;
         if written {
             self.creds.store(Some(Arc::new(stamped.value)));
@@ -594,17 +632,18 @@ impl Store {
             disk.creds_gen.max(disk.tokens_gen)
         };
         let paths = (
+            self.paths.dir.clone(),
             self.paths.auth_lock.clone(),
             self.paths.tokens.clone(),
             self.paths.credentials.clone(),
         );
         let fresh = c.clone();
         let generation = tokio::task::spawn_blocking(move || -> Result<u64> {
-            let (lock_path, tokens_path, creds_path) = paths;
-            let _held = lock_auth(&lock_path).map_err(|e| internal("auth lock failed", e))?;
+            let (dir, lock_name, tokens_name, creds_name) = paths;
+            let _held = lock_auth(&dir, &lock_name).map_err(|e| internal("auth lock failed", e))?;
             let generation = floor
-                .max(disk_generation(&creds_path))
-                .max(disk_generation(&tokens_path))
+                .max(disk_generation(&dir, &creds_name))
+                .max(disk_generation(&dir, &tokens_name))
                 .saturating_add(1);
             let empty = Stamped {
                 generation,
@@ -614,10 +653,20 @@ impl Store {
                 generation,
                 value: c,
             };
-            write_atomic(&tokens_path, &serde_json::to_vec_pretty(&empty)?, 0o600)
-                .map_err(|e| internal("write failed", e))?;
-            write_atomic(&creds_path, &serde_json::to_vec_pretty(&creds)?, 0o600)
-                .map_err(|e| internal("write failed", e))?;
+            write_atomic_in(
+                &dir,
+                &tokens_name,
+                &serde_json::to_vec_pretty(&empty)?,
+                0o600,
+            )
+            .map_err(|e| internal("write failed", e))?;
+            write_atomic_in(
+                &dir,
+                &creds_name,
+                &serde_json::to_vec_pretty(&creds)?,
+                0o600,
+            )
+            .map_err(|e| internal("write failed", e))?;
             Ok(generation)
         })
         .await
@@ -728,9 +777,10 @@ impl Store {
             value: &next,
         };
         let bytes = serde_json::to_vec_pretty(&stamped)?;
-        let lock_path = self.paths.auth_lock.clone();
+        let dir = self.paths.dir.clone();
+        let lock_name = self.paths.auth_lock.clone();
         let target = self.paths.tokens.clone();
-        let written = guarded_write(lock_path, target, seen, bytes).await?;
+        let written = guarded_write(dir, lock_name, target, seen, bytes).await?;
         lock(&self.disk).tokens_key = None;
         if !written {
             self.refresh_tokens(tokens);
@@ -813,13 +863,28 @@ pub(crate) mod testing {
 mod tests {
     use super::testing::test_config;
     use super::*;
+    use cite_core::atomic::write_atomic;
     use cite_edge::auth::hash_password;
     use cite_edge::model::{MaintenancePage, Retention};
     use cite_edge::totp;
+    use std::fs;
     use std::os::unix::fs::PermissionsExt;
 
+    fn root(dir: &Path) -> TrustedDir {
+        TrustedDir::open(dir).expect("open dir")
+    }
+
+    fn nm(name: &str) -> FileName {
+        FileName::new(name).expect("name")
+    }
+
     const SECRET: &str = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
-    const PASSWORD: &str = "correct horse battery";
+
+    fn password() -> &'static str {
+        static PW: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        PW.get_or_init(|| cite_edge::auth::generate_password().expect("rng"))
+    }
+
     const NOW: u64 = 1_700_000_000;
 
     async fn open_temp() -> (tempfile::TempDir, Arc<Store>) {
@@ -840,7 +905,7 @@ mod tests {
     fn creds() -> Credentials {
         Credentials {
             username: "admin".into(),
-            password_hash: hash_password(PASSWORD).expect("hash"),
+            password_hash: hash_password(password()).expect("hash"),
             totp_secret: SECRET.into(),
             totp_last_step: 0,
         }
@@ -974,8 +1039,13 @@ mod tests {
         body.extend(serde_json::to_vec(&fresh).expect("json"));
         body.push(b'\n');
         fs::write(&path, body).expect("write");
-        let size = prune_file(&path, NOW, 30).expect("prune");
-        let kept = read_tail(&path, 10);
+        let dir_handle = root(dir.path());
+        let files = AuditFiles {
+            current: nm("audit.jsonl"),
+            rotated: nm("audit.jsonl.1"),
+        };
+        let size = prune_file(&dir_handle, &files.current, NOW, 30).expect("prune");
+        let kept = read_tail(&dir_handle, &files, 10);
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].action, "fresh");
         assert_eq!(size, fs::metadata(&path).expect("meta").len());
@@ -1006,13 +1076,13 @@ mod tests {
         let code = totp::code_at(SECRET, NOW).expect("code");
         assert!(
             store
-                .verify_login("admin", PASSWORD, &code, NOW)
+                .verify_login("admin", password(), &code, NOW)
                 .await
                 .expect("ok")
         );
         assert!(
             !store
-                .verify_login("admin", PASSWORD, &code, NOW)
+                .verify_login("admin", password(), &code, NOW)
                 .await
                 .expect("ok")
         );
@@ -1027,7 +1097,7 @@ mod tests {
         let code = totp::code_at(SECRET, NOW).expect("code");
         assert!(
             !store
-                .verify_login("admin", PASSWORD, &code, NOW)
+                .verify_login("admin", password(), &code, NOW)
                 .await
                 .expect("ok")
         );
@@ -1071,7 +1141,7 @@ mod tests {
     async fn a_server_token_write_cannot_undo_a_reset_that_landed_first() {
         let (dir, running) = open_temp().await;
         running.reset_credentials(creds()).await.expect("seed");
-        let held = lock_auth(&dir.path().join("auth.lock")).expect("lock");
+        let held = lock_auth(&root(dir.path()), &nm("auth.lock")).expect("lock");
         let writer = Arc::clone(&running);
         let task = tokio::spawn(async move { writer.create_api_token("backdoor").await });
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
@@ -1085,7 +1155,7 @@ mod tests {
         assert!(running.list_api_tokens().await.is_empty());
         let disk = fs::read_to_string(dir.path().join("tokens.json")).expect("tokens");
         assert!(!disk.contains("backdoor"), "{disk}");
-        assert_eq!(disk_generation(&dir.path().join("tokens.json")), 5);
+        assert_eq!(disk_generation(&root(dir.path()), &nm("tokens.json")), 5);
         let (_, fresh) = running.create_api_token("later").await.expect("token");
         assert!(running.verify_api_token(&fresh).await.is_some());
     }
@@ -1094,7 +1164,7 @@ mod tests {
     async fn a_server_credential_write_cannot_undo_a_reset_that_landed_first() {
         let (dir, running) = open_temp().await;
         running.reset_credentials(creds()).await.expect("seed");
-        let held = lock_auth(&dir.path().join("auth.lock")).expect("lock");
+        let held = lock_auth(&root(dir.path()), &nm("auth.lock")).expect("lock");
         let writer = Arc::clone(&running);
         let task = tokio::spawn(async move { writer.set_credentials(creds()).await });
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
@@ -1107,13 +1177,16 @@ mod tests {
         );
         let adopted = running.credentials().expect("credentials");
         assert_eq!(adopted.totp_secret, "MFRGGZDFMZTWQ2LK");
-        assert_eq!(disk_generation(&dir.path().join("credentials.json")), 5);
+        assert_eq!(
+            disk_generation(&root(dir.path()), &nm("credentials.json")),
+            5
+        );
     }
 
     #[tokio::test]
     async fn a_reset_waits_for_a_write_that_holds_the_auth_lock() {
         let (dir, store) = open_temp().await;
-        let held = lock_auth(&dir.path().join("auth.lock")).expect("lock");
+        let held = lock_auth(&root(dir.path()), &nm("auth.lock")).expect("lock");
         let cli = Arc::clone(&store);
         let reset = tokio::spawn(async move { cli.reset_credentials(creds()).await });
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
@@ -1134,6 +1207,59 @@ mod tests {
         let (again, _) = store.create_session("admin", NOW).expect("session");
         store.clear_sessions();
         assert!(store.validate_session(&again, NOW + 1).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_symlinked_store_file_is_refused_not_followed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("outside");
+        let target = outside.path().join("elsewhere");
+        let valid = EdgeConfig {
+            version: CONFIG_VERSION,
+            ..EdgeConfig::default()
+        };
+        let body = serde_json::to_vec_pretty(&valid).expect("json");
+        fs::write(&target, &body).expect("write");
+        std::os::unix::fs::symlink(&target, dir.path().join("edge.json")).expect("link");
+        let err = Store::open(&test_config(dir.path()))
+            .await
+            .err()
+            .expect("open must refuse the symlink");
+        let text = err.to_string();
+        assert!(text.contains("cannot read edge.json"), "{text}");
+        assert!(!text.contains("is invalid"), "{text}");
+        assert_eq!(fs::read(&target).expect("read"), body);
+    }
+
+    #[test]
+    fn audit_append_and_lock_refuse_symlinks_and_stay_in_the_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("outside");
+        let target = outside.path().join("victim");
+        fs::write(&target, b"keep").expect("write");
+        std::os::unix::fs::symlink(&target, dir.path().join("audit.jsonl")).expect("link");
+        std::os::unix::fs::symlink(&target, dir.path().join("auth.lock")).expect("link");
+        let handle = root(dir.path());
+        let files = AuditFiles {
+            current: nm("audit.jsonl"),
+            rotated: nm("audit.jsonl.1"),
+        };
+        let state = AuditState {
+            size: 0,
+            last_prune: NOW,
+        };
+        assert!(append_audit(&handle, &files, b"x\n", state, NOW, 30).is_err());
+        assert!(lock_auth(&handle, &nm("auth.lock")).is_err());
+        assert_eq!(fs::read(&target).expect("read"), b"keep");
+    }
+
+    #[test]
+    fn store_file_names_reject_traversal_nul_and_separators() {
+        for bad in ["", ".", "..", "../edge.json", "/etc/passwd", "a/b", "a\0b"] {
+            assert!(fixed_name(bad).is_err(), "{bad:?}");
+        }
+        assert!(fixed_name(&"x".repeat(cite_core::confined::NAME_MAX + 1)).is_err());
+        assert!(fixed_name("edge.json").is_ok());
     }
 
     #[tokio::test]

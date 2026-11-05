@@ -25,9 +25,15 @@ function applyProps(el, props, isSvg) {
 function append(el, kids) {
   for (const kid of kids) {
     if (kid === null || kid === undefined || kid === false || kid === true) continue;
-    if (Array.isArray(kid)) append(el, kid);
-    else if (kid instanceof Node) el.appendChild(kid);
-    else el.appendChild(document.createTextNode(String(kid)));
+    if (typeof kid === 'string' || typeof kid === 'number' || typeof kid === 'bigint') {
+      el.appendChild(document.createTextNode(String(kid)));
+    } else if (Array.isArray(kid)) {
+      append(el, kid);
+    } else if (kid instanceof Node) {
+      el.append(kid);
+    } else {
+      el.appendChild(document.createTextNode(String(kid)));
+    }
   }
 }
 
