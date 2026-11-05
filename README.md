@@ -26,7 +26,7 @@
 <tr>
 <td width="25%" valign="top"><b>Blue/green switch</b><br><sub>The new release is built and health-checked in the idle slot. Traffic moves by changing one entry in a map, with no proxy reload.</sub></td>
 <td width="25%" valign="top"><b>Edge firewall</b><br><sub>Path, method, user agent, address and host rules that deny, silently drop or tarpit. Four presets cover common probes.</sub></td>
-<td width="25%" valign="top"><b>Analytics</b><br><sub>Requests, status classes, latency percentiles and top paths from HAProxy's own logs, held in bounded memory with set retention.</sub></td>
+<td width="25%" valign="top"><b>Analytics</b><br><sub>Requests, status classes, latency percentiles, top paths and header-first bot scoring from HAProxy's own logs, kept in an embedded SQLite database with set retention and CSV export.</sub></td>
 <td width="25%" valign="top"><b>Many nodes, one console</b><br><sub>A connector on each node exposes an authenticated API. The dashboard talks to all of them and can replicate a site to every node.</sub></td>
 </tr>
 </table>
