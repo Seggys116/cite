@@ -16,6 +16,7 @@ name = "cite-dockerproxy"
 path = "src/main.rs"
 
 [dependencies]
+serde.workspace = true
 serde_json.workspace = true
 regex.workspace = true
 tokio.workspace = true

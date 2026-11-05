@@ -27,6 +27,7 @@ use tokio::time::Instant;
 
 use crate::config::Config;
 use crate::policy::{BodyKind, Check, MAX_BODY, Policy, Route};
+use crate::strict;
 use crate::target::normalise;
 
 const HEADER_TIMEOUT: Duration = Duration::from_secs(10);
@@ -214,14 +215,20 @@ impl State {
             .classify(parts.method.as_str(), &target)
             .map_err(Fail::Deny)?;
         let deadline = Instant::now() + route.timeout();
-        let payload = read_payload(&route, &parts.headers, body).await?;
-        if let Some(bytes) = &payload {
-            let value: Value = serde_json::from_slice(bytes)
-                .map_err(|_| Fail::Deny("body is not valid json".to_string()))?;
-            self.policy
-                .validate_body(&route, &value)
-                .map_err(Fail::Deny)?;
-        }
+        let payload = match read_payload(&route, &parts.headers, body).await? {
+            Some(bytes) => {
+                let value = strict::parse(&bytes)
+                    .map_err(|_| Fail::Deny("body is not valid json".to_string()))?;
+                self.policy
+                    .validate_body(&route, &value)
+                    .map_err(Fail::Deny)?;
+                // The validated value is re-encoded so dockerd decodes exactly what was checked.
+                let canonical = serde_json::to_vec(&value)
+                    .map_err(|_| Fail::Deny("body cannot be re-encoded".to_string()))?;
+                Some(Bytes::from(canonical))
+            }
+            None => None,
+        };
         if let Some(check) = route.check() {
             match self.managed(&check, deadline).await? {
                 Managed::Missing => return Err(Fail::NotFound),

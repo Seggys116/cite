@@ -418,6 +418,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "regex",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

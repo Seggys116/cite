@@ -121,6 +121,57 @@ async fn container_create_is_forwarded_byte_exact() {
     assert_eq!(seen[0].header("content-type"), Some("application/json"));
 }
 
+// Reproduces the verified bypass: dockerd merges duplicate keys, a map-based validator keeps the last one.
+#[tokio::test]
+async fn duplicate_host_config_cannot_smuggle_a_privileged_container() {
+    let (addr, docker) = proxy_and_docker().await;
+    let (name, spec) = manager_spec();
+    let clean = serde_json::to_string(&spec).unwrap();
+    let evil = r#"{"HostConfig":{"Privileged":true,"Binds":["/:/host"],"PidMode":"host"},"#;
+    for body in [
+        clean.replacen('{', evil, 1),
+        clean.replacen('{', r#"{"hostconfig":{"Privileged":true},"#, 1),
+        clean.replacen('{', r#"{"\u0048ostConfig":{"Privileged":true},"#, 1),
+    ] {
+        let r = raw(
+            addr,
+            &build(
+                "POST",
+                &format!("/v1.45/containers/create?name={name}"),
+                &[("Content-Type", "application/json")],
+                body.as_bytes(),
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(denied_body(&r), "{body}");
+    }
+    assert_eq!(docker.seen_count(), 0);
+}
+
+// Whatever layout the client sends, dockerd only ever receives the value that was validated.
+#[tokio::test]
+async fn forwarded_bodies_are_the_canonical_validated_value() {
+    let (addr, docker) = proxy_and_docker().await;
+    let (name, spec) = manager_spec();
+    let pretty = serde_json::to_vec_pretty(&spec).unwrap();
+    let r = raw(
+        addr,
+        &build(
+            "POST",
+            &format!("/v1.45/containers/create?name={name}"),
+            &[("Content-Type", "application/json")],
+            &pretty,
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(r.status, 201);
+    let seen = docker.seen();
+    assert_eq!(seen[0].body, serde_json::to_vec(&spec).unwrap());
+    assert_ne!(seen[0].body, pretty);
+}
+
 #[tokio::test]
 async fn privileged_create_is_denied_before_docker() {
     let (addr, docker) = proxy_and_docker().await;
