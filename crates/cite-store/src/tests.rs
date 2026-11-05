@@ -1922,6 +1922,7 @@ fn retention_erases_path_rollups_and_dictionary_text_of_expired_rows() {
         b"ExpiredAgent",
         b"expired-ref.example",
         b"expired-host-",
+        b"/expired-path/",
     ] {
         assert!(
             !db_and_wal_contain(dir.path(), needle),

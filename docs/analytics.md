@@ -66,7 +66,7 @@ Earlier versions kept counters in memory and wrote them to `analytics.json` in t
 
 ## Retention
 
-Rows are kept until they are older than the retention period. Nothing else removes them: there is no memory budget, and no limit on rows or on database size unless you set one. Retention removes everything that came with the expired rows: their rollups (including the per-path rollups), and every dictionary entry that no remaining row or rollup refers to. Client addresses, user agents and referers are overwritten in the file when their dictionary entry is deleted, and the write-ahead log is folded away afterwards, so the text does not linger in either file. Path text of deleted raw rows is not overwritten and can remain in unused space inside a page until SQLite reuses it.
+Rows are kept until they are older than the retention period. Nothing else removes them: there is no memory budget, and no limit on rows or on database size unless you set one. Retention removes everything that came with the expired rows: their rollups (including the per-path rollups), and every dictionary entry that no remaining row or rollup refers to. Client addresses, user agents and referers are overwritten in the file when their dictionary entry is deleted, and the write-ahead log is folded away afterwards, so the text does not linger in either file. Path text of deleted raw rows is zeroed too, because the writer runs with `secure_delete=FAST`.
 
 The period is the `hour_buckets_days` value of the `retention` object in the node's settings (`GET` and `PUT /api/v1/settings`), 90 days by default. Retention is applied every 10 minutes and straight after a settings change, so shortening it removes the older rows within moments. The connector's start uses the stored value.
 

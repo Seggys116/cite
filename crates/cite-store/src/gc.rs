@@ -110,7 +110,7 @@ impl Inner {
                 tx.commit()?;
                 Ok((all, ident))
             })();
-            let restored = w.conn.execute_batch("PRAGMA secure_delete = OFF");
+            let restored = w.conn.execute_batch("PRAGMA secure_delete = FAST");
             let (all, ident) = deleted?;
             restored?;
             swept.removed += all;

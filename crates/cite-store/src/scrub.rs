@@ -70,7 +70,7 @@ impl Inner {
             tx.commit()?;
             Ok(tail)
         })();
-        let restored = w.conn.execute_batch("PRAGMA secure_delete = OFF");
+        let restored = w.conn.execute_batch("PRAGMA secure_delete = FAST");
         w.forget(&kinds);
         touched += result?;
         restored?;
