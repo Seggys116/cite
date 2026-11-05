@@ -492,3 +492,246 @@ fn the_archive_directory_is_private() {
     assert_eq!(mode(&archive), 0o700);
     assert_eq!(mode(&archive.join(&cut.files[0])), 0o600);
 }
+
+fn archive_text(path: &Path) -> String {
+    use std::io::Read;
+    let mut text = String::new();
+    flate2::read::GzDecoder::new(fs::File::open(path).expect("open"))
+        .read_to_string(&mut text)
+        .expect("gunzip");
+    text
+}
+
+fn sha_of(path: &Path) -> String {
+    Sha256::digest(fs::read(path).expect("read"))
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+#[test]
+fn a_second_restore_is_refused_unless_asked_for() {
+    let (_d, s, _a) = open_archived();
+    s.insert(&day_events(DAY0 - 3 * DAY, 6)).expect("insert");
+    let cut = s.cut_before(NOW, true, false).expect("cut");
+    let name = &cut.files[0];
+    assert_eq!(s.restore_archive(name).expect("restore"), 6);
+    assert!(matches!(s.restore_archive(name), Err(Error::Conflict(_))));
+    assert_eq!(rows(&s), 6);
+    assert_eq!(s.restore_archive_again(name).expect("again"), 6);
+    assert_eq!(rows(&s), 12);
+}
+
+#[test]
+fn concurrent_restores_import_the_archive_once() {
+    let (_d, s, _a) = open_archived();
+    s.insert(&day_events(DAY0 - 3 * DAY, 20)).expect("insert");
+    let cut = s.cut_before(NOW, true, false).expect("cut");
+    let name = &cut.files[0];
+    let results: Vec<_> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..4)
+            .map(|_| scope.spawn(|| s.restore_archive(name)))
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("join"))
+            .collect()
+    });
+    assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+    assert!(
+        results
+            .iter()
+            .filter(|r| r.is_err())
+            .all(|r| matches!(r, Err(Error::Conflict(_))))
+    );
+    assert_eq!(rows(&s), 20);
+}
+
+#[test]
+fn a_failed_restore_leaves_no_marker_and_can_be_retried() {
+    let (_d, s, archive) = open_archived();
+    s.insert(&day_events(DAY0 - 3 * DAY, 12)).expect("insert");
+    let cut = s.cut_before(NOW, true, false).expect("cut");
+    let path = archive.join(&cut.files[0]);
+    let good = fs::read(&path).expect("read");
+    let mut bad = good.clone();
+    let mid = bad.len() / 2;
+    bad[mid] ^= 0xff;
+    fs::write(&path, bad).expect("damage");
+    assert!(s.restore_archive(&cut.files[0]).is_err());
+    assert!(
+        !files_in(&archive)
+            .iter()
+            .any(|n| n.ends_with(".restored.json"))
+    );
+    fs::write(&path, good).expect("repair");
+    assert_eq!(s.restore_archive(&cut.files[0]).expect("retry"), 12);
+}
+
+#[test]
+fn deleting_an_archive_also_removes_its_restore_marker() {
+    let (_d, s, archive) = open_archived();
+    s.insert(&day_events(DAY0 - 3 * DAY, 3)).expect("insert");
+    let cut = s.cut_before(NOW, true, false).expect("cut");
+    s.restore_archive(&cut.files[0]).expect("restore");
+    assert!(
+        files_in(&archive)
+            .iter()
+            .any(|n| n.ends_with(".restored.json"))
+    );
+    s.delete_archive(&cut.files[0]).expect("delete");
+    assert!(files_in(&archive).is_empty());
+}
+
+#[test]
+fn a_cut_inside_an_hour_rounds_down_so_a_restore_does_not_double_count() {
+    let (_d, s, _a) = open_archived();
+    let day = DAY0 - 2 * DAY;
+    let hour = 3_600_000;
+    let mut events = day_events(day, 5);
+    events.push(rich(day + 3 * hour + 10_000, 1));
+    events.push(rich(day + 3 * hour + 2_000_000, 2));
+    events.push(rich(day + 3 * hour + 3_000_000, 3));
+    s.insert(&events).expect("insert");
+    let window = 30 * 86_400;
+    let before = s.summary(window, None, NOW).expect("summary");
+
+    let cut = s
+        .cut_before(day + 3 * hour + 1_800_000, true, false)
+        .expect("cut");
+    assert_eq!(cut.cutoff_ms, day + 3 * hour);
+    assert_eq!(cut.archived_rows, 5);
+    let during = s.summary(window, None, NOW).expect("summary");
+    assert_eq!(during.requests, 3);
+
+    s.restore_archive(&cut.files[0]).expect("restore");
+    let after = s.summary(window, None, NOW).expect("summary");
+    assert_eq!(after.requests, before.requests);
+    assert_eq!(rows(&s), 8);
+}
+
+#[test]
+fn two_backups_at_once_both_succeed_under_different_names() {
+    let (_d, s, archive) = open_archived();
+    s.insert(&day_events(DAY0 - 2 * DAY, 10)).expect("insert");
+    let items: Vec<_> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..4).map(|_| scope.spawn(|| s.backup())).collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("join"))
+            .collect()
+    });
+    let mut names: Vec<String> = items.into_iter().map(|r| r.expect("backup").name).collect();
+    names.sort();
+    names.dedup();
+    assert_eq!(names.len(), 4);
+    assert!(!files_in(&archive).iter().any(|n| n.ends_with(".tmp")));
+}
+
+#[test]
+fn oversized_lines_and_oversized_archives_are_refused_while_reading() {
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+    let gz = |bytes: &[u8]| {
+        let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(bytes).expect("write");
+        enc.finish().expect("finish")
+    };
+    let line = serde_json::to_string(&rich(NOW, 1)).expect("json");
+    let ok = gz(format!("{line}\n{line}\n").as_bytes());
+    let n = crate::archive::read_events_capped(ok.as_slice(), 4096, 1 << 20, |_| Ok(()));
+    assert_eq!(n.expect("read"), 2);
+
+    let long = gz(&vec![b'x'; 5000]);
+    let err = crate::archive::read_events_capped(long.as_slice(), 4096, 1 << 20, |_| Ok(()));
+    assert!(matches!(err, Err(Error::Archive(_))));
+
+    let total = line.len() as u64 + 1;
+    let err = crate::archive::read_events_capped(ok.as_slice(), 4096, total, |_| Ok(()));
+    assert!(matches!(err, Err(Error::Archive(_))));
+}
+
+#[test]
+fn scrubbing_blanks_archives_and_backups_and_keeps_them_valid() {
+    let (_d, s, archive) = open_archived();
+    s.insert(&day_events(DAY0 - 3 * DAY, 8)).expect("insert");
+    let cut = s.cut_before(NOW, true, false).expect("cut");
+    s.insert(&day_events(DAY0 - DAY / 2, 4)).expect("live");
+    let backup = s.backup().expect("backup");
+    s.restore_archive(&cut.files[0]).expect("restore");
+
+    let path = archive.join(&cut.files[0]);
+    assert!(archive_text(&path).contains("203.0.113."));
+    let report = s.scrub_archived_fields(true, false).expect("scrub");
+    assert_eq!((report.archives, report.backups, report.rows), (1, 1, 8));
+    assert!(report.failed.is_empty());
+
+    let text = archive_text(&path);
+    assert!(!text.contains("203.0.113."));
+    assert!(text.contains("ua-1"));
+    let list = s.list_archives().expect("list");
+    for item in &list.items {
+        assert_eq!(item.sha256, sha_of(&archive.join(&item.name)));
+    }
+    let item = list
+        .items
+        .iter()
+        .find(|i| i.name == cut.files[0])
+        .expect("archive");
+    assert_eq!(item.rows, 8);
+    assert!(matches!(
+        s.restore_archive(&cut.files[0]),
+        Err(Error::Conflict(_))
+    ));
+
+    let copy = rusqlite::Connection::open(archive.join(&backup.name)).expect("open");
+    let ips: i64 = copy
+        .query_row(
+            "SELECT (SELECT count(*) FROM requests WHERE client_ip_id IS NOT NULL) + (SELECT count(*) FROM dict WHERE kind = ?1)",
+            [crate::schema::kind::CLIENT_IP],
+            |r| r.get(0),
+        )
+        .expect("count");
+    assert_eq!(ips, 0);
+    let uas: i64 = copy
+        .query_row(
+            "SELECT count(*) FROM requests WHERE ua_id IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )
+        .expect("count");
+    assert!(uas > 0);
+    drop(copy);
+    let raw = fs::read(archive.join(&backup.name)).expect("read");
+    assert!(!raw.windows(10).any(|w| w == b"203.0.113."));
+
+    let again = s.scrub_archived_fields(true, true).expect("scrub both");
+    assert_eq!((again.archives, again.backups), (1, 1));
+    assert!(!archive_text(&path).contains("ua-1"));
+    let none = s.scrub_archived_fields(true, true).expect("scrub clean");
+    assert_eq!((none.archives, none.backups, none.rows), (0, 0, 0));
+}
+
+#[test]
+fn a_scrub_waits_for_the_maintenance_lock_and_precedes_an_archive_pass() {
+    let (_d, s, archive) = open_archived();
+    s.insert(&day_events(DAY0 - 3 * DAY, 6)).expect("insert");
+    let turn = s
+        .inner
+        .maintenance
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    std::thread::scope(|scope| {
+        let scrub = scope.spawn(|| s.scrub_fields(true, false));
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let held = s
+            .requests(&RequestFilter::default(), 100)
+            .expect("requests");
+        assert!(held.iter().all(|e| !e.client_ip.is_empty()));
+        drop(turn);
+        assert_eq!(scrub.join().expect("join").expect("scrub"), 6);
+    });
+    let cut = s.cut_before(NOW, true, false).expect("cut");
+    assert!(!archive_text(&archive.join(&cut.files[0])).contains("203.0.113."));
+}

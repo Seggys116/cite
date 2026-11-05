@@ -1,6 +1,8 @@
 use std::fs::{self, DirBuilder, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, Write};
 use std::path::{Path, PathBuf};
+use std::sync::PoisonError;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -14,10 +16,14 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::error::{Error, Result};
-use crate::limits::DAY_MS;
+use crate::limits::{DAY_MS, HOUR_MS};
 use crate::queries::{self, Where, int};
 use crate::retention::PruneReport;
 use crate::store::Inner;
+
+mod scrub;
+
+pub use scrub::ArchiveScrub;
 
 const PAGE: usize = 5000;
 const MAX_NAME: usize = 120;
@@ -25,6 +31,7 @@ const MAX_LISTED: usize = 10_000;
 const MAX_SEQ: u32 = 1000;
 const TMP_SUFFIX: &str = ".tmp";
 const MANIFEST_SUFFIX: &str = ".manifest.json";
+const RESTORED_SUFFIX: &str = ".restored.json";
 const ARCHIVE_PREFIX: &str = "requests-";
 const ARCHIVE_EXT: &str = ".ndjson.gz";
 const BACKUP_PREFIX: &str = "backup-";
@@ -32,6 +39,11 @@ const BACKUP_EXT: &str = ".db";
 const BACKUP_ATTEMPTS: u32 = 600;
 const BACKUP_RETRY: Duration = Duration::from_millis(100);
 const HASH_BUF: usize = 64 * 1024;
+// A real event is a few kilobytes; anything near this size is damage or an attack, not data.
+const MAX_LINE: usize = 1 << 20;
+// Decompressed bytes accepted from one archive, so a small file cannot expand without bound.
+const MAX_DECODED: u64 = 32 << 30;
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// One archive or backup file with the manifest entry that vouches for it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -178,8 +190,14 @@ fn exists(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok()
 }
 
-fn tmp_path(dir: &Path, name: &str) -> PathBuf {
-    dir.join(format!("{name}{TMP_SUFFIX}"))
+// Unique per call, so a stale file or a concurrent writer can never share a temp path.
+fn unique_tmp(dir: &Path, name: &str) -> PathBuf {
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    dir.join(format!("{name}.{}.{seq}{TMP_SUFFIX}", std::process::id()))
+}
+
+fn marker_path(dir: &Path, name: &str) -> PathBuf {
+    dir.join(format!("{name}{RESTORED_SUFFIX}"))
 }
 
 fn manifest_path(dir: &Path, name: &str) -> PathBuf {
@@ -222,8 +240,7 @@ impl<W: Write> Write for HashingWriter<W> {
     }
 }
 
-fn file_sha256(path: &Path) -> io::Result<String> {
-    let mut file = File::open(path)?;
+fn handle_sha256(file: &mut impl Read) -> io::Result<String> {
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; HASH_BUF];
     loop {
@@ -235,43 +252,81 @@ fn file_sha256(path: &Path) -> io::Result<String> {
     }
 }
 
+fn file_sha256(path: &Path) -> io::Result<String> {
+    handle_sha256(&mut File::open(path)?)
+}
+
 // Decodes every line as an event, so a truncated or damaged file fails here rather than half-way through a restore.
-fn read_events(path: &Path, mut each: impl FnMut(LogEvent) -> Result<()>) -> Result<u64> {
-    let file = File::open(path)?;
-    let reader = BufReader::new(GzDecoder::new(BufReader::new(file)));
-    let mut count = 0u64;
-    for line in reader.lines() {
-        let line = line?;
-        if line.is_empty() {
+fn read_events(src: impl Read, each: impl FnMut(LogEvent) -> Result<()>) -> Result<u64> {
+    read_events_capped(src, MAX_LINE, MAX_DECODED, each)
+}
+
+// Reads lines through a take() so an endless line is cut off at max_line instead of being buffered whole.
+pub(crate) fn read_events_capped(
+    src: impl Read,
+    max_line: usize,
+    max_total: u64,
+    mut each: impl FnMut(LogEvent) -> Result<()>,
+) -> Result<u64> {
+    let mut reader = BufReader::new(GzDecoder::new(BufReader::new(src)));
+    let (mut count, mut total) = (0u64, 0u64);
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        let n = (&mut reader)
+            .take(max_line as u64 + 1)
+            .read_until(b'\n', &mut line)?;
+        if n == 0 {
+            return Ok(count);
+        }
+        if n > max_line {
+            return Err(Error::Archive(format!(
+                "a line is longer than the {max_line} byte limit"
+            )));
+        }
+        total += n as u64;
+        if total > max_total {
+            return Err(Error::Archive(format!(
+                "the decompressed data is larger than the {max_total} byte limit"
+            )));
+        }
+        let body = line.strip_suffix(b"\n").unwrap_or(&line);
+        if body.is_empty() {
             continue;
         }
-        each(serde_json::from_str::<LogEvent>(&line)?)?;
+        each(serde_json::from_slice::<LogEvent>(body)?)?;
         count += 1;
     }
-    Ok(count)
 }
 
 fn verify_archive(path: &Path, sha256: &str, rows: u64) -> Result<()> {
+    let mut file =
+        File::open(path).map_err(|e| Error::Archive(format!("verification failed: {e}")))?;
+    verify_handle(&mut file, sha256, rows)
+}
+
+// Checks the open handle itself, so the bytes imported afterwards are the bytes that were verified.
+fn verify_handle(file: &mut File, sha256: &str, rows: u64) -> Result<()> {
     let fail = |what: String| Error::Archive(format!("verification failed: {what}"));
-    let got = file_sha256(path).map_err(|e| fail(e.to_string()))?;
+    let got = handle_sha256(file).map_err(|e| fail(e.to_string()))?;
     if got != sha256 {
         return Err(fail("checksum does not match".into()));
     }
-    let counted = read_events(path, |_| Ok(())).map_err(|e| fail(e.to_string()))?;
+    file.rewind().map_err(|e| fail(e.to_string()))?;
+    let counted = read_events(&mut *file, |_| Ok(())).map_err(|e| fail(e.to_string()))?;
     if counted != rows {
         return Err(fail(format!("{counted} rows read back, expected {rows}")));
     }
     Ok(())
 }
 
-// The manifest is what makes a file listable, so it is written last and atomically.
-fn write_manifest(dir: &Path, item: &ArchiveItem) -> Result<()> {
-    let path = manifest_path(dir, &item.name);
-    let tmp = tmp_path(dir, &format!("{}{MANIFEST_SUFFIX}", item.name));
-    let _ = fs::remove_file(&tmp);
+// Atomic by temp file and rename, so a reader sees the old file or the whole new one.
+fn write_atomic(dir: &Path, file_name: &str, bytes: &[u8]) -> Result<()> {
+    let path = dir.join(file_name);
+    let tmp = unique_tmp(dir, file_name);
     let outcome = (|| -> Result<()> {
         let mut file = create_private(&tmp)?;
-        file.write_all(&serde_json::to_vec(item)?)?;
+        file.write_all(bytes)?;
         file.sync_all()?;
         fs::rename(&tmp, &path)?;
         Ok(())
@@ -282,12 +337,65 @@ fn write_manifest(dir: &Path, item: &ArchiveItem) -> Result<()> {
     outcome
 }
 
+// The manifest is what makes a file listable, so it is written last and atomically.
+fn write_manifest(dir: &Path, item: &ArchiveItem) -> Result<()> {
+    write_atomic(
+        dir,
+        &format!("{}{MANIFEST_SUFFIX}", item.name),
+        &serde_json::to_vec(item)?,
+    )
+}
+
+/// Durable record that an archive was imported; restoring the same bytes again would duplicate its rows.
+#[derive(Debug, Serialize, Deserialize)]
+struct Restored {
+    sha256: String,
+    restored_ms: i64,
+    rows: u64,
+}
+
+fn read_marker(dir: &Path, name: &str) -> Result<Option<Restored>> {
+    match fs::read(marker_path(dir, name)) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(|_| {
+            Error::Archive(format!(
+                "the restore marker of {name} is unreadable; restore with again set to override it"
+            ))
+        }),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn write_marker(dir: &Path, name: &str, marker: &Restored) -> Result<()> {
+    write_atomic(
+        dir,
+        &format!("{name}{RESTORED_SUFFIX}"),
+        &serde_json::to_vec(marker)?,
+    )?;
+    sync_dir(dir)?;
+    Ok(())
+}
+
 struct Written {
     rows: u64,
     sha256: String,
     bytes: u64,
     first_ms: Option<i64>,
     last_ms: Option<i64>,
+}
+
+type Encoder = GzEncoder<HashingWriter<BufWriter<File>>>;
+
+// Finishes the gzip stream and syncs the file; returns the checksum and size of what reached the disk.
+fn seal(enc: Encoder) -> Result<(String, u64)> {
+    let HashingWriter {
+        inner,
+        hasher,
+        bytes,
+    } = enc.finish()?;
+    let file = inner.into_inner().map_err(io::IntoInnerError::into_error)?;
+    file.sync_all()?;
+    Ok((hex(&hasher.finalize()), bytes))
 }
 
 struct Segment {
@@ -317,8 +425,7 @@ impl Inner {
         make_dir(dir)?;
         let stem = format!("{ARCHIVE_PREFIX}{from:013}-{to:013}");
         let name = free_name(dir, &stem, Kind::Archive)?;
-        let tmp = tmp_path(dir, &name);
-        let _ = fs::remove_file(&tmp);
+        let tmp = unique_tmp(dir, &name);
         let written = match self.write_rows(&tmp, from, to, max_id) {
             Ok(w) => w,
             Err(e) => {
@@ -354,7 +461,7 @@ impl Inner {
             hasher: Sha256::new(),
             bytes: 0,
         };
-        let mut enc = GzEncoder::new(sink, Compression::default());
+        let mut enc: Encoder = GzEncoder::new(sink, Compression::default());
         let (mut rows, mut first_ms, mut last_ms) = (0u64, None, None);
         let mut after = None;
         loop {
@@ -375,15 +482,7 @@ impl Inner {
                 _ => break,
             }
         }
-        let HashingWriter {
-            inner,
-            hasher,
-            bytes,
-        } = enc.finish()?;
-        let file = inner.into_inner().map_err(io::IntoInnerError::into_error)?;
-        file.sync_all()?;
-        drop(file);
-        let sha256 = hex(&hasher.finalize());
+        let (sha256, bytes) = seal(enc)?;
         self.inject_fault(tmp, bytes)?;
         verify_archive(tmp, &sha256, rows)?;
         Ok(Written {
@@ -444,6 +543,8 @@ impl Inner {
         archive: bool,
         dry_run: bool,
     ) -> Result<CutReport> {
+        // Rollups are hourly, so a cutoff inside an hour would delete raw rows whose rollup stays and a restore would count that hour twice.
+        let cutoff_ms = cutoff_ms.div_euclid(HOUR_MS) * HOUR_MS;
         let dir = if archive {
             Some(self.archive_dir_required()?)
         } else {
@@ -493,6 +594,10 @@ impl Inner {
 
     pub(crate) fn backup(&self) -> Result<ArchiveItem> {
         let dir = self.archive_dir_required()?;
+        let _turn = self
+            .maintenance
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         make_dir(dir)?;
         let created_ms = now_ms();
         let name = free_name(
@@ -500,8 +605,7 @@ impl Inner {
             &format!("{BACKUP_PREFIX}{created_ms:013}"),
             Kind::Backup,
         )?;
-        let tmp = tmp_path(dir, &name);
-        let _ = fs::remove_file(&tmp);
+        let tmp = unique_tmp(dir, &name);
         let outcome = self.copy_database(dir, &tmp, &name, created_ms);
         if outcome.is_err() {
             let _ = fs::remove_file(&tmp);
@@ -533,26 +637,17 @@ impl Inner {
         })?;
         // The copy keeps the source's WAL mode; switching it back leaves one self-contained file.
         dst.execute_batch("PRAGMA journal_mode = DELETE")?;
-        let check: String = dst.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
-        if check != "ok" {
-            return Err(Error::Archive(format!("backup failed its check: {check}")));
-        }
-        let (rows, first_ms, last_ms): (i64, Option<i64>, Option<i64>) =
-            dst.query_row("SELECT count(*), min(ts), max(ts) FROM requests", [], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-            })?;
-        dst.close().map_err(|(_, e)| e)?;
-        File::open(tmp)?.sync_all()?;
-        let item = ArchiveItem {
+        let base = ArchiveItem {
             name: name.to_string(),
             kind: Kind::Backup.label().into(),
-            bytes: fs::metadata(tmp)?.len(),
+            bytes: 0,
             created_ms,
-            sha256: file_sha256(tmp)?,
-            rows: u64::try_from(rows).unwrap_or(0),
-            from_ms: first_ms,
-            to_ms: last_ms,
+            sha256: String::new(),
+            rows: 0,
+            from_ms: None,
+            to_ms: None,
         };
+        let item = seal_backup(dst, tmp, base)?;
         publish(dir, tmp, &item)?;
         Ok(item)
     }
@@ -630,7 +725,16 @@ impl Inner {
         Ok(list)
     }
 
-    pub(crate) fn restore_archive(&self, name: &str) -> Result<u64> {
+    // One restore at a time, and none while a cut, backup or scrub runs, so the file and its manifest cannot change under it.
+    pub(crate) fn restore_archive(&self, name: &str, again: bool) -> Result<u64> {
+        let _once = self
+            .restoring
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let _turn = self
+            .maintenance
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let (kind, dir, path) = self.resolve(name)?;
         if kind != Kind::Archive {
             return Err(Error::Rejected(
@@ -638,10 +742,17 @@ impl Inner {
             ));
         }
         let item = self.read_item(dir, name, kind)?;
-        verify_archive(&path, &item.sha256, item.rows)?;
+        if !again && read_marker(dir, name)?.is_some_and(|m| m.sha256 == item.sha256) {
+            return Err(Error::Conflict(format!(
+                "{name} was already restored; restoring it again would duplicate its rows, so send again set to true if that is intended"
+            )));
+        }
+        let mut file = File::open(&path)?;
+        verify_handle(&mut file, &item.sha256, item.rows)?;
+        file.rewind()?;
         let mut chunk: Vec<LogEvent> = Vec::with_capacity(PAGE);
         let mut total = 0u64;
-        read_events(&path, |ev| {
+        read_events(&mut file, |ev| {
             chunk.push(ev);
             if chunk.len() >= PAGE {
                 total += self.insert(&chunk)? as u64;
@@ -650,16 +761,28 @@ impl Inner {
             Ok(())
         })?;
         total += self.insert(&chunk)? as u64;
+        let marker = Restored {
+            sha256: item.sha256,
+            restored_ms: now_ms(),
+            rows: total,
+        };
+        write_marker(dir, name, &marker).map_err(|e| {
+            Error::Archive(format!(
+                "{total} rows were restored but the restore marker could not be written ({e}); do not restore {name} again"
+            ))
+        })?;
         Ok(total)
     }
 
     pub(crate) fn delete_archive(&self, name: &str) -> Result<()> {
         let (_, dir, path) = self.resolve(name)?;
         fs::remove_file(&path)?;
-        match fs::remove_file(manifest_path(dir, name)) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.into()),
+        for side in [manifest_path(dir, name), marker_path(dir, name)] {
+            match fs::remove_file(side) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
         }
         sync_dir(dir)?;
         Ok(())
@@ -682,4 +805,26 @@ fn publish(dir: &Path, tmp: &Path, item: &ArchiveItem) -> Result<()> {
         return Err(e);
     }
     Ok(())
+}
+
+// Checks, measures and syncs a finished backup copy, keeping the identity fields of base.
+fn seal_backup(dst: Connection, tmp: &Path, base: ArchiveItem) -> Result<ArchiveItem> {
+    let check: String = dst.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
+    if check != "ok" {
+        return Err(Error::Archive(format!("backup failed its check: {check}")));
+    }
+    let (rows, first_ms, last_ms): (i64, Option<i64>, Option<i64>) =
+        dst.query_row("SELECT count(*), min(ts), max(ts) FROM requests", [], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?;
+    dst.close().map_err(|(_, e)| e)?;
+    File::open(tmp)?.sync_all()?;
+    Ok(ArchiveItem {
+        bytes: fs::metadata(tmp)?.len(),
+        sha256: file_sha256(tmp)?,
+        rows: u64::try_from(rows).unwrap_or(0),
+        from_ms: first_ms,
+        to_ms: last_ms,
+        ..base
+    })
 }

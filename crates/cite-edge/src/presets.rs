@@ -327,6 +327,16 @@ mod tests {
     }
 
     #[test]
+    fn the_empty_user_agent_preset_renders_a_condition_that_fires_without_the_header() {
+        let rules = preset("scanners").map(|p| p.rules).unwrap_or_default();
+        let empty = rules
+            .iter()
+            .find(|r| r.name == "Empty user agent")
+            .map(|r| r.matchers.user_agent_regex.clone());
+        assert_eq!(empty, Some(Some("^$".to_string())));
+    }
+
+    #[test]
     fn scanner_user_agents() {
         let p = preset("scanners");
         let re = p.and_then(|p| p.rules[0].matchers.user_agent_regex.clone());

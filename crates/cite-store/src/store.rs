@@ -10,7 +10,7 @@ use cite_edge::model::LogEvent;
 use rusqlite::Connection;
 use serde::Serialize;
 
-use crate::archive::{ArchiveItem, ArchiveList, CutReport};
+use crate::archive::{ArchiveItem, ArchiveList, ArchiveScrub, CutReport};
 use crate::error::{Error, Result};
 use crate::export::{self, CsvSink, ExportFilter, ExportKind, NdjsonSink};
 use crate::ingest::{Privacy, WriteConn};
@@ -92,6 +92,8 @@ pub(crate) struct Inner {
     export_timeout: Duration,
     // Serialises prune passes so the scheduled one and a settings-triggered one never interleave.
     pub(crate) maintenance: Mutex<()>,
+    // Lets one restore run at a time, so a retry cannot overlap the request it repeats.
+    pub(crate) restoring: Mutex<()>,
     // Set when a privacy scrub could not fold the WAL; the next prune pass retries.
     pub(crate) wal_dirty: AtomicBool,
 }
@@ -214,6 +216,7 @@ impl Store {
             query_timeout: opts.query_timeout,
             export_timeout: opts.export_timeout,
             maintenance: Mutex::new(()),
+            restoring: Mutex::new(()),
             wal_dirty: AtomicBool::new(false),
         };
         Ok(Store {
@@ -340,7 +343,7 @@ impl Store {
         self.inner.backup()
     }
 
-    /// Deletes every raw row older than cutoff_ms. With archive on, each UTC day is first written to a verified archive file and a failure deletes nothing further. A dry run only counts.
+    /// Deletes every raw row older than cutoff_ms rounded down to an hour boundary (CutReport::cutoff_ms is the one used). With archive on, each UTC day is first written to a verified archive file and a failure deletes nothing further. A dry run only counts.
     pub fn cut_before(&self, cutoff_ms: i64, archive: bool, dry_run: bool) -> Result<CutReport> {
         self.inner.cut_before(cutoff_ms, archive, dry_run)
     }
@@ -349,9 +352,23 @@ impl Store {
         self.inner.list_archives()
     }
 
-    /// Re-imports an archive file and returns the rows added; backups are rejected.
+    /// Re-imports an archive file and returns the rows added; backups are rejected and an archive already restored is a Conflict.
     pub fn restore_archive(&self, name: &str) -> Result<u64> {
-        self.inner.restore_archive(name)
+        self.inner.restore_archive(name, false)
+    }
+
+    /// Like restore_archive but imports again even if the archive was restored before, which duplicates its rows.
+    pub fn restore_archive_again(&self, name: &str) -> Result<u64> {
+        self.inner.restore_archive(name, true)
+    }
+
+    /// Blanks the chosen fields inside every archive file and backup; pair with scrub_fields when a privacy setting is switched off.
+    pub fn scrub_archived_fields(
+        &self,
+        client_ips: bool,
+        user_agents: bool,
+    ) -> Result<ArchiveScrub> {
+        self.inner.scrub_archived(client_ips, user_agents)
     }
 
     pub fn delete_archive(&self, name: &str) -> Result<()> {

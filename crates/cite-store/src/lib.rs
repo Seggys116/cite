@@ -23,7 +23,7 @@ mod archive_tests;
 #[cfg(test)]
 mod tests;
 
-pub use archive::{ArchiveItem, ArchiveList, CutReport};
+pub use archive::{ArchiveItem, ArchiveList, ArchiveScrub, CutReport};
 pub use error::{Error, Result};
 pub use export::{
     BOT_COLUMNS, ExportFilter, ExportKind, HOURLY_COLUMNS, REQUEST_COLUMNS, TOP_COLUMNS,

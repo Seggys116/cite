@@ -30,6 +30,11 @@ impl Inner {
         let Some((set, cond)) = fragments(client_ips, user_agents) else {
             return Ok(0);
         };
+        // Shared with prune and cuts, so an archive pass can never read rows this scrub has not reached yet.
+        let _turn = self
+            .maintenance
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut touched = 0;
         let mut after = 0i64;
         loop {

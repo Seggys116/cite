@@ -85,7 +85,7 @@ Deploys, switches, rollbacks, site changes and every other change that touches t
 | `GET /analytics/archives` | `{items:[{name,kind,bytes,created_ms,sha256,rows,from_ms,to_ms}],dir_bytes}`, newest first. `kind` is `archive` or `backup`; `from_ms` and `to_ms` are the oldest and newest request in the file, `null` for an empty backup. `dir_bytes` is everything in the archive directory. |
 | `POST /analytics/backup` | No body. Writes a consistent copy of the database and returns its item. |
 | `POST /analytics/cut` | `{before_ms \| before_days, archive?, dry_run?}` returns `{dry_run,cutoff_ms,rows,oldest_ms,archived_rows,files,archive}`. See below. |
-| `POST /analytics/restore` | `{name}` imports an archive and returns `{rows}`. A backup name is a 400. |
+| `POST /analytics/restore` | `{name, again?}` imports an archive and returns `{rows}`. A backup name is a 400. An archive that was already restored is a 409 unless `again` is `true`, which imports it a second time and duplicates its rows. A failed restore can be partially applied and leaves no marker. |
 | `GET /analytics/archives/{name}` | The file, `application/gzip` or `application/vnd.sqlite3`, with `X-Archive-Sha256`. |
 | `DELETE /analytics/archives/{name}` | `{ok:true}`; removes the file and its manifest entry. |
 | `GET /analytics/export?kind=&top=&format=&from=&to=&site=&status_min=&status_max=&bot_class=&min_bot_score=&host=&path_prefix=&client_ip=&method=&limit=` | A streamed file download, not JSON. See below. |
@@ -116,14 +116,14 @@ curl -H "Authorization: Bearer $TOKEN" -OJ \
 
 The archive directory is `CITE_ANALYTICS_ARCHIVE_DIR` (default `<data>/analytics/archive`). Names are those returned by the list; anything with a path separator, `..`, other characters or an unknown prefix or extension is a 400, and a well-formed name that is not there is a 404. How the files are written and verified is in [Analytics](analytics.md#archives-and-backups).
 
-`POST /analytics/cut` takes exactly one of `before_ms` (epoch milliseconds, not negative and not in the future) or `before_days` (1 to 36500, counted back from now). `archive` defaults to `true`: each UTC day older than the cutoff is written to a verified archive file and then deleted, oldest first, and a failure stops the run with 503 `{error}` after leaving the rows of the failing day in place. Only `"archive": false` deletes without a copy. `"dry_run": true` changes nothing and reports `rows` (rows older than the cutoff), `oldest_ms`, and an empty `files`. `files` lists the archive names written, `archived_rows` how many rows they hold. Bodies are limited to 1 MiB and unknown fields are a 400.
+`POST /analytics/cut` takes exactly one of `before_ms` (epoch milliseconds, not negative and not in the future) or `before_days` (1 to 36500, counted back from now). `archive` defaults to `true`: each UTC day older than the cutoff is written to a verified archive file and then deleted, oldest first, and a failure stops the run with 503 `{error}` after leaving the rows of the failing day in place. Only `"archive": false` deletes without a copy. `"dry_run": true` changes nothing and reports `rows` (rows older than the cutoff), `oldest_ms`, and an empty `files`. `files` lists the archive names written, `archived_rows` how many rows they hold. The cutoff is rounded down to a whole hour and the one used is returned as `cutoff_ms`. Bodies are limited to 1 MiB and unknown fields are a 400.
 
 ```sh
 curl -H "Authorization: Bearer $TOKEN" -X POST https://node:7443/api/v1/analytics/cut \
   -d '{"before_days": 90, "dry_run": true}'
 ```
 
-Backups, cuts (dry runs included), restores, downloads and deletes are recorded in the audit log as `analytics.backup`, `analytics.cut`, `analytics.restore`, `analytics.archive.download` and `analytics.archive.delete`. Downloads share the 2-at-once limit of exports and answer 429 beyond it.
+Backups, cuts (dry runs included), restores, downloads and deletes are recorded in the audit log as `analytics.backup`, `analytics.cut`, `analytics.restore`, `analytics.archive.download` and `analytics.archive.delete`. Turning off `store_client_ips` or `store_user_agents` in the settings also blanks the field in existing archives and backups, recorded as `analytics.archive.scrub` with the file counts. Downloads share the 2-at-once limit of exports and answer 429 beyond it.
 
 `PUT /settings` takes `retention.hour_buckets_days` of 0 (keep forever, the default) or 1 to 3650, and `retention.archive_before_delete` (boolean, default `true`, which an older client may omit).
 

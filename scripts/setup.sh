@@ -6,7 +6,7 @@ umask 077
 
 RAW_BASE="https://raw.githubusercontent.com/seggys116/cite"
 IMAGE_REPO="ghcr.io/seggys116/cite-connector"
-DEFAULT_VERSION="0.2.0"
+DEFAULT_VERSION="0.3.0"
 DEFAULT_REF="main"
 WAIT_SECS=90
 TOTAL_STEPS=6

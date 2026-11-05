@@ -67,8 +67,8 @@ jobs:
         run: |
           docker build -f images/manager/Dockerfile -t cite-manager:dev-node24 \
             --build-arg NODE_MAJOR=24 \
-            --build-arg NODE_IMAGE=docker.io/library/node:24-bookworm-slim@sha256:0e0ff40c39bc087845bfb27465a0df4ea419520094bc35842ff83dd8cbe6f9b6 .
+            --build-arg NODE_IMAGE=docker.io/library/node:24-bookworm-slim@sha256:55fb5f5a527ea2c5c4a95f963e48ef90aa38c7b346054fdc8ee9957a2b55d205 .
           docker build -f images/executor-node/Dockerfile -t cite-executor-node:e2e-node24 \
             --build-arg NODE_MAJOR=24 \
-            --build-arg EXECUTOR_IMAGE=gcr.io/distroless/nodejs24-debian12:nonroot@sha256:14d42e2511532589a7c7e01a753667a74fcc96266e137e8125006b87b0c32d0a .
+            --build-arg EXECUTOR_IMAGE=gcr.io/distroless/nodejs24-debian13:nonroot@sha256:cb606325b7ec4af55462cb0b424a53b452a5b4a894ffe841fcf1048d216fb9f8 .
       - run: ./scripts/e2e-runtimes.sh ${{ matrix.scenario }}

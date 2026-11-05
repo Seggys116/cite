@@ -841,6 +841,12 @@ async fn archive_downloads_save_atomically_with_a_safe_suggested_name() {
         .await
         .expect("download");
     assert_eq!(std::fs::read(&dest).expect("file"), [0x1f, 0x8b, 8, 0]);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&dest).expect("meta").permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
     assert_eq!(report.bytes, 4);
     assert_eq!(
         report.suggested_name.as_deref(),

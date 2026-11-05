@@ -3,7 +3,7 @@
 
 services:
   dockerproxy:
-    image: ghcr.io/seggys116/cite-dockerproxy:${CITE_VERSION:-0.2.0}
+    image: ghcr.io/seggys116/cite-dockerproxy:${CITE_VERSION:-0.3.0}
     restart: unless-stopped
     init: true
     user: "10001:10001"

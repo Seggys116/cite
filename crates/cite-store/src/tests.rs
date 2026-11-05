@@ -2081,6 +2081,52 @@ fn retention_erases_path_rollups_and_dictionary_text_of_expired_rows() {
 }
 
 #[test]
+fn the_dictionary_scan_pages_by_id_and_flags_only_unused_rows() {
+    let (_d, s) = open();
+    let mut a = ev(NOW);
+    a.user_agent = "KeptAgent".into();
+    let mut b = ev(NOW + 1);
+    b.user_agent = "DroppedAgent".into();
+    s.insert(&[a, b.clone()]).expect("insert");
+    s.inner
+        .lock_writer()
+        .conn
+        .execute_batch(&format!(
+            "DELETE FROM requests WHERE ts = {}; DELETE FROM rollup_dim; DELETE FROM rollup_dim_min;",
+            NOW + 1
+        ))
+        .expect("orphan one");
+    let (paged, total) = s
+        .inner
+        .read_long(|c| {
+            let used = crate::gc::used_ids(c)?;
+            let (mut all, mut after, mut pages) = (Vec::new(), 0, 0);
+            loop {
+                let (page, last) = crate::gc::unreferenced_page(c, &used, after, 2)?;
+                all.extend(page);
+                match last {
+                    Some(id) => after = id,
+                    None => break,
+                }
+                pages += 1;
+            }
+            Ok((all, pages))
+        })
+        .expect("scan");
+    assert!(total > 1, "small pages must cross several chunks");
+    let val = |id: i64| -> String {
+        s.inner
+            .read(|c| Ok(c.query_row("SELECT val FROM dict WHERE id = ?1", [id], |r| r.get(0))?))
+            .expect("val")
+    };
+    let names: Vec<String> = paged.iter().map(|(id, _)| val(*id)).collect();
+    assert!(names.contains(&"DroppedAgent".to_string()));
+    assert!(!names.contains(&"KeptAgent".to_string()));
+    let swept = s.inner.sweep_dict().expect("sweep");
+    assert!(swept.removed >= 1);
+}
+
+#[test]
 fn the_dictionary_sweep_spares_ids_inserts_used_after_tracking_began() {
     let (_d, s) = open();
     let mut a = ev(NOW);

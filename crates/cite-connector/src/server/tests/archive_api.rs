@@ -249,3 +249,68 @@ async fn the_archive_setting_reaches_the_store_and_shows_in_stats() {
     let (_, stats) = h.get(&t, "/analytics/stats").await;
     assert_eq!(stats["archive_before_delete"], false);
 }
+
+#[tokio::test]
+async fn a_second_restore_is_a_conflict_unless_again_is_set() {
+    let h = start().await;
+    let t = h.token().await;
+    h.ingest([old_event("10.0.0.1", 10)]);
+    let (_, done) = h
+        .post(&t, "/analytics/cut", json!({ "before_days": 5 }))
+        .await;
+    let name = done["files"][0].as_str().expect("file").to_string();
+
+    let (status, _) = h
+        .post(&t, "/analytics/restore", json!({ "name": name }))
+        .await;
+    assert_eq!(status, 200);
+    let (status, body) = h
+        .post(&t, "/analytics/restore", json!({ "name": name }))
+        .await;
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(stored_rows(&h).await, 1);
+
+    let (status, body) = h
+        .post(
+            &t,
+            "/analytics/restore",
+            json!({ "name": name, "again": true }),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(stored_rows(&h).await, 2);
+}
+
+#[tokio::test]
+async fn turning_off_client_ips_also_scrubs_archives_and_audits_it() {
+    let h = start().await;
+    let t = h.token().await;
+    h.ingest([old_event("10.9.8.7", 10)]);
+    let (_, done) = h
+        .post(&t, "/analytics/cut", json!({ "before_days": 5 }))
+        .await;
+    let name = done["files"][0].as_str().expect("file").to_string();
+    let sha = |h: &Harness| {
+        let (_, item) = h.state.analytics.open_archive(&name).expect("open");
+        (item.sha256, item.rows)
+    };
+    let (before, rows) = sha(&h);
+
+    let (_, mut settings) = h.get(&t, "/settings").await;
+    settings["retention"]["store_client_ips"] = json!(false);
+    assert_eq!(h.put(&t, "/settings", settings).await.0, 200);
+    let mut audited = false;
+    for _ in 0..100 {
+        audited = audit_actions(&h, &t)
+            .await
+            .contains(&"analytics.archive.scrub".to_string());
+        if audited {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(audited);
+    let (after, kept) = sha(&h);
+    assert_ne!(before, after);
+    assert_eq!(rows, kept);
+}

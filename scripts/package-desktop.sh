@@ -57,6 +57,10 @@ esac
 
 mkdir -p "$OUT_DIR"
 OUT_DIR=$(cd "$OUT_DIR" && pwd)
+ASSETS=$(cd "$(dirname "$0")/../apps/desktop/assets" && pwd)
+if [ ! -f "$ASSETS/icon.icns" ] || [ ! -f "$ASSETS/icon.png" ]; then
+  die "icon files are missing from $ASSETS"
+fi
 STAGE=$(mktemp -d "${TMPDIR:-/tmp}/cite-desktop.XXXXXX")
 # The staging directory is removed on every exit path, including a failed archive step.
 trap 'rm -rf "$STAGE"' EXIT
@@ -67,6 +71,7 @@ case $TARGET_OS in
     mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
     cp "$BINARY" "$APP/Contents/MacOS/cite-desktop"
     chmod 755 "$APP/Contents/MacOS/cite-desktop"
+    cp "$ASSETS/icon.icns" "$APP/Contents/Resources/icon.icns"
     cat >"$APP/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -78,6 +83,8 @@ case $TARGET_OS in
   <string>Cite</string>
   <key>CFBundleIdentifier</key>
   <string>dev.seggys116.cite</string>
+  <key>CFBundleIconFile</key>
+  <string>icon</string>
   <key>CFBundleExecutable</key>
   <string>cite-desktop</string>
   <key>CFBundlePackageType</key>
@@ -102,17 +109,19 @@ EOF
     mkdir -p "$STAGE/$PKG"
     cp "$BINARY" "$STAGE/$PKG/cite-desktop"
     chmod 755 "$STAGE/$PKG/cite-desktop"
+    cp "$ASSETS/icon.png" "$STAGE/$PKG/cite.png"
     cat >"$STAGE/$PKG/cite.desktop" <<EOF
 [Desktop Entry]
 Type=Application
 Name=Cite
 Comment=Cite node and site manager
 Exec=cite-desktop
+Icon=cite
 Terminal=false
 Categories=Network;Utility;
 EOF
     cat >"$STAGE/$PKG/README.txt" <<EOF
-Cite desktop $VERSION (unsigned build). Put cite-desktop on your PATH and copy cite.desktop to ~/.local/share/applications/.
+Cite desktop $VERSION (unsigned build). Put cite-desktop on your PATH and copy cite.desktop to ~/.local/share/applications/ and cite.png to ~/.local/share/icons/.
 EOF
     ARCHIVE="$OUT_DIR/$PKG.tar.gz"
     tar -C "$STAGE" -czf "$ARCHIVE" "$PKG"
