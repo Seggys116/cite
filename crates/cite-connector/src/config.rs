@@ -51,6 +51,7 @@ pub struct ConnectorConfig {
     pub log_listen: LogListen,
     pub log_addr_for_haproxy: String,
     pub analytics_db: PathBuf,
+    pub analytics_archive_dir: PathBuf,
     // None keeps every row until age retention removes it.
     pub analytics_max_bytes: Option<u64>,
     pub haproxy_bin: String,
@@ -180,6 +181,26 @@ fn parse_analytics_db(raw: &str) -> Result<PathBuf> {
     }
 }
 
+// Archives hold raw request history, so the directory must be an explicit absolute path that cannot climb out of where it was put.
+fn parse_archive_dir(raw: &str) -> Result<PathBuf> {
+    let path = PathBuf::from(raw);
+    let ok = path.is_absolute()
+        && path.file_name().is_some()
+        && raw.len() <= MAX_DB_PATH
+        && !raw.chars().any(char::is_control)
+        && !path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir));
+    if ok {
+        Ok(path)
+    } else {
+        Err(config_err(
+            "CITE_ANALYTICS_ARCHIVE_DIR must be an absolute directory path, without '..' or control characters"
+                .into(),
+        ))
+    }
+}
+
 fn check_host_port(key: &str, value: &str) -> Result<()> {
     match value.rsplit_once(':') {
         Some((host, port)) if !host.is_empty() && port.parse::<u16>().is_ok_and(|p| p > 0) => {
@@ -274,6 +295,10 @@ impl ConnectorConfig {
             Some(raw) => parse_analytics_db(raw)?,
             None => data_dir.join("analytics").join("analytics.db"),
         };
+        let analytics_archive_dir = match get(env, "CITE_ANALYTICS_ARCHIVE_DIR") {
+            Some(raw) => parse_archive_dir(raw)?,
+            None => data_dir.join("analytics").join("archive"),
+        };
         // An explicit name must be valid; an ambient HOSTNAME that is not falls back quietly.
         let node_name = match get(env, "CITE_NODE_NAME") {
             Some(name) if valid_node_name(name) => name.to_string(),
@@ -353,6 +378,7 @@ impl ConnectorConfig {
             log_listen,
             log_addr_for_haproxy,
             analytics_db,
+            analytics_archive_dir,
             analytics_max_bytes,
             haproxy_bin: get(env, "CITE_HAPROXY_BIN")
                 .unwrap_or("haproxy")
@@ -427,6 +453,10 @@ mod tests {
         assert_eq!(
             cfg.analytics_db,
             PathBuf::from("/conf/analytics/analytics.db")
+        );
+        assert_eq!(
+            cfg.analytics_archive_dir,
+            PathBuf::from("/conf/analytics/archive")
         );
         assert_eq!(cfg.data_dir, PathBuf::from("/conf"));
         assert_eq!(cfg.haproxy_dir, PathBuf::from("/conf/haproxy"));
@@ -627,6 +657,34 @@ mod tests {
             e.insert("CITE_ANALYTICS_DB".into(), bad.into());
             let err = ConnectorConfig::from_env_map(&e).expect_err(bad);
             assert!(err.to_string().contains("CITE_ANALYTICS_DB"), "{bad}");
+        }
+    }
+
+    #[test]
+    fn archive_directory_follows_the_data_dir_unless_set() {
+        let mut e = base();
+        e.insert("CITE_CONNECTOR_DATA".into(), "/srv/cite".into());
+        let cfg = ConnectorConfig::from_env_map(&e).expect("config");
+        assert_eq!(
+            cfg.analytics_archive_dir,
+            PathBuf::from("/srv/cite/analytics/archive")
+        );
+        e.insert(
+            "CITE_ANALYTICS_ARCHIVE_DIR".into(),
+            "/mnt/backups/cite".into(),
+        );
+        let cfg = ConnectorConfig::from_env_map(&e).expect("config");
+        assert_eq!(
+            cfg.analytics_archive_dir,
+            PathBuf::from("/mnt/backups/cite")
+        );
+        for bad in ["relative/dir", "/", "/mnt/../etc", "/mnt/a\nb"] {
+            e.insert("CITE_ANALYTICS_ARCHIVE_DIR".into(), bad.into());
+            let err = ConnectorConfig::from_env_map(&e).expect_err(bad);
+            assert!(
+                err.to_string().contains("CITE_ANALYTICS_ARCHIVE_DIR"),
+                "{bad}"
+            );
         }
     }
 

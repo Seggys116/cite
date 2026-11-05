@@ -10,6 +10,8 @@ use serde_json::{Value, json};
 use super::*;
 use crate::store::testing::test_config;
 
+mod archive_api;
+
 const SECRET: &str = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
 const PASSWORD: &str = "correct horse battery";
 

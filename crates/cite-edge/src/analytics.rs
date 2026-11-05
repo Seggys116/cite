@@ -15,6 +15,7 @@ const TOP_N: usize = 20;
 const MINUTE_MS: i64 = 60_000;
 const HOUR_MS: i64 = 3_600_000;
 const DAY_MS: i64 = 86_400_000;
+const UNLIMITED_MEMORY_DAYS: i64 = 90;
 const MINUTE_MAX_WINDOW_SECS: u64 = 48 * 3600;
 const MAX_WINDOW_SECS: u64 = 400 * 86_400;
 const PRUNE_EVERY: u32 = 8192;
@@ -935,6 +936,14 @@ pub struct Snapshot {
     recent: Vec<LogEvent>,
 }
 
+// Unlimited retention lives in the store, so the in-memory hour buckets stay capped.
+fn hour_span_ms(r: &Retention) -> i64 {
+    match r.hour_buckets_days {
+        0 => UNLIMITED_MEMORY_DAYS * DAY_MS,
+        d => i64::from(d) * DAY_MS,
+    }
+}
+
 #[derive(Debug)]
 pub struct Analytics {
     retention: Retention,
@@ -1138,7 +1147,7 @@ impl Analytics {
     // Also runs automatically every PRUNE_EVERY records so memory stays bounded without a timer.
     pub fn prune(&mut self, now_ms: i64) {
         let minute_span = i64::from(self.retention.minute_buckets_hours) * HOUR_MS;
-        let hour_span = i64::from(self.retention.hour_buckets_days) * DAY_MS;
+        let hour_span = hour_span_ms(&self.retention);
         let minute_cut = now_ms.saturating_sub(minute_span).div_euclid(MINUTE_MS);
         let hour_cut = now_ms.saturating_sub(hour_span).div_euclid(HOUR_MS);
         let mut freed = self.global.prune(minute_cut, hour_cut);
@@ -1172,7 +1181,7 @@ impl Analytics {
         let hour = window_secs > MINUTE_MAX_WINDOW_SECS;
         let step = if hour { HOUR_MS } else { MINUTE_MS };
         let span = if hour {
-            i64::from(self.retention.hour_buckets_days) * DAY_MS
+            hour_span_ms(&self.retention)
         } else {
             i64::from(self.retention.minute_buckets_hours) * HOUR_MS
         };

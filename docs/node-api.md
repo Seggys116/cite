@@ -81,7 +81,13 @@ Deploys, switches, rollbacks, site changes and every other change that touches t
 | `GET /analytics/requests?limit=&status=&method=&path=&ip=&blocked=&site=` | `[LogEvent]` newest first, `limit` 1 to 1000 (default 100) |
 | `GET /analytics/bots?window=&site=` | `{total_requests,bot_requests,bot_share_pct,classes:[{key,count,bytes}],signals:[...],agents:[...],score_buckets:[...]}`. `classes` keys are `human`, `suspect`, `crawler`, `tool`, `bot`; `score_buckets` keys are `0-19`, `20-39`, `40-59`, `60-79`, `80-100`. |
 | `GET /analytics/top?kind=&window=&site=&limit=` | `{items:[{key,count,bytes}]}`. `kind` is required: `paths`, `hosts`, `referers`, `agents`, `content_types`, `statuses`, `ips` or `languages`. `limit` 1 to 1000 (default 100). An unknown `kind` is a 400. |
-| `GET /analytics/stats` | `{rows,db_bytes,oldest_ts_ms,newest_ts_ms,write_batches,write_errors,retention_days,max_bytes,ingest_stalls}`. The two timestamps are `null` for an empty database, and `max_bytes` is `null` when no size cap is set. `ingest_stalls` counts the times the log receiver waited on the database writer. |
+| `GET /analytics/stats` | `{rows,db_bytes,oldest_ts_ms,newest_ts_ms,write_batches,write_errors,retention_days,archive_before_delete,max_bytes,ingest_stalls}`. The two timestamps are `null` for an empty database, and `max_bytes` is `null` when no size cap is set. `retention_days` 0 means rows are kept forever. `ingest_stalls` counts the times the log receiver waited on the database writer. |
+| `GET /analytics/archives` | `{items:[{name,kind,bytes,created_ms,sha256,rows,from_ms,to_ms}],dir_bytes}`, newest first. `kind` is `archive` or `backup`; `from_ms` and `to_ms` are the oldest and newest request in the file, `null` for an empty backup. `dir_bytes` is everything in the archive directory. |
+| `POST /analytics/backup` | No body. Writes a consistent copy of the database and returns its item. |
+| `POST /analytics/cut` | `{before_ms \| before_days, archive?, dry_run?}` returns `{dry_run,cutoff_ms,rows,oldest_ms,archived_rows,files,archive}`. See below. |
+| `POST /analytics/restore` | `{name}` imports an archive and returns `{rows}`. A backup name is a 400. |
+| `GET /analytics/archives/{name}` | The file, `application/gzip` or `application/vnd.sqlite3`, with `X-Archive-Sha256`. |
+| `DELETE /analytics/archives/{name}` | `{ok:true}`; removes the file and its manifest entry. |
 | `GET /analytics/export?kind=&top=&format=&from=&to=&site=&status_min=&status_max=&bot_class=&min_bot_score=&host=&path_prefix=&client_ip=&method=&limit=` | A streamed file download, not JSON. See below. |
 
 ### Export
@@ -105,6 +111,21 @@ The response is 200 with `Content-Type: text/csv; charset=utf-8` or `application
 curl -H "Authorization: Bearer $TOKEN" -OJ \
   "https://node:7443/api/v1/analytics/export?kind=requests&bot_class=crawler&from=2026-11-01T00:00:00Z"
 ```
+
+### Archives, backups and cuts
+
+The archive directory is `CITE_ANALYTICS_ARCHIVE_DIR` (default `<data>/analytics/archive`). Names are those returned by the list; anything with a path separator, `..`, other characters or an unknown prefix or extension is a 400, and a well-formed name that is not there is a 404. How the files are written and verified is in [Analytics](analytics.md#archives-and-backups).
+
+`POST /analytics/cut` takes exactly one of `before_ms` (epoch milliseconds, not negative and not in the future) or `before_days` (1 to 36500, counted back from now). `archive` defaults to `true`: each UTC day older than the cutoff is written to a verified archive file and then deleted, oldest first, and a failure stops the run with 503 `{error}` after leaving the rows of the failing day in place. Only `"archive": false` deletes without a copy. `"dry_run": true` changes nothing and reports `rows` (rows older than the cutoff), `oldest_ms`, and an empty `files`. `files` lists the archive names written, `archived_rows` how many rows they hold. Bodies are limited to 1 MiB and unknown fields are a 400.
+
+```sh
+curl -H "Authorization: Bearer $TOKEN" -X POST https://node:7443/api/v1/analytics/cut \
+  -d '{"before_days": 90, "dry_run": true}'
+```
+
+Backups, cuts (dry runs included), restores, downloads and deletes are recorded in the audit log as `analytics.backup`, `analytics.cut`, `analytics.restore`, `analytics.archive.download` and `analytics.archive.delete`. Downloads share the 2-at-once limit of exports and answer 429 beyond it.
+
+`PUT /settings` takes `retention.hour_buckets_days` of 0 (keep forever, the default) or 1 to 3650, and `retention.archive_before_delete` (boolean, default `true`, which an older client may omit).
 
 Analytics read failures return 500 `{error:"internal error"}`; the cause is in the connector log.
 

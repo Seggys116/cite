@@ -520,9 +520,11 @@ name = "cite-store"
 version = "0.2.0"
 dependencies = [
  "cite-edge",
+ "flate2",
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror",
  "tracing",

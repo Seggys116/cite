@@ -33,6 +33,7 @@ use crate::orchestrator::Orchestrator;
 use crate::store::{Store, now_unix, unix_to_rfc3339};
 use crate::{ConnectorError, Result, tls};
 
+mod archives;
 mod export;
 mod handlers;
 mod health;
@@ -480,6 +481,14 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/analytics/top", get(h::analytics_top))
         .route("/api/v1/analytics/stats", get(h::analytics_stats))
         .route("/api/v1/analytics/export", get(export::analytics_export))
+        .route("/api/v1/analytics/archives", get(archives::list_archives))
+        .route(
+            "/api/v1/analytics/archives/{name}",
+            get(archives::download).delete(archives::delete_archive),
+        )
+        .route("/api/v1/analytics/backup", post(archives::backup))
+        .route("/api/v1/analytics/cut", post(archives::cut))
+        .route("/api/v1/analytics/restore", post(archives::restore))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
     Router::new()
         .merge(public)
@@ -680,6 +689,7 @@ async fn open_analytics(
     let cfg = cfg.clone();
     tokio::task::spawn_blocking(move || {
         let analytics = logsink::open_store(&cfg, retention_days)?;
+        analytics.set_archive_before_delete(retention.archive_before_delete);
         logsink::migrate_snapshot(&cfg.data_dir, &analytics, &retention);
         Ok(analytics)
     })

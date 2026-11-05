@@ -284,6 +284,7 @@ pub(super) async fn put_settings(
 ) -> ApiResult<Response> {
     // Retention reaches the analytics store only once the new settings were applied.
     let days = logsink::retention_days(&settings.retention);
+    let archive = settings.retention.archive_before_delete;
     let before = st.store.config().settings.retention.clone();
     let (drop_ips, drop_agents) = (
         before.store_client_ips && !settings.retention.store_client_ips,
@@ -295,6 +296,7 @@ pub(super) async fn put_settings(
     })
     .await?;
     st.analytics.set_retention_days(days);
+    st.analytics.set_archive_before_delete(archive);
     let now_kept = st.store.config().settings.retention.clone();
     // Applied before the scrub so events still queued are stripped when they commit instead of re-creating the text.
     st.analytics
@@ -763,18 +765,22 @@ fn join_failure(e: tokio::task::JoinError) -> ApiError {
 }
 
 // The detail is logged by the Internal mapping and the client only sees a generic 500.
-fn store_failure(e: cite_store::Error) -> ApiError {
-    if matches!(e, cite_store::Error::Timeout) {
-        return ConnectorError::Unavailable(
+pub(super) fn store_failure(e: cite_store::Error) -> ApiError {
+    match e {
+        cite_store::Error::Timeout => ConnectorError::Unavailable(
             "the analytics query took too long and was cancelled; try a shorter window".into(),
         )
-        .into();
+        .into(),
+        cite_store::Error::Rejected(_) => ConnectorError::BadRequest(e.to_string()).into(),
+        cite_store::Error::NotFound(_) => ConnectorError::NotFound(e.to_string()).into(),
+        // The archive messages are written for operators and hold no paths.
+        cite_store::Error::Archive(_) => ConnectorError::Unavailable(e.to_string()).into(),
+        _ => ConnectorError::Internal(format!("analytics store: {e}")).into(),
     }
-    ConnectorError::Internal(format!("analytics store: {e}")).into()
 }
 
 // Queries run off the async workers so a large window cannot stall other requests.
-async fn with_store<T: Send + 'static>(
+pub(super) async fn with_store<T: Send + 'static>(
     st: &AppState,
     f: impl FnOnce(&cite_store::Store) -> cite_store::Result<T> + Send + 'static,
 ) -> ApiResult<T> {
@@ -853,6 +859,7 @@ struct AnalyticsOverview {
     #[serde(flatten)]
     store: cite_store::StoreStats,
     retention_days: u32,
+    archive_before_delete: bool,
     max_bytes: Option<u64>,
     ingest_stalls: u64,
 }
@@ -860,12 +867,18 @@ struct AnalyticsOverview {
 async fn analytics_overview(st: &AppState) -> ApiResult<AnalyticsOverview> {
     let store = with_store(st, |s| {
         let stats = s.stats()?;
-        Ok((stats, s.retention_days(), s.max_bytes()))
+        Ok((
+            stats,
+            s.retention_days(),
+            s.max_bytes(),
+            s.archive_before_delete(),
+        ))
     })
     .await?;
     Ok(AnalyticsOverview {
         store: store.0,
         retention_days: store.1,
+        archive_before_delete: store.3,
         max_bytes: store.2,
         ingest_stalls: st.ingest.stalls(),
     })

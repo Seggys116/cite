@@ -246,11 +246,19 @@ impl Default for EdgeSettings {
 pub struct Retention {
     pub recent_events: usize,
     pub minute_buckets_hours: u32,
+    /// 0 keeps hourly data and stored events forever.
     pub hour_buckets_days: u32,
     pub audit_days: u32,
     pub persist_interval_secs: u32,
     pub store_user_agents: bool,
     pub store_client_ips: bool,
+    /// Complete days of events are written to an archive file before age retention deletes them.
+    #[serde(default = "archive_by_default")]
+    pub archive_before_delete: bool,
+}
+
+fn archive_by_default() -> bool {
+    true
 }
 
 impl Default for Retention {
@@ -258,11 +266,12 @@ impl Default for Retention {
         Self {
             recent_events: 5000,
             minute_buckets_hours: 48,
-            hour_buckets_days: 90,
+            hour_buckets_days: 0,
             audit_days: 365,
             persist_interval_secs: 60,
             store_user_agents: true,
             store_client_ips: true,
+            archive_before_delete: true,
         }
     }
 }
@@ -313,4 +322,34 @@ pub struct LogEvent {
     pub bot_class: String,
     #[serde(default)]
     pub bot_signals: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retention_keeps_history_forever_and_archives_by_default() {
+        let r = Retention::default();
+        assert_eq!(r.hour_buckets_days, 0);
+        assert!(r.archive_before_delete);
+    }
+
+    #[test]
+    fn archive_flag_defaults_on_for_settings_saved_before_it_existed() {
+        let mut value = serde_json::to_value(Retention::default()).expect("serialize");
+        value
+            .as_object_mut()
+            .expect("object")
+            .remove("archive_before_delete");
+        let r: Retention = serde_json::from_value(value).expect("deserialize");
+        assert!(r.archive_before_delete);
+    }
+
+    #[test]
+    fn retention_still_rejects_unknown_fields() {
+        let mut value = serde_json::to_value(Retention::default()).expect("serialize");
+        value["surprise"] = serde_json::json!(1);
+        assert!(serde_json::from_value::<Retention>(value).is_err());
+    }
 }

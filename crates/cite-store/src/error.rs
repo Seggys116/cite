@@ -27,6 +27,14 @@ pub enum Error {
     Closed,
     #[error("integrity check failed: {0}")]
     Integrity(String),
+    /// The request itself is unusable: a bad archive name, no archive directory, a backup passed to restore.
+    #[error("{0}")]
+    Rejected(String),
+    #[error("{0} not found")]
+    NotFound(String),
+    /// An archive or backup could not be written or did not verify; nothing was deleted because of it.
+    #[error("archive failed: {0}")]
+    Archive(String),
 }
 
 impl From<rusqlite::Error> for Error {

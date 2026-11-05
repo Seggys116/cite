@@ -64,7 +64,7 @@ impl IngestStats {
     }
 }
 
-// Age retention follows the longest-lived bucket setting, which is what the old collector kept longest.
+// Age retention follows the longest-lived bucket setting, which is what the old collector kept longest; 0 never deletes by age.
 pub fn retention_days(retention: &Retention) -> u32 {
     retention.hour_buckets_days
 }
@@ -86,6 +86,7 @@ pub fn open_store(cfg: &ConnectorConfig, retention_days: u32) -> Result<Arc<cite
     }
     let opts = cite_store::StoreOptions {
         retention_days,
+        archive_dir: Some(cfg.analytics_archive_dir.clone()),
         max_bytes: cfg.analytics_max_bytes,
         ..cite_store::StoreOptions::default()
     };
@@ -382,6 +383,7 @@ async fn maintenance_loop(store: Arc<cite_store::Store>) {
                 {
                     tracing::info!(
                         expired = report.expired_rows,
+                        archived = report.archived_rows,
                         trimmed = report.trimmed_rows,
                         dictionary = report.dict_rows_removed,
                         bytes_before = report.bytes_before,
@@ -746,6 +748,7 @@ mod tests {
             ..Retention::default()
         };
         assert_eq!(retention_days(&r), 12);
+        assert_eq!(retention_days(&Retention::default()), 0);
     }
 
     fn snapshot_with(paths: &[&str]) -> Vec<u8> {
@@ -894,6 +897,11 @@ mod tests {
         assert_eq!(mode, 0o700);
         assert!(cfg.analytics_db.exists());
         assert_eq!(store.retention_days(), 14);
+        assert_eq!(
+            store.archive_dir(),
+            Some(cfg.analytics_archive_dir.as_path())
+        );
+        assert!(store.archive_before_delete());
         assert_eq!(store.max_bytes(), Some(64 * 1024 * 1024));
     }
 

@@ -513,6 +513,7 @@ fn bots_breakdown_counts_classes_signals_agents_and_scores() {
 fn age_retention_removes_only_expired_rows() {
     let (_d, s) = open();
     s.set_retention_days(1);
+    s.set_archive_before_delete(false);
     assert_eq!(s.retention_days(), 1);
     let mut events: Vec<LogEvent> = (0..5).map(|i| ev(NOW - 3 * DAY - i)).collect();
     events.extend((0..7).map(|i| ev(NOW - 1000 - i)));
@@ -2004,6 +2005,7 @@ fn retention_erases_path_rollups_and_dictionary_text_of_expired_rows() {
     let dir = tempfile::tempdir().expect("tempdir");
     let s = Store::open(&dir.path().join("events.db"), StoreOptions::default()).expect("open");
     s.set_retention_days(1);
+    s.set_archive_before_delete(false);
     let mut events: Vec<LogEvent> = (0..30)
         .map(|i| {
             let mut e = ev(NOW - 3 * DAY - i);
@@ -2634,6 +2636,7 @@ fn scrubbing_removes_addresses_and_agents_from_the_minute_rollups() {
 fn freed_request_ids_are_folded_when_they_are_handed_out_again() {
     let (_d, s) = open();
     s.set_retention_days(1);
+    s.set_archive_before_delete(false);
     let mut stale = ev(NOW - 40 * DAY);
     stale.path = "/stale".into();
     let mut fresh = ev(NOW - 1000);

@@ -66,13 +66,14 @@ Earlier versions kept counters in memory and wrote them to `analytics.json` in t
 
 ## Retention
 
-Rows are kept until they are older than the retention period. Nothing else removes them: there is no memory budget, and no limit on rows or on database size unless you set one. Retention removes everything that came with the expired rows: their hourly rollups (including the per-path rollups), and every dictionary entry that no remaining row or rollup refers to. Client addresses, user agents and referers are overwritten in the file when their dictionary entry is deleted, and the write-ahead log is folded away afterwards, so the text does not linger in either file. Path text of deleted raw rows is zeroed too, because the writer runs with `secure_delete=FAST`.
+Retention is unlimited by default: `hour_buckets_days` is 0, which keeps every row and rollup forever. Nothing removes them: there is no memory budget, and no limit on rows or on database size unless you set one. Set `hour_buckets_days` to a number of days and rows older than that are removed, after a copy is written (see [Archives and backups](#archives-and-backups)). Removal takes everything that came with the expired rows: their hourly rollups (including the per-path rollups), and every dictionary entry that no remaining row or rollup refers to. Client addresses, user agents and referers are overwritten in the file when their dictionary entry is deleted, and the write-ahead log is folded away afterwards, so the text does not linger in either file. Path text of deleted raw rows is zeroed too, because the writer runs with `secure_delete=FAST`. The archive files keep that text, so they are as sensitive as the database and are only removed by you.
 
-The minute rollups are not subject to the period: every retention pass removes the ones older than 7 hours, which is longer than the windows they serve. The period is the `hour_buckets_days` value of the `retention` object in the node's settings (`GET` and `PUT /api/v1/settings`), 90 days by default. Retention is applied every 10 minutes and straight after a settings change, so shortening it removes the older rows within moments. The connector's start uses the stored value.
+The minute rollups are not subject to the period: every retention pass removes the ones older than 7 hours, which is longer than the windows they serve. The period is the `hour_buckets_days` value of the `retention` object in the node's settings (`GET` and `PUT /api/v1/settings`). Retention is applied every 10 minutes and straight after a settings change, so shortening it removes the older rows within moments. The connector's start uses the stored value.
 
 | Setting | Default | Allowed | Meaning |
 |---|---|---|---|
-| `hour_buckets_days` | 90 | 1 to 3650 | Days a request row and its rollups are kept. |
+| `hour_buckets_days` | 0 | 0, or 1 to 3650 | Days a request row and its rollups are kept. 0 keeps them forever. |
+| `archive_before_delete` | `true` | boolean | Write each complete day to a verified archive file before age retention deletes it. |
 | `audit_days` | 365 | 1 to 3650 | How long audit log entries are kept. |
 | `store_user_agents` | `true` | boolean | See privacy settings. |
 | `store_client_ips` | `true` | boolean | See privacy settings. |
@@ -80,13 +81,46 @@ The minute rollups are not subject to the period: every retention pass removes t
 
 The audit log is pruned of entries older than `audit_days` once an hour. `audit.jsonl` rotates to `audit.jsonl.1` at 4 MiB, so at most about 8 MiB is kept and a very busy node can lose audit entries sooner than `audit_days`.
 
+### Archives and backups
+
+Archives and backups are files in the archive directory, `/conf/analytics/archive` by default (`CITE_ANALYTICS_ARCHIVE_DIR` moves it; the value must be an absolute path). The connector creates it with mode 0700 and its files with 0600. Put it on a different disk or mount than the database if you want it to survive losing the database volume.
+
+An archive holds the raw rows of one UTC day (or the part of a day before a manual cut), one JSON object per line, gzip compressed. It is named `requests-<from_ms>-<to_ms>.ndjson.gz`, where the two numbers are the range in epoch milliseconds, `to` exclusive. A backup is a consistent copy of the whole database made with SQLite's backup API while the connector keeps running, named `backup-<created_ms>.db`. Every file has a manifest entry next to it (`<name>.manifest.json`) with its SHA-256, size, row count and the oldest and newest request time. A file without a manifest entry is not listed and cannot be restored.
+
+When age retention is on and `archive_before_delete` is true, each pass handles only complete UTC days older than the retention period, oldest first. For each day the connector writes the archive to a temporary file, syncs it, reads it back to check the SHA-256 and the row count, renames it into place, writes the manifest and syncs the directory. Only then does it delete that day's rows. If any step fails, nothing is deleted for that day or later ones, the failure is logged and reported as `archive_error` in the pass, and the next pass (10 minutes later) tries again. If the archive directory is not usable, age deletion simply waits; turning `archive_before_delete` off is the only way to delete without a copy. Rows that arrive for a day that was already archived get their own file (`-2`, `-3` and so on) on the next pass; an archive is never overwritten.
+
+The size cap below does not archive: it trims the oldest rows to fit the disk and is meant for volumes that cannot hold the history.
+
+Manual control uses the API, under `/api/v1/analytics` (see [Connector API](node-api.md)):
+
+| Route | Does |
+|---|---|
+| `GET /archives` | Lists archives and backups with their checksum, rows and time range, and the total bytes in the directory. |
+| `POST /backup` | Makes a backup. |
+| `POST /cut` | Deletes raw rows older than `before_ms` (or `before_days`). It archives first unless the body says `"archive": false`. `"dry_run": true` only reports what would go; run that first. |
+| `POST /restore` | Imports an archive back into the database. Backups are rejected. |
+| `GET /archives/{name}` | Downloads a file, with its checksum in `X-Archive-Sha256`. |
+| `DELETE /archives/{name}` | Removes a file and its manifest. |
+
+```sh
+# what would a cut at 90 days remove
+curl -sH "Authorization: Bearer $TOKEN" -X POST "$NODE/api/v1/analytics/cut" \
+  -d '{"before_days": 90, "dry_run": true}'
+
+# do it, keeping a verified copy
+curl -sH "Authorization: Bearer $TOKEN" -X POST "$NODE/api/v1/analytics/cut" \
+  -d '{"before_days": 90}'
+```
+
+Restoring adds the archived rows as new rows, with their rollups rebuilt. It does not look for rows that are already there, so restoring the same file twice, or a file whose rows are still in the database, counts them twice. Restore into a day you cut. To go back to a backup, stop the connector and replace `analytics.db` (and remove its `-wal` and `-shm` files) with the backup file. Names are checked strictly: only files this feature wrote, with plain characters, no path separators and no `..`, in the archive directory. Every backup, cut, restore, download and delete is written to the audit log. A node runs at most 2 downloads and exports at once between them.
+
 ### Optional size cap
 
 `CITE_ANALYTICS_MAX_BYTES` sets a hard cap on the database size. It is unset by default, which means no cap. When it is set (8 MiB to 1 TiB), each retention pass (every 10 minutes) also trims the oldest rows until the data fits under the cap, and logs how many it removed. Between passes the file can briefly exceed the cap. A cap trades history for disk space, so set it only when the volume is small.
 
 A pass removes at most 25% of the raw rows. A burst of traffic that pushes the file over the cap therefore costs history over several passes (10 minutes apart) instead of at once, and the file stays over the cap in between. When the file is at least twice the cap, the limit is lifted so the cap is still honoured. Trimming only removes raw rows; the hourly rollups and the dictionary stay. If those alone already exceed the cap, no raw row is deleted for it: the pass logs a warning, reports `trim_blocked`, and the cap needs raising. The current size and cap are in `GET /api/v1/analytics/stats`.
 
-Plan the disk for the default of no cap: the file grows with the number of requests inside the retention period. Watch `db_bytes` against `rows` in `GET /api/v1/analytics/stats` for a few days to get the per-request cost of your own traffic, then size the volume or lower `hour_buckets_days` to match.
+Plan the disk for the default of no cap and no age limit: the file grows with every request the node has ever served. Watch `db_bytes` against `rows` in `GET /api/v1/analytics/stats` for a few days to get the per-request cost of your own traffic, then size the volume, set `hour_buckets_days` or cut old data with `POST /analytics/cut` to match.
 
 ## Privacy settings
 
@@ -151,7 +185,7 @@ This is a heuristic, not a verdict. It reads headers that a determined client ca
 
 ## Reading it
 
-All routes are `GET` under `/api/v1/analytics` and need the same bearer token as the rest of the API. See [Connector API](node-api.md) for the response shapes.
+The routes below are `GET` under `/api/v1/analytics` and need the same bearer token as the rest of the API. The archive and backup routes are described under Retention. See [Connector API](node-api.md) for the response shapes.
 
 | Route | Returns |
 |---|---|
@@ -160,7 +194,7 @@ All routes are `GET` under `/api/v1/analytics` and need the same bearer token as
 | `/requests` | Requests, newest first, filtered by `status`, `method`, `path`, `ip`, `blocked` or `site`. At most 1000 per call. |
 | `/bots` | Bot share, counts per class, signal and user agent, and a score histogram. |
 | `/top` | The highest-count values of one field: paths, hosts, referers, agents, content types, statuses, IPs or languages. |
-| `/stats` | Row count, file size, oldest and newest timestamp, writer counters, retention days, size cap. |
+| `/stats` | Row count, file size, oldest and newest timestamp, writer counters, retention days (0 is unlimited), whether archiving is on, size cap. |
 | `/export` | A download of the underlying data. |
 
 ```sh
@@ -246,7 +280,7 @@ SELECT d.val, count(*) FROM requests r JOIN dict d ON d.id = r.host_id
 GROUP BY d.val ORDER BY 2 DESC LIMIT 10;
 ```
 
-Do not write to the file, and do not copy it while the connector runs without also copying the `-wal` file next to it. The table layout is versioned (`PRAGMA user_version`) and may change between releases; the export and API formats are the stable interface.
+Do not write to the file, and do not copy it while the connector runs without also copying the `-wal` file next to it. Use `POST /analytics/backup` for a consistent copy instead. The table layout is versioned (`PRAGMA user_version`) and may change between releases; the export and API formats are the stable interface.
 
 ## Limits
 

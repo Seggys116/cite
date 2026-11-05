@@ -1,5 +1,5 @@
 use std::io::{BufWriter, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError, Weak};
 use std::time::Duration;
@@ -10,6 +10,7 @@ use cite_edge::model::LogEvent;
 use rusqlite::Connection;
 use serde::Serialize;
 
+use crate::archive::{ArchiveItem, ArchiveList, CutReport};
 use crate::error::{Error, Result};
 use crate::export::{self, CsvSink, ExportFilter, ExportKind, NdjsonSink};
 use crate::ingest::{Privacy, WriteConn};
@@ -28,8 +29,12 @@ const CHECKPOINT_WAIT: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone)]
 pub struct StoreOptions {
-    /// 0 keeps everything.
+    /// 0 never deletes by age.
     pub retention_days: u32,
+    /// Where archives and backups are written; without it nothing can be archived, so age deletion with archiving on is skipped.
+    pub archive_dir: Option<PathBuf>,
+    /// Complete days are archived and verified before age retention deletes them.
+    pub archive_before_delete: bool,
     pub max_bytes: Option<u64>,
     /// Clamped to 1 to 16.
     pub read_connections: usize,
@@ -45,7 +50,9 @@ pub struct StoreOptions {
 impl Default for StoreOptions {
     fn default() -> Self {
         Self {
-            retention_days: 30,
+            retention_days: 0,
+            archive_dir: None,
+            archive_before_delete: true,
             max_bytes: None,
             read_connections: 4,
             batch_size: 5000,
@@ -72,6 +79,10 @@ pub(crate) struct Inner {
     readers: Vec<Mutex<Reader>>,
     cursor: AtomicUsize,
     retention_days: AtomicU32,
+    pub(crate) archive_dir: Option<PathBuf>,
+    archive_before_delete: AtomicBool,
+    #[cfg(test)]
+    pub(crate) archive_fault: AtomicBool,
     max_bytes: AtomicU64,
     batches: AtomicU64,
     errors: AtomicU64,
@@ -161,6 +172,10 @@ impl Inner {
         self.retention_days.load(Ordering::Relaxed)
     }
 
+    pub(crate) fn archive_before_delete(&self) -> bool {
+        self.archive_before_delete.load(Ordering::Relaxed)
+    }
+
     pub(crate) fn max_bytes(&self) -> Option<u64> {
         match self.max_bytes.load(Ordering::Relaxed) {
             NO_LIMIT => None,
@@ -187,6 +202,10 @@ impl Store {
             readers,
             cursor: AtomicUsize::new(0),
             retention_days: AtomicU32::new(opts.retention_days),
+            archive_dir: opts.archive_dir.clone(),
+            archive_before_delete: AtomicBool::new(opts.archive_before_delete),
+            #[cfg(test)]
+            archive_fault: AtomicBool::new(false),
             max_bytes: AtomicU64::new(opts.max_bytes.unwrap_or(NO_LIMIT)),
             batches: AtomicU64::new(0),
             errors: AtomicU64::new(0),
@@ -300,6 +319,48 @@ impl Store {
 
     pub fn retention_days(&self) -> u32 {
         self.inner.retention_days()
+    }
+
+    pub fn set_archive_before_delete(&self, on: bool) {
+        self.inner
+            .archive_before_delete
+            .store(on, Ordering::Relaxed);
+    }
+
+    pub fn archive_before_delete(&self) -> bool {
+        self.inner.archive_before_delete()
+    }
+
+    pub fn archive_dir(&self) -> Option<&Path> {
+        self.inner.archive_dir.as_deref()
+    }
+
+    /// Writes a checksummed, consistent copy of the live database into the archive directory.
+    pub fn backup(&self) -> Result<ArchiveItem> {
+        self.inner.backup()
+    }
+
+    /// Deletes every raw row older than cutoff_ms. With archive on, each UTC day is first written to a verified archive file and a failure deletes nothing further. A dry run only counts.
+    pub fn cut_before(&self, cutoff_ms: i64, archive: bool, dry_run: bool) -> Result<CutReport> {
+        self.inner.cut_before(cutoff_ms, archive, dry_run)
+    }
+
+    pub fn list_archives(&self) -> Result<ArchiveList> {
+        self.inner.list_archives()
+    }
+
+    /// Re-imports an archive file and returns the rows added; backups are rejected.
+    pub fn restore_archive(&self, name: &str) -> Result<u64> {
+        self.inner.restore_archive(name)
+    }
+
+    pub fn delete_archive(&self, name: &str) -> Result<()> {
+        self.inner.delete_archive(name)
+    }
+
+    /// Opens an archive or backup for download, with the manifest entry that describes it.
+    pub fn open_archive(&self, name: &str) -> Result<(std::fs::File, ArchiveItem)> {
+        self.inner.open_archive(name)
     }
 
     pub fn set_max_bytes(&self, max_bytes: Option<u64>) {

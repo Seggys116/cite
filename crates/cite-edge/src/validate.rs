@@ -545,7 +545,7 @@ pub fn validate_settings(s: &EdgeSettings) -> Result<(), ValidationError> {
     check_range(
         "retention hour_buckets_days",
         r.hour_buckets_days.into(),
-        1,
+        0,
         3650,
     )?;
     check_range("retention audit_days", r.audit_days.into(), 1, 3650)

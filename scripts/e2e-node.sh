@@ -386,6 +386,45 @@ pass "csv export holds the stored requests"
 grep -q '/.env' "$WORK/export.csv" || fail "the dropped dotfile is missing from the csv"
 pass "csv export includes the dropped request"
 
+echo "== archives and backups"
+api GET /api/v1/settings
+code_is "read default settings" 200
+jq_ok "retention is unlimited and archives before deleting by default" '.retention.hour_buckets_days == 0 and .retention.archive_before_delete == true'
+api GET /api/v1/analytics/archives
+code_is "list archives" 200
+jq_ok "archive list shape" '(.items | type) == "array" and (.dir_bytes | type) == "number"'
+api POST /api/v1/analytics/backup
+code_is "back up the database" 200
+jq_ok "backup is a checksummed copy of the stored rows" '.kind == "backup" and (.sha256 | length) == 64 and .rows > 200 and .bytes > 0'
+BACKUP_NAME=$(printf '%s' "$BODY" | jq -er .name)
+BACKUP_SHA=$(printf '%s' "$BODY" | jq -er .sha256)
+api GET /api/v1/analytics/archives
+jq_ok "backup is listed" "any(.items[]; .name == \"$BACKUP_NAME\" and .kind == \"backup\")"
+BACKUP_HEADERS="$WORK/backup.headers"
+curl -sS --max-time 60 --cacert "$CA" --resolve "localhost:$API_PORT:127.0.0.1" -D "$BACKUP_HEADERS" -o "$WORK/backup.db" \
+  -H "Authorization: Bearer $TOKEN" "https://localhost:$API_PORT/api/v1/analytics/archives/$BACKUP_NAME" || fail "backup download failed"
+BACKUP_FILE_SHA=$(python3 -I -c 'import hashlib, sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$WORK/backup.db")
+expect "downloaded backup matches its checksum" "$BACKUP_SHA" "$BACKUP_FILE_SHA"
+grep -qi "^x-archive-sha256: $BACKUP_SHA" "$BACKUP_HEADERS" || fail "download has no checksum header: $(<"$BACKUP_HEADERS")"
+pass "download carries the checksum header"
+api GET /api/v1/analytics/stats
+ROWS_BEFORE_CUT=$(printf '%s' "$BODY" | jq -r .rows)
+api POST /api/v1/analytics/cut '{"before_days":1,"dry_run":true}'
+code_is "cut dry run" 200
+jq_ok "dry run reports and archives nothing" '.dry_run == true and .archive == true and .archived_rows == 0 and (.files | length) == 0'
+api GET /api/v1/analytics/stats
+expect "dry run deleted nothing" "$ROWS_BEFORE_CUT" "$(printf '%s' "$BODY" | jq -r .rows)"
+api POST /api/v1/analytics/cut '{}'
+code_is "cut without a cutoff is rejected" 400
+api POST /api/v1/analytics/cut '{"before_days":1,"archive":"no"}'
+code_is "cut with a non-boolean archive flag is rejected" 400
+api GET "/api/v1/analytics/archives/..%2Fanalytics.db"
+code_is "archive name traversal is rejected" 400
+api DELETE "/api/v1/analytics/archives/$BACKUP_NAME"
+code_is "delete the backup" 200
+api GET /api/v1/analytics/archives
+jq_ok "backup is gone from the list" "all(.items[]; .name != \"$BACKUP_NAME\")"
+
 echo "== settings and retention"
 api GET /api/v1/settings
 code_is "read settings" 200

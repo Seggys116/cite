@@ -6,6 +6,7 @@ use std::time::Duration;
 use rusqlite::params;
 use serde::Serialize;
 
+use crate::archive::Cut;
 use crate::error::Result;
 use crate::fold;
 use crate::limits::{DAY_MS, HOUR_MS, MINUTE_KEEP_MS, MINUTE_MS};
@@ -38,6 +39,10 @@ pub struct PruneReport {
     /// None when age retention is off.
     pub cutoff_ms: Option<i64>,
     pub expired_rows: u64,
+    /// Rows written to verified archive files before they were deleted by age.
+    pub archived_rows: u64,
+    /// Why age deletion stopped early; the rows stay and the next pass retries.
+    pub archive_error: Option<String>,
     pub trimmed_rows: u64,
     pub trimmed_from_ms: Option<i64>,
     pub trimmed_to_ms: Option<i64>,
@@ -64,9 +69,10 @@ impl fmt::Display for PruneReport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "pruned {} expired rows (cutoff {:?}), trimmed {} oldest rows ({:?}..{:?}), removed {} rollup rows and \
+            "pruned {} expired rows ({} archived, cutoff {:?}), trimmed {} oldest rows ({:?}..{:?}), removed {} rollup rows and \
              {} dictionary rows, live bytes {} -> {}",
             self.expired_rows,
+            self.archived_rows,
             self.cutoff_ms,
             self.trimmed_rows,
             self.trimmed_from_ms,
@@ -95,13 +101,47 @@ impl Inner {
         if days > 0 {
             let cutoff = now_ms.saturating_sub(i64::from(days).saturating_mul(DAY_MS));
             report.cutoff_ms = Some(cutoff);
-            self.expire(cutoff, &mut report)?;
+            self.expire_by_age(cutoff, &mut report)?;
         }
         if let Some(max) = self.max_bytes() {
             self.trim(max, &mut report)?;
         }
         // Under a size cap raw rows can go before their minute rollups, which may then be the last reference to a dictionary entry.
         let changed = !report.is_empty() || (minute_rows > 0 && self.max_bytes().is_some());
+        self.settle(changed, &mut report)?;
+        report.bytes_after = self.live_bytes()?;
+        Ok(report)
+    }
+
+    // Age deletion that keeps a verified copy first; an archive failure is reported and retried on the next pass, never turned into a delete.
+    fn expire_by_age(&self, cutoff: i64, report: &mut PruneReport) -> Result<()> {
+        if !self.archive_before_delete() {
+            return self.expire(cutoff, report);
+        }
+        let Some(dir) = self.archive_dir.as_deref() else {
+            let msg = "age retention is on with archiving but no archive directory is configured";
+            tracing::warn!("{msg}; nothing was deleted");
+            report.archive_error = Some(msg.into());
+            return Ok(());
+        };
+        // Only complete UTC days are archived, so a day is never split across files by the schedule.
+        let whole_days = cutoff.div_euclid(DAY_MS) * DAY_MS;
+        let mut cut = Cut::default();
+        let outcome = self.archive_and_delete(dir, whole_days, &mut cut);
+        report.expired_rows += cut.deleted;
+        report.archived_rows += cut.archived;
+        if let Some(done) = cut.done_to {
+            self.expire_rollups(done, report)?;
+        }
+        if let Err(e) = outcome {
+            tracing::warn!(error = %e, "archiving old analytics failed; nothing past the last verified archive was deleted and the next pass retries");
+            report.archive_error = Some(e.to_string());
+        }
+        Ok(())
+    }
+
+    // Shared tail of every pass that deleted rows: free dictionary entries nothing references, give the pages back and fold the log if text was erased.
+    pub(crate) fn settle(&self, changed: bool, report: &mut PruneReport) -> Result<()> {
         let mut sensitive = false;
         if changed {
             let swept = self.sweep_dict()?;
@@ -117,11 +157,10 @@ impl Inner {
         {
             tracing::warn!(error = %e, "write-ahead log still holds pages removed from the database");
         }
-        report.bytes_after = self.live_bytes()?;
-        Ok(report)
+        Ok(())
     }
 
-    fn expire(&self, cutoff: i64, report: &mut PruneReport) -> Result<()> {
+    pub(crate) fn expire(&self, cutoff: i64, report: &mut PruneReport) -> Result<()> {
         loop {
             let n = {
                 let w = self.lock_writer();
@@ -140,6 +179,11 @@ impl Inner {
             }
             thread::sleep(YIELD);
         }
+        self.expire_rollups(cutoff, report)
+    }
+
+    // Rollups before the cutoff hour; the caller has already removed or archived the raw rows they summarise.
+    pub(crate) fn expire_rollups(&self, cutoff: i64, report: &mut PruneReport) -> Result<()> {
         let hour = cutoff.div_euclid(HOUR_MS);
         let w = self.lock_writer();
         for sql in [
@@ -151,6 +195,30 @@ impl Inner {
             report.rollup_rows_removed += w.conn.execute(sql, params![hour])? as u64;
         }
         Ok(())
+    }
+
+    // Deletes the rows of one archived segment in chunks; the id bound keeps rows that arrived after the archive was read.
+    pub(crate) fn delete_segment(&self, from: i64, to: i64, max_id: i64) -> Result<u64> {
+        let mut total = 0u64;
+        loop {
+            let n = {
+                let w = self.lock_writer();
+                let tx = w.conn.unchecked_transaction()?;
+                let n = tx.execute(
+                    "DELETE FROM requests WHERE id IN (SELECT id FROM requests \
+                     WHERE ts >= ?1 AND ts < ?2 AND id <= ?3 LIMIT ?4)",
+                    params![from, to, max_id, EXPIRE_CHUNK],
+                )?;
+                fold::clamp(&tx)?;
+                tx.commit()?;
+                n
+            };
+            total += n as u64;
+            if (n as i64) < EXPIRE_CHUNK {
+                return Ok(total);
+            }
+            thread::sleep(YIELD);
+        }
     }
 
     // The minute tables only serve windows of a few hours, so they are cut at a fixed age whatever the retention period.
