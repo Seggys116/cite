@@ -122,7 +122,7 @@ Options:
   --http-port PORT             Public HTTP port (default 80)
   --https-port PORT            Public HTTPS port (default 443)
   --dashboard-bind IP          Address the dashboard is exposed on (default 127.0.0.1)
-  --dashboard-port PORT        Dashboard port (default 9000)
+  --dashboard-port PORT        Dashboard port (default 8088)
   --orchestrator               Enable the Docker socket proxy so the connector can start sites
   --version X.Y.Z              Image version (default $DEFAULT_VERSION)
   --ref GIT_REF                Git ref to fetch compose files from (default $DEFAULT_REF)
@@ -294,7 +294,7 @@ check_allow() {
 resolve_allow() {
   if [ "$1" = allow-all ]; then
     if confirm "Allow ANY address to reach this service? Only the credentials will protect it."; then
-      ALLOW="0.0.0.0/0,::/0"
+      ALLOW="0.0.0.0/0,::/0,allow-all"
       warn "open to every address; make sure a firewall restricts the exposed ports"
       return 0
     fi
@@ -757,7 +757,7 @@ collect_config() {
   [ -n "$PORT" ] || PORT=7443
   [ -n "$HTTP_PORT" ] || HTTP_PORT=80
   [ -n "$HTTPS_PORT" ] || HTTPS_PORT=443
-  [ -n "$DASH_PORT" ] || DASH_PORT=9000
+  [ -n "$DASH_PORT" ] || DASH_PORT=8088
   valid_version "$VERSION" || die "invalid --version: $VERSION"
   for _p in "$PORT" "$HTTP_PORT" "$HTTPS_PORT" "$DASH_PORT"; do
     valid_port "$_p" || die "invalid port: $_p"
@@ -958,7 +958,7 @@ do_status() {
     say "connector    https://$(connector_host):${PORT:-7443}"
   fi
   if stack_enabled dashboard && [ -n "$DASH_BIND" ]; then
-    say "dashboard    http://$DASH_BIND:${DASH_PORT:-9000}"
+    say "dashboard    http://$DASH_BIND:${DASH_PORT:-8088}"
   fi
 }
 

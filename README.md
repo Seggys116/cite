@@ -126,6 +126,13 @@ Without it, a site routes to upstream addresses you run yourself. [Running a nod
 
 The dashboard is a browser console with seven views: Overview, Nodes, Sites, Traffic, Firewall, Maintenance and Settings. A node switcher scopes every view to one node or to all of them. Signing in takes a username, a password and a six-digit authenticator code. A node is added with a name, its connector URL and a connector API token.
 
+```bash
+docker compose -f docker-compose.dashboard.yml up -d
+docker compose -f docker-compose.dashboard.yml logs dashboard
+```
+
+Open `http://127.0.0.1:8088` and enter the one-time setup token from the log to create the first account.
+
 The console source is in `crates/cite-dashboard/web`. [Dashboard](docs/dashboard.md) describes each view and the API the console uses.
 
 ## Adding a site

@@ -1,5 +1,3 @@
-use std::fs::File;
-use std::io::BufReader;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
@@ -11,6 +9,7 @@ use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder;
+use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
@@ -26,8 +25,10 @@ fn tls_err(msg: impl Into<String>) -> Error {
 }
 
 fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
-    let mut reader = BufReader::new(File::open(path)?);
-    let certs = rustls_pemfile::certs(&mut reader).collect::<std::result::Result<Vec<_>, _>>()?;
+    let certs = CertificateDer::pem_file_iter(path)
+        .map_err(|e| tls_err(format!("cannot read {}: {e}", path.display())))?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| tls_err(format!("invalid certificate in {}: {e}", path.display())))?;
     if certs.is_empty() {
         return Err(tls_err(format!(
             "no certificate found in {}",
@@ -38,9 +39,8 @@ fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
 }
 
 fn load_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
-    let mut reader = BufReader::new(File::open(path)?);
-    rustls_pemfile::private_key(&mut reader)?
-        .ok_or_else(|| tls_err(format!("no private key found in {}", path.display())))
+    PrivateKeyDer::from_pem_file(path)
+        .map_err(|e| tls_err(format!("no usable private key in {}: {e}", path.display())))
 }
 
 pub fn tls_acceptor(files: &TlsFiles) -> Result<TlsAcceptor> {
@@ -113,6 +113,18 @@ async fn serve_tls(listener: TcpListener, app: Router, acceptor: TlsAcceptor) {
     }
 }
 
+// Printed outside the structured log so the token is easy to spot in `docker compose logs`.
+fn announce_setup_token(token: &str) {
+    eprintln!("==============================================================");
+    eprintln!("Cite dashboard is not set up yet.");
+    eprintln!("Open the console and enter this one-time setup token:");
+    eprintln!();
+    eprintln!("    {token}");
+    eprintln!();
+    eprintln!("A new token is generated each time the dashboard starts until setup is complete.");
+    eprintln!("==============================================================");
+}
+
 // An explicit CITE_DASHBOARD_LISTEN wins over the listen address stored in the config file.
 pub async fn run(settings: Settings) -> Result<()> {
     let config = ConfigFile::load_or_default(&settings.config_path)?;
@@ -127,6 +139,12 @@ pub async fn run(settings: Settings) -> Result<()> {
     let acceptor = settings.tls.as_ref().map(tls_acceptor).transpose()?;
     let onboarding = config.admin.is_none();
     let state = AppState::new(settings, config, tokens);
+    if onboarding {
+        let token = state
+            .issue_setup_token()
+            .map_err(|e| Error::Setup(e.message().to_string()))?;
+        announce_setup_token(&token);
+    }
     let app = api::router(state);
     let listener = TcpListener::bind(listen).await?;
     tracing::info!(

@@ -148,6 +148,7 @@ export function onboardingScreen({ onDone }) {
 
   function stepAccount() {
     mark(0);
+    const setupToken = h('input', { class: 'input mono', type: 'text', autocomplete: 'off', required: true, spellcheck: 'false', autocapitalize: 'none' });
     const user = h('input', { class: 'input', type: 'text', autocomplete: 'username', required: true, spellcheck: 'false', autocapitalize: 'none' });
     const pass = h('input', { class: 'input', type: 'password', autocomplete: 'new-password', required: true });
     const again = h('input', { class: 'input', type: 'password', autocomplete: 'new-password', required: true });
@@ -164,24 +165,26 @@ export function onboardingScreen({ onDone }) {
       novalidate: true,
       onSubmit: async (e) => {
         e.preventDefault();
+        if (!setupToken.value.trim()) return showError(err, 'Enter the setup token from the dashboard log.');
         if (!user.value.trim()) return showError(err, 'Choose a username.');
         if (pass.value.length < 8) return showError(err, 'Use at least 8 characters for the password.');
         if (pass.value !== again.value) return showError(err, 'The passwords do not match.');
         showError(err, '');
         try {
-          const res = await withBusy(next, () => api.post('/setup', { username: user.value.trim(), password: pass.value }));
+          const res = await withBusy(next, () => api.post('/setup', { setup_token: setupToken.value.trim(), username: user.value.trim(), password: pass.value }));
           stepScan(res);
         } catch (ex) {
           showError(err, formatError(ex));
         }
       },
-    }, field('Username', user), field('Password', pass),
+    }, field('Setup token', setupToken, 'Printed in the container log: docker compose logs dashboard'),
+    field('Username', user), field('Password', pass),
     h('div', { class: 'meter-row' }, meter, meterLabel),
     field('Confirm password', again), err, next);
     clear(host);
     host.append(h('h1', { class: 'auth-title' }, 'Create the console account'),
       h('p', { class: 'muted' }, 'This is the first run. The account protects every node you connect.'), steps, form);
-    user.focus();
+    setupToken.focus();
   }
 
   function stepScan(res) {

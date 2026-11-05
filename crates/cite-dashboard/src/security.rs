@@ -17,7 +17,7 @@ pub const COOKIE_NAME: &str = "cite_session";
 pub const CSRF_HEADER: &str = "x-cite-csrf";
 
 const CSP: &str = "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; \
-frame-src about:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'; \
+frame-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'; \
 connect-src 'self'; object-src 'none'";
 const PERMISSIONS_POLICY: &str = "accelerometer=(), camera=(), geolocation=(), gyroscope=(), \
 magnetometer=(), microphone=(), payment=(), usb=()";
@@ -197,10 +197,13 @@ pub async fn security_headers(
     let is_api = req.uri().path().starts_with("/api/");
     let mut resp = next.run(req).await;
     let headers = resp.headers_mut();
-    headers.insert(
-        header::CONTENT_SECURITY_POLICY,
-        HeaderValue::from_static(CSP),
-    );
+    // Handlers that set their own stricter policy (the sandboxed preview) keep it.
+    if !headers.contains_key(header::CONTENT_SECURITY_POLICY) {
+        headers.insert(
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static(CSP),
+        );
+    }
     headers.insert(
         header::X_CONTENT_TYPE_OPTIONS,
         HeaderValue::from_static("nosniff"),

@@ -419,21 +419,27 @@ fn site_json(id: &str) -> Value {
 async fn setup_status_tracks_whether_an_admin_exists() {
     let fresh = harness_with(DashboardConfig::default(), &[], &[]);
     let reply = get_path(&fresh.app, "/api/v1/setup", &[]).await;
-    assert_eq!(reply.json(), json!({ "needs_onboarding": true }));
+    assert_eq!(
+        reply.json(),
+        json!({ "needs_onboarding": true, "needs_token": true })
+    );
     let done = harness();
     let reply = get_path(&done.app, "/api/v1/setup", &[]).await;
-    assert_eq!(reply.json(), json!({ "needs_onboarding": false }));
+    assert_eq!(reply.json()["needs_onboarding"], json!(false));
 }
 
 #[tokio::test]
 async fn onboarding_happy_path_ends_with_a_working_login() {
     let h = harness_with(DashboardConfig::default(), &[], &[]);
+    let setup_token = h.state.issue_setup_token().expect("setup token");
+    assert_eq!(setup_token.len(), 32);
+    assert!(setup_token.bytes().all(|b| b.is_ascii_hexdigit()));
     let begin = send_json(
         &h.app,
         Method::POST,
         "/api/v1/setup",
         &[],
-        json!({ "username": "operator", "password": "a long enough passphrase" }),
+        json!({ "setup_token": setup_token, "username": "operator", "password": "a long enough passphrase" }),
     )
     .await;
     assert_eq!(begin.status, StatusCode::OK, "{}", begin.text());
@@ -461,6 +467,7 @@ async fn onboarding_happy_path_ends_with_a_working_login() {
     assert!(!h.state.needs_onboarding().await);
     let saved = ConfigFile::load(&h.config_path).expect("config on disk");
     assert_eq!(saved.admin.expect("admin saved").username, "operator");
+    assert!(!h.state.setup_token_matches(&setup_token));
 
     // The confirmation used this step, so the first login needs the next one.
     let next = totp::code_at(&secret, now() + 30).expect("code");
@@ -473,11 +480,12 @@ async fn onboarding_happy_path_ends_with_a_working_login() {
 #[tokio::test]
 async fn setup_validates_username_and_password() {
     let h = harness_with(DashboardConfig::default(), &[], &[]);
+    let t = h.state.issue_setup_token().expect("setup token");
     for body in [
-        json!({ "username": "Bad Name", "password": "a long enough passphrase" }),
-        json!({ "username": "ab", "password": "a long enough passphrase" }),
-        json!({ "username": "operator", "password": "short" }),
-        json!({ "username": "operator" }),
+        json!({ "setup_token": t, "username": "Bad Name", "password": "a long enough passphrase" }),
+        json!({ "setup_token": t, "username": "ab", "password": "a long enough passphrase" }),
+        json!({ "setup_token": t, "username": "operator", "password": "short" }),
+        json!({ "setup_token": t, "username": "operator" }),
     ] {
         let reply = send_json(&h.app, Method::POST, "/api/v1/setup", &[], body).await;
         assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.text());
@@ -488,6 +496,7 @@ async fn setup_validates_username_and_password() {
 #[tokio::test]
 async fn setup_confirm_needs_a_started_setup_and_a_valid_code() {
     let h = harness_with(DashboardConfig::default(), &[], &[]);
+    let t = h.state.issue_setup_token().expect("setup token");
     let url = "/api/v1/setup/confirm";
     let early = send_json(&h.app, Method::POST, url, &[], json!({ "code": "123456" })).await;
     assert_eq!(early.status, StatusCode::BAD_REQUEST);
@@ -496,7 +505,7 @@ async fn setup_confirm_needs_a_started_setup_and_a_valid_code() {
         Method::POST,
         "/api/v1/setup",
         &[],
-        json!({ "username": "operator", "password": "a long enough passphrase" }),
+        json!({ "setup_token": t, "username": "operator", "password": "a long enough passphrase" }),
     )
     .await;
     assert_eq!(begin.status, StatusCode::OK);
@@ -521,7 +530,7 @@ async fn setup_endpoints_are_404_once_onboarded() {
         Method::POST,
         "/api/v1/setup",
         &[],
-        json!({ "username": "intruder", "password": "a long enough passphrase" }),
+        json!({ "setup_token": "x", "username": "intruder", "password": "a long enough passphrase" }),
     )
     .await;
     assert_eq!(begin.status, StatusCode::NOT_FOUND);
@@ -796,6 +805,7 @@ async fn security_headers_are_on_every_response() {
             "frame-ancestors 'none'",
             "base-uri 'none'",
             "form-action 'self'",
+            "frame-src 'self'",
         ] {
             assert!(csp.contains(directive), "{directive} missing from {csp}");
         }
@@ -1362,4 +1372,132 @@ async fn deployments_need_a_session_and_the_csrf_token() {
     )
     .await;
     assert_eq!(no_csrf.status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn setup_needs_the_one_time_token_and_failures_lock_out() {
+    let h = harness_with(DashboardConfig::default(), &[], &[]);
+    let body = |token: &str| json!({ "setup_token": token, "username": "operator", "password": "a long enough passphrase" });
+    let before = send_json(&h.app, Method::POST, "/api/v1/setup", &[], body("anything")).await;
+    assert_eq!(before.status, StatusCode::FORBIDDEN);
+    let token = h.state.issue_setup_token().expect("setup token");
+    let wrong = send_json(
+        &h.app,
+        Method::POST,
+        "/api/v1/setup",
+        &[],
+        body("0".repeat(32).as_str()),
+    )
+    .await;
+    assert_eq!(wrong.status, StatusCode::FORBIDDEN);
+    assert!(h.state.needs_onboarding().await);
+    let missing = send_json(
+        &h.app,
+        Method::POST,
+        "/api/v1/setup",
+        &[],
+        json!({ "username": "operator", "password": "a long enough passphrase" }),
+    )
+    .await;
+    assert_eq!(missing.status, StatusCode::BAD_REQUEST);
+    for _ in 0..4 {
+        send_json(&h.app, Method::POST, "/api/v1/setup", &[], body("nope")).await;
+    }
+    let locked = send_json(&h.app, Method::POST, "/api/v1/setup", &[], body(&token)).await;
+    assert_eq!(locked.status, StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn a_new_setup_token_replaces_the_old_one() {
+    let h = harness_with(DashboardConfig::default(), &[], &[]);
+    let first = h.state.issue_setup_token().expect("token");
+    let second = h.state.issue_setup_token().expect("token");
+    assert_ne!(first, second);
+    assert!(!h.state.setup_token_matches(&first));
+    assert!(h.state.setup_token_matches(&second));
+}
+
+async fn store_preview(h: &Harness, s: &Session, html: &str) -> Reply {
+    send_json(
+        &h.app,
+        Method::POST,
+        "/api/v1/preview",
+        &s.headers(),
+        json!({ "html": html }),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn preview_creation_needs_a_session_and_csrf() {
+    let h = harness();
+    let anon = send_json(
+        &h.app,
+        Method::POST,
+        "/api/v1/preview",
+        &[],
+        json!({ "html": "<p>x</p>" }),
+    )
+    .await;
+    assert_eq!(anon.status, StatusCode::UNAUTHORIZED);
+    let s = login(&h).await;
+    let no_csrf = send_json(
+        &h.app,
+        Method::POST,
+        "/api/v1/preview",
+        &[("cookie", s.cookie.as_str())],
+        json!({ "html": "<p>x</p>" }),
+    )
+    .await;
+    assert_eq!(no_csrf.status, StatusCode::FORBIDDEN);
+    let ok = store_preview(&h, &s, "<p>x</p>").await;
+    assert_eq!(ok.status, StatusCode::OK, "{}", ok.text());
+    assert_eq!(ok.json()["id"].as_str().expect("id").len(), 32);
+}
+
+#[tokio::test]
+async fn preview_html_is_capped_at_256_kib() {
+    let h = harness();
+    let s = login(&h).await;
+    let at_limit = "a".repeat(256 * 1024);
+    assert_eq!(
+        store_preview(&h, &s, &at_limit).await.status,
+        StatusCode::OK
+    );
+    let over = "a".repeat(256 * 1024 + 1);
+    assert_eq!(
+        store_preview(&h, &s, &over).await.status,
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
+}
+
+#[tokio::test]
+async fn stored_previews_are_served_sandboxed_to_signed_in_users_only() {
+    let h = harness();
+    let s = login(&h).await;
+    let html = "<style>p{color:red}</style><p>hi</p>";
+    let id = store_preview(&h, &s, html).await.json()["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    let uri = format!("/preview/{id}");
+    let anon = get_path(&h.app, &uri, &[]).await;
+    assert_eq!(anon.status, StatusCode::UNAUTHORIZED);
+    let reply = get_path(&h.app, &uri, &[("cookie", s.cookie.as_str())]).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(reply.text(), html);
+    assert_eq!(
+        reply.header("content-security-policy"),
+        "sandbox; default-src 'none'; style-src 'unsafe-inline'; img-src data:; font-src data:"
+    );
+    assert_eq!(reply.header("cache-control"), "no-store");
+    assert_eq!(reply.header("x-content-type-options"), "nosniff");
+    assert_eq!(reply.header("content-type"), "text/html; charset=utf-8");
+    let missing = get_path(
+        &h.app,
+        "/preview/deadbeef",
+        &[("cookie", s.cookie.as_str())],
+    )
+    .await;
+    assert_eq!(missing.status, StatusCode::NOT_FOUND);
 }

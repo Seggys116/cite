@@ -26,7 +26,7 @@ use serde_json::{Value, json};
 use crate::error::ApiError;
 use crate::security::{self, PeerIp, SessionCtx};
 use crate::state::{AppState, NodeStatus, PendingSetup, lock, now_unix};
-use crate::{assets, proxy, qr};
+use crate::{assets, preview, proxy, qr};
 
 pub const MAX_BODY_BYTES: usize = 1024 * 1024;
 
@@ -65,12 +65,14 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/nodes/{node}", delete(nodes_remove))
         .route("/api/v1/nodes/{node}/{*rest}", any(proxy::proxy))
         .route("/api/v1/deployments", post(deployments))
+        .route("/api/v1/preview", post(preview::create))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             security::api_guard,
         ));
     Router::new()
         .route("/healthz", get(healthz))
+        .route("/preview/{id}", get(preview::serve))
         .merge(api)
         .fallback(assets::serve)
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
@@ -90,22 +92,31 @@ async fn healthz() -> Json<Value> {
 }
 
 async fn setup_status(State(s): State<Arc<AppState>>) -> Json<Value> {
-    Json(json!({ "needs_onboarding": s.needs_onboarding().await }))
+    Json(json!({ "needs_onboarding": s.needs_onboarding().await, "needs_token": true }))
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SetupBody {
+    setup_token: String,
     username: String,
     password: String,
 }
 
 async fn setup_begin(
     State(s): State<Arc<AppState>>,
+    PeerIp(ip): PeerIp,
     ApiJson(body): ApiJson<SetupBody>,
 ) -> Result<Json<Value>, ApiError> {
     if !s.needs_onboarding().await {
         return Err(ApiError::not_found("not found"));
+    }
+    let now = now_unix();
+    let key = format!("setup:{ip}");
+    limiter_check(&s, &key, now)?;
+    if !s.setup_token_matches(&body.setup_token) {
+        lock(&s.limiter).record_failure(&key, now);
+        return Err(ApiError::forbidden("the setup token is not valid"));
     }
     let username = body.username.trim().to_string();
     if !validate_username(&username) {
@@ -181,6 +192,7 @@ async fn setup_confirm(
     });
     s.commit_config(cfg).await?;
     *lock(&s.pending) = None;
+    s.clear_setup_token();
     Ok(Json(json!({ "ok": true })))
 }
 

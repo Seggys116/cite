@@ -554,11 +554,14 @@ async function nodeRoute(node, method, seg, q, body) {
   throw new ApiError(404, 'not found');
 }
 
+const MOCK_CSRF = 'mock-csrf-token';
+
 async function dashboardRoute(method, seg, q, body) {
   const [a, b] = seg;
   if (a === 'setup') {
-    if (method === 'GET' && !b) return { needs_onboarding: state.needsOnboarding };
+    if (method === 'GET' && !b) return { needs_onboarding: state.needsOnboarding, needs_token: true };
     if (method === 'POST' && !b) {
+      if (!body.setup_token) throw new ApiError(403, 'the setup token is not valid');
       if (!body.username || !body.password) throw new ApiError(400, 'username and password are required');
       state.username = body.username;
       const secret = 'JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP';
@@ -575,14 +578,14 @@ async function dashboardRoute(method, seg, q, body) {
       if (!body.username || !body.password || !/^\d{6}$/.test(String(body.totp))) throw new ApiError(401, 'invalid credentials');
       state.loggedIn = true;
       state.username = body.username;
-      return { ok: true, username: body.username };
+      return { ok: true, username: body.username, csrf: MOCK_CSRF };
     }
     if (method === 'DELETE') {
       state.loggedIn = false;
       return { ok: true };
     }
     if (!state.loggedIn) throw new ApiError(401, 'not signed in');
-    return { username: state.username };
+    return { username: state.username, csrf: MOCK_CSRF };
   }
   if (!state.loggedIn) throw new ApiError(401, 'not signed in');
   if (a === 'nodes') {

@@ -2,11 +2,19 @@
 
 This page covers the web console that manages Cite nodes: what each view does, how it signs in, and how it talks to connectors.
 
-The console source is in `crates/cite-dashboard/web`. The dashboard server that serves these files and relays requests to connectors is described in the last section of [Connector API](node-api.md); its source is not in this repository yet, so no run instructions are given here.
+The console source is in `crates/cite-dashboard/web`. The dashboard server that serves these files and relays requests to connectors is in `crates/cite-dashboard`. Its proxy behaviour is described in the last section of [Connector API](node-api.md).
+
+## Running it
+
+```bash
+docker compose -f docker-compose.dashboard.yml up -d
+```
+
+The console listens on port 8088 (`CITE_DASHBOARD_PORT`) and is published on `127.0.0.1` unless `CITE_DASHBOARD_BIND` says otherwise. Open `http://127.0.0.1:8088` to finish setup in the browser, or run `docker compose -f docker-compose.dashboard.yml run --rm dashboard init` to create the account from the command line.
 
 ## Signing in
 
-The first visit shows a setup form: a username, a password with confirmation, then a confirmation code from an authenticator app. After that, signing in takes the username, the password and the current six-digit code. The form requires at least 8 characters and shows a strength hint.
+The first visit shows a setup form. Until an account exists, the dashboard prints a one-time setup token to its log on every start (`docker compose -f docker-compose.dashboard.yml logs dashboard`). The form asks for that token first, so only someone with access to the log can claim an unconfigured console. It then asks for a username, a password with confirmation, and then a confirmation code from an authenticator app. After that, signing in takes the username, the password and the current six-digit code. The form requires at least 8 characters and shows a strength hint.
 
 The Sign out action in the top bar and the command palette ends the session.
 

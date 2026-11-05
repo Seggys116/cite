@@ -1,5 +1,5 @@
 import { h, debounce } from '../dom.js';
-import { nodeApi } from '../api.js';
+import { api, nodeApi, isMock } from '../api.js';
 import { currentNode, state } from '../state.js';
 import {
   pageHeader, button, loadInto, pill, emptyState, field, openDrawer, confirmDialog, toast, withBusy,
@@ -29,13 +29,39 @@ h1 { color: #ffd23f; }
 </html>
 `;
 
-// Renders page html in a fully sandboxed frame (no scripts, no same-origin access) scaled to fit its box
+// Renders page html in a fully sandboxed frame (no scripts, no same-origin access) scaled to fit its box.
+// The server hosts the html under its own strict policy so inline styles work; mock mode has no server
+// and falls back to srcdoc.
 export function pagePreview(page) {
-  const frame = h('iframe', { class: 'preview-frame', sandbox: '', srcdoc: page.html || '', title: `Preview of ${page.name || 'page'}`, tabindex: '-1' });
+  const frame = h('iframe', { class: 'preview-frame', sandbox: '', title: `Preview of ${page.name || 'page'}`, tabindex: '-1' });
   const box = h('div', { class: 'preview' }, frame);
   const fit = () => frame.style.setProperty('transform', `scale(${(box.clientWidth / PAGE_WIDTH).toFixed(4)})`);
   new ResizeObserver(fit).observe(box);
-  box.update = (html) => frame.setAttribute('srcdoc', html);
+  let latest = 0;
+  box.update = async (html) => {
+    if (isMock) {
+      frame.setAttribute('srcdoc', html);
+      return;
+    }
+    const ticket = ++latest;
+    try {
+      const res = await api.post('/preview', { html });
+      if (ticket === latest && res && res.id) frame.setAttribute('src', '/preview/' + encodeURIComponent(res.id));
+    } catch (ex) {
+      if (ticket === latest) toast(formatError(ex), 'error');
+    }
+  };
+  const first = () => box.update(page.html || '');
+  if (typeof IntersectionObserver === 'function' && !isMock) {
+    const watcher = new IntersectionObserver((entries) => {
+      if (!entries.some((e) => e.isIntersecting)) return;
+      watcher.disconnect();
+      first();
+    });
+    watcher.observe(box);
+  } else {
+    first();
+  }
   return box;
 }
 
