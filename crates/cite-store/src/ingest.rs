@@ -131,8 +131,7 @@ impl WriteConn {
         self.cache.forget(kinds);
     }
 
-    // Starts recording every dictionary id an insert hands out. The cache is emptied first so each later use goes
-    // through the dictionary and is seen, which lets a sweep delete only ids that no insert has touched since.
+    // Starts recording every dictionary id an insert hands out. The cache is emptied first so each later use goes through the dictionary and is seen, which lets a sweep delete only ids that no insert has touched since.
     pub(crate) fn track_ids(&mut self) {
         self.cache.clear();
         self.cache.touched = Some(HashSet::new());
@@ -178,8 +177,7 @@ impl WriteConn {
     }
 }
 
-// Adds the batch's unseen client ips, agents and referers to the dictionary in key order, which keeps the unique
-// index writes of a high-cardinality batch close together instead of scattered.
+// Adds the batch's unseen client ips, agents and referers to the dictionary in key order, which keeps the unique index writes of a high-cardinality batch close together instead of scattered.
 fn warm(
     conn: &Connection,
     cache: &mut DictCache,

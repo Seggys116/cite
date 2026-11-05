@@ -234,10 +234,7 @@ pub(crate) const MIGRATIONS: &[&str] = &[V1, V2];
 
 pub(crate) const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
-// auto_vacuum only takes effect on a new file. WAL with synchronous=NORMAL fsyncs on checkpoint rather than on every
-// commit, which is the right trade for an analytics log. The writer keeps temp_store=MEMORY because its sorts are tiny.
-// A 64 MiB page cache and 256 MiB mmap let the hot index pages stay resident; the WAL is truncated to 128 MiB after
-// a checkpoint and auto-checkpointed every 25000 pages (about 100 MiB) so it cannot grow without bound.
+// auto_vacuum only takes effect on a new file. WAL with synchronous=NORMAL fsyncs on checkpoint rather than on every commit, which is the right trade for an analytics log. The writer keeps temp_store=MEMORY because its sorts are tiny. A 64 MiB page cache and 256 MiB mmap let the hot index pages stay resident; the WAL is truncated to 128 MiB after a checkpoint and auto-checkpointed every 25000 pages (about 100 MiB) so it cannot grow without bound.
 const WRITER_PRAGMAS: &str = "
 PRAGMA auto_vacuum = INCREMENTAL;
 PRAGMA journal_mode = WAL;
@@ -249,8 +246,7 @@ PRAGMA wal_autocheckpoint = 25000;
 PRAGMA journal_size_limit = 134217728;
 ";
 
-// Readers are read-only and share the mmap; a smaller cache each keeps a pool of them cheap. temp_store=FILE lets a
-// group-by over hostile cardinality spill its sorter to disk instead of growing the heap.
+// Readers are read-only and share the mmap; a smaller cache each keeps a pool of them cheap. temp_store=FILE lets a group-by over hostile cardinality spill its sorter to disk instead of growing the heap.
 const READER_PRAGMAS: &str = "
 PRAGMA temp_store = FILE;
 PRAGMA cache_size = -16384;
@@ -258,9 +254,7 @@ PRAGMA mmap_size = 268435456;
 PRAGMA query_only = ON;
 ";
 
-// SQLite applies both limits to the whole process. The caches of a full pool are at most 64 MiB for the writer and
-// 16 x 16 MiB for readers, so the soft limit leaves room for them and the hard limit makes a runaway query fail with
-// an out-of-memory error rather than take the host down.
+// SQLite applies both limits to the whole process. The caches of a full pool are at most 64 MiB for the writer and 16 x 16 MiB for readers, so the soft limit leaves room for them and the hard limit makes a runaway query fail with an out-of-memory error rather than take the host down.
 const SOFT_HEAP_LIMIT: u64 = 512 * 1024 * 1024;
 const HARD_HEAP_LIMIT: u64 = 1024 * 1024 * 1024;
 
@@ -289,8 +283,7 @@ fn create_private(path: &Path) -> io::Result<()> {
         .map(|_| ())
 }
 
-// Applies the file modes only when an existing path is looser than wanted, so a database created by an older build or
-// restored from a backup stops being readable by other users.
+// Applies the file modes only when an existing path is looser than wanted, so a database created by an older build or restored from a backup stops being readable by other users.
 #[cfg(unix)]
 fn tighten(path: &Path, mode: u32) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;

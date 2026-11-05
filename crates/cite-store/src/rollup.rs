@@ -47,8 +47,7 @@ struct Row {
     ms_sum: u64,
 }
 
-// Per-batch accumulator: events are folded in memory and written as one upsert per touched key. Tallies are kept per
-// site; the all-sites rows of rollup_dim and rollup_path are summed from them when the batch is applied.
+// Per-batch accumulator: events are folded in memory and written as one upsert per touched key. Tallies are kept per site; the all-sites rows of rollup_dim and rollup_path are summed from them when the batch is applied.
 #[derive(Default)]
 pub(crate) struct Rollups {
     rows: IntMap<(i64, i64), Row>,
@@ -58,8 +57,7 @@ pub(crate) struct Rollups {
     paths: IntMap<(i64, i64), HashMap<String, Tally>>,
 }
 
-// Keeps the TOP_KEEP heaviest entries, ties broken by key so the choice is deterministic; returned in key order so
-// the upserts walk the index forward.
+// Keeps the TOP_KEEP heaviest entries, ties broken by key so the choice is deterministic; returned in key order so the upserts walk the index forward.
 fn heaviest<K: Ord, S>(group: &HashMap<K, Tally, S>) -> Vec<(&K, Tally)> {
     let mut all: Vec<(&K, Tally)> = group.iter().map(|(k, t)| (k, *t)).collect();
     let order = |a: &(&K, Tally), b: &(&K, Tally)| b.1.0.cmp(&a.1.0).then_with(|| a.0.cmp(b.0));

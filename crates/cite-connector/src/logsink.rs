@@ -246,8 +246,7 @@ async fn hand_off(
     }
 }
 
-// Reads what peers already sent until the socket has been quiet for DRAIN_IDLE, or DRAIN_MAX has passed. try_recv is
-// not enough here: it reports WouldBlock until the reactor has seen the readiness, which can lag behind the kernel.
+// Reads what peers already sent until the socket has been quiet for DRAIN_IDLE, or DRAIN_MAX has passed. try_recv is not enough here: it reports WouldBlock until the reactor has seen the readiness, which can lag behind the kernel.
 async fn drain_socket(
     sink: &Sink,
     buf: &mut [u8],
@@ -368,8 +367,7 @@ fn pipeline(
     (tx, forwarder)
 }
 
-// The only scheduled owner of retention: it runs on a blocking thread, apart from the ingest path, and also covers an
-// idle node. A settings change triggers an extra pass through the same store lock.
+// The only scheduled owner of retention: it runs on a blocking thread, apart from the ingest path, and also covers an idle node. A settings change triggers an extra pass through the same store lock.
 async fn maintenance_loop(store: Arc<cite_store::Store>) {
     let mut tick = interval(MAINTENANCE_EVERY);
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -406,8 +404,7 @@ pub struct LogSink {
 }
 
 impl LogSink {
-    // Tells the receiver to stop, which hands over its last batch and closes the queue; then waits until every
-    // event has been committed to the database.
+    // Tells the receiver to stop, which hands over its last batch and closes the queue; then waits until every event has been committed to the database.
     pub async fn shutdown(self) {
         self.stop.notify_one();
         if let Err(err) = self.receiver.await {

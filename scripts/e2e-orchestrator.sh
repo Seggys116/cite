@@ -1,7 +1,5 @@
 #!/usr/bin/env bash
-# End to end check of the orchestrator against a real Docker daemon, ending in a live phase that builds a site from a mock GitHub and serves it through HAProxy.
-# Needs local images tagged ghcr.io/seggys116/cite-{connector,dockerproxy,executor-static}:$CITE_VERSION, cite-{manager,executor-node}:$CITE_VERSION-node22 and $MOCK_IMAGE (images/mock-github/Dockerfile).
-# E2E_KEEP=1 skips teardown. On Linux the managers cannot resolve host.docker.internal, so the mock is published on the docker0 gateway address instead.
+# End to end check of the orchestrator against a real Docker daemon, ending in a live phase that builds a site from a mock GitHub and serves it through HAProxy. Needs local images tagged ghcr.io/seggys116/cite-{connector,dockerproxy,executor-static}:$CITE_VERSION, cite-{manager,executor-node}:$CITE_VERSION-node22 and $MOCK_IMAGE (images/mock-github/Dockerfile). E2E_KEEP=1 skips teardown. On Linux the managers cannot resolve host.docker.internal, so the mock is published on the docker0 gateway address instead.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
