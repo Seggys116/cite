@@ -95,7 +95,7 @@ jobs:
         if: matrix.os == 'linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libxkbcommon-x11-dev libxkbcommon-dev libwayland-dev libxcb1-dev libfontconfig-dev libasound2-dev libssl-dev libvulkan-dev mesa-vulkan-drivers pkg-config cmake clang
+          sudo apt-get install -y libxkbcommon-x11-dev libxkbcommon-dev libwayland-dev libxcb1-dev libfontconfig-dev libasound2-dev libssl-dev libvulkan-dev libdbus-1-dev mesa-vulkan-drivers pkg-config cmake clang
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: apps/desktop

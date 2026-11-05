@@ -28,7 +28,7 @@ cargo build --release --locked
 ./target/release/cite-desktop
 ```
 
-On Linux the build needs the development packages CI installs: `libxkbcommon-x11-dev`, `libxkbcommon-dev`, `libwayland-dev`, `libxcb1-dev`, `libfontconfig-dev`, `libasound2-dev`, `libssl-dev`, `libvulkan-dev`, `mesa-vulkan-drivers`, `pkg-config`, `cmake` and `clang`.
+On Linux the build needs the development packages CI installs: `libxkbcommon-x11-dev`, `libxkbcommon-dev`, `libwayland-dev`, `libxcb1-dev`, `libfontconfig-dev`, `libasound2-dev`, `libssl-dev`, `libvulkan-dev`, `libdbus-1-dev`, `mesa-vulkan-drivers`, `pkg-config`, `cmake` and `clang`.
 
 ## Command line
 
