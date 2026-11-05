@@ -2,6 +2,7 @@ name: node
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, labeled]
   push:
     branches: [main]
   workflow_dispatch:
@@ -68,6 +69,7 @@ jobs:
       CITE_CONNECTOR_BIND: 127.0.0.1
       CITE_DASHBOARD_ALLOW: 192.0.2.1
       CITE_DASHBOARD_BIND: 127.0.0.1
+      DOCKER_GID: "0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -191,8 +193,8 @@ jobs:
         run: bash scripts/e2e-node.sh
 
   e2e-orchestrator:
-    # Builds six images, so it runs on main and on demand instead of every pull request.
-    if: github.event_name != 'pull_request'
+    # Builds six images, so pull requests opt in with the e2e-orchestrator label.
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'e2e-orchestrator')
     runs-on: ubuntu-latest
     timeout-minutes: 75
     permissions:

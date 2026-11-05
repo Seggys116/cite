@@ -640,7 +640,7 @@ default_dir() {
   if [ -z "$DIR" ]; then
     case $0 in
       */cite-setup.sh)
-        _d=$(cd "$(dirname "$0")" 2>/dev/null && pwd || true)
+        if _d=$(cd "$(dirname "$0")" 2>/dev/null && pwd); then :; else _d=; fi
         if [ -n "$_d" ] && [ -f "$_d/.env" ]; then
           DIR=$_d
         fi

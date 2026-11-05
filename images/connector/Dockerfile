@@ -30,7 +30,7 @@ COPY --chmod=0755 --from=build /src/target/release/cite-connector /usr/local/bin
 
 ENV RUST_LOG=info
 
-USER root
+USER 0
 WORKDIR /conf
 USER 10001:10001
 
