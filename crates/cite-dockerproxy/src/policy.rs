@@ -101,6 +101,7 @@ pub struct Stack {
 pub struct Policy {
     pub(crate) haproxy: String,
     pub(crate) edge: String,
+    pub(crate) github_api_url: Option<String>,
     container: Regex,
     volume: Regex,
     network: Regex,
@@ -122,6 +123,7 @@ impl Policy {
         Policy {
             haproxy: cfg.haproxy_container.clone(),
             edge: cfg.edge_network.clone(),
+            github_api_url: cfg.github_api_url.clone(),
             container: stack("manager|executor|init"),
             volume: stack("data|work|cache"),
             network: stack("net|egress"),

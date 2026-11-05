@@ -9,6 +9,12 @@ use serde_json::{Value, json};
 // A fake token; specs carry it only in the manager environment.
 const TOKEN: &str = "ghp_secrettoken123";
 
+const GITHUB_URLS: [Option<&str>; 3] = [
+    None,
+    Some("https://ghe.example.com/api/v3"),
+    Some("http://host.docker.internal:18080"),
+];
+
 fn site(id: &str, runtime: &str, node_major: Option<u8>) -> Site {
     Site {
         id: id.to_string(),
@@ -39,6 +45,7 @@ fn specs(id: &str, runtime: &str, slot: Slot, isolate: bool) -> SpecSet {
         version: "0.2.0",
         edge_network: "cite_edge",
         isolate,
+        github_api_url: None,
     };
     stack_specs(&site(id, runtime, None), slot, None, TOKEN, &env).unwrap()
 }
@@ -77,42 +84,126 @@ fn denied(result: Result<(), String>) {
 }
 
 #[test]
-// Covers each runtime, slot, node major, git ref and network mode the orchestrator can produce.
+// Covers each runtime, slot, node major, git ref, network mode and GitHub API URL the orchestrator can produce.
 fn every_spec_the_orchestrator_emits_is_accepted() {
     let mut checked = 0;
-    for runtime in ["node", "bun", "static", "rust"] {
-        for slot in [Slot::Blue, Slot::Green] {
-            for isolate in [true, false] {
-                for major in [None, Some(24)] {
-                    let env = StackEnv {
-                        registry: common::REGISTRY,
-                        version: "0.2.0",
-                        edge_network: "cite_edge",
-                        isolate,
-                    };
-                    for git_ref in [None, Some("release/1.2")] {
-                        let s = stack_specs(
-                            &site("shop-2", runtime, major),
-                            slot,
-                            git_ref,
-                            TOKEN,
-                            &env,
-                        )
-                        .unwrap();
-                        for (name, body) in [
-                            (&s.manager_name, &s.manager),
-                            (&s.executor_name, &s.executor),
-                            (&s.init_name, &s.init),
-                        ] {
-                            accepts(name, body).unwrap_or_else(|e| panic!("{name} {runtime}: {e}"));
-                            checked += 1;
+    for api_url in GITHUB_URLS {
+        let policy = common::policy_with_github(api_url);
+        for runtime in ["node", "bun", "static", "rust"] {
+            for slot in [Slot::Blue, Slot::Green] {
+                for isolate in [true, false] {
+                    for major in [None, Some(24)] {
+                        let env = StackEnv {
+                            registry: common::REGISTRY,
+                            version: "0.2.0",
+                            edge_network: "cite_edge",
+                            isolate,
+                            github_api_url: api_url,
+                        };
+                        for git_ref in [None, Some("release/1.2")] {
+                            let s = stack_specs(
+                                &site("shop-2", runtime, major),
+                                slot,
+                                git_ref,
+                                TOKEN,
+                                &env,
+                            )
+                            .unwrap();
+                            for (name, body) in [
+                                (&s.manager_name, &s.manager),
+                                (&s.executor_name, &s.executor),
+                                (&s.init_name, &s.init),
+                            ] {
+                                let target =
+                                    normalise(&format!("/v1.45/containers/create?name={name}"))
+                                        .unwrap();
+                                let route = policy.classify("POST", &target).unwrap();
+                                policy.validate_body(&route, body).unwrap_or_else(|e| {
+                                    panic!("{name} {runtime} {api_url:?}: {e}")
+                                });
+                                checked += 1;
+                            }
                         }
                     }
                 }
             }
         }
     }
-    assert_eq!(checked, 4 * 2 * 2 * 2 * 2 * 3);
+    assert_eq!(checked, GITHUB_URLS.len() * 4 * 2 * 2 * 2 * 2 * 3);
+}
+
+#[test]
+fn the_github_api_url_is_accepted_only_when_it_equals_the_operator_setting() {
+    let url = "https://ghe.example.com/api/v3";
+    let with_url = |url: Option<&'static str>| {
+        let env = StackEnv {
+            registry: common::REGISTRY,
+            version: "0.2.0",
+            edge_network: "cite_edge",
+            isolate: true,
+            github_api_url: url,
+        };
+        stack_specs(&site("shop", "node", None), Slot::Blue, None, TOKEN, &env).unwrap()
+    };
+    let check = |policy: &cite_dockerproxy::policy::Policy, s: &SpecSet, body: &Value| {
+        let target =
+            normalise(&format!("/v1.45/containers/create?name={}", s.manager_name)).unwrap();
+        let route = policy.classify("POST", &target).unwrap();
+        policy.validate_body(&route, body)
+    };
+    let s = with_url(Some(url));
+    assert!(s.manager["Env"].to_string().contains("CITE_GITHUB_API_URL"));
+    check(&common::policy_with_github(Some(url)), &s, &s.manager).unwrap();
+    for other in [
+        "https://evil.example.com/api/v3",
+        "https://ghe.example.com/api/v3/",
+        "http://ghe.example.com/api/v3",
+        "https://ghe.example.com/api/v4",
+    ] {
+        denied(check(
+            &common::policy_with_github(Some(other)),
+            &s,
+            &s.manager,
+        ));
+    }
+    denied(check(&common::policy_with_github(None), &s, &s.manager));
+    // A site created without the setting still works next to a proxy that has one.
+    let plain = with_url(None);
+    check(
+        &common::policy_with_github(Some(url)),
+        &plain,
+        &plain.manager,
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_manager_cannot_redirect_the_github_token() {
+    let push = |value: &'static str| {
+        manager(move |b| {
+            b["Env"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!(format!("CITE_GITHUB_API_URL={value}")))
+        })
+    };
+    denied(push("https://evil.example.com"));
+    denied(push(""));
+    denied(manager(|b| {
+        b["Env"].as_array_mut().unwrap().extend([
+            json!("CITE_GITHUB_API_URL=a"),
+            json!("CITE_GITHUB_API_URL=a"),
+        ])
+    }));
+    denied(executor(|b| {
+        b["Env"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!("CITE_GITHUB_API_URL=https://evil.example.com"))
+    }));
+    denied(init(|b| {
+        b["Env"] = json!(["CITE_GITHUB_API_URL=https://evil.example.com"])
+    }));
 }
 
 #[test]

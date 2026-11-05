@@ -36,14 +36,16 @@ enum EnvRule {
     Poll,
     Node,
     Token,
+    GithubApi,
 }
 
-const MANAGER_ENV: [(&str, EnvRule); 14] = [
+const MANAGER_ENV: [(&str, EnvRule); 15] = [
     ("CITE_REPO", EnvRule::Repo),
     ("CITE_BRANCH", EnvRule::Branch),
     ("CITE_POLL_INTERVAL", EnvRule::Poll),
     ("CITE_NODE", EnvRule::Node),
     ("CITE_GITHUB_TOKEN", EnvRule::Token),
+    ("CITE_GITHUB_API_URL", EnvRule::GithubApi),
     ("CITE_DATA_DIR", EnvRule::Fixed("/var/lib/cite")),
     (
         "CITE_RELEASES_DIR",
@@ -233,7 +235,7 @@ fn is_slug_part(s: &str, max: usize, extra: &[char]) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || extra.contains(&c))
 }
 
-fn env_value_ok(rule: &EnvRule, value: &str) -> bool {
+fn env_value_ok(policy: &Policy, rule: &EnvRule, value: &str) -> bool {
     match rule {
         EnvRule::Fixed(want) => value == *want,
         EnvRule::Repo => match value.split_once('/') {
@@ -257,10 +259,12 @@ fn env_value_ok(rule: &EnvRule, value: &str) -> bool {
                 && value.len() <= MAX_TOKEN_LEN
                 && value.chars().all(|c| c.is_ascii_graphic())
         }
+        // The manager sends the token here, so only the operator's own setting is accepted.
+        EnvRule::GithubApi => policy.github_api_url.as_deref() == Some(value),
     }
 }
 
-fn check_env(role: Role, env: Option<&Value>) -> Result<Value, String> {
+fn check_env(policy: &Policy, role: Role, env: Option<&Value>) -> Result<Value, String> {
     if role == Role::Init {
         return match env {
             None => Ok(Value::Null),
@@ -287,7 +291,7 @@ fn check_env(role: Role, env: Option<&Value>) -> Result<Value, String> {
         if seen.contains(&key) {
             return Err(format!("Env key {key:?} is repeated"));
         }
-        if !env_value_ok(rule, value) {
+        if !env_value_ok(policy, rule, value) {
             return Err(format!("Env value for {key:?} is not allowed"));
         }
         seen.push(key);
@@ -330,7 +334,7 @@ pub fn validate_container(policy: &Policy, name: &str, body: &Value) -> Result<(
     if !image_ok {
         return Err("Image is not allowed for this container".to_string());
     }
-    let env = check_env(role, obj.get("Env"))?;
+    let env = check_env(policy, role, obj.get("Env"))?;
     let host = obj
         .get("HostConfig")
         .map(|h| object(h, "HostConfig"))

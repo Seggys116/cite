@@ -47,13 +47,13 @@ The three `/tokens` routes need a session token from login. An API token gets 40
 
 `PUT /sites/{id}` changes the name, hosts, `path_regex`, kind, health check and source. The active slot, both slots' targets and the maintenance flag are kept from the stored site, whatever the body says, so a stale copy of a site cannot undo a deploy. Those fields change only through `deploy`, `switch`, `rollback` and `maintenance`. `DELETE /sites/{id}` returns 409 naming the firewall rules while any rule is scoped to the site; delete or change those rules first.
 
-Deploys, switches, rollbacks, site changes and every other change that touches the HAProxy config run to completion on the node even if the client disconnects or the 180 s request limit passes. Read the result afterwards from `GET /sites/{id}`. A change is refused, and the stored config restored, when a reachable HAProxy rejects the rendered config (400) or does not load it (400 for a refused reload, 503 for an unconfirmed one). When HAProxy cannot be reached at all the change is stored and applied on the next reload.
+Deploys, switches, rollbacks, site changes and every other change that touches the HAProxy config run to completion on the node even if the client disconnects or the 700 s request limit passes. Read the result afterwards from `GET /sites/{id}`. A change is refused, and the stored config restored, when a reachable HAProxy rejects the rendered config (400) or does not load it (400 for a refused reload, 503 for an unconfirmed one). When HAProxy cannot be reached at all the change is stored and applied on the next reload.
 
 `POST /haproxy/reload` always asks HAProxy to reload, even when the config is unchanged, so renewed certificates are picked up and a failed reload can be retried. It returns 503 when HAProxy is unreachable or does not confirm a new worker.
 
 `switch` and `rollback` start a stopped slot again on the git ref it last ran, not on the site's current branch.
 
-`deploy` writes the targets into the idle slot, waits for every target to pass health checks (up to 60 s), flips the active slot through the HAProxy runtime API, and records a `Deployment`. A failed health check leaves the active slot untouched and records `failed`.
+`deploy` writes the targets into the idle slot, waits for every target to pass health checks (up to 60 s, or the build wait of 600 s by default for a site built from a repo), flips the active slot through the HAProxy runtime API, and records a `Deployment`. A failed health check leaves the active slot untouched and records `failed`.
 
 ## Maintenance pages
 

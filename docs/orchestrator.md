@@ -40,7 +40,7 @@ JSON bodies are parsed strictly: a duplicate object key at any depth, or two key
 | `DELETE /containers/{name}` | Name pattern, `cite.managed=true`, optional `force`. |
 | `GET /containers/json` | The `filters` parameter must pin `cite.managed=true`. |
 
-A container create body is rebuilt by the proxy from the site id, slot and role in the name, and the request must equal it. Only a few values are free, and each is checked: the image (registry, image name for the role, tag form), the environment (a fixed list of keys, fixed values for paths, validated values for repo, branch, poll interval, node major and token), the memory, CPU and pids limits (positive and under a per-role cap), and the network (`none` for init, the stack's own egress network for the manager, the stack's own network or the configured edge network for the executor). Any other key or value is rejected, which covers `Privileged`, `Binds`, `Devices`, `PidMode`, `IpcMode`, `UsernsMode`, `CapAdd` beyond the fixed sets, other users, other mounts, `Sysctls`, `VolumesFrom`, port bindings and the rest. Mounts are volumes only, named after the same stack, with the exact subpaths and read-only flags.
+A container create body is rebuilt by the proxy from the site id, slot and role in the name, and the request must equal it. Only a few values are free, and each is checked: the image (registry, image name for the role, tag form), the environment (a fixed list of keys, fixed values for paths, validated values for repo, branch, poll interval, node major and token, and the GitHub API URL only when it equals the proxy's own setting), the memory, CPU and pids limits (positive and under a per-role cap), and the network (`none` for init, the stack's own egress network for the manager, the stack's own network or the configured edge network for the executor). Any other key or value is rejected, which covers `Privileged`, `Binds`, `Devices`, `PidMode`, `IpcMode`, `UsernsMode`, `CapAdd` beyond the fixed sets, other users, other mounts, `Sysctls`, `VolumesFrom`, port bindings and the rest. Mounts are volumes only, named after the same stack, with the exact subpaths and read-only flags.
 
 The proxy also refuses, before any matching: request targets that are not origin-form, percent-encoding in paths, `.` and `..` segments, empty segments, backslashes and NUL bytes, API versions outside 1.45 to 1.99, duplicate query keys, any `Upgrade` or `Connection: upgrade` (so no attach, exec or hijack), any `Transfer-Encoding`, a body on a request that should have none, a body over 64 KiB, and a body without `Content-Type: application/json`. Client headers are not forwarded; the proxy builds its own request to the engine, so request smuggling toward Docker is not possible. Responses are streamed back (image pull progress) with a per-route deadline. Connections are capped (`CITE_PROXY_MAX_CONNS`, default 64) and request headers must arrive within 10 seconds.
 
@@ -54,6 +54,7 @@ Proxy settings, all on the `dockerproxy` service:
 | `CITE_PROXY_HAPROXY_CONTAINER` | `cite-node-haproxy` | Container the proxy lets the connector attach to stack networks. |
 | `CITE_PROXY_EDGE_NETWORK` | `cite_edge` | Shared network executors may join when per-stack networks are off. |
 | `CITE_PROXY_MAX_CONNS` | `64` | Concurrent connections. |
+| `CITE_PROXY_GITHUB_API_URL` | unset | The one GitHub API URL a manager may be given. Unset means a manager create body must not carry `CITE_GITHUB_API_URL` at all. |
 
 Because the stack version becomes an image tag, `CITE_STACK_VERSION` must be a plain `x.y.z` version. The overlay passes it from `.env` to the connector; when it is unset the connector uses its own version. The connector uses Docker Engine API v1.45, which is why Docker Engine 26 or newer is required.
 
@@ -109,12 +110,22 @@ Images are pulled only when they are not present locally; a pull can take up to 
 
 The token is supplied when the site is created, as a `github_token` string beside the site object in the `POST /api/v1/sites` body (printable ASCII, up to 512 bytes). The connector stores it in `secrets.json` (mode 0600, up to 512 secrets, 16 KiB each) under a name it chooses from the site id, and records only that name in the site. It reaches the manager as `CITE_GITHUB_TOKEN` in the container's environment. It is not in container labels or in `edge.json`. Anyone who can inspect containers through the Docker API can read it, including the connector.
 
+## GitHub Enterprise Server and the API URL
+
+Managers talk to `https://api.github.com` unless told otherwise. To build from a GitHub Enterprise Server, or any GitHub-compatible API, set `CITE_GITHUB_API_URL` in `.env`. The overlay passes it to the connector as `CITE_STACK_GITHUB_API_URL` and to the proxy as `CITE_PROXY_GITHUB_API_URL`, and the connector hands it to every manager as `CITE_GITHUB_API_URL`.
+
+```bash
+CITE_GITHUB_API_URL=https://ghe.example.com/api/v3
+```
+
+The URL must be `http` or `https`, at most 200 characters, with a plain host (optionally a port) and a path of letters, digits and `. - _ ~ /`. User names, passwords, queries, fragments, percent-encoding and IPv6 literals are refused, by the connector at start and by the proxy at start. The manager sends the GitHub token to this URL, so the proxy does not trust the connector's choice: a manager create body may carry `CITE_GITHUB_API_URL` only with exactly the value of the proxy's own `CITE_PROXY_GITHUB_API_URL`. With none set, the key is denied. A compromised connector therefore cannot point a manager, and its token, at another host. Changing the value recreates the managers on their next ensure, because the connector compares each manager's environment with what it wants.
+
 ## Lifecycle
 
 | Event | What happens |
 |---|---|
 | Create | Pulls images, creates volumes and the egress network, runs `init`, starts the manager and executor, sets the slot's target, applies the HAProxy config and waits up to 30 seconds for health. An unhealthy site is still created and an audit entry is written. If the stack fails to start, the stored secret is dropped and no site is created. If HAProxy rejects the new config, the stack and secret are removed. |
-| Deploy | Starts the idle slot's stack, writes its target, waits up to 60 seconds for health, switches. A failed start or health check stops only the idle stack and records a `failed` deployment. |
+| Deploy | Starts the idle slot's stack, writes its target, waits for health, then switches. A repo-built slot gets the build wait, 600 seconds by default and set with `CITE_DEPLOY_BUILD_TIMEOUT` (60 to 3600). A failed start or health check stops only the idle stack and records a `failed` deployment. |
 | Switch, rollback | Restart the target slot's stack if it was stopped, check health, flip. |
 | After a switch | The previous slot's stack stays up for a 30 second drain delay, then the executor and manager are stopped (the executor first). Volumes are kept so a rollback is fast. If the site has moved back in the meantime, nothing is stopped. |
 | Update | Replaces the site's fields and keeps history and the stored secret. |
@@ -123,6 +134,14 @@ The token is supplied when the site is created, as a `github_token` string besid
 The connector compares each running container's image and environment with what it wants. A changed branch or token recreates only the manager. Containers it did not create are never adopted or removed: a name clash is reported as a conflict.
 
 Deployment history keeps the last 50 entries per site.
+
+## Live end to end check
+
+`scripts/e2e-orchestrator.sh` runs the whole orchestrator against a real Docker daemon. After the onboarding, isolation, proxy-attack, restart and delete checks, a live phase starts the mock GitHub from `images/mock-github/Dockerfile`, sets `CITE_GITHUB_API_URL` for the proxy and connector, and creates a `static` site for the mock repository. It then checks that the manager built the site from the mock, that `curl -H 'Host: app.e2e.test'` against HAProxy returns the built page, that the stack containers and networks are as hardened as before, that a deploy of a second branch switches traffic and that a rollback restarts the drained slot on its own branch. Deleting the site must remove every container, volume, network and the stored token.
+
+The managers sit on a per-stack bridge network, so the mock is published on the host and reached through it. On Docker Desktop the script binds the mock to `127.0.0.1` and uses `http://host.docker.internal:18090`. On Linux, `host.docker.internal` does not resolve inside the stacks and the orchestrator does not add `--add-host host.docker.internal:host-gateway` to them, so the script binds the mock to the `docker0` gateway address and uses that address as the API URL. If you point a real stack at a service on the Docker host, use the same approach.
+
+The script needs these local images, tagged as the orchestrator asks for them (version `0.0.1` in CI): `cite-connector`, `cite-dockerproxy`, `cite-manager:<version>-node22`, `cite-executor-node:<version>-node22` and `cite-executor-static:<version>`, all under `ghcr.io/seggys116`, and `cite-mock-github:e2e` (override with `MOCK_IMAGE`). The mock cannot delete a file or rewind a branch, so the second version of the site is a push to a new `release` branch, deployed through `git_ref`.
 
 ## Resource planning
 

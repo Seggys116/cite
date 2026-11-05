@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use cite_edge::allow::IpAllowlist;
 
+use crate::orchestrator::validate_github_api_url;
 use crate::{ConnectorError, Result};
 
 const DEFAULT_SESSION_TTL_SECS: u64 = 8 * 3600;
@@ -55,10 +56,12 @@ pub struct ConnectorConfig {
     pub tls: bool,
     pub tls_sans: Vec<String>,
     pub docker_host: Option<String>,
+    pub deploy_build_timeout_secs: u64,
     pub edge_network: String,
     pub haproxy_container: String,
     pub stack_version: String,
     pub registry: String,
+    pub github_api_url: Option<String>,
     pub session_ttl_secs: u64,
     pub tls_dir: PathBuf,
 }
@@ -268,6 +271,27 @@ impl ConnectorConfig {
             None => DEFAULT_SESSION_TTL_SECS,
         };
 
+        let deploy_build_timeout_secs = match get(env, "CITE_DEPLOY_BUILD_TIMEOUT") {
+            Some(raw) => match raw.trim().parse::<u64>() {
+                Ok(n) if (60..=3600).contains(&n) => n,
+                _ => {
+                    return Err(config_err(
+                        "CITE_DEPLOY_BUILD_TIMEOUT must be 60 to 3600 seconds".to_string(),
+                    ));
+                }
+            },
+            None => 600,
+        };
+
+        let github_api_url = match get(env, "CITE_STACK_GITHUB_API_URL") {
+            Some(url) => {
+                validate_github_api_url(url)
+                    .map_err(|e| config_err(format!("CITE_STACK_GITHUB_API_URL: {e}")))?;
+                Some(url.to_string())
+            }
+            None => None,
+        };
+
         let runtime_addr = get(env, "CITE_HAPROXY_RUNTIME")
             .unwrap_or("haproxy:9999")
             .to_string();
@@ -309,6 +333,7 @@ impl ConnectorConfig {
             tls: bool_or(env, "CITE_CONNECTOR_TLS", true)?,
             tls_sans,
             docker_host: get(env, "CITE_DOCKER_HOST").map(str::to_string),
+            deploy_build_timeout_secs,
             edge_network: get(env, "CITE_EDGE_NETWORK")
                 .unwrap_or("cite_edge")
                 .to_string(),
@@ -322,6 +347,7 @@ impl ConnectorConfig {
             registry: get(env, "CITE_REGISTRY")
                 .unwrap_or("ghcr.io/seggys116")
                 .to_string(),
+            github_api_url,
             session_ttl_secs,
             tls_dir: data_dir.join("tls"),
             data_dir,
@@ -342,6 +368,23 @@ mod tests {
 
     fn base() -> HashMap<String, String> {
         env(&[("CITE_CONNECTOR_ALLOW", "10.0.0.0/24")])
+    }
+
+    #[test]
+    fn build_wait_defaults_to_ten_minutes_and_is_bounded() {
+        let cfg = ConnectorConfig::from_env_map(&base()).expect("config");
+        assert_eq!(cfg.deploy_build_timeout_secs, 600);
+        for (raw, ok) in [
+            ("60", true),
+            ("3600", true),
+            ("59", false),
+            ("3601", false),
+            ("x", false),
+        ] {
+            let mut env = base();
+            env.insert("CITE_DEPLOY_BUILD_TIMEOUT".into(), raw.into());
+            assert_eq!(ConnectorConfig::from_env_map(&env).is_ok(), ok, "{raw}");
+        }
     }
 
     #[test]
@@ -370,6 +413,7 @@ mod tests {
         assert_eq!(cfg.edge_network, "cite_edge");
         assert_eq!(cfg.haproxy_container, "cite-node-haproxy");
         assert_eq!(cfg.registry, "ghcr.io/seggys116");
+        assert_eq!(cfg.github_api_url, None);
         assert_eq!(cfg.session_ttl_secs, 8 * 3600);
         assert_eq!(cfg.node_name, "node");
         assert_eq!(cfg.stack_version, env!("CARGO_PKG_VERSION"));
@@ -417,6 +461,34 @@ mod tests {
         assert_eq!(cfg.tls_sans, vec!["a.example.com", "10.0.0.5"]);
         assert_eq!(cfg.docker_host.as_deref(), Some("tcp://socketproxy:2375"));
         assert_eq!(cfg.session_ttl_secs, 600);
+    }
+
+    #[test]
+    fn github_api_url_is_optional_and_validated() {
+        let mut e = base();
+        e.insert(
+            "CITE_STACK_GITHUB_API_URL".into(),
+            " https://ghe.example.com/api/v3 ".into(),
+        );
+        let cfg = ConnectorConfig::from_env_map(&e).expect("config");
+        assert_eq!(
+            cfg.github_api_url.as_deref(),
+            Some("https://ghe.example.com/api/v3")
+        );
+        for bad in [
+            "ftp://ghe.example.com",
+            "https://user:pw@ghe.example.com",
+            "https://ghe.example.com?x=1",
+            "https://ghe.example.com/#top",
+            "ghe.example.com",
+        ] {
+            e.insert("CITE_STACK_GITHUB_API_URL".into(), bad.into());
+            let err = ConnectorConfig::from_env_map(&e).expect_err(bad);
+            assert!(
+                err.to_string().contains("CITE_STACK_GITHUB_API_URL"),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

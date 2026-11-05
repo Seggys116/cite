@@ -81,6 +81,8 @@ Compose reads `docker-compose.override.yml` automatically only when you run `doc
 | `CITE_EDGE_NETWORK` | `cite_edge` | Shared network that executors join when per-stack networks are off. |
 | `CITE_STACK_VERSION` | the connector's version | Image tag used for orchestrated stacks. |
 | `CITE_REGISTRY` | `ghcr.io/seggys116` | Registry prefix for orchestrated stack images. |
+| `CITE_DEPLOY_BUILD_TIMEOUT` | `600` | Seconds a deploy or switch waits for a repo-built slot to become healthy. 60 to 3600. Upstream-only sites keep the 60 second health wait. |
+| `CITE_STACK_GITHUB_API_URL` | unset (managers use `https://api.github.com`) | GitHub API base URL passed to every orchestrated manager as `CITE_GITHUB_API_URL`, for GitHub Enterprise Server. An `http` or `https` URL of at most 200 characters, with no user name, query or fragment. The Docker proxy must have the same value in `CITE_PROXY_GITHUB_API_URL`, or it refuses to create the managers. The overlay sets both from `CITE_GITHUB_API_URL` in `.env`. See [Orchestrator](orchestrator.md#github-enterprise-server-and-the-api-url). |
 | `RUST_LOG` | `info` | Log level. |
 
 Boolean values accept `1`, `true`, `yes`, `on`, `0`, `false`, `no`, `off`. The connector refuses to start on a malformed value.

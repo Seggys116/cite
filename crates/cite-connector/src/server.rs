@@ -46,7 +46,8 @@ pub const MAX_BODY_BYTES: usize = 1024 * 1024;
 const MAX_CONNECTIONS: usize = 256;
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
+// A repo-built deploy waits for the build, so the handler may legitimately run for minutes.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(700);
 const CONNECTION_MAX_AGE: Duration = Duration::from_secs(15 * 60);
 const MAX_HEADER_BUF: usize = 32 * 1024;
 const MAX_BEARER_LEN: usize = 200;
@@ -606,11 +607,14 @@ pub async fn run(cfg: ConnectorConfig) -> Result<()> {
         }
         None => None,
     };
-    let deployer = Arc::new(Deployer::new(
-        Arc::clone(&store),
-        Arc::clone(&haproxy),
-        orchestrator.clone(),
-    ));
+    let deployer = Arc::new(
+        Deployer::new(
+            Arc::clone(&store),
+            Arc::clone(&haproxy),
+            orchestrator.clone(),
+        )
+        .with_build_wait(Duration::from_secs(cfg.deploy_build_timeout_secs)),
+    );
     let reconciler = Arc::clone(&deployer);
     tokio::spawn(async move { reconciler.reconcile_idle_stacks().await });
     let acceptor = if cfg.tls {

@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# End to end check of the orchestrator against a real Docker daemon; needs local images tagged ghcr.io/seggys116/cite-{connector,dockerproxy}:$CITE_VERSION and cite-{manager,executor-node}:$CITE_VERSION[-node22]. E2E_KEEP=1 skips teardown.
+# End to end check of the orchestrator against a real Docker daemon, ending in a live phase that builds a site from a mock GitHub and serves it through HAProxy.
+# Needs local images tagged ghcr.io/seggys116/cite-{connector,dockerproxy,executor-static}:$CITE_VERSION, cite-{manager,executor-node}:$CITE_VERSION-node22 and $MOCK_IMAGE (images/mock-github/Dockerfile).
+# E2E_KEEP=1 skips teardown. On Linux the managers cannot resolve host.docker.internal, so the mock is published on the docker0 gateway address instead.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -12,6 +14,13 @@ HAPROXY=cite-node-haproxy
 NET="cite-$SITE-blue-net"
 EGRESS="cite-$SITE-blue-egress"
 GREEN_NET="cite-$SITE-green-net"
+LIVE_SITE=e2elive
+LIVE_HOST=app.e2e.test
+LIVE_REPO=acme/live
+MOCK_NAME=cite-e2e-mock-github
+MOCK_IMAGE="${MOCK_IMAGE:-cite-mock-github:e2e}"
+MOCK_PORT=18090
+MOCK_TOKEN=ghp_citeMockGithubPat00000000000000001
 CURL_IMAGE=docker.io/curlimages/curl:latest
 
 export CITE_VERSION="${CITE_VERSION:-0.0.1}"
@@ -51,16 +60,21 @@ compose() {
 
 # Only resources of the test site are removed by label, so a real node on the same daemon is never touched.
 remove_stack() {
-  local c
-  for c in $(docker ps -aq --filter "label=cite.site=$SITE"); do
-    docker rm -f "$c" >/dev/null 2>&1 || true
+  local c site
+  docker rm -f "$MOCK_NAME" >/dev/null 2>&1 || true
+  for site in "$SITE" "$LIVE_SITE"; do
+    for c in $(docker ps -aq --filter "label=cite.site=$site"); do
+      docker rm -f "$c" >/dev/null 2>&1 || true
+    done
   done
   compose down -v --remove-orphans >/dev/null 2>&1 || true
-  for c in $(docker network ls -q --filter "label=cite.site=$SITE"); do
-    docker network rm "$c" >/dev/null 2>&1 || true
-  done
-  for c in $(docker volume ls -q --filter "label=cite.site=$SITE"); do
-    docker volume rm -f "$c" >/dev/null 2>&1 || true
+  for site in "$SITE" "$LIVE_SITE"; do
+    for c in $(docker network ls -q --filter "label=cite.site=$site"); do
+      docker network rm "$c" >/dev/null 2>&1 || true
+    done
+    for c in $(docker volume ls -q --filter "label=cite.site=$site"); do
+      docker volume rm -f "$c" >/dev/null 2>&1 || true
+    done
   done
 }
 
@@ -80,7 +94,10 @@ trap 'exit 143' TERM
 fail() {
   echo "e2e-orchestrator FAIL: $*" >&2
   compose logs --no-color --tail 40 connector dockerproxy >&2 2>/dev/null || true
-  docker logs --tail 20 "cite-$SITE-blue-manager" >&2 2>&1 || true
+  local c
+  for c in "cite-$SITE-blue-manager" "cite-$LIVE_SITE-blue-manager" "cite-$LIVE_SITE-green-manager" "cite-$LIVE_SITE-blue-executor" "$MOCK_NAME"; do
+    docker logs --tail 30 "$c" >&2 2>&1 || true
+  done
   exit 1
 }
 
@@ -230,6 +247,45 @@ container_running() {
   [ "$(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null)" = true ]
 }
 
+# The managers sit on a bridge network and reach the host through host.docker.internal on Docker Desktop; Linux has no such name inside stacks, so the docker0 gateway carries the mock.
+mock_endpoint() {
+  if [ "$(uname -s)" = Darwin ]; then
+    MOCK_BIND=127.0.0.1
+    MOCK_HOST=host.docker.internal
+  else
+    MOCK_BIND=$(docker network inspect bridge -f '{{(index .IPAM.Config 0).Gateway}}')
+    MOCK_HOST=$MOCK_BIND
+  fi
+  MOCK_API_URL="http://$MOCK_HOST:$MOCK_PORT"
+}
+
+# Pushes one commit to the mock; the files form a complete static site that builds with node build.js and a vite dependency resolved from the repo itself.
+mock_push() {
+  local branch=$1 marker=$2 payload
+  payload=$(jq -nc --arg branch "$branch" --arg marker "$marker" '{
+    branch: $branch, message: ("e2e " + $marker), author: "e2e",
+    files: {
+      "package.json": "{\"name\":\"live\",\"scripts\":{\"build\":\"node build.js\"},\"dependencies\":{\"vite\":\"file:./stub\"}}",
+      "stub/package.json": "{\"name\":\"vite\",\"version\":\"6.0.0\"}",
+      "build.js": "const fs = require(\"fs\");\nfs.mkdirSync(\"dist\", { recursive: true });\nfs.copyFileSync(\"index.html\", \"dist/index.html\");\n",
+      "index.html": ("<html>" + $marker + "</html>\n")
+    }}')
+  curl -fsS --max-time 15 -H "Authorization: Bearer $MOCK_TOKEN" -H 'Content-Type: application/json' \
+    --data "$payload" "http://$MOCK_BIND:$MOCK_PORT/__cite/push" >/dev/null || fail "could not push $marker to the mock"
+}
+
+live_get() {
+  curl -sS --max-time 5 -H "Host: $LIVE_HOST" "http://127.0.0.1:$CITE_HTTP_PORT/${1:-}" 2>/dev/null
+}
+
+live_serves() {
+  live_get | grep -q "$1"
+}
+
+container_stopped() {
+  [ "$(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null)" = false ]
+}
+
 # The hardening every stack container must show in docker inspect.
 HARDENED='.[0] | .HostConfig.ReadonlyRootfs == true
   and .HostConfig.CapDrop == ["ALL"]
@@ -251,9 +307,11 @@ if docker inspect "$HAPROXY" >/dev/null 2>&1 || [ -n "$(docker ps -aq --filter l
   exit 2
 fi
 for ref in "cite-connector:$CITE_VERSION" "cite-dockerproxy:$CITE_VERSION" \
-  "cite-manager:$CITE_STACK_VERSION-node22" "cite-executor-node:$CITE_STACK_VERSION-node22"; do
+  "cite-manager:$CITE_STACK_VERSION-node22" "cite-executor-node:$CITE_STACK_VERSION-node22" \
+  "cite-executor-static:$CITE_STACK_VERSION"; do
   docker image inspect "$REGISTRY/$ref" >/dev/null 2>&1 || { echo "e2e-orchestrator: image $REGISTRY/$ref is missing" >&2; exit 2; }
 done
+docker image inspect "$MOCK_IMAGE" >/dev/null 2>&1 || { echo "e2e-orchestrator: image $MOCK_IMAGE is missing" >&2; exit 2; }
 docker pull -q "$CURL_IMAGE" >/dev/null
 remove_stack
 
@@ -448,6 +506,116 @@ SECRETS=$(docker run --rm --entrypoint cat -v "${PROJECT}_cite_conf:/conf:ro" "$
 expect "the stored token is gone" 0 "$(printf '%s' "$SECRETS" | grep -c "$TOKEN_VALUE" || true)"
 api GET /api/v1/sites
 jq_ok "site list is empty" 'length == 0'
+
+# The live phase points the proxy and connector at a mock GitHub and expects the manager to build the site and HAProxy to serve it.
+echo "== live: mock GitHub and the API URL passthrough"
+mock_endpoint
+docker run -d --name "$MOCK_NAME" -p "$MOCK_BIND:$MOCK_PORT:8080" "$MOCK_IMAGE" >/dev/null || fail "mock GitHub did not start"
+wait_for "mock GitHub answers" 30 curl -fsS --max-time 3 -H "Authorization: Bearer $MOCK_TOKEN" "http://$MOCK_BIND:$MOCK_PORT/repos/acme/live"
+mock_push main e2e-live-v1
+export CITE_GITHUB_API_URL=$MOCK_API_URL
+compose up -d >"$WORK/up.log" 2>&1 || fail "compose up with the mock URL failed: $(<"$WORK/up.log")"
+wait_api
+wait_for "dockerproxy is healthy with the mock URL" 60 test "$(docker inspect -f '{{.State.Health.Status}}' "$(compose ps -q dockerproxy)")" = healthy
+wait_for "HAProxy stopped restarting" 90 haproxy_settled
+PROXY_ID=$(compose ps -q dockerproxy)
+CONNECTOR_ID=$(compose ps -q connector)
+BODY=$(docker inspect "$PROXY_ID")
+jq_ok "dockerproxy carries the operator URL" ".[0].Config.Env | any(. == \"CITE_PROXY_GITHUB_API_URL=$MOCK_API_URL\")"
+BODY=$(docker inspect "$CONNECTOR_ID")
+jq_ok "connector carries the same URL" ".[0].Config.Env | any(. == \"CITE_STACK_GITHUB_API_URL=$MOCK_API_URL\")"
+login
+api GET /api/v1/node
+jq_ok "orchestrator is reachable after the restart" '.orchestrator.enabled == true and .orchestrator.reachable == true'
+
+echo "== live: create a static site from the mock repository"
+LIVE_BLUE_NET="cite-$LIVE_SITE-blue-net"
+LIVE_EGRESS="cite-$LIVE_SITE-blue-egress"
+LIVE_MANAGER=cite-$LIVE_SITE-blue-manager
+LIVE_EXECUTOR=cite-$LIVE_SITE-blue-executor
+live_json=$(jq -nc --arg token "$MOCK_TOKEN" --arg repo "$LIVE_REPO" --arg host "$LIVE_HOST" '{
+  id: "e2elive", name: "E2E Live", hosts: [$host], active: "blue",
+  blue: {targets: []}, green: {targets: []},
+  source: {repo: $repo, branch: "main", runtime: "static", poll_interval: "off"},
+  github_token: $token
+}')
+API_TIMEOUT=240 api POST /api/v1/sites "$live_json"
+code_is "create live site from source" 200
+jq_ok "live site is active on blue with the static executor target" \
+  ".id == \"$LIVE_SITE\" and .active == \"blue\" and .blue.targets[0].addr == \"$LIVE_EXECUTOR:8080\""
+BODY=$(docker inspect "$LIVE_MANAGER")
+jq_ok "manager image is the node22 manager" '.[0].Config.Image | endswith("/cite-manager:'"$CITE_STACK_VERSION"'-node22")'
+jq_ok "manager reports the mock as its GitHub API" ".[0].Config.Env | any(. == \"CITE_GITHUB_API_URL=$MOCK_API_URL\")"
+BODY=$(docker inspect "$LIVE_EXECUTOR")
+jq_ok "executor image is the static executor" '.[0].Config.Image | endswith("/cite-executor-static:'"$CITE_STACK_VERSION"'")'
+jq_ok "executor does not see the API URL or the token" '.[0].Config.Env | any(test("GITHUB")) | not'
+jq_ok "executor publishes no port" '((.[0].HostConfig.PortBindings // {}) | length) == 0'
+
+echo "== live: the manager builds and HAProxy serves"
+wait_for "site is served through HAProxy with the v1 build" 180 live_serves e2e-live-v1
+expect "HTTP status of the served site" 200 "$(curl -sS --max-time 5 -o /dev/null -w '%{http_code}' -H "Host: $LIVE_HOST" "http://127.0.0.1:$CITE_HTTP_PORT/")"
+NOHOST=$(curl -sS --max-time 5 -o /dev/null -w '%{http_code}' -H 'Host: other.e2e.test' "http://127.0.0.1:$CITE_HTTP_PORT/")
+[ "$NOHOST" != 200 ] || fail "an unknown host was served"
+pass "an unknown host is not served (HTTP $NOHOST)"
+api GET "/api/v1/sites/$LIVE_SITE"
+code_is "live site status" 200
+jq_ok "HAProxy reports the executor UP" '.live.blue[0].status == "UP"'
+for name in "$LIVE_MANAGER" "$LIVE_EXECUTOR"; do
+  BODY=$(docker inspect "$name")
+  jq_ok "$name is hardened after the build" "$HARDENED"
+done
+expect "live executor is only on its own internal network" "$LIVE_BLUE_NET" "$(nets_of "$LIVE_EXECUTOR")"
+expect "live manager is only on its egress network" "$LIVE_EGRESS" "$(nets_of "$LIVE_MANAGER")"
+BODY=$(docker network inspect "$LIVE_BLUE_NET")
+jq_ok "live stack network is internal and holds only the executor and HAProxy" \
+  ".[0].Internal == true and ([.[0].Containers[].Name] | sort == [\"$LIVE_EXECUTOR\", \"$HAPROXY\"])"
+BODY=$(docker network inspect "$LIVE_EGRESS")
+jq_ok "live egress network is not internal and holds only the manager" ".[0].Internal == false and ([.[0].Containers[].Name] == [\"$LIVE_MANAGER\"])"
+HOLDERS=0
+for c in $(docker ps -aq); do
+  if docker inspect "$c" | grep -q "$MOCK_TOKEN"; then
+    HOLDERS=$((HOLDERS + 1))
+    expect "mock token holder is the live manager" "$LIVE_MANAGER" "$(docker inspect -f '{{.Name}}' "$c" | tr -d /)"
+  fi
+done
+expect "exactly one container carries the mock token" 1 "$HOLDERS"
+expect "no network or volume carries the mock token" 0 "$(resource_dump | grep -c "$MOCK_TOKEN" || true)"
+
+echo "== live: deploy a second commit from a git ref"
+mock_push release e2e-live-v2
+API_TIMEOUT=240 api POST "/api/v1/sites/$LIVE_SITE/deploy" '{"git_ref":"release","note":"e2e live ref deploy"}'
+code_is "deploy of the release ref" 200
+jq_ok "deploy promoted green" '.action == "promote" and .slot == "green"'
+BODY=$(docker inspect "cite-$LIVE_SITE-green-manager")
+jq_ok "green manager builds the release ref" '.[0].Config.Env | any(. == "CITE_BRANCH=release")'
+jq_ok "green manager is hardened" "$HARDENED"
+wait_for "site is served with the v2 build" 60 live_serves e2e-live-v2
+if live_serves e2e-live-v1; then fail "the v1 build is still served after the promote"; fi
+pass "the v1 build is no longer served"
+api GET "/api/v1/sites/$LIVE_SITE"
+jq_ok "site is active on green and the deploy is in the history" '.active == "green" and (.history | last | .action) == "promote"'
+wait_for "drained blue executor is stopped" 90 container_stopped "$LIVE_EXECUTOR"
+wait_for "site still serves v2 after the drain" 30 live_serves e2e-live-v2
+
+echo "== live: rollback restarts the drained slot on its own ref"
+API_TIMEOUT=240 api POST "/api/v1/sites/$LIVE_SITE/rollback"
+code_is "rollback to blue" 200
+jq_ok "rollback recorded" '.action == "rollback" and .slot == "blue"'
+wait_for "rolled back site serves the v1 build again" 120 live_serves e2e-live-v1
+BODY=$(docker inspect "$LIVE_MANAGER")
+jq_ok "blue manager still builds main" '.[0].Config.Env | any(. == "CITE_BRANCH=main")'
+
+echo "== live: delete"
+api DELETE "/api/v1/sites/$LIVE_SITE"
+code_is "delete live site" 200
+expect "no container of the live site remains" 0 "$(docker ps -aq --filter "label=cite.site=$LIVE_SITE" | wc -l | tr -d ' ')"
+expect "no volume of the live site remains" 0 "$(docker volume ls -q --filter "name=cite-$LIVE_SITE-" | wc -l | tr -d ' ')"
+expect "no network of the live site remains" 0 "$(docker network ls -q --filter "name=cite-$LIVE_SITE-" | wc -l | tr -d ' ')"
+truthy "HAProxy is no longer on the live stack network" haproxy_off "$LIVE_BLUE_NET"
+if live_serves e2e-live; then fail "the deleted site is still served"; fi
+pass "the deleted site is no longer served"
+SECRETS=$(docker run --rm --entrypoint cat -v "${PROJECT}_cite_conf:/conf:ro" "$REGISTRY/cite-connector:$CITE_VERSION" /conf/secrets.json)
+expect "the stored mock token is gone" 0 "$(printf '%s' "$SECRETS" | grep -c "$MOCK_TOKEN" || true)"
 
 echo "== teardown"
 if [ "${E2E_KEEP:-0}" = 1 ]; then

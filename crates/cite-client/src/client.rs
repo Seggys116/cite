@@ -17,8 +17,8 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 pub const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
-// The connector gives a deploy up to 180 s end to end; create, switch and rollback wait for health too.
-const DEPLOY_TIMEOUT: Duration = Duration::from_secs(180);
+// The connector gives a deploy up to 700 s end to end; create, switch and rollback wait for health too.
+const DEPLOY_TIMEOUT: Duration = Duration::from_secs(700);
 const ACTION_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_ERROR_CHARS: usize = 512;
 
@@ -633,7 +633,7 @@ mod tests {
 
     #[test]
     fn long_operations_get_budgets_beyond_the_read_timeout() {
-        assert!(DEPLOY_TIMEOUT >= Duration::from_secs(180));
+        assert!(DEPLOY_TIMEOUT >= Duration::from_secs(600));
         assert!(ACTION_TIMEOUT >= Duration::from_secs(120));
         assert!(ACTION_TIMEOUT > REQUEST_TIMEOUT);
     }

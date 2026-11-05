@@ -19,12 +19,15 @@ use crate::store::{Store, now_rfc3339};
 const HISTORY_CAP: usize = 50;
 const CREATE_HEALTH: Duration = Duration::from_secs(30);
 const DEPLOY_HEALTH: Duration = Duration::from_secs(60);
+// A repo-built site has to clone, install and compile before its executor answers.
+const BUILD_HEALTH: Duration = Duration::from_secs(600);
 const DRAIN_DELAY: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy)]
 struct Timing {
     create_health: Duration,
     deploy_health: Duration,
+    build_health: Duration,
     drain: Duration,
 }
 
@@ -123,6 +126,7 @@ impl Deployer {
             timing: Timing {
                 create_health: CREATE_HEALTH,
                 deploy_health: DEPLOY_HEALTH,
+                build_health: BUILD_HEALTH,
                 drain: DRAIN_DELAY,
             },
         }
@@ -137,9 +141,24 @@ impl Deployer {
         self.timing = Timing {
             create_health,
             deploy_health,
+            build_health: deploy_health,
             drain,
         };
         self
+    }
+
+    pub fn with_build_wait(mut self, wait: Duration) -> Deployer {
+        self.timing.build_health = wait;
+        self
+    }
+
+    // A repo-built slot gets the long build wait, an upstream slot only the short health wait.
+    fn health_wait(&self, orchestrated: bool) -> Duration {
+        if orchestrated {
+            self.timing.build_health
+        } else {
+            self.timing.deploy_health
+        }
     }
 
     // Config changes, their apply and any restore after a failed apply share this lock, so a restore never wipes another operation's change.
@@ -583,7 +602,7 @@ impl Deployer {
             self.stop_stack_quietly(id, idle).await;
             return Err(err);
         }
-        let wait = self.timing.deploy_health;
+        let wait = self.health_wait(site.source.is_some());
         let healthy = self
             .haproxy
             .wait_healthy(id, idle, wait)
@@ -674,7 +693,7 @@ impl Deployer {
         }
         let healthy = self
             .haproxy
-            .wait_healthy(id, slot, self.timing.deploy_health)
+            .wait_healthy(id, slot, self.health_wait(orchestrated))
             .await?;
         if !healthy {
             return Err(ConnectorError::Conflict(format!(

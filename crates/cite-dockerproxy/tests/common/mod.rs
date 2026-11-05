@@ -43,6 +43,16 @@ pub fn policy() -> Policy {
     Policy::new(&config(Path::new("/unused.sock")))
 }
 
+// A policy whose operator set (or left unset) the one GitHub API URL managers may use.
+pub fn policy_with_github(url: Option<&str>) -> Policy {
+    let cfg = Config::from_lookup(|k| match k {
+        "CITE_PROXY_GITHUB_API_URL" => url.map(str::to_string),
+        _ => None,
+    })
+    .unwrap();
+    Policy::new(&cfg)
+}
+
 #[derive(Debug, Clone)]
 pub struct Seen {
     pub method: String,

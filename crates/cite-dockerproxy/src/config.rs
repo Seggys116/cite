@@ -1,6 +1,8 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
+const MAX_GITHUB_URL_LEN: usize = 200;
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub listen: SocketAddr,
@@ -9,6 +11,7 @@ pub struct Config {
     pub haproxy_container: String,
     pub edge_network: String,
     pub max_conns: usize,
+    pub github_api_url: Option<String>,
 }
 
 // Names end up in regexes and Docker paths, so only plain name characters are accepted.
@@ -18,6 +21,47 @@ fn chars_ok(value: &str, extra: &[char]) -> bool {
         && value.chars().all(|c| {
             c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.') || extra.contains(&c)
         })
+}
+
+// Same rules as the connector: http(s), plain host and port, plain path, no userinfo, query or fragment.
+pub fn validate_github_api_url(url: &str) -> Result<(), String> {
+    if url.len() > MAX_GITHUB_URL_LEN {
+        return Err(format!("longer than {MAX_GITHUB_URL_LEN} characters"));
+    }
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .ok_or("must start with http:// or https://")?;
+    if !rest
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '~' | ':' | '/'))
+    {
+        return Err("has characters that are not allowed".to_string());
+    }
+    let (authority, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+    let (host, port) = match authority.split_once(':') {
+        Some((host, port)) => (host, Some(port)),
+        None => (authority, None),
+    };
+    let edge_ok = |c: Option<char>| c.is_some_and(|c| c.is_ascii_alphanumeric());
+    let host_ok = edge_ok(host.chars().next())
+        && edge_ok(host.chars().last())
+        && host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-'));
+    let port_ok = |p: &str| {
+        !p.is_empty()
+            && p.len() <= 5
+            && p.chars().all(|c| c.is_ascii_digit())
+            && p.parse::<u32>().is_ok_and(|n| (1..=65535).contains(&n))
+    };
+    if !host_ok || port.is_some_and(|p| !port_ok(p)) {
+        return Err("has no valid host and port".to_string());
+    }
+    if path.contains("//") || path.split('/').any(|seg| seg == "." || seg == "..") {
+        return Err("has an empty or relative path segment".to_string());
+    }
+    Ok(())
 }
 
 impl Config {
@@ -67,6 +111,17 @@ impl Config {
             .ok()
             .filter(|n| (1..=1024).contains(n))
             .ok_or_else(|| format!("CITE_PROXY_MAX_CONNS {conns_raw:?} must be 1 to 1024"))?;
+        let github_api_url = match get("CITE_PROXY_GITHUB_API_URL")
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+        {
+            Some(url) => {
+                validate_github_api_url(&url)
+                    .map_err(|e| format!("CITE_PROXY_GITHUB_API_URL {url:?} {e}"))?;
+                Some(url)
+            }
+            None => None,
+        };
         Ok(Config {
             listen,
             socket: PathBuf::from(socket),
@@ -74,6 +129,7 @@ impl Config {
             haproxy_container,
             edge_network,
             max_conns,
+            github_api_url,
         })
     }
 }
@@ -100,6 +156,48 @@ mod tests {
         assert_eq!(c.haproxy_container, "cite-node-haproxy");
         assert_eq!(c.edge_network, "cite_edge");
         assert_eq!(c.max_conns, 64);
+        assert_eq!(c.github_api_url, None);
+    }
+
+    #[test]
+    fn github_api_url_is_trimmed_and_validated() {
+        let c = cfg(&[(
+            "CITE_PROXY_GITHUB_API_URL",
+            " https://ghe.example.com/api/v3 ",
+        )])
+        .unwrap();
+        assert_eq!(
+            c.github_api_url.as_deref(),
+            Some("https://ghe.example.com/api/v3")
+        );
+        let blank = cfg(&[("CITE_PROXY_GITHUB_API_URL", "  ")]).unwrap();
+        assert_eq!(blank.github_api_url, None);
+        for bad in [
+            "ftp://ghe.example.com",
+            "ghe.example.com",
+            "https://user:pw@ghe.example.com",
+            "https://user@ghe.example.com",
+            "https://ghe.example.com?x=1",
+            "https://ghe.example.com/#frag",
+            "https://ghe.example.com:0",
+            "https://ghe.example.com:99999",
+            "https://ghe.example.com/a b",
+            "https://ghe.example.com/%2e%2e",
+            "https://ghe.example.com//x",
+            "https://ghe.example.com/../x",
+            "https://",
+            "https://.example.com",
+            "HTTPS://ghe.example.com",
+            "https://ghe.example.com\\evil.test",
+            "https://ghe.example.com/\u{e9}",
+        ] {
+            assert!(
+                cfg(&[("CITE_PROXY_GITHUB_API_URL", bad)]).is_err(),
+                "{bad:?}"
+            );
+        }
+        let long = format!("https://{}.example.com", "a".repeat(200));
+        assert!(cfg(&[("CITE_PROXY_GITHUB_API_URL", &long)]).is_err());
     }
 
     #[test]

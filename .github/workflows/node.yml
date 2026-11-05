@@ -191,7 +191,7 @@ jobs:
         run: bash scripts/e2e-node.sh
 
   e2e-orchestrator:
-    # Builds four images, so it runs on main and on demand instead of every pull request.
+    # Builds six images, so it runs on main and on demand instead of every pull request.
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 75
@@ -210,6 +210,8 @@ jobs:
           docker build -f images/dockerproxy/Dockerfile -t "$R/cite-dockerproxy:$V" .
           docker build -f images/manager/Dockerfile -t "$R/cite-manager:$V-node22" .
           docker build -f images/executor-node/Dockerfile -t "$R/cite-executor-node:$V-node22" .
+          docker build -f images/executor-static/Dockerfile -t "$R/cite-executor-static:$V" .
+          docker build -f images/mock-github/Dockerfile -t cite-mock-github:e2e .
       - name: Run the orchestrator end to end script
         run: CITE_VERSION=0.0.1 bash scripts/e2e-orchestrator.sh
 

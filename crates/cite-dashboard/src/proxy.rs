@@ -15,7 +15,7 @@ pub const MAX_REQUEST_BODY: usize = 1024 * 1024;
 const PREFIX: &str = "/api/v1/nodes/";
 const PROXY_TIMEOUT: Duration = Duration::from_secs(30);
 // Switch, rollback, deploy and create wait on health checks and stack starts, which can take over a minute.
-const LONG_TIMEOUT: Duration = Duration::from_secs(180);
+const LONG_TIMEOUT: Duration = Duration::from_secs(700);
 const LONG_ACTIONS: [&str; 4] = ["switch", "rollback", "deploy", "maintenance"];
 const MAX_SEGMENT_LEN: usize = 128;
 const ALLOWED_PREFIXES: [&str; 9] = [
@@ -228,7 +228,7 @@ mod tests {
         ] {
             assert_eq!(timeout_for(&method, rest), PROXY_TIMEOUT, "{method} {rest}");
         }
-        assert!(LONG_TIMEOUT >= Duration::from_secs(120));
+        assert!(LONG_TIMEOUT >= Duration::from_secs(600));
     }
 
     #[test]

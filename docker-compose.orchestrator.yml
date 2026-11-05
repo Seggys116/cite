@@ -1,4 +1,5 @@
 # Overlay for docker-compose.node.yml; set DOCKER_GID in .env to the group id that owns /var/run/docker.sock (stat -c %g).
+# CITE_GITHUB_API_URL (GitHub Enterprise Server, for example https://ghe.example.com/api/v3) goes to both services: the proxy allows exactly that value in a manager.
 
 services:
   dockerproxy:
@@ -19,6 +20,7 @@ services:
       CITE_PROXY_REGISTRY: ${CITE_REGISTRY:-ghcr.io/seggys116}
       CITE_PROXY_HAPROXY_CONTAINER: cite-node-haproxy
       CITE_PROXY_EDGE_NETWORK: cite_edge
+      CITE_PROXY_GITHUB_API_URL: ${CITE_GITHUB_API_URL:-}
       RUST_LOG: ${RUST_LOG:-info}
     # A read-only bind does not restrict the API on a unix socket; the filter in the proxy does.
     volumes:
@@ -46,6 +48,7 @@ services:
       CITE_HAPROXY_CONTAINER: cite-node-haproxy
       CITE_REGISTRY: ${CITE_REGISTRY:-ghcr.io/seggys116}
       CITE_STACK_VERSION: ${CITE_STACK_VERSION:-}
+      CITE_STACK_GITHUB_API_URL: ${CITE_GITHUB_API_URL:-}
     networks:
       - docker_api
 

@@ -28,6 +28,7 @@ const DEFAULT_NODE_MAJOR: u8 = 22;
 const NODE_MAJORS: [u8; 2] = [22, 24];
 const MAX_REF_LEN: usize = 100;
 const MAX_TOKEN_LEN: usize = 512;
+const MAX_GITHUB_URL_LEN: usize = 200;
 pub const DEFAULT_HAPROXY_CONTAINER: &str = "cite-node-haproxy";
 
 const GIB: i64 = 1024 * 1024 * 1024;
@@ -108,6 +109,7 @@ pub struct Orchestrator {
     haproxy_container: String,
     stack_version: String,
     registry: String,
+    github_api_url: Option<String>,
     reconciled: AtomicBool,
 }
 
@@ -117,6 +119,7 @@ pub struct StackEnv<'a> {
     pub version: &'a str,
     pub edge_network: &'a str,
     pub isolate: bool,
+    pub github_api_url: Option<&'a str>,
 }
 
 // Names, images and bodies for one stack, in the form they are sent to the engine.
@@ -247,7 +250,8 @@ impl Orchestrator {
         match cfg.docker_host.as_deref() {
             None => Ok(None),
             Some(host) => Self::new(host, &cfg.edge_network, &cfg.stack_version, &cfg.registry)?
-                .with_haproxy_container(&cfg.haproxy_container)
+                .with_haproxy_container(&cfg.haproxy_container)?
+                .with_github_api_url(cfg.github_api_url.as_deref())
                 .map(Some),
         }
     }
@@ -285,8 +289,18 @@ impl Orchestrator {
             haproxy_container: DEFAULT_HAPROXY_CONTAINER.to_string(),
             stack_version: stack_version.to_string(),
             registry: registry.to_string(),
+            github_api_url: None,
             reconciled: AtomicBool::new(false),
         })
+    }
+
+    // Managers send the GitHub token to this URL, so it is validated before any stack can carry it.
+    pub fn with_github_api_url(mut self, url: Option<&str>) -> Result<Orchestrator> {
+        if let Some(url) = url {
+            validate_github_api_url(url).map_err(ConnectorError::BadRequest)?;
+        }
+        self.github_api_url = url.map(str::to_string);
+        Ok(self)
     }
 
     // An empty name turns per-stack networks off and puts executors on the shared edge network.
@@ -311,6 +325,7 @@ impl Orchestrator {
             version: &self.stack_version,
             edge_network: &self.edge_network,
             isolate: self.isolated(),
+            github_api_url: self.github_api_url.as_deref(),
         }
     }
 
@@ -968,6 +983,53 @@ fn validate_token(token: &str) -> Result<()> {
     Ok(())
 }
 
+fn valid_host(host: &str) -> bool {
+    let edge_ok = |c: Option<char>| c.is_some_and(|c| c.is_ascii_alphanumeric());
+    edge_ok(host.chars().next())
+        && edge_ok(host.chars().last())
+        && host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-'))
+}
+
+fn valid_port(port: &str) -> bool {
+    !port.is_empty()
+        && port.len() <= 5
+        && port.chars().all(|c| c.is_ascii_digit())
+        && port.parse::<u32>().is_ok_and(|p| (1..=65535).contains(&p))
+}
+
+// An http(s) URL without userinfo, query or fragment, made only of host, port and plain path characters.
+pub fn validate_github_api_url(url: &str) -> std::result::Result<(), String> {
+    if url.len() > MAX_GITHUB_URL_LEN {
+        return Err(format!(
+            "github api url is longer than {MAX_GITHUB_URL_LEN} characters"
+        ));
+    }
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .ok_or("github api url must start with http:// or https://")?;
+    if !rest
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '~' | ':' | '/'))
+    {
+        return Err("github api url has characters that are not allowed".to_string());
+    }
+    let (authority, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+    let (host, port) = match authority.split_once(':') {
+        Some((host, port)) => (host, Some(port)),
+        None => (authority, None),
+    };
+    if !valid_host(host) || port.is_some_and(|p| !valid_port(p)) {
+        return Err("github api url has no valid host and port".to_string());
+    }
+    if path.contains("//") || path.split('/').any(|seg| seg == "." || seg == "..") {
+        return Err("github api url has an empty or relative path segment".to_string());
+    }
+    Ok(())
+}
+
 fn poll_interval(raw: Option<&str>) -> Result<String> {
     let value = raw
         .map(str::trim)
@@ -1045,6 +1107,10 @@ fn plan_stack(
         manager_env.push(format!("CITE_NODE={node_major}"));
     }
     manager_env.push(format!("CITE_GITHUB_TOKEN={token}"));
+    if let Some(url) = env.github_api_url {
+        validate_github_api_url(url).map_err(ConnectorError::BadRequest)?;
+        manager_env.push(format!("CITE_GITHUB_API_URL={url}"));
+    }
     manager_env.extend(
         [
             "CITE_DATA_DIR=/var/lib/cite",
@@ -1725,6 +1791,7 @@ pub(crate) mod tests {
             version,
             edge_network: "cite_edge",
             isolate,
+            github_api_url: None,
         }
     }
 
@@ -1990,6 +2057,94 @@ pub(crate) mod tests {
         let mut without_env = p.manager.clone();
         without_env["Env"] = json!([]);
         assert!(!without_env.to_string().contains(TOKEN));
+    }
+
+    #[test]
+    fn github_api_url_validator_accepts_plain_urls() {
+        for ok in [
+            "https://api.github.com",
+            "https://ghe.example.com/api/v3",
+            "http://host.docker.internal:18080",
+            "http://127.0.0.1:8080/",
+            "http://mock-github:8080",
+        ] {
+            assert_eq!(validate_github_api_url(ok), Ok(()), "{ok}");
+        }
+    }
+
+    #[test]
+    fn github_api_url_validator_refuses_hostile_urls() {
+        let long = format!("https://{}.example.com", "a".repeat(200));
+        for bad in [
+            "",
+            "ftp://ghe.example.com",
+            "file:///etc/passwd",
+            "ghe.example.com",
+            "HTTPS://ghe.example.com",
+            "https://",
+            "https://user@ghe.example.com",
+            "https://user:pw@ghe.example.com",
+            "https://ghe.example.com?x=1",
+            "https://ghe.example.com/a?x=1",
+            "https://ghe.example.com/#frag",
+            "https://ghe.example.com:abc",
+            "https://ghe.example.com:0",
+            "https://ghe.example.com:99999",
+            "https://ghe.example.com:",
+            "https://ghe example.com",
+            "https://ghe.example.com/a b",
+            "https://ghe.example.com\\evil.test",
+            "https://ghe.example.com/%2e%2e",
+            "https://ghe.example.com//x",
+            "https://ghe.example.com/../x",
+            "https://.example.com",
+            "https://exa_mple.com:80@evil.test",
+            "https://ghe.example.com\n",
+            "https://ghe.example.com\"x",
+            "https://ghe.example.com/\u{e9}",
+            long.as_str(),
+        ] {
+            assert!(validate_github_api_url(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn github_api_url_reaches_only_the_manager_env() {
+        let env = StackEnv {
+            github_api_url: Some("https://ghe.example.com/api/v3"),
+            ..stack_env("ghcr.io/seggys116", "0.2.0", true)
+        };
+        let p = plan_stack(&site("shop", None), Slot::Blue, None, TOKEN, &env).unwrap();
+        let line = json!("CITE_GITHUB_API_URL=https://ghe.example.com/api/v3");
+        assert!(p.manager["Env"].as_array().unwrap().contains(&line));
+        assert!(!p.executor.to_string().contains("CITE_GITHUB_API_URL"));
+        assert!(!p.init.to_string().contains("CITE_GITHUB_API_URL"));
+        let unset = plan(None, None).unwrap();
+        assert!(!unset.manager.to_string().contains("CITE_GITHUB_API_URL"));
+        let bad = StackEnv {
+            github_api_url: Some("https://u:p@evil.test"),
+            ..stack_env("ghcr.io/seggys116", "0.2.0", true)
+        };
+        let err = plan_stack(&site("shop", None), Slot::Blue, None, TOKEN, &bad);
+        assert!(matches!(err, Err(ConnectorError::BadRequest(_))));
+    }
+
+    #[test]
+    fn orchestrator_refuses_a_bad_github_api_url() {
+        let make = || Orchestrator::new("tcp://proxy:2375", "cite_edge", "0.2.0", "ghcr.io/x");
+        assert!(
+            make()
+                .unwrap()
+                .with_github_api_url(Some("https://ghe.example.com"))
+                .is_ok()
+        );
+        assert!(make().unwrap().with_github_api_url(None).is_ok());
+        assert!(
+            make()
+                .unwrap()
+                .with_github_api_url(Some("https://u@ghe.example.com"))
+                .is_err()
+        );
     }
 
     #[test]

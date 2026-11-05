@@ -45,6 +45,7 @@ fn manager_spec() -> (String, Value) {
         version: "0.2.0",
         edge_network: "cite_edge",
         isolate: true,
+        github_api_url: None,
     };
     let specs = stack_specs(&site, Slot::Blue, None, "ghp_token", &env).unwrap();
     (specs.manager_name, specs.manager)
