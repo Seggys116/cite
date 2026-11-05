@@ -332,15 +332,25 @@ pub fn authenticate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::OnceLock;
 
     const SECRET: &str = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
-    const PASSWORD: &str = "correct horse battery";
     const NOW: u64 = 1_700_000_000;
+
+    fn password() -> &'static str {
+        static PW: OnceLock<String> = OnceLock::new();
+        PW.get_or_init(|| generate_password().expect("rng"))
+    }
+
+    fn wrong_password() -> &'static str {
+        static PW: OnceLock<String> = OnceLock::new();
+        PW.get_or_init(|| generate_password().expect("rng"))
+    }
 
     fn creds() -> Credentials {
         Credentials {
             username: "admin".to_string(),
-            password_hash: hash_password(PASSWORD).expect("hash"),
+            password_hash: hash_password(password()).expect("hash"),
             totp_secret: SECRET.to_string(),
             totp_last_step: 0,
         }
@@ -352,26 +362,26 @@ mod tests {
 
     #[test]
     fn password_round_trip() {
-        let hash = hash_password(PASSWORD).expect("hash");
+        let hash = hash_password(password()).expect("hash");
         assert!(hash.starts_with("$argon2id$"));
-        assert!(verify_password(PASSWORD, &hash));
+        assert!(verify_password(password(), &hash));
         assert!(!verify_password("wrong password!!", &hash));
     }
 
     #[test]
     fn hashes_use_distinct_salts() {
         assert_ne!(
-            hash_password(PASSWORD).expect("a"),
-            hash_password(PASSWORD).expect("b")
+            hash_password(password()).expect("a"),
+            hash_password(password()).expect("b")
         );
     }
 
     #[test]
     fn malformed_hash_never_verifies() {
-        assert!(!verify_password(PASSWORD, ""));
-        assert!(!verify_password(PASSWORD, "not a phc string"));
+        assert!(!verify_password(password(), ""));
+        assert!(!verify_password(password(), "not a phc string"));
         assert!(!verify_password(
-            PASSWORD,
+            password(),
             "$argon2id$v=19$m=64,t=1,p=1$bad"
         ));
     }
@@ -537,7 +547,7 @@ mod tests {
     fn authenticate_happy_path_records_step() {
         let mut c = creds();
         assert_eq!(
-            authenticate(&mut c, "admin", PASSWORD, &code(NOW), NOW),
+            authenticate(&mut c, "admin", password(), &code(NOW), NOW),
             Ok(())
         );
         assert_eq!(c.totp_last_step, NOW / 30);
@@ -547,11 +557,11 @@ mod tests {
     fn every_failure_mode_gives_the_same_error() {
         let good = code(NOW);
         let attempts = [
-            ("nobody", PASSWORD, good.as_str()),
-            ("admin", "wrong password", good.as_str()),
-            ("admin", PASSWORD, "000000"),
-            ("admin", PASSWORD, ""),
-            ("nobody", "wrong password", "000000"),
+            ("nobody", password(), good.as_str()),
+            ("admin", wrong_password(), good.as_str()),
+            ("admin", password(), "000000"),
+            ("admin", password(), ""),
+            ("nobody", wrong_password(), "000000"),
         ];
         for (user, pw, otp) in attempts {
             let mut c = creds();
@@ -568,9 +578,9 @@ mod tests {
     fn authenticate_rejects_totp_replay() {
         let mut c = creds();
         let otp = code(NOW);
-        assert!(authenticate(&mut c, "admin", PASSWORD, &otp, NOW).is_ok());
+        assert!(authenticate(&mut c, "admin", password(), &otp, NOW).is_ok());
         assert_eq!(
-            authenticate(&mut c, "admin", PASSWORD, &otp, NOW),
+            authenticate(&mut c, "admin", password(), &otp, NOW),
             Err(AuthError::Invalid)
         );
     }
@@ -579,8 +589,8 @@ mod tests {
     fn wrong_password_does_not_burn_the_totp_code() {
         let mut c = creds();
         let otp = code(NOW);
-        assert!(authenticate(&mut c, "admin", "wrong password", &otp, NOW).is_err());
-        assert!(authenticate(&mut c, "admin", PASSWORD, &otp, NOW).is_ok());
+        assert!(authenticate(&mut c, "admin", wrong_password(), &otp, NOW).is_err());
+        assert!(authenticate(&mut c, "admin", password(), &otp, NOW).is_ok());
     }
 
     #[test]
