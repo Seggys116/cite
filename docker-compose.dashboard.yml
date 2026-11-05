@@ -1,0 +1,84 @@
+# Dashboard stack: the web console for Cite nodes. Open http://127.0.0.1:8088 to finish setup, or run the init subcommand for a CLI onboarding.
+
+name: cite-dashboard
+
+services:
+  init:
+    image: ghcr.io/seggys116/cite-dashboard:${CITE_VERSION:-0.2.0}
+    restart: "no"
+    user: "0:0"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - FOWNER
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        mkdir -p /config &&
+        chown 10001:10001 /config &&
+        chmod 0750 /config
+    volumes:
+      - type: volume
+        source: cite_dashboard
+        target: /config
+    network_mode: none
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  dashboard:
+    image: ghcr.io/seggys116/cite-dashboard:${CITE_VERSION:-0.2.0}
+    restart: unless-stopped
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    init: true
+    user: "10001:10001"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp:size=16m,mode=1777,noexec,nosuid,nodev
+    environment:
+      CITE_DASHBOARD_LISTEN: 0.0.0.0:8088
+      CITE_DASHBOARD_CONFIG: /config/dashboard.json
+      CITE_DASHBOARD_ALLOW: ${CITE_DASHBOARD_ALLOW:-}
+      CITE_DASHBOARD_TLS_CERT: ${CITE_DASHBOARD_TLS_CERT:-}
+      CITE_DASHBOARD_TLS_KEY: ${CITE_DASHBOARD_TLS_KEY:-}
+      CITE_DASHBOARD_COOKIE_SECURE: ${CITE_DASHBOARD_COOKIE_SECURE:-}
+      CITE_DASHBOARD_SESSION_TTL: ${CITE_DASHBOARD_SESSION_TTL:-}
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      - type: volume
+        source: cite_dashboard
+        target: /config
+    ports:
+      - target: 8088
+        published: ${CITE_DASHBOARD_PORT:-8088}
+        host_ip: ${CITE_DASHBOARD_BIND:-127.0.0.1}
+        protocol: tcp
+    mem_limit: ${CITE_DASHBOARD_MEM:-256m}
+    cpus: ${CITE_DASHBOARD_CPUS:-1.0}
+    pids_limit: ${CITE_DASHBOARD_PIDS:-128}
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "cite-dashboard", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  cite_dashboard:

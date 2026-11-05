@@ -382,7 +382,6 @@ dependencies = [
  "axum",
  "bytes",
  "cite-client",
- "cite-core",
  "cite-edge",
  "clap",
  "http",

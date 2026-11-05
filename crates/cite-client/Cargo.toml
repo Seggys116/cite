@@ -1,0 +1,26 @@
+[package]
+name = "cite-client"
+description = "Typed node client, node registry and fleet helpers shared by the Cite dashboard and desktop app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish = false
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[dependencies]
+cite-core.workspace = true
+cite-edge.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+reqwest.workspace = true
+futures-util.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+tempfile.workspace = true
