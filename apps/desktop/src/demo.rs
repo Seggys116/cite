@@ -4,9 +4,11 @@ use std::time::Instant;
 
 use cite_client::ClientError;
 use cite_client::{
-    CreatedToken, DeployRequest, NodeInfo, PresetInfo, RequestQuery, SiteDetail, TokenMeta,
+    AnalyticsStats, CreatedToken, DeployRequest, NodeInfo, PresetInfo, RequestQuery, SiteDetail,
+    TokenMeta,
 };
 use cite_edge::analytics::{Point, SizeBucket, Summary, Timeseries, TopItem, window_from_str};
+use cite_edge::bot::BotSummary;
 use cite_edge::model::{
     DeployAction, Deployment, EdgeSettings, FirewallAction, FirewallRule, HealthCheck, LogEvent,
     Maintenance, MaintenancePage, Matchers, Site, SiteKind, Slot, Source, Target, Upstream,
@@ -269,6 +271,9 @@ pub fn demo_events(seed: u64, now: i64, count: usize) -> Vec<LogEvent> {
                 r if r < 0.97 => 404,
                 _ => 502,
             };
+            let ua = ((rng.next() * AGENTS.len() as f64) as usize) % AGENTS.len();
+            let total_ms = 5 + (rng.next() * 140.0) as u32;
+            let bot = bot_fields(ua, risky, rng.next());
             LogEvent {
                 ts_ms: now - (i as i64) * 1700 - (rng.next() * 900.0) as i64,
                 client_ip: (*rng.pick(&IPS)).to_string(),
@@ -283,17 +288,364 @@ pub fn demo_events(seed: u64, now: i64, count: usize) -> Vec<LogEvent> {
                 } else {
                     300
                 },
-                total_ms: 5 + (rng.next() * 140.0) as u32,
-                user_agent: (*rng.pick(&AGENTS)).to_string(),
+                total_ms,
+                user_agent: AGENTS[ua].to_string(),
                 referer: String::new(),
                 content_type: "text/html".into(),
                 backend: format!("{site}_blue"),
                 server: "s1".into(),
                 site: site.to_string(),
                 blocked: risky.then(|| "scanner".to_string()),
+                http_version: (if bot.modern { "HTTP/2.0" } else { "HTTP/1.1" }).into(),
+                accept: bot.accept.into(),
+                accept_language: bot.lang.into(),
+                accept_encoding: bot.encoding.into(),
+                sec_fetch_site: bot.fetch[0].into(),
+                sec_fetch_mode: bot.fetch[1].into(),
+                sec_fetch_dest: bot.fetch[2].into(),
+                sec_ch_ua: bot.ch_ua.into(),
+                tls_version: (if risky { "TLSv1.2" } else { "TLSv1.3" }).into(),
+                resp_ms: total_ms.saturating_sub(2),
+                bot_score: bot.score,
+                bot_class: bot.class.into(),
+                bot_signals: bot.signals.into(),
             }
         })
         .collect()
+}
+
+const BROWSER_ACCEPT: &str =
+    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8";
+const CHROME_HINT: &str =
+    "\"Chromium\";v=\"130\", \"Google Chrome\";v=\"130\", \"Not?A_Brand\";v=\"99\"";
+
+struct BotFields {
+    modern: bool,
+    accept: &'static str,
+    lang: &'static str,
+    encoding: &'static str,
+    fetch: [&'static str; 3],
+    ch_ua: &'static str,
+    score: u8,
+    class: &'static str,
+    signals: &'static str,
+}
+
+// Header sets follow what each client really sends, so the detail view shows believable evidence.
+fn bot_fields(ua: usize, risky: bool, shade: f64) -> BotFields {
+    let bare = BotFields {
+        modern: false,
+        accept: "",
+        lang: "",
+        encoding: "",
+        fetch: ["", "", ""],
+        ch_ua: "",
+        score: 0,
+        class: "human",
+        signals: "",
+    };
+    let browser = |ch_ua: &'static str| BotFields {
+        modern: true,
+        accept: BROWSER_ACCEPT,
+        lang: "en-US,en;q=0.9",
+        encoding: "gzip, deflate, br",
+        fetch: ["same-origin", "navigate", "document"],
+        ch_ua,
+        score: 3,
+        class: "human",
+        signals: "",
+    };
+    if risky {
+        return BotFields {
+            score: 91,
+            class: "bot",
+            signals: "missing_accept,missing_accept_language,missing_accept_encoding,no_sec_fetch",
+            ..bare
+        };
+    }
+    match ua {
+        0 if shade < 0.12 => BotFields {
+            fetch: ["", "", ""],
+            score: 45,
+            class: "suspect",
+            signals: "no_sec_fetch,no_sec_ch_ua",
+            ..browser("")
+        },
+        0 => browser(CHROME_HINT),
+        1 | 2 => BotFields {
+            score: 5,
+            ..browser("")
+        },
+        3 => BotFields {
+            accept: "*/*",
+            score: 62,
+            class: "tool",
+            signals: "missing_accept_language,accept_wildcard_only,missing_accept_encoding,ua_curl",
+            ..bare
+        },
+        _ => BotFields {
+            accept: "*/*",
+            encoding: "gzip, deflate",
+            score: 35,
+            class: "crawler",
+            signals: "missing_accept_language,ua_googlebot",
+            ..bare
+        },
+    }
+}
+
+// Class, signal and agent mixes are fixed shares of the window total so they add up with the other cards.
+pub fn demo_bot_summary(seed: u64, scale: f64, window: &str, now: i64) -> BotSummary {
+    let total: u64 = demo_series(seed, scale, window, now)
+        .points
+        .iter()
+        .map(|p| p.requests)
+        .sum();
+    let classes = top(
+        &[
+            ("human", 74),
+            ("suspect", 8),
+            ("crawler", 7),
+            ("tool", 6),
+            ("bot", 5),
+        ],
+        total,
+        0,
+    );
+    let bot_requests: u64 = classes
+        .iter()
+        .filter(|c| c.key != "human")
+        .map(|c| c.count)
+        .sum();
+    BotSummary {
+        total_requests: total,
+        bot_requests,
+        bot_share_pct: if total == 0 {
+            0.0
+        } else {
+            bot_requests as f64 * 100.0 / total as f64
+        },
+        classes,
+        signals: top(
+            &[
+                ("missing_accept_language", 40),
+                ("no_sec_fetch", 31),
+                ("accept_wildcard_only", 24),
+                ("ua_curl", 18),
+                ("missing_accept_encoding", 15),
+                ("ua_googlebot", 12),
+                ("no_sec_ch_ua", 9),
+                ("http1_modern_browser", 4),
+            ],
+            bot_requests,
+            0,
+        ),
+        agents: top(
+            &[
+                ("curl/8.4.0", 30),
+                ("Googlebot/2.1 (+http://www.google.com/bot.html)", 24),
+                ("python-requests/2.31.0", 18),
+                ("Mozilla/5.0 (compatible; bingbot/2.0)", 12),
+                ("Go-http-client/2.0", 9),
+                ("HeadlessChrome/130.0.0.0", 7),
+            ],
+            bot_requests,
+            0,
+        ),
+        score_buckets: top(
+            &[
+                ("0-19", 72),
+                ("20-39", 8),
+                ("40-59", 8),
+                ("60-79", 7),
+                ("80-100", 5),
+            ],
+            total,
+            0,
+        ),
+    }
+}
+
+// Each kind returns the same keys the node would, including the fixed lists the summary lacks.
+pub fn demo_top(kind: &str, seed: u64, scale: f64, window: &str, now: i64) -> Vec<TopItem> {
+    let summary = demo_summary(seed, scale, window, now);
+    let from_map = |map: &BTreeMap<String, u64>| {
+        let mut items: Vec<TopItem> = map
+            .iter()
+            .map(|(key, count)| TopItem {
+                key: key.clone(),
+                count: *count,
+                bytes: 0,
+            })
+            .collect();
+        items.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.key.cmp(&b.key)));
+        items
+    };
+    match kind {
+        "paths" => summary.top_paths,
+        "hosts" => summary.top_hosts,
+        "agents" => summary.top_user_agents,
+        "ips" => summary.top_ips,
+        "statuses" => from_map(&summary.status),
+        "content_types" => from_map(&summary.content_types),
+        "referers" => top(
+            &[
+                ("-", 52),
+                ("https://www.google.com/", 21),
+                ("https://news.example.org/", 9),
+                ("https://shop.example.com/products", 8),
+                ("https://duckduckgo.com/", 6),
+            ],
+            summary.requests,
+            0,
+        ),
+        "languages" => top(
+            &[
+                ("en-US", 46),
+                ("en-GB", 14),
+                ("de-DE", 12),
+                ("fr-FR", 8),
+                ("es-ES", 5),
+                ("-", 15),
+            ],
+            summary.requests,
+            0,
+        ),
+        _ => Vec::new(),
+    }
+}
+
+fn csv_cell(value: &Value) -> String {
+    let text = match value {
+        Value::String(s) => s.clone(),
+        Value::Null => String::new(),
+        other => other.to_string(),
+    };
+    if text.contains([',', '"', '\n']) {
+        format!("\"{}\"", text.replace('"', "\"\""))
+    } else {
+        text
+    }
+}
+
+fn render_rows(ndjson: bool, header: &[&str], rows: Vec<Vec<Value>>) -> String {
+    let mut out = String::new();
+    if !ndjson {
+        out.push_str(&header.join(","));
+        out.push('\n');
+    }
+    for row in rows {
+        if ndjson {
+            let obj: Map<String, Value> =
+                header.iter().map(|h| (*h).to_string()).zip(row).collect();
+            out.push_str(&Value::Object(obj).to_string());
+        } else {
+            let cells: Vec<String> = row.iter().map(csv_cell).collect();
+            out.push_str(&cells.join(","));
+        }
+        out.push('\n');
+    }
+    out
+}
+
+// Builds a small file for the validated query pairs so the demo export flow ends in a real file.
+pub fn demo_export_body(pairs: &[(&'static str, String)], seed: u64, scale: f64) -> String {
+    let get = |name: &str| {
+        pairs
+            .iter()
+            .find(|(k, _)| *k == name)
+            .map(|(_, v)| v.as_str())
+    };
+    let ndjson = get("format") == Some("ndjson");
+    let now = now_ms();
+    match get("kind") {
+        Some("hourly") => {
+            let rows = demo_series(seed, scale, "7d", now)
+                .points
+                .iter()
+                .map(|p| {
+                    vec![
+                        json!(p.ts),
+                        json!(p.requests),
+                        json!(p.bytes_out),
+                        json!(p.errors),
+                    ]
+                })
+                .collect();
+            render_rows(
+                ndjson,
+                &["hour_ts", "requests", "bytes_out", "errors"],
+                rows,
+            )
+        }
+        Some("bots") => {
+            let s = demo_bot_summary(seed, scale, "24h", now);
+            let rows = s
+                .classes
+                .iter()
+                .map(|c| vec![json!(c.key), json!(c.count)])
+                .collect();
+            render_rows(ndjson, &["class", "requests"], rows)
+        }
+        Some("top") => {
+            let kind = get("top").unwrap_or("paths");
+            let rows = demo_top(kind, seed, scale, "24h", now)
+                .iter()
+                .map(|t| vec![json!(t.key), json!(t.count), json!(t.bytes)])
+                .collect();
+            render_rows(ndjson, &["key", "requests", "bytes"], rows)
+        }
+        _ => {
+            let limit = get("limit").and_then(|l| l.parse().ok()).unwrap_or(200);
+            let rows = demo_events(seed, now, 200)
+                .into_iter()
+                .take(limit)
+                .map(|e| {
+                    vec![
+                        json!(e.ts_ms),
+                        json!(e.client_ip),
+                        json!(e.host),
+                        json!(e.method),
+                        json!(e.path),
+                        json!(e.status),
+                        json!(e.total_ms),
+                        json!(e.bot_class),
+                        json!(e.bot_score),
+                        json!(e.bot_signals),
+                    ]
+                })
+                .collect();
+            let header = [
+                "ts_ms",
+                "client_ip",
+                "host",
+                "method",
+                "path",
+                "status",
+                "total_ms",
+                "bot_class",
+                "bot_score",
+                "bot_signals",
+            ];
+            render_rows(ndjson, &header, rows)
+        }
+    }
+}
+
+// The name a node would suggest, so the demo exercises the rename step as well.
+pub fn demo_export_name(pairs: &[(&'static str, String)]) -> String {
+    let get = |name: &str| {
+        pairs
+            .iter()
+            .find(|(k, _)| *k == name)
+            .map(|(_, v)| v.as_str())
+    };
+    let what = match (get("kind"), get("top")) {
+        (Some("top"), Some(top)) => format!("top-{top}"),
+        (Some(kind), _) => kind.to_string(),
+        _ => "requests".to_string(),
+    };
+    format!("cite-{what}.{}", get("format").unwrap_or("csv"))
 }
 
 fn page_html(title: &str, text: &str) -> String {
@@ -803,6 +1155,41 @@ impl DemoNode {
         Ok(events)
     }
 
+    pub fn bots(&self, window: &str) -> Res<BotSummary> {
+        Ok(demo_bot_summary(
+            self.seed(),
+            self.scale(),
+            window,
+            now_ms(),
+        ))
+    }
+
+    pub fn top(&self, kind: &str, window: &str, limit: Option<usize>) -> Res<Vec<TopItem>> {
+        let mut items = demo_top(kind, self.seed(), self.scale(), window, now_ms());
+        items.truncate(limit.unwrap_or(items.len()));
+        Ok(items)
+    }
+
+    // The second node plays an older release so the missing-endpoint path is visible in screenshots.
+    pub fn stats(&self) -> Res<AnalyticsStats> {
+        if self.index != 0 {
+            return Err(status_err(404, "not found"));
+        }
+        let now = now_ms();
+        Ok(AnalyticsStats {
+            rows: 1_284_906,
+            db_bytes: 436_207_616,
+            oldest_ts_ms: Some(now - 29 * 24 * HOUR_MS),
+            newest_ts_ms: Some(now),
+            write_batches: 48_211,
+            write_errors: 0,
+        })
+    }
+
+    pub fn export_body(&self, pairs: &[(&'static str, String)]) -> String {
+        demo_export_body(pairs, self.seed(), self.scale())
+    }
+
     pub fn get_settings(&self) -> Res<EdgeSettings> {
         Ok(self.st().settings.clone())
     }
@@ -939,6 +1326,84 @@ mod tests {
         let a = demo_events(5, 9_000_000, 20);
         assert_eq!(a, demo_events(5, 9_000_000, 20));
         assert!(a.windows(2).all(|w| w[0].ts_ms >= w[1].ts_ms));
+    }
+
+    #[test]
+    fn events_carry_bot_verdicts_and_headers() {
+        let events = demo_events(5, 9_000_000, 120);
+        let class = |c: &str| events.iter().filter(|e| e.bot_class == c).count();
+        assert!(events.iter().all(|e| !e.bot_class.is_empty()));
+        for c in ["human", "tool", "crawler", "bot"] {
+            assert!(class(c) > 0, "{c}");
+        }
+        let human = events
+            .iter()
+            .find(|e| e.bot_class == "human")
+            .expect("human");
+        assert!(human.bot_score < 20 && !human.accept_language.is_empty());
+        let tool = events.iter().find(|e| e.bot_class == "tool").expect("tool");
+        assert!(tool.bot_signals.contains("ua_curl") && tool.accept_language.is_empty());
+    }
+
+    #[test]
+    fn bot_summary_adds_up() {
+        let s = demo_bot_summary(1, 1.0, "24h", 1_700_000_000_000);
+        assert!(s.total_requests > 0 && s.bot_requests < s.total_requests);
+        let classes: u64 = s.classes.iter().map(|c| c.count).sum();
+        assert!(classes <= s.total_requests);
+        assert!(
+            (s.bot_share_pct - s.bot_requests as f64 * 100.0 / s.total_requests as f64).abs()
+                < 1e-9
+        );
+        assert_eq!(s.score_buckets.len(), 5);
+        assert!(!s.signals.is_empty() && !s.agents.is_empty());
+    }
+
+    #[test]
+    fn every_top_kind_has_demo_rows() {
+        for kind in cite_client::TOP_KINDS {
+            let rows = demo_top(kind, 1, 1.0, "24h", 1_700_000_000_000);
+            assert!(!rows.is_empty(), "{kind}");
+        }
+    }
+
+    #[test]
+    fn older_demo_node_has_no_storage_stats() {
+        let nodes = demo_nodes();
+        assert!(nodes[0].1.stats().expect("stats").rows > 0);
+        let err = nodes[1].1.stats().expect_err("old node");
+        assert_eq!(err.status_code(), Some(404));
+    }
+
+    #[test]
+    fn export_bodies_follow_the_requested_format() {
+        let csv = demo_export_body(
+            &[("kind", "requests".into()), ("limit", "3".into())],
+            1,
+            1.0,
+        );
+        let lines: Vec<&str> = csv.lines().collect();
+        assert_eq!(lines.len(), 4);
+        assert!(lines[0].starts_with("ts_ms,client_ip"));
+        let nd = demo_export_body(
+            &[
+                ("kind", "top".into()),
+                ("top", "paths".into()),
+                ("format", "ndjson".into()),
+            ],
+            1,
+            1.0,
+        );
+        let first: Value = serde_json::from_str(nd.lines().next().expect("line")).expect("json");
+        assert!(first["key"].is_string() && first["requests"].is_u64());
+        assert_eq!(
+            demo_export_name(&[
+                ("kind", "top".into()),
+                ("top", "agents".into()),
+                ("format", "ndjson".into())
+            ]),
+            "cite-top-agents.ndjson"
+        );
     }
 
     #[test]

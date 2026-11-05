@@ -1,4 +1,5 @@
 // Each view lives in its own module and extends Console with loaders and a render method.
+pub mod bots;
 pub mod chart;
 pub mod create;
 pub mod detail;

@@ -3,16 +3,17 @@ use cite_edge::model::LogEvent;
 use gpui::{AnyElement, Context, div, prelude::*, px};
 
 use crate::api::join_all;
-use crate::app::{Console, Load};
+use crate::app::{Console, Load, View};
 use crate::model::{
     WINDOWS, fmt_bytes, fmt_clock, fmt_int, fmt_ms, fmt_num, fmt_pct, merge_series,
     merge_summaries, per_bucket_sizes,
 };
 use crate::theme::{ACCENT, BLUE, DIM, GREEN, Tone, YELLOW, c};
+use crate::ui::bots::{bot_badge, request_detail};
 use crate::ui::chart::{Line, hbar, line_chart};
 use crate::ui::widgets::{
-    Col, card, clip, dot, empty_state, id, mono, page_header, pill, seg_item, seg_row, skeleton,
-    stat, table, text_dim, tone_for_status,
+    BtnKind, Col, btn, card, clip, dot, empty_state, id, mono, page_header, pill, seg_item,
+    seg_row, skeleton, stat, table, text_dim, tone_for_status,
 };
 
 const RECENT_LIMIT: usize = 30;
@@ -26,6 +27,8 @@ pub struct Data {
 pub struct State {
     pub window: usize,
     pub data: Load<Data>,
+    pub inspect: Option<LogEvent>,
+    pub auto_inspect: bool,
 }
 
 impl Default for State {
@@ -33,6 +36,8 @@ impl Default for State {
         Self {
             window: 1,
             data: Load::Idle,
+            inspect: None,
+            auto_inspect: false,
         }
     }
 }
@@ -79,6 +84,16 @@ impl Console {
         };
         self.fetch(cx, fut, |this, res, cx| {
             this.traffic.data = Load::from_result(res);
+            // Screenshot mode opens the detail card on the first request that raised signals.
+            if std::mem::take(&mut this.traffic.auto_inspect)
+                && let Load::Ready(data) = &this.traffic.data
+            {
+                this.traffic.inspect = data
+                    .recent
+                    .iter()
+                    .find(|e| !e.bot_signals.is_empty())
+                    .cloned();
+            }
             cx.notify();
         });
     }
@@ -116,29 +131,62 @@ impl Console {
         });
     }
 
-    pub fn render_traffic(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    // Shared by the four traffic tabs: the window picker reloads whichever tab is open.
+    pub fn traffic_header(
+        &self,
+        cx: &mut Context<Self>,
+        active: &View,
+        subtitle: &str,
+    ) -> AnyElement {
         let mut items = Vec::new();
         for (i, w) in WINDOWS.iter().enumerate() {
             items.push(
                 seg_item(id("window", w), w, i == self.traffic.window)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.traffic.window = i;
-                        this.load_traffic(cx);
+                        this.load_current(cx);
                         cx.notify();
                     }))
                     .into_any_element(),
             );
         }
+        let mut tabs = Vec::new();
+        for (label, view) in [
+            ("Requests", View::Traffic),
+            ("Bots", View::Bots),
+            ("Explore", View::Explore),
+            ("Export", View::Export),
+        ] {
+            let selected = *active == view;
+            tabs.push(
+                seg_item(id("traffic-tab", label), label, selected)
+                    .on_click(cx.listener(move |this, _, _, cx| this.navigate(view.clone(), cx)))
+                    .into_any_element(),
+            );
+        }
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(12.))
+            .child(page_header(
+                "Traffic",
+                subtitle,
+                vec![seg_row(items).into_any_element()],
+            ))
+            .child(div().flex().child(seg_row(tabs)))
+            .into_any_element()
+    }
+
+    pub fn render_traffic(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let subtitle = match &self.selected {
             Some(n) => format!("Requests handled by {n}"),
             None => "Requests handled by every node".to_string(),
         };
-        let header = page_header(
-            "Traffic",
-            &subtitle,
-            vec![seg_row(items).into_any_element()],
-        );
-        let mut col = div().flex().flex_col().gap(px(16.)).child(header);
+        let mut col = div()
+            .flex()
+            .flex_col()
+            .gap(px(16.))
+            .child(self.traffic_header(cx, &View::Traffic, &subtitle));
         if self.handles.is_empty() {
             return col.child(self.no_nodes_block(cx)).into_any_element();
         }
@@ -153,14 +201,21 @@ impl Console {
                 let msg = msg.clone();
                 col = col.child(self.error_block(cx, &msg));
             }
-            Load::Ready(data) => col = col.child(traffic_body(data, WINDOWS[self.traffic.window])),
+            Load::Ready(data) => {
+                col = col.child(traffic_body(
+                    data,
+                    WINDOWS[self.traffic.window],
+                    self.traffic.inspect.as_ref(),
+                    cx,
+                ))
+            }
         }
         col.into_any_element()
     }
 }
 
 // Top lists show six rows to keep the cards level.
-fn top_table(items: &[TopItem], with_bytes: bool) -> AnyElement {
+pub fn top_table(items: &[TopItem], with_bytes: bool) -> AnyElement {
     let rows: Vec<Vec<AnyElement>> = items
         .iter()
         .take(6)
@@ -195,7 +250,12 @@ fn top_table(items: &[TopItem], with_bytes: bool) -> AnyElement {
 }
 
 // Error and blocked lines share the request scale so their size reads honestly.
-fn traffic_body(data: &Data, window: &str) -> AnyElement {
+fn traffic_body(
+    data: &Data,
+    window: &str,
+    inspect: Option<&LogEvent>,
+    cx: &mut Context<Console>,
+) -> AnyElement {
     let sm = &data.summary;
     let errors = sm.errors_4xx + sm.errors_5xx;
     let stats = div()
@@ -357,16 +417,24 @@ fn traffic_body(data: &Data, window: &str) -> AnyElement {
             None,
             top_table(&sm.top_user_agents, false),
         )));
-    div()
+    let mut page = div()
         .flex()
         .flex_col()
         .gap(px(16.))
         .child(stats)
         .child(series_card)
         .child(row_a)
-        .child(row_b)
-        .child(recent_card(&data.recent))
-        .into_any_element()
+        .child(row_b);
+    if let Some(event) = inspect {
+        let close = btn(id("inspect", "close"), "Close", BtnKind::Plain).on_click(cx.listener(
+            |this, _, _, cx| {
+                this.traffic.inspect = None;
+                cx.notify();
+            },
+        ));
+        page = page.child(request_detail(event, close.into_any_element()));
+    }
+    page.child(recent_card(&data.recent, cx)).into_any_element()
 }
 
 fn legend_item(label: &str, color: u32) -> AnyElement {
@@ -380,10 +448,12 @@ fn legend_item(label: &str, color: u32) -> AnyElement {
 }
 
 // Rows are newest first and trimmed to the most recent thirty.
-fn recent_card(events: &[LogEvent]) -> AnyElement {
+fn recent_card(events: &[LogEvent], cx: &mut Context<Console>) -> AnyElement {
     let rows: Vec<Vec<AnyElement>> = events
         .iter()
-        .map(|e| {
+        .enumerate()
+        .map(|(i, e)| {
+            let picked = e.clone();
             vec![
                 mono(fmt_clock(e.ts_ms))
                     .text_color(c(DIM))
@@ -402,22 +472,38 @@ fn recent_card(events: &[LogEvent]) -> AnyElement {
                     .text_color(c(DIM))
                     .into_any_element(),
                 mono(format!("{} ms", e.total_ms)).into_any_element(),
+                bot_badge(e),
                 match &e.blocked {
                     Some(_) => pill("blocked", Tone::Bad).into_any_element(),
                     None => div().into_any_element(),
                 },
+                div()
+                    .id(id("inspect", i))
+                    .cursor_pointer()
+                    .text_size(px(12.))
+                    .text_color(c(BLUE))
+                    .hover(|s| s.opacity(0.7))
+                    .child("Details")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let same = this.traffic.inspect.as_ref() == Some(&picked);
+                        this.traffic.inspect = (!same).then(|| picked.clone());
+                        cx.notify();
+                    }))
+                    .into_any_element(),
             ]
         })
         .collect();
     let cols = [
-        Col::fixed("Time", 80.),
-        Col::fixed("Status", 70.),
-        Col::fixed("Method", 70.),
+        Col::fixed("Time", 76.),
+        Col::fixed("Status", 64.),
+        Col::fixed("Method", 60.),
         Col::flex("Path"),
-        Col::fixed("Host", 150.),
-        Col::fixed("Client", 130.),
-        Col::fixed("Time", 80.),
-        Col::fixed("", 80.),
+        Col::fixed("Host", 120.),
+        Col::fixed("Client", 120.),
+        Col::fixed("Took", 72.),
+        Col::fixed("Bot", 130.),
+        Col::fixed("", 70.),
+        Col::fixed("", 60.),
     ];
     let live = div()
         .flex()

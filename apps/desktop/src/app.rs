@@ -19,7 +19,9 @@ use crate::theme::{
 };
 use crate::ui::input::TextInput;
 use crate::ui::widgets::{BtnKind, btn, id, strong, text_dim};
-use crate::ui::{create, detail, firewall, maintenance, nodes, overview, settings, sites, traffic};
+use crate::ui::{
+    bots, create, detail, firewall, maintenance, nodes, overview, settings, sites, traffic,
+};
 
 const TICK: Duration = Duration::from_millis(500);
 const LOGO_FLIP_TICKS: u64 = 5;
@@ -34,6 +36,9 @@ pub enum View {
     SiteDetail { node: String, id: String },
     SiteNew,
     Traffic,
+    Bots,
+    Explore,
+    Export,
     Firewall,
     Maintenance,
     Settings,
@@ -51,6 +56,9 @@ impl View {
             },
             "site-new" => View::SiteNew,
             "traffic" => View::Traffic,
+            "bots" => View::Bots,
+            "explore" => View::Explore,
+            "export" => View::Export,
             "firewall" => View::Firewall,
             "maintenance" => View::Maintenance,
             "settings" => View::Settings,
@@ -63,7 +71,7 @@ impl View {
             View::Overview => "Overview",
             View::Nodes => "Nodes",
             View::Sites | View::SiteDetail { .. } | View::SiteNew => "Sites",
-            View::Traffic => "Traffic",
+            View::Traffic | View::Bots | View::Explore | View::Export => "Traffic",
             View::Firewall => "Firewall",
             View::Maintenance => "Maintenance",
             View::Settings => "Settings",
@@ -135,6 +143,7 @@ pub struct Options {
     pub demo: bool,
     pub view: Option<View>,
     pub select: Option<String>,
+    pub inspect: bool,
 }
 
 pub struct Console {
@@ -156,6 +165,7 @@ pub struct Console {
     pub detail: detail::State,
     pub create: create::State,
     pub traffic: traffic::State,
+    pub bots: bots::State,
     pub firewall: firewall::State,
     pub maintenance: maintenance::State,
     pub settings: settings::State,
@@ -193,7 +203,11 @@ impl Console {
             sites: sites::State::new(cx),
             detail: detail::State::new(cx),
             create: create::State::new(cx),
-            traffic: traffic::State::default(),
+            traffic: traffic::State {
+                auto_inspect: opts.inspect,
+                ..traffic::State::default()
+            },
+            bots: bots::State::new(cx),
             firewall: firewall::State::new(cx),
             maintenance: maintenance::State::new(cx),
             settings: settings::State::new(cx),
@@ -328,6 +342,9 @@ impl Console {
             View::SiteDetail { node, id } => self.load_detail(node, id, cx),
             View::SiteNew => self.reset_create(cx),
             View::Traffic => self.load_traffic(cx),
+            View::Bots => self.load_bots(cx),
+            View::Explore => self.load_explore(cx),
+            View::Export => {}
             View::Firewall => self.load_firewall(cx),
             View::Maintenance => self.load_maintenance(cx),
             View::Settings => self.load_settings(cx),
@@ -348,6 +365,12 @@ impl Console {
         }
         if self.view == View::Traffic && self.tick.is_multiple_of(REFRESH_TICKS) {
             self.refresh_recent(cx);
+        }
+        // The export panel counts elapsed seconds, so it repaints while a download runs.
+        if self.view == View::Export
+            && matches!(self.bots.export.run, bots::ExportRun::Running { .. })
+        {
+            dirty = true;
         }
         if dirty {
             cx.notify();
@@ -606,6 +629,9 @@ impl Render for Console {
             View::SiteDetail { .. } => self.render_detail(cx),
             View::SiteNew => self.render_create(cx),
             View::Traffic => self.render_traffic(cx),
+            View::Bots => self.render_bots(cx),
+            View::Explore => self.render_explore(cx),
+            View::Export => self.render_export(cx),
             View::Firewall => self.render_firewall(cx),
             View::Maintenance => self.render_maintenance(cx),
             View::Settings => self.render_settings(cx),

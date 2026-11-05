@@ -224,7 +224,7 @@ pub fn read_info(info: &NodeInfo) -> InfoView {
     }
 }
 
-fn merge_top(lists: Vec<&Vec<TopItem>>, keep: usize) -> Vec<TopItem> {
+pub fn merge_top(lists: Vec<&Vec<TopItem>>, keep: usize) -> Vec<TopItem> {
     let mut by_key: BTreeMap<String, (u64, u64)> = BTreeMap::new();
     for item in lists.into_iter().flatten() {
         let slot = by_key.entry(item.key.clone()).or_default();

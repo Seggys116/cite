@@ -72,7 +72,11 @@ pub fn btn(key: ElementId, label: &str, kind: BtnKind) -> Stateful<Div> {
 }
 
 pub fn pill(text: &str, tone: Tone) -> Div {
-    let color = tone.color();
+    pill_color(text, tone.color())
+}
+
+// Same shape as pill for palette colours that have no Tone, such as the bot classes.
+pub fn pill_color(text: &str, color: u32) -> Div {
     div()
         .flex()
         .items_center()

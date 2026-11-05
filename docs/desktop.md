@@ -39,9 +39,15 @@ cite-desktop [--demo] [--view <name>] [--node <name>]
 | Flag | Effect |
 |---|---|
 | `--demo` | Runs against built-in sample data instead of real nodes, for trying the app. |
-| `--view <name>` | Opens on a view: `overview`, `nodes`, `sites`, `site-detail`, `site-new`, `traffic`, `firewall`, `maintenance` or `settings`. The default is `overview`. |
+| `--view <name>` | Opens on a view: `overview`, `nodes`, `sites`, `site-detail`, `site-new`, `traffic`, `request-detail`, `bots`, `explore`, `export`, `firewall`, `maintenance` or `settings`. The default is `overview`. |
 | `--node <name>` | Selects a node on start. |
 | `-h`, `--help` | Prints the usage and exits. |
+
+## Bot analytics and export
+
+Traffic has four tabs that share the window picker. Requests lists recent requests with a bot class badge and score, and Details opens the captured headers and the signals behind the verdict. Bots shows the bot share, the split by class (human, suspect, crawler, tool, bot), the score distribution, the top signals and the top bot agents. Detection reads the headers first and then the user agent, and the score is a heuristic, not proof. Explore has a top-value explorer for any field and a Storage card with the analytics database size and the oldest and newest record on each node. A node that predates these endpoints shows as "needs an update" instead of failing the page.
+
+Export streams a file from the node (requests, hourly rollups, the bot summary or a top list) as CSV or NDJSON, for the current window or a custom UTC range, with optional site, status, bot class, score, host, path, client IP, method and row limit filters. The app has no native save dialog, so the file goes to the `Downloads` folder under your home directory, named by the node, and an existing file is never replaced: a number is added to the name instead. With "All nodes" selected the export comes from the first node, as on the other single-node screens.
 
 ## Adding a node
 

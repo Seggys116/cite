@@ -1,11 +1,14 @@
 use std::future::Future;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use cite_client::{
-    ClientError, CreatedToken, DeployRequest, NodeClient, NodeConfig, NodeInfo, PresetInfo,
-    RequestQuery, SiteDetail, TokenMeta,
+    AnalyticsStats, ClientError, CreatedToken, DeployRequest, ExportQuery, ExportReport,
+    NodeClient, NodeConfig, NodeInfo, PresetInfo, RequestQuery, SiteDetail, TokenMeta,
 };
-use cite_edge::analytics::{Summary, Timeseries};
+use cite_edge::analytics::{Summary, Timeseries, TopItem};
+use cite_edge::bot::BotSummary;
 use cite_edge::model::{
     Deployment, EdgeSettings, FirewallRule, LogEvent, MaintenancePage, Site, Slot,
 };
@@ -226,6 +229,55 @@ impl NodeHandle {
         }
     }
 
+    pub async fn bots(&self, window: &str) -> Res<BotSummary> {
+        match self {
+            Self::Live(c) => c.analytics_bots(window, None).await,
+            Self::Demo(_, d) => d.bots(window),
+        }
+    }
+
+    pub async fn top(&self, kind: &str, window: &str, limit: usize) -> Res<Vec<TopItem>> {
+        match self {
+            Self::Live(c) => c.analytics_top(kind, window, None, Some(limit)).await,
+            Self::Demo(_, d) => d.top(kind, window, Some(limit)),
+        }
+    }
+
+    pub async fn stats(&self) -> Res<AnalyticsStats> {
+        match self {
+            Self::Live(c) => c.analytics_stats().await,
+            Self::Demo(_, d) => d.stats(),
+        }
+    }
+
+    // Demo nodes write a generated file with the same no-overwrite rule the live download follows.
+    pub async fn export_to(
+        &self,
+        query: &ExportQuery,
+        dest: &Path,
+        max_bytes: u64,
+    ) -> Res<ExportReport> {
+        match self {
+            Self::Live(c) => c.analytics_export_to(query, dest, max_bytes).await,
+            Self::Demo(_, d) => {
+                let pairs = query.pairs()?;
+                let body = d.export_body(&pairs);
+                let written = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(dest)
+                    .and_then(|mut f| f.write_all(body.as_bytes()));
+                written.map_err(|e| ClientError::Config(format!("cannot write export: {e}")))?;
+                Ok(ExportReport {
+                    path: dest.to_path_buf(),
+                    bytes: body.len() as u64,
+                    content_type: None,
+                    suggested_name: Some(crate::demo::demo_export_name(&pairs)),
+                })
+            }
+        }
+    }
+
     pub async fn get_settings(&self) -> Res<EdgeSettings> {
         match self {
             Self::Live(c) => c.get_settings().await,
@@ -260,6 +312,30 @@ impl NodeHandle {
             Self::Demo(_, d) => d.delete_token(id),
         }
     }
+}
+
+// Downloads under a free local name, then takes the node's suggested name when that one is free too.
+pub async fn run_export(
+    handle: NodeHandle,
+    query: ExportQuery,
+    dir: PathBuf,
+    fallback: String,
+) -> Res<ExportReport> {
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| ClientError::Config(format!("cannot create {}: {e}", dir.display())))?;
+    let dest = crate::bots::unique_path(&dir, &fallback);
+    let mut report = handle
+        .export_to(&query, &dest, cite_client::DEFAULT_EXPORT_MAX_BYTES)
+        .await?;
+    if let Some(name) = report.suggested_name.clone()
+        && report.path.file_name().is_none_or(|n| n != name.as_str())
+    {
+        let target = crate::bots::unique_path(&dir, &name);
+        if std::fs::rename(&report.path, &target).is_ok() {
+            report.path = target;
+        }
+    }
+    Ok(report)
 }
 
 #[derive(Clone)]

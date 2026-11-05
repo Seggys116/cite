@@ -10,6 +10,8 @@ pub const ACCENT: u32 = 0xce422b;
 pub const YELLOW: u32 = 0xffd23f;
 pub const BLUE: u32 = 0x3b82f6;
 pub const GREEN: u32 = 0x22c55e;
+pub const TOOL: u32 = 0xa371f7;
+pub const RED: u32 = 0xf85149;
 
 #[cfg(target_os = "macos")]
 pub const MONO: &str = "Menlo";
