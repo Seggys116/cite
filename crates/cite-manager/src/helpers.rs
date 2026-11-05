@@ -236,8 +236,25 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "macOS applies the process limit user-wide"
+    )]
     fn build_limits_and_ptrace_probe_do_not_panic() {
-        apply_build_limits();
-        probe_ptrace_pid1();
+        if std::env::var_os("CITE_LIMITS_CHILD").is_some() {
+            apply_build_limits();
+            probe_ptrace_pid1();
+            return;
+        }
+        // The limits are irreversible, so a child keeps them off the shared test process.
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "helpers::tests::build_limits_and_ptrace_probe_do_not_panic",
+            ])
+            .env("CITE_LIMITS_CHILD", "1")
+            .status()
+            .unwrap();
+        assert!(status.success());
     }
 }

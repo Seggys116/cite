@@ -1663,6 +1663,11 @@ pub fn release_manifest(built: &BuiltRelease, slot: Slot, branch: &str) -> Relea
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::await_holding_lock)]
+
+    // Guards the process-wide abort and pid statics shared by the shell-running tests.
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     use super::{
         BuildJob, BuiltRelease, cache_env, give_tree, load_build_env, make_redactor, prune_cache,
         prune_command, release_manifest, resolve_site, run_build_helper, wipe_work,
@@ -1930,6 +1935,7 @@ mod tests {
 
     #[test]
     fn abort_stops_a_running_build_command() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         use std::sync::atomic::Ordering;
         let dir = tempfile::tempdir().unwrap();
         let mut env = HashMap::new();
@@ -1957,6 +1963,7 @@ mod tests {
 
     #[test]
     fn a_shutdown_requested_before_a_phase_starts_is_not_cleared() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         use std::sync::atomic::Ordering;
         super::BUILD_ABORT.store(true, Ordering::SeqCst);
         let dir = tempfile::tempdir().unwrap();
@@ -1968,6 +1975,7 @@ mod tests {
 
     #[tokio::test]
     async fn source_is_extracted_under_the_job_directory() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let tree = tmp.path().join("tree");
         let prefix = tree.join("repo");
@@ -2151,6 +2159,7 @@ mod tests {
 
     #[test]
     fn build_helper_runs_commands_and_a_failure_is_an_error() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("src");
         std::fs::create_dir_all(&src).unwrap();
@@ -2290,6 +2299,7 @@ mod tests {
 
     #[test]
     fn log_lines_are_capped_and_a_bad_byte_does_not_stop_the_drain() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let mut data = vec![b'a'; 100];
         data.push(b'\n');
         data.extend_from_slice(&[0xff, 0xfe, b'x', b'\n']);
@@ -2304,6 +2314,7 @@ mod tests {
 
     #[tokio::test]
     async fn build_failures_are_classified_as_transient_or_permanent() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let prefix = tmp.path().join("tree/repo");
         std::fs::create_dir_all(&prefix).unwrap();
