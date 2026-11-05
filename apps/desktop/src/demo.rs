@@ -162,6 +162,23 @@ fn top(items: &[(&str, u64)], total: u64, bytes_per: u64) -> Vec<TopItem> {
         .collect()
 }
 
+// Like the API, each bucket counts every response up to its bound and the open-ended bucket holds the total.
+pub fn cumulative_sizes(total: u64) -> Vec<SizeBucket> {
+    let mut running = 0;
+    [
+        (Some(1024), 38),
+        (Some(10_240), 41),
+        (Some(102_400), 16),
+        (None, 5),
+    ]
+    .into_iter()
+    .map(|(le, share)| {
+        running += total * share / 100;
+        SizeBucket { le, count: running }
+    })
+    .collect()
+}
+
 // Totals derive from the series so the cards and the chart always agree.
 pub fn demo_summary(seed: u64, scale: f64, window: &str, now: i64) -> Summary {
     let series = demo_series(seed, scale, window, now);
@@ -199,18 +216,7 @@ pub fn demo_summary(seed: u64, scale: f64, window: &str, now: i64) -> Summary {
     content_types.insert("application/json".to_string(), total * 35 / 100);
     content_types.insert("application/javascript".to_string(), total * 12 / 100);
     content_types.insert("image/png".to_string(), total * 8 / 100);
-    let sizes = [
-        (Some(1024), 38),
-        (Some(10_240), 41),
-        (Some(102_400), 16),
-        (None, 5),
-    ]
-    .into_iter()
-    .map(|(le, share)| SizeBucket {
-        le,
-        count: total * share / 100,
-    })
-    .collect();
+    let sizes = cumulative_sizes(total);
     Summary {
         requests: total,
         bytes_in: total * 900,

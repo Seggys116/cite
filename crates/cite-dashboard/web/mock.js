@@ -269,13 +269,22 @@ function summary(node, win, siteId) {
     status: { '2xx': requests - errors - redirects - blocked, '3xx': redirects, '4xx': errors - e5 + blocked, '5xx': e5 },
     methods: { GET: Math.round(requests * 0.86), POST: Math.round(requests * 0.1), HEAD: Math.round(requests * 0.02), PUT: Math.round(requests * 0.01), DELETE: Math.round(requests * 0.007), OPTIONS: Math.round(requests * 0.003) },
     content_types: { 'text/html': Math.round(requests * 0.34), 'application/json': Math.round(requests * 0.31), 'application/javascript': Math.round(requests * 0.09), 'image/webp': Math.round(requests * 0.14), 'text/css': Math.round(requests * 0.07), 'image/png': Math.round(requests * 0.03), 'font/woff2': Math.round(requests * 0.02) },
-    sizes: [1024, 4096, 16384, 65536, 262144, 1048576, null].map((le, i) => ({ le, count: Math.round(requests * [0.14, 0.22, 0.24, 0.2, 0.12, 0.06, 0.02][i]) })),
+    sizes: cumulativeSizes(requests),
     top_paths: top(withBytes(share(requests, pathPool, 0.8), 21000)),
     top_ips: share(requests, IPS.map((ip, i) => [ip, 30 - i * 3]), 0.7),
     top_user_agents: share(requests, AGENTS.map((ua, i) => [ua, 40 - i * 6]), 0.9),
     top_hosts: top(withBytes(share(requests, hostEntries), 30000)),
     top_blocked: topBlocked,
   };
+}
+
+// The API reports response sizes cumulatively: each bucket counts everything up to and including its bound
+function cumulativeSizes(requests) {
+  let running = 0;
+  return [1024, 4096, 16384, 65536, 262144, 1048576, null].map((le, i) => {
+    running += Math.round(requests * [0.14, 0.22, 0.24, 0.2, 0.12, 0.06, 0.02][i]);
+    return { le, count: running };
+  });
 }
 
 function filterEvents(node, q) {
@@ -409,7 +418,8 @@ async function siteRoute(node, method, seg, body) {
     if (method === 'GET') return withLive(node, site);
     if (method === 'PUT') {
       checkSiteShape(body);
-      Object.assign(site, clone(body), { id: site.id, history: site.history });
+      const { name, hosts, path_regex: pathRegex, kind, health, source } = clone(body);
+      Object.assign(site, { name, hosts, path_regex: pathRegex, kind, health, source });
       audit(node, 'site.update', `site ${id} updated`);
       return clone(site);
     }
@@ -428,7 +438,8 @@ async function siteRoute(node, method, seg, body) {
     const broken = targets.some((t) => /bad|down/i.test(t.addr));
     if (broken) {
       audit(node, 'site.deploy', `site ${id} deploy failed health checks`);
-      return clone(pushHistory(site, idle, 'failed', (body.note || 'Deploy') + ' (health check timed out)'));
+      pushHistory(site, idle, 'failed', (body.note || 'Deploy') + ' (health check timed out)');
+      throw new ApiError(409, `deploy failed health checks: the ${idle} slot of ${id} never came up, active slot unchanged`);
     }
     site[idle].targets = clone(targets);
     site.active = idle;

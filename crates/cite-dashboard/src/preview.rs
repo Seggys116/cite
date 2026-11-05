@@ -112,8 +112,11 @@ pub async fn serve(
     headers: HeaderMap,
 ) -> Response {
     let now = now_unix();
-    let signed_in = security::cookie_token(&headers, s.settings.cookie_secure())
-        .is_some_and(|token| lock(&s.sessions).validate(token, now).is_some());
+    let token = security::cookie_token(&headers, s.settings.cookie_secure());
+    let signed_in = match token {
+        Some(token) => s.validate_session(token, now).await.is_some(),
+        None => false,
+    };
     if !signed_in {
         return StatusCode::UNAUTHORIZED.into_response();
     }

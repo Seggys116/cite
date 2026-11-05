@@ -5,6 +5,7 @@ use cite_client::ConfigFile;
 use cite_edge::auth::{Credentials, generate_password, hash_password, validate_username};
 use cite_edge::totp;
 
+use crate::configlock::ConfigLock;
 use crate::error::{Error, Result};
 use crate::qr;
 use crate::settings::{DEFAULT_PORT, Settings};
@@ -30,6 +31,7 @@ pub fn init_account(config_path: &Path, username: &str, force: bool) -> Result<I
             "username must be 3 to 32 characters of a-z, 0-9, '_', '.' or '-'".into(),
         ));
     }
+    let _lock = ConfigLock::acquire(config_path)?;
     let mut config = ConfigFile::load_or_default(config_path)?;
     if config.admin.is_some() && !force {
         return Err(Error::Setup(
@@ -46,6 +48,8 @@ pub fn init_account(config_path: &Path, username: &str, force: bool) -> Result<I
         totp_secret: totp_secret.clone(),
         totp_last_step: 0,
     });
+    // A running dashboard adopts the new admin and drops its sessions when it sees a newer generation.
+    config.generation = config.generation.saturating_add(1);
     ConfigFile::save(config_path, &config)?;
     let totp_uri = totp::otpauth_uri(TOTP_ISSUER, username, &totp_secret);
     Ok(InitReport {

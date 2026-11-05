@@ -46,7 +46,9 @@ async fn spawn_node() -> String {
             "/api/v1/sites",
             get(|| async { Json(json!([])) }),
         );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
     let addr = listener.local_addr().expect("addr");
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
@@ -54,7 +56,13 @@ async fn spawn_node() -> String {
     format!("http://{addr}")
 }
 
-async fn call(app: &Router, method: Method, uri: &str, headers: &[(&str, &str)], body: Option<Value>) -> (StatusCode, usize, Vec<(String, String)>) {
+async fn call(
+    app: &Router,
+    method: Method,
+    uri: &str,
+    headers: &[(&str, &str)],
+    body: Option<Value>,
+) -> (StatusCode, usize, Vec<(String, String)>) {
     let mut builder = Request::builder().method(method).uri(uri);
     for (k, v) in headers {
         builder = builder.header(*k, *v);
@@ -82,7 +90,11 @@ async fn call(app: &Router, method: Method, uri: &str, headers: &[(&str, &str)],
 
 fn report(label: &str, mut v: Vec<f64>) {
     v.sort_by(|a, b| a.total_cmp(b));
-    println!("{label}: p50 {:.3} ms p99 {:.3} ms", v[v.len() / 2], v[v.len() * 99 / 100]);
+    println!(
+        "{label}: p50 {:.3} ms p99 {:.3} ms",
+        v[v.len() / 2],
+        v[v.len() * 99 / 100]
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -120,7 +132,10 @@ async fn dashboard_paths() {
     let settings = Settings::from_env_map(&vars).expect("settings");
     let state = AppState::new(settings, config, store as Arc<dyn TokenStore>);
     let app = router(state);
-    println!("state and router construction: {:.2} ms", started.elapsed().as_secs_f64() * 1e3);
+    println!(
+        "state and router construction: {:.2} ms",
+        started.elapsed().as_secs_f64() * 1e3
+    );
 
     let code = totp::code_at(SECRET, now()).expect("code");
     let (status, _, heads) = {
@@ -147,7 +162,14 @@ async fn dashboard_paths() {
     let mut v = Vec::new();
     for _ in 0..500 {
         let t = Instant::now();
-        let (status, _, _) = call(&app, Method::GET, "/api/v1/nodes/node-3/sites", &session, None).await;
+        let (status, _, _) = call(
+            &app,
+            Method::GET,
+            "/api/v1/nodes/node-3/sites",
+            &session,
+            None,
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
         v.push(t.elapsed().as_secs_f64() * 1e3);
     }

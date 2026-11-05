@@ -5,7 +5,8 @@ use gpui::{AnyElement, Context, div, prelude::*, px};
 use crate::api::join_all;
 use crate::app::{Console, Load};
 use crate::model::{
-    WINDOWS, fmt_bytes, fmt_clock, fmt_int, fmt_ms, fmt_num, fmt_pct, merge_series, merge_summaries,
+    WINDOWS, fmt_bytes, fmt_clock, fmt_int, fmt_ms, fmt_num, fmt_pct, merge_series,
+    merge_summaries, per_bucket_sizes,
 };
 use crate::theme::{ACCENT, BLUE, DIM, GREEN, Tone, YELLOW, c};
 use crate::ui::chart::{Line, hbar, line_chart};
@@ -315,6 +316,16 @@ fn traffic_body(data: &Data, window: &str) -> AnyElement {
     ] {
         latency = latency.child(hbar(label, v as u64, latency_max, BLUE, fmt_ms(v)));
     }
+    let sizes = per_bucket_sizes(&sm.sizes);
+    let sizes_max = sizes.iter().map(|b| b.count).max().unwrap_or(0).max(1);
+    let mut size_bars = div().flex().flex_col().gap(px(10.));
+    for b in &sizes {
+        let label = b.le.map_or_else(
+            || "larger".to_string(),
+            |le| format!("up to {}", fmt_bytes(le)),
+        );
+        size_bars = size_bars.child(hbar(&label, b.count, sizes_max, BLUE, fmt_int(b.count)));
+    }
     let half = |card: gpui::Div| card.flex_1().min_w(px(300.));
     let row_a = div()
         .flex()
@@ -325,7 +336,8 @@ fn traffic_body(data: &Data, window: &str) -> AnyElement {
             Some("Latency"),
             Some("Total time per request"),
             latency,
-        )));
+        )))
+        .child(half(card(Some("Response sizes"), None, size_bars)));
     let row_b = div()
         .flex()
         .flex_wrap()

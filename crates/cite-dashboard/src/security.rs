@@ -11,7 +11,7 @@ use cite_edge::auth::hash_token;
 use subtle::ConstantTimeEq;
 
 use crate::error::ApiError;
-use crate::state::{AppState, lock, now_unix};
+use crate::state::{AppState, now_unix};
 
 pub const COOKIE_NAME: &str = "cite_session";
 pub const SECURE_COOKIE_NAME: &str = "__Host-cite_session";
@@ -184,7 +184,7 @@ pub async fn api_guard(
     else {
         return ApiError::unauthorized("not signed in").into_response();
     };
-    let info = lock(&state.sessions).validate(&token, now_unix());
+    let info = state.validate_session(&token, now_unix()).await;
     let Some(info) = info else {
         return ApiError::unauthorized("not signed in").into_response();
     };

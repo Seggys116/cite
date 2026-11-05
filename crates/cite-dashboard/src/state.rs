@@ -6,18 +6,20 @@ use cite_client::{
     ConfigError, ConfigFile, DEFAULT_FAN_OUT_LIMIT, DashboardConfig, NodeClient, TokenStore,
     fan_out,
 };
-use cite_edge::auth::{SessionStore, hash_token};
+use cite_edge::auth::{SessionInfo, SessionStore, hash_token};
 use cite_edge::ratelimit::LoginLimiter;
 use serde::Serialize;
 use subtle::ConstantTimeEq;
 use tokio::sync::RwLock;
 
+use crate::configlock::{ConfigLock, FileKey, file_key};
 use crate::error::ApiError;
 use crate::preview::PreviewStore;
 use crate::settings::Settings;
 
 pub const PROBE_TTL: Duration = Duration::from_secs(5);
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+const LOGIN_CONCURRENCY: usize = 2;
 const SETUP_TOKEN_BYTES: usize = 16;
 
 pub fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -62,8 +64,12 @@ pub struct AppState {
     setup_token_hash: Mutex<Option<String>>,
     // Held across config mutations and logins so read-modify-write cycles never interleave.
     pub write_gate: tokio::sync::Mutex<()>,
+    // Bounds concurrent Argon2 runs so a login burst cannot exhaust memory.
+    pub login_permits: tokio::sync::Semaphore,
     tokens: Arc<dyn TokenStore>,
     config: RwLock<DashboardConfig>,
+    disk_key: Mutex<Option<FileKey>>,
+    refresh_gate: tokio::sync::Mutex<()>,
     clients: RwLock<HashMap<String, NodeClient>>,
     probes: Mutex<HashMap<String, Probe>>,
     probe_gate: tokio::sync::Mutex<()>,
@@ -91,6 +97,7 @@ impl AppState {
             }
         }
         let sessions = SessionStore::new(settings.session_ttl_secs, settings.idle_timeout_secs());
+        let disk_key = file_key(&settings.config_path);
         Arc::new(Self {
             settings,
             sessions: Mutex::new(sessions),
@@ -99,8 +106,11 @@ impl AppState {
             previews: Mutex::new(PreviewStore::new()),
             setup_token_hash: Mutex::new(None),
             write_gate: tokio::sync::Mutex::new(()),
+            login_permits: tokio::sync::Semaphore::new(LOGIN_CONCURRENCY),
             tokens,
             config: RwLock::new(config),
+            disk_key: Mutex::new(disk_key),
+            refresh_gate: tokio::sync::Mutex::new(()),
             clients: RwLock::new(clients),
             probes: Mutex::new(HashMap::new()),
             probe_gate: tokio::sync::Mutex::new(()),
@@ -130,22 +140,77 @@ impl AppState {
     }
 
     pub async fn config_snapshot(&self) -> DashboardConfig {
+        self.refresh_config().await;
         self.config.read().await.clone()
     }
 
     pub async fn needs_onboarding(&self) -> bool {
+        self.refresh_config().await;
         self.config.read().await.admin.is_none()
     }
 
-    // Callers hold `write_gate`; the file is written first so memory never runs ahead of disk.
-    pub async fn commit_config(&self, new: DashboardConfig) -> Result<(), ApiError> {
+    pub async fn validate_session(&self, token: &str, now: u64) -> Option<SessionInfo> {
+        self.refresh_config().await;
+        lock(&self.sessions).validate(token, now)
+    }
+
+    fn reset_sessions(&self) {
+        *lock(&self.sessions) = SessionStore::new(
+            self.settings.session_ttl_secs,
+            self.settings.idle_timeout_secs(),
+        );
+    }
+
+    // A newer generation on disk is a CLI reset: adopt the admin and drop every session and pending setup.
+    async fn refresh_config(&self) {
+        let _gate = self.refresh_gate.lock().await;
+        let path = self.settings.config_path.clone();
+        let key = file_key(&path);
+        if *lock(&self.disk_key) == key {
+            return;
+        }
+        let loaded = tokio::task::spawn_blocking(move || ConfigFile::load(&path).ok())
+            .await
+            .ok()
+            .flatten();
+        let mut config = self.config.write().await;
+        *lock(&self.disk_key) = key;
+        let Some(disk) = loaded.filter(|d| d.generation > config.generation) else {
+            return;
+        };
+        config.admin = disk.admin;
+        config.generation = disk.generation;
+        drop(config);
+        self.reset_sessions();
+        *lock(&self.pending) = None;
+    }
+
+    // Callers hold `write_gate`; the file is written first so memory never runs ahead of disk, and a newer generation on disk is never overwritten.
+    pub async fn commit_config(&self, mut new: DashboardConfig) -> Result<(), ApiError> {
+        let running = self.config.read().await.generation;
+        new.generation = running;
         let path = self.settings.config_path.clone();
         let to_save = new.clone();
-        tokio::task::spawn_blocking(move || ConfigFile::save(&path, &to_save))
-            .await
-            .map_err(ApiError::internal)?
-            .map_err(ApiError::internal)?;
+        let saved = tokio::task::spawn_blocking(move || {
+            let _lock = ConfigLock::acquire(&path)?;
+            let on_disk = ConfigFile::load(&path).map_or(0, |c| c.generation);
+            if on_disk > running {
+                return Ok(None);
+            }
+            ConfigFile::save(&path, &to_save)?;
+            Ok::<_, crate::error::Error>(Some(file_key(&path)))
+        })
+        .await
+        .map_err(ApiError::internal)?
+        .map_err(ApiError::internal)?;
+        let Some(key) = saved else {
+            self.refresh_config().await;
+            return Err(ApiError::conflict(
+                "the configuration was reset elsewhere; sign in again",
+            ));
+        };
         *self.config.write().await = new;
+        *lock(&self.disk_key) = key;
         Ok(())
     }
 

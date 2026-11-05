@@ -43,6 +43,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 include_dir = "0.7"
 getrandom = "0.3"
+rustix = { workspace = true }
 
 [dev-dependencies]
 tempfile.workspace = true

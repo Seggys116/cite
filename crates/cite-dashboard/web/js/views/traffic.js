@@ -8,6 +8,7 @@ import {
   skeletonCards, skeletonBlock, toMs,
 } from '../ui.js';
 import { noNodes, nodeNotice } from './common.js';
+import { perBucketSizes } from '../sizes.js';
 
 const WINDOWS = ['15m', '1h', '24h', '7d', '30d'];
 const SERIES = [
@@ -47,7 +48,7 @@ function renderAnalytics({ summary: sm, series }) {
   const donutSegs = statusKeys.map((k) => ({ label: k, value: sm.status[k], cls: 'seg-' + (STATUS_ORDER.includes(k) ? k : 'other') }));
   const methodItems = Object.entries(sm.methods || {}).sort((a, b) => b[1] - a[1]).map(([label, value]) => ({ label, value }));
   const typeItems = Object.entries(sm.content_types || {}).sort((a, b) => b[1] - a[1]).slice(0, 8).map(([label, value]) => ({ label, value }));
-  const sizeBuckets = (sm.sizes || []).map((b) => ({ label: typeof b.le === 'number' ? '≤ ' + fmtBytes(b.le) : 'larger', value: b.count }));
+  const sizeBuckets = perBucketSizes(sm.sizes).map((b) => ({ label: typeof b.le === 'number' ? '≤ ' + fmtBytes(b.le) : 'larger', value: b.count }));
   const latency = [
     { label: 'Average', value: sm.avg_ms || 0 }, { label: 'p50', value: sm.p50_ms || 0 },
     { label: 'p95', value: sm.p95_ms || 0 }, { label: 'p99', value: sm.p99_ms || 0 },

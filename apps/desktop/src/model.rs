@@ -248,6 +248,19 @@ fn merge_counts(maps: Vec<&BTreeMap<String, u64>>) -> BTreeMap<String, u64> {
     out
 }
 
+// The API reports sizes cumulatively (each bucket counts everything up to its bound); charts need per-bucket counts.
+pub fn per_bucket_sizes(sizes: &[SizeBucket]) -> Vec<SizeBucket> {
+    let mut previous = 0u64;
+    sizes
+        .iter()
+        .map(|b| {
+            let count = b.count.saturating_sub(previous);
+            previous = previous.max(b.count);
+            SizeBucket { le: b.le, count }
+        })
+        .collect()
+}
+
 // Percentiles cannot be combined exactly, so the worst node is reported for them.
 pub fn merge_summaries(all: &[Summary]) -> Summary {
     let requests: u64 = all.iter().map(|s| s.requests).sum();
@@ -706,6 +719,36 @@ pub fn action_label(a: FirewallAction) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cumulative_sizes_become_per_bucket_counts() {
+        let cumulative = [(Some(1024), 14), (Some(4096), 36), (None, 100)]
+            .map(|(le, count)| SizeBucket { le, count });
+        let counts: Vec<u64> = per_bucket_sizes(&cumulative)
+            .iter()
+            .map(|b| b.count)
+            .collect();
+        assert_eq!(counts, [14, 22, 64]);
+        let les: Vec<Option<u64>> = per_bucket_sizes(&cumulative).iter().map(|b| b.le).collect();
+        assert_eq!(les, [Some(1024), Some(4096), None]);
+        assert!(per_bucket_sizes(&[]).is_empty());
+    }
+
+    #[test]
+    fn a_decreasing_bucket_never_underflows() {
+        let odd =
+            [(Some(1), 5), (Some(2), 3), (None, 9)].map(|(le, count)| SizeBucket { le, count });
+        let counts: Vec<u64> = per_bucket_sizes(&odd).iter().map(|b| b.count).collect();
+        assert_eq!(counts, [5, 0, 4]);
+    }
+
+    #[test]
+    fn demo_sizes_are_cumulative_like_the_api() {
+        let sizes = crate::demo::cumulative_sizes(1000);
+        assert!(sizes.windows(2).all(|w| w[0].count <= w[1].count));
+        let counts: Vec<u64> = per_bucket_sizes(&sizes).iter().map(|b| b.count).collect();
+        assert_eq!(counts, [380, 410, 160, 50]);
+    }
 
     fn snap(
         name: &str,

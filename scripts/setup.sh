@@ -37,6 +37,7 @@ ARCH=""
 ANSWER=""
 CA_COPIED=0
 FORCE_REMOTE=0
+VERIFY=0
 
 setup_colors() {
   TTY_OUT=0
@@ -125,7 +126,8 @@ Options:
   --dashboard-port PORT        Dashboard port (default 8088)
   --orchestrator               Enable the Docker socket proxy so the connector can start sites
   --version X.Y.Z              Image version (default $DEFAULT_VERSION)
-  --ref GIT_REF                Git ref to fetch compose files from (default $DEFAULT_REF)
+  --ref GIT_REF                Git ref to fetch compose files from (default v<version> when that tag exists, else $DEFAULT_REF)
+  --verify                     Print the sha256 of each downloaded compose file
   --yes                        Never prompt; accept defaults and confirmations
   --no-start                   Write the files and stop before pulling and starting
   --purge                      With uninstall: also remove volumes and installed files
@@ -424,6 +426,40 @@ fetch() {
   fi
 }
 
+url_exists() {
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSI --proto '=https' --tlsv1.2 -o /dev/null "$1" </dev/null 2>/dev/null
+  elif command -v wget >/dev/null 2>&1; then
+    wget -q --spider --https-only "$1" </dev/null 2>/dev/null
+  else
+    return 1
+  fi
+}
+
+# Files come from the release tag of the pinned version when it exists, so they match the images.
+resolve_ref() {
+  [ -z "$SRC_DIR" ] || return 0
+  [ -z "$REF" ] || return 0
+  if url_exists "$RAW_BASE/v$VERSION/docker-compose.node.yml"; then
+    REF=v$VERSION
+  else
+    REF=$DEFAULT_REF
+    warn "no tag v$VERSION found; images are pinned to $VERSION but the compose files come from $DEFAULT_REF"
+  fi
+}
+
+print_sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    _sum=$(sha256sum "$1" | awk '{ print $1 }')
+  elif command -v shasum >/dev/null 2>&1; then
+    _sum=$(shasum -a 256 "$1" | awk '{ print $1 }')
+  else
+    warn "no sha256 tool found; cannot verify $2"
+    return 0
+  fi
+  say "  sha256 $_sum  $2"
+}
+
 find_checkout() {
   [ "$FORCE_REMOTE" != 1 ] || return 0
   case $0 in
@@ -445,6 +481,9 @@ get_file() {
   else
     fetch "$RAW_BASE/$REF/$1" "$WORK/$1" || die "could not download $1 at ref $REF"
     mv "$WORK/$1" "$DIR/$1"
+  fi
+  if [ "$VERIFY" = 1 ]; then
+    print_sha256 "$DIR/$1" "$1"
   fi
 }
 
@@ -890,6 +929,7 @@ do_install() {
   DIR=$(cd "$DIR" && pwd)
   ENV_FILE=$DIR/.env
   WORK=$(mktemp -d "${TMPDIR:-/tmp}/cite-setup.XXXXXX")
+  resolve_ref
   fetch_files
   write_env
   install_self
@@ -961,6 +1001,13 @@ do_status() {
   say "install dir  $DIR"
   say "version      $VERSION"
   say "mode         $MODE (orchestrator: $([ "$ORCH" = 1 ] && echo on || echo off))"
+  if [ "$ORCH" = 1 ]; then
+    if [ -n "$(env_get DOCKER_GID)" ]; then
+      say "docker gid   $(env_get DOCKER_GID)"
+    else
+      warn "orchestrator is on but DOCKER_GID is missing from $ENV_FILE; run the update command to add it"
+    fi
+  fi
   for _s in node dashboard; do
     if stack_enabled "$_s"; then
       say ""
@@ -986,6 +1033,10 @@ do_update() {
   step "updating files"
   set_env_key CITE_VERSION "$VERSION"
   set_env_key CITE_SETUP_ORCHESTRATOR "$ORCH"
+  if [ "$ORCH" = 1 ] && [ -z "$(env_get DOCKER_GID)" ]; then
+    set_env_key DOCKER_GID "$(docker_socket_gid)"
+  fi
+  resolve_ref
   fetch_files
   for _s in node dashboard; do
     if stack_enabled "$_s"; then
@@ -1078,6 +1129,7 @@ parse_args() {
       --version) need_value "$@"; VERSION=$2; shift 2 ;;
       --ref) need_value "$@"; REF=$2; shift 2 ;;
       --orchestrator) ORCH=1; shift ;;
+      --verify) VERIFY=1; shift ;;
       --yes|-y) YES=1; shift ;;
       --no-start) NOSTART=1; shift ;;
       --purge) PURGE=1; shift ;;
@@ -1124,9 +1176,6 @@ main() {
   validate_flags
   if [ "$CMD" = install ]; then
     banner
-  fi
-  if [ -z "$REF" ]; then
-    REF=$DEFAULT_REF
   fi
   case $CMD in
     install) do_install ;;

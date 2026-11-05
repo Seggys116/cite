@@ -45,6 +45,9 @@ pub struct DashboardConfig {
     pub admin: Option<Credentials>,
     #[serde(default)]
     pub nodes: Vec<NodeConfig>,
+    // Bumped whenever the admin is replaced out of band, so a running dashboard can tell a CLI reset from its own writes.
+    #[serde(default)]
+    pub generation: u64,
 }
 
 fn default_listen() -> String {
@@ -58,6 +61,7 @@ impl Default for DashboardConfig {
             listen: default_listen(),
             admin: None,
             nodes: Vec::new(),
+            generation: 0,
         }
     }
 }
@@ -289,6 +293,18 @@ mod tests {
             ConfigFile::load(&path),
             Err(ConfigError::Version(9))
         ));
+    }
+
+    #[test]
+    fn files_without_a_generation_load_as_zero() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("dashboard.json");
+        std::fs::write(&path, r#"{"version":1}"#).expect("write");
+        assert_eq!(ConfigFile::load(&path).expect("load").generation, 0);
+        let mut cfg = DashboardConfig::default();
+        cfg.generation = 7;
+        ConfigFile::save(&path, &cfg).expect("save");
+        assert_eq!(ConfigFile::load(&path).expect("load").generation, 7);
     }
 
     #[test]

@@ -120,20 +120,19 @@ function deploymentsPanel(ctx, site, reload) {
     }
     const stop = showProgress();
     try {
-      const res = await withBusy(deployBtn, () => nodeApi(node).post(`/sites/${encodeURIComponent(site.id)}/deploy`, { targets: editor.get(), note: note.value.trim() || undefined }));
+      await withBusy(deployBtn, () => nodeApi(node).post(`/sites/${encodeURIComponent(site.id)}/deploy`, { targets: editor.get(), note: note.value.trim() || undefined }));
       stop();
-      if (res && res.action === 'failed') {
-        err.textContent = 'Health checks did not pass. The active slot was left untouched.';
-        err.hidden = false;
-        toast('Deployment failed health checks', 'error');
-      } else {
-        toast(`Deployed. ${idle} is now active.`, 'success');
-      }
+      toast(`Deployed. ${idle} is now active.`, 'success');
       reload();
     } catch (ex) {
       stop();
       err.textContent = formatError(ex);
       err.hidden = false;
+      // A failed health check is a 409 whose record is already in the history, so refresh to show it
+      if (ex && ex.status === 409) {
+        toast(formatError(ex), 'error');
+        reload();
+      }
     }
   });
 
@@ -199,14 +198,18 @@ function routingPanel(ctx, site, reload) {
     if (tool.error()) return fail('The path regex is not valid.');
     if (!path.value.startsWith('/')) return fail('The health check path must start with /.');
     err.hidden = true;
-    // The connector rejects unknown fields, so the live health block is dropped before saving
-    const { live, ...rest } = site;
+    // Editable fields only; id, slots and active are what the Site schema requires and the server ignores them on update
     const next = {
-      ...rest,
+      id: site.id,
+      blue: site.blue,
+      green: site.green,
+      active: site.active,
       name: name.value.trim(),
       hosts: hosts.get(),
       path_regex: tool.value() || null,
+      kind: site.kind,
       health: { path: path.value, interval_ms: Number(interval.value), rise: Number(rise.value), fall: Number(fall.value), timeout_ms: Number(timeout.value) },
+      source: site.source,
     };
     try {
       await withBusy(save, () => nodeApi(ctx.node).put(`/sites/${encodeURIComponent(site.id)}`, next));

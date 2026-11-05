@@ -654,8 +654,10 @@ async fn login_before_onboarding_is_a_conflict() {
 #[tokio::test]
 async fn a_totp_code_cannot_be_replayed() {
     let h = harness();
-    let _first = login(&h).await;
+    // one code string for both requests, so a step boundary between them cannot hide a replay
     let body = json!({ "username": "admin", "password": PASSWORD, "totp": code(0) });
+    let first = send_json(&h.app, Method::POST, "/api/v1/session", &[], body.clone()).await;
+    assert_eq!(first.status, StatusCode::OK);
     let replay = send_json(&h.app, Method::POST, "/api/v1/session", &[], body).await;
     assert_eq!(replay.status, StatusCode::UNAUTHORIZED);
 }
@@ -1584,6 +1586,99 @@ async fn a_slow_login_does_not_hold_the_write_gate() {
     .await
     .expect("a failing login must not wait on the write gate");
     assert_eq!(reply, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_concurrent_login_burst_is_capped_at_the_limit_before_any_hash_runs() {
+    let h = harness();
+    let peer = SocketAddr::from(([203, 0, 113, 77], 1));
+    let mut tasks = Vec::new();
+    for _ in 0..40 {
+        let app = h.app.clone();
+        tasks.push(tokio::spawn(async move {
+            let body =
+                json!({ "username": "admin", "password": "wrong password!!", "totp": "000000" });
+            post_login_from(&app, peer, body).await
+        }));
+    }
+    let (mut rejected, mut limited) = (0, 0);
+    for task in tasks {
+        match task.await.expect("task") {
+            StatusCode::UNAUTHORIZED => rejected += 1,
+            StatusCode::TOO_MANY_REQUESTS => limited += 1,
+            other => panic!("unexpected status {other}"),
+        }
+    }
+    assert_eq!(rejected, 5, "only the per-key limit may reach the hash");
+    assert_eq!(limited, 35);
+}
+
+#[tokio::test]
+async fn a_successful_login_clears_its_provisional_failure() {
+    let h = harness();
+    let url = "/api/v1/session";
+    let wrong = || json!({ "username": "admin", "password": "wrong password!!", "totp": "000000" });
+    for _ in 0..4 {
+        let reply = send_json(&h.app, Method::POST, url, &[], wrong()).await;
+        assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
+    }
+    let _ok = login(&h).await;
+    for _ in 0..4 {
+        let reply = send_json(&h.app, Method::POST, url, &[], wrong()).await;
+        assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
+    }
+}
+
+fn seed_config_file(h: &Harness) {
+    ConfigFile::save(&h.config_path, &onboarded()).expect("seed config");
+}
+
+#[tokio::test]
+async fn a_cli_reset_is_adopted_and_drops_existing_sessions() {
+    let h = harness();
+    seed_config_file(&h);
+    let s = login(&h).await;
+    let before = get_path(&h.app, "/api/v1/session", &[("cookie", s.cookie.as_str())]).await;
+    assert_eq!(before.status, StatusCode::OK);
+    cite_dashboard::cli::init_account(&h.config_path, "ops", true).expect("forced init");
+    let after = get_path(&h.app, "/api/v1/session", &[("cookie", s.cookie.as_str())]).await;
+    assert_eq!(after.status, StatusCode::UNAUTHORIZED);
+    let admin = h.state.config_snapshot().await.admin.expect("admin");
+    assert_eq!(admin.username, "ops");
+}
+
+#[tokio::test]
+async fn running_state_cannot_overwrite_a_cli_reset() {
+    let h = harness();
+    seed_config_file(&h);
+    let stale = h.state.config_snapshot().await;
+    cite_dashboard::cli::init_account(&h.config_path, "ops", true).expect("forced init");
+    let _gate = h.state.write_gate.lock().await;
+    let err = h
+        .state
+        .commit_config(stale)
+        .await
+        .expect_err("stale write must be refused");
+    assert_eq!(err.status(), StatusCode::CONFLICT);
+    let saved = ConfigFile::load(&h.config_path).expect("load");
+    assert_eq!(saved.admin.expect("admin").username, "ops");
+    assert_eq!(saved.generation, 1);
+    let adopted = h.state.config_snapshot().await;
+    assert_eq!(adopted.admin.expect("admin").username, "ops");
+    h.state
+        .commit_config(adopted_with_node(&h).await)
+        .await
+        .expect("commit after adopting");
+    let saved = ConfigFile::load(&h.config_path).expect("load");
+    assert_eq!(saved.admin.expect("admin").username, "ops");
+    assert_eq!(saved.nodes.len(), 1);
+}
+
+async fn adopted_with_node(h: &Harness) -> DashboardConfig {
+    let mut cfg = h.state.config_snapshot().await;
+    cfg.add_node(node_entry("edge-1", "http://127.0.0.1:7443"))
+        .expect("node");
+    cfg
 }
 
 async fn post_login_from(app: &Router, peer: SocketAddr, body: Value) -> StatusCode {

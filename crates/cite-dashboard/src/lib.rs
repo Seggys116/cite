@@ -3,6 +3,7 @@
 pub mod api;
 pub mod assets;
 pub mod cli;
+pub mod configlock;
 pub mod error;
 pub mod preview;
 pub mod proxy;

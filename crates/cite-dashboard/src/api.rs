@@ -227,6 +227,24 @@ async fn session_login(
     } = body;
     // Only attempts naming the real account count toward the global lock, so a stranger cannot arm it.
     let targets_admin = username == creds.username;
+    // The check and the provisional failure share one lock, so a burst is capped at the per-key limit before any hash runs.
+    {
+        let mut limiter = lock(&s.limiter);
+        limiter
+            .check(&key, now)
+            .map_err(ApiError::too_many_requests)?;
+        if targets_admin {
+            limiter.record_failure(&key, now);
+        } else {
+            limiter.record_failure_local(&key, now);
+        }
+    }
+    let _permit = s
+        .login_permits
+        .acquire()
+        .await
+        .map_err(ApiError::internal)?;
+    let now = now_unix();
     let verified = creds.clone();
     // Argon2 runs without the write gate so slow logins never delay node changes.
     let (result, creds) = tokio::task::spawn_blocking(move || {
@@ -235,17 +253,9 @@ async fn session_login(
     })
     .await
     .map_err(ApiError::internal)?;
-    let reject = |s: &AppState| {
-        let mut limiter = lock(&s.limiter);
-        if targets_admin {
-            limiter.record_failure(&key, now);
-        } else {
-            limiter.record_failure_local(&key, now);
-        }
-        ApiError::unauthorized("invalid credentials")
-    };
+    let reject = || ApiError::unauthorized("invalid credentials");
     if result.is_err() {
-        return Err(reject(&s));
+        return Err(reject());
     }
     // The gate serializes the TOTP step, so one code cannot be replayed by parallel logins.
     let _gate = s.write_gate.lock().await;
@@ -258,7 +268,7 @@ async fn session_login(
             && c.totp_last_step < creds.totp_last_step
     });
     if !still_valid {
-        return Err(reject(&s));
+        return Err(reject());
     }
     lock(&s.limiter).record_success(&key);
     cfg.admin = Some(creds.clone());
@@ -416,7 +426,8 @@ async fn nodes_summary(State(s): State<Arc<AppState>>) -> Json<Value> {
     let limit = clients.len().clamp(DEFAULT_FAN_OUT_LIMIT, MAX_NODES);
     let results = fan_out(&clients, limit, Some(SUMMARY_TIMEOUT), |c| async move {
         // Node info is required; the summary is best effort so one slow query does not hide a node.
-        let (info, summary) = tokio::join!(c.node_info(), c.analytics_summary(SUMMARY_WINDOW, None));
+        let (info, summary) =
+            tokio::join!(c.node_info(), c.analytics_summary(SUMMARY_WINDOW, None));
         info.map(|info| (info, summary.ok()))
     })
     .await;

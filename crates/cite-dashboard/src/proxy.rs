@@ -14,7 +14,9 @@ pub const MAX_REQUEST_BODY: usize = 1024 * 1024;
 
 const PREFIX: &str = "/api/v1/nodes/";
 const PROXY_TIMEOUT: Duration = Duration::from_secs(30);
-const DEPLOY_TIMEOUT: Duration = Duration::from_secs(90);
+// Switch, rollback, deploy and create wait on health checks and stack starts, which can take over a minute.
+const LONG_TIMEOUT: Duration = Duration::from_secs(180);
+const LONG_ACTIONS: [&str; 4] = ["switch", "rollback", "deploy", "maintenance"];
 const MAX_SEGMENT_LEN: usize = 128;
 const ALLOWED_PREFIXES: [&str; 9] = [
     "node",
@@ -58,6 +60,24 @@ fn response_content_type(upstream: Option<&str>) -> &'static str {
     }
 }
 
+fn timeout_for(method: &Method, rest: &str) -> Duration {
+    if method == Method::GET {
+        return PROXY_TIMEOUT;
+    }
+    let mut segments = rest.split('/');
+    let long = match (
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+    ) {
+        (Some("sites"), None, ..) => method == Method::POST,
+        (Some("sites"), Some(_), Some(action), None) => LONG_ACTIONS.contains(&action),
+        _ => false,
+    };
+    if long { LONG_TIMEOUT } else { PROXY_TIMEOUT }
+}
+
 pub async fn proxy(State(state): State<Arc<AppState>>, req: Request) -> Response {
     match forward(&state, req).await {
         Ok(resp) => resp,
@@ -98,11 +118,7 @@ async fn forward(state: &AppState, req: Request) -> Result<Response, ApiError> {
     } else {
         Bytes::new()
     };
-    let timeout = if rest.ends_with("/deploy") {
-        DEPLOY_TIMEOUT
-    } else {
-        PROXY_TIMEOUT
-    };
+    let timeout = timeout_for(&parts.method, rest);
     let forwarded = client
         .forward(
             parts.method.clone(),
@@ -188,6 +204,31 @@ mod tests {
             assert!(!allowed(bad), "{bad}");
         }
         assert!(allowed("analytics/summary") && allowed("haproxy/reload") && allowed("tokens/x"));
+    }
+
+    #[test]
+    fn slow_site_actions_get_the_long_timeout_and_reads_stay_short() {
+        for (method, rest) in [
+            (Method::POST, "sites"),
+            (Method::POST, "sites/a/deploy"),
+            (Method::POST, "sites/a/switch"),
+            (Method::POST, "sites/a/rollback"),
+            (Method::PUT, "sites/a/maintenance"),
+            (Method::DELETE, "sites/a/maintenance"),
+        ] {
+            assert_eq!(timeout_for(&method, rest), LONG_TIMEOUT, "{method} {rest}");
+        }
+        for (method, rest) in [
+            (Method::GET, "sites"),
+            (Method::GET, "sites/a/maintenance"),
+            (Method::PUT, "sites/a"),
+            (Method::DELETE, "sites/a"),
+            (Method::POST, "firewall/rules"),
+            (Method::POST, "sites/a/other"),
+        ] {
+            assert_eq!(timeout_for(&method, rest), PROXY_TIMEOUT, "{method} {rest}");
+        }
+        assert!(LONG_TIMEOUT >= Duration::from_secs(120));
     }
 
     #[test]
