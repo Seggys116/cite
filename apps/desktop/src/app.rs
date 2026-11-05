@@ -144,10 +144,13 @@ pub struct Options {
     pub view: Option<View>,
     pub select: Option<String>,
     pub inspect: bool,
+    pub scroll_end: bool,
 }
 
 pub struct Console {
     pub demo: bool,
+    // Set only by the --scroll preview flag so a screenshot can reach content below the fold.
+    pub preview_scroll: Option<gpui::ScrollHandle>,
     pub config: DesktopConfig,
     pub config_path: PathBuf,
     pub tokens: Arc<dyn TokenStore>,
@@ -188,6 +191,7 @@ impl Console {
             };
         let mut console = Console {
             demo: opts.demo,
+            preview_scroll: opts.scroll_end.then(gpui::ScrollHandle::new),
             config,
             config_path,
             tokens,
@@ -638,6 +642,15 @@ impl Render for Console {
             View::Settings => self.render_settings(cx),
         };
         let scroll_key = format!("scroll-{:?}", self.view);
+        let mut scroller = div()
+            .id(gpui::SharedString::from(scroll_key))
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll();
+        if let Some(handle) = &self.preview_scroll {
+            handle.scroll_to_bottom();
+            scroller = scroller.track_scroll(handle);
+        }
         let main = div()
             .flex()
             .flex_col()
@@ -646,20 +659,15 @@ impl Render for Console {
             .h_full()
             .child(self.topbar(cx))
             .child(
-                div()
-                    .id(gpui::SharedString::from(scroll_key))
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap(px(16.))
-                            .p(px(24.))
-                            .max_w(px(1180.))
-                            .child(content),
-                    ),
+                scroller.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(16.))
+                        .p(px(24.))
+                        .max_w(px(1180.))
+                        .child(content),
+                ),
             );
         div()
             .relative()

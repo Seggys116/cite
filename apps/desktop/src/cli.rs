@@ -1,6 +1,6 @@
 use crate::app::{Options, View};
 
-pub const USAGE: &str = "usage: cite-desktop [--demo] [--view <name>] [--node <name>]\n\nviews: overview, nodes, sites, site-detail, site-new, traffic, request-detail, bots, explore, export, firewall, maintenance, settings";
+pub const USAGE: &str = "usage: cite-desktop [--demo] [--view <name>] [--node <name>] [--scroll end]\n\nviews: overview, nodes, sites, site-detail, site-new, traffic, request-detail, bots, explore, export, firewall, maintenance, settings";
 
 // Flags are parsed by hand: the surface is three options and no extra crate is justified.
 pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
@@ -9,6 +9,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> 
         view: None,
         select: None,
         inspect: false,
+        scroll_end: false,
     };
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
@@ -26,6 +27,10 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> 
                 opts.view =
                     Some(View::parse(lookup).ok_or_else(|| format!("unknown view {name:?}"))?);
             }
+            "--scroll" => match args.next().as_deref() {
+                Some("end") => opts.scroll_end = true,
+                _ => return Err("--scroll only accepts end".to_string()),
+            },
             "--node" => opts.select = Some(args.next().ok_or("--node needs a node name")?),
             "-h" | "--help" => return Err(USAGE.to_string()),
             other => return Err(format!("unknown argument {other:?}")),
@@ -88,6 +93,17 @@ mod tests {
         assert!(takes_focus(&run(&["--node", "edge-fra"]).expect("parse")));
         assert!(!takes_focus(&run(&["--demo"]).expect("parse")));
         assert!(!takes_focus(&run(&["--view", "traffic"]).expect("parse")));
+    }
+
+    #[test]
+    fn scroll_end_is_a_preview_flag() {
+        assert!(
+            run(&["--demo", "--scroll", "end"])
+                .expect("parse")
+                .scroll_end
+        );
+        assert!(!run(&["--demo"]).expect("parse").scroll_end);
+        assert!(run(&["--scroll", "top"]).is_err());
     }
 
     #[test]
