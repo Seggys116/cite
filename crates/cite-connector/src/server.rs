@@ -36,6 +36,8 @@ use crate::{ConnectorError, Result, logsink, tls};
 mod handlers;
 mod health;
 #[cfg(test)]
+mod perf;
+#[cfg(test)]
 mod tests;
 
 pub use health::healthcheck;

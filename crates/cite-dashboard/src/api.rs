@@ -412,17 +412,13 @@ async fn nodes_remove(
 async fn nodes_summary(State(s): State<Arc<AppState>>) -> Json<Value> {
     let config = s.config_snapshot().await;
     let clients = s.all_clients().await;
-    // Node info is required; the summary is best effort so one slow query does not hide a node.
-    let results = fan_out(
-        &clients,
-        DEFAULT_FAN_OUT_LIMIT,
-        Some(SUMMARY_TIMEOUT),
-        |c| async move {
-            let (info, summary) =
-                tokio::join!(c.node_info(), c.analytics_summary(SUMMARY_WINDOW, None));
-            info.map(|info| (info, summary.ok()))
-        },
-    )
+    // The fleet is capped at MAX_NODES, so querying every node at once keeps latency at one round trip.
+    let limit = clients.len().clamp(DEFAULT_FAN_OUT_LIMIT, MAX_NODES);
+    let results = fan_out(&clients, limit, Some(SUMMARY_TIMEOUT), |c| async move {
+        // Node info is required; the summary is best effort so one slow query does not hide a node.
+        let (info, summary) = tokio::join!(c.node_info(), c.analytics_summary(SUMMARY_WINDOW, None));
+        info.map(|info| (info, summary.ok()))
+    })
     .await;
     let mut by_name: HashMap<String, Value> = results
         .into_iter()

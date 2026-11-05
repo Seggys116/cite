@@ -1,4 +1,5 @@
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Mutex as StdMutex, MutexGuard};
@@ -134,6 +135,15 @@ fn make_dir(path: &Path) -> Result<()> {
     ensure_dir(path, DIR_MODE).map_err(internal)
 }
 
+// Pages and maps rarely change between applies, and every atomic write costs file and directory syncs.
+fn write_if_changed(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
+    let current_mode = fs::metadata(path).map(|m| m.permissions().mode() & 0o7777);
+    if current_mode.is_ok_and(|m| m == mode) && fs::read(path).is_ok_and(|cur| cur == bytes) {
+        return Ok(());
+    }
+    write_atomic(path, bytes, mode).map_err(internal)
+}
+
 fn write_files(
     maps_dir: &Path,
     pages_dir: &Path,
@@ -146,14 +156,14 @@ fn write_files(
         make_dir(parent)?;
     }
     for (name, html) in &rendered.pages {
-        write_atomic(&pages_dir.join(name), html.as_bytes(), PUBLIC_MODE).map_err(internal)?;
+        write_if_changed(&pages_dir.join(name), html.as_bytes(), PUBLIC_MODE)?;
     }
     let maps = [
         ("active.map", &rendered.active_map),
         ("maint.map", &rendered.maint_map),
     ];
     for (name, body) in maps {
-        write_atomic(&maps_dir.join(name), body.as_bytes(), PUBLIC_MODE).map_err(internal)?;
+        write_if_changed(&maps_dir.join(name), body.as_bytes(), PUBLIC_MODE)?;
     }
     write_atomic(cfg_path, rendered.config.as_bytes(), PUBLIC_MODE).map_err(internal)
 }
@@ -791,6 +801,57 @@ mod tests {
         assert_eq!(truncate("short", 10), "short");
         assert_eq!(truncate("abcdef", 3), "abc...");
         assert_eq!(truncate("\u{e9}\u{e9}\u{e9}", 3), "\u{e9}...");
+    }
+
+    #[tokio::test]
+    async fn unchanged_maps_and_pages_are_not_rewritten_on_apply() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let hp = haproxy_in(&dir, "127.0.0.1:9");
+        let mut cfg = edge(vec![site("shop")]);
+        hp.apply(&cfg).await.unwrap();
+        let inode = |p: &Path| fs::metadata(p).unwrap().ino();
+        let active = hp.maps_dir.join("active.map");
+        let page = hp.pages_dir.join("_default.html");
+        let (map_ino, page_ino, cfg_ino) = (inode(&active), inode(&page), inode(&hp.haproxy_cfg));
+        cfg.sites[0].blue.targets[0].weight = 50;
+        hp.apply(&cfg).await.unwrap();
+        assert_eq!(inode(&active), map_ino);
+        assert_eq!(inode(&page), page_ino);
+        assert_ne!(inode(&hp.haproxy_cfg), cfg_ino);
+        fs::write(&active, "shop be_shop_green\n").unwrap();
+        cfg.sites[0].blue.targets[0].weight = 60;
+        hp.apply(&cfg).await.unwrap();
+        assert_eq!(fs::read_to_string(&active).unwrap(), "shop be_shop_blue\n");
+    }
+
+    // Run with: cargo test -p cite-connector --release perf_apply -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn perf_apply_500_sites() {
+        let dir = tempfile::tempdir().unwrap();
+        let hp = haproxy_in(&dir, "127.0.0.1:9");
+        let mut cfg = edge((0..500).map(|i| site(&format!("s{i}"))).collect());
+        let started = Instant::now();
+        hp.apply(&cfg).await.unwrap();
+        println!("first apply: {:.2} ms", started.elapsed().as_secs_f64() * 1e3);
+        let started = Instant::now();
+        for _ in 0..20 {
+            hp.apply(&cfg).await.unwrap();
+        }
+        println!(
+            "hash-skip apply: {:.3} ms",
+            started.elapsed().as_secs_f64() * 1e3 / 20.0
+        );
+        let started = Instant::now();
+        for i in 0..20 {
+            cfg.sites[0].blue.targets[0].weight = 50 + i;
+            hp.apply(&cfg).await.unwrap();
+        }
+        println!(
+            "changed apply (no haproxy -c, failing reload): {:.2} ms",
+            started.elapsed().as_secs_f64() * 1e3 / 20.0
+        );
     }
 
     #[tokio::test]

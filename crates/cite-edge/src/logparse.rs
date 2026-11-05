@@ -40,15 +40,20 @@ pub fn parse_line(line: &str, now_ms: i64) -> Option<LogEvent> {
         return None;
     }
     let msg = message(line)?;
-    let f: Vec<&str> = msg.split(' ').collect();
-    if f.len() < MIN_FIELDS {
+    let mut f = [""; FIELD_COUNT];
+    let mut n = 0;
+    for (slot, part) in f.iter_mut().zip(msg.split(' ')) {
+        *slot = part;
+        n += 1;
+    }
+    if n < MIN_FIELDS {
         return None;
     }
     let get = |i: usize| f.get(i).copied().unwrap_or("");
     // a short line was cut by the log target, so its last variable field may be partial and is dropped
-    let cut = f.len() < FIELD_COUNT;
+    let cut = n < FIELD_COUNT;
     let tail = |i: usize| {
-        if cut && i + 1 >= f.len() { "" } else { get(i) }
+        if cut && i + 1 >= n { "" } else { get(i) }
     };
     let ts: i64 = get(0).parse().ok()?;
     // an unusable clock on the sender must not push events outside the retention window
@@ -177,6 +182,9 @@ fn hex(b: u8) -> Option<u8> {
 }
 
 fn decode(s: &str, max: usize) -> String {
+    if !s.bytes().any(|c| c == b'+' || c == b'%') {
+        return sanitise(s, max);
+    }
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
@@ -197,10 +205,17 @@ fn decode(s: &str, max: usize) -> String {
         }
         i += 1;
     }
-    sanitise(&String::from_utf8_lossy(&out), max)
+    match String::from_utf8(out) {
+        Ok(owned) if owned.len() <= max && !owned.chars().any(char::is_control) => owned,
+        Ok(owned) => sanitise(&owned, max),
+        Err(e) => sanitise(&String::from_utf8_lossy(e.as_bytes()), max),
+    }
 }
 
 fn sanitise(s: &str, max: usize) -> String {
+    if s.len() <= max && !s.chars().any(char::is_control) {
+        return s.to_string();
+    }
     let mut out = String::with_capacity(s.len().min(max));
     for c in s.chars() {
         if out.len() + c.len_utf8() > max {

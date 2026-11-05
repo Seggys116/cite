@@ -4,7 +4,12 @@ use crate::logparse::LOG_FORMAT;
 use crate::model::{EdgeConfig, FirewallAction, FirewallRule, Site, Slot};
 use crate::validate::{ValidationError, invalid, parse_cidr, validate_config};
 
-const HOST_FETCH: &str = "req.hdr(host),field(1,:),lower";
+const HOST_FETCH: &str = "var(txn.host)";
+// Runs of at least this many plain sites are routed by one map lookup instead of one ACL each.
+const MAP_RUN_MIN: usize = 4;
+// HAProxy cuts configuration lines at 2048 bytes and 64 words, so long pattern lists are split over repeated ACLs.
+const MAX_ACL_LINE: usize = 1500;
+const MAX_ACL_VALUES: usize = 48;
 const DEFAULT_PAGE_FILE: &str = "_default.html";
 const DEFAULT_PAGE_STATUS: u16 = 503;
 
@@ -193,21 +198,30 @@ fn host_patterns(hosts: &[String]) -> (Vec<String>, Vec<String>) {
     (exact, suffix)
 }
 
+fn chunked_acl(name: &str, matcher: &str, values: &[String]) -> Vec<String> {
+    let head = format!("acl {name} {matcher}");
+    let mut lines = Vec::new();
+    let mut line = head.clone();
+    let mut count = 0;
+    for value in values {
+        if count >= MAX_ACL_VALUES || (count > 0 && line.len() + 1 + value.len() > MAX_ACL_LINE) {
+            lines.push(std::mem::replace(&mut line, head.clone()));
+            count = 0;
+        }
+        line.push(' ');
+        line.push_str(value);
+        count += 1;
+    }
+    if count > 0 {
+        lines.push(line);
+    }
+    lines
+}
+
 fn host_acl_lines(name: &str, hosts: &[String]) -> Vec<String> {
     let (exact, suffix) = host_patterns(hosts);
-    let mut lines = Vec::new();
-    if !exact.is_empty() {
-        lines.push(format!(
-            "acl {name} {HOST_FETCH} -m str {}",
-            exact.join(" ")
-        ));
-    }
-    if !suffix.is_empty() {
-        lines.push(format!(
-            "acl {name} {HOST_FETCH} -m end {}",
-            suffix.join(" ")
-        ));
-    }
+    let mut lines = chunked_acl(name, &format!("{HOST_FETCH} -m str"), &exact);
+    lines.extend(chunked_acl(name, &format!("{HOST_FETCH} -m end"), &suffix));
     lines
 }
 
@@ -219,6 +233,7 @@ fn host_inline(host: &str) -> String {
     }
 }
 
+// A site matched by its own ACLs; plain sites in a long run are matched through the host map instead.
 fn site_cond(site: &Site) -> String {
     match site.path_regex {
         Some(_) => format!("host_{0} path_{0}", site.id),
@@ -241,27 +256,19 @@ fn rule_acl_lines(rule: &FirewallRule) -> Vec<String> {
     lines
 }
 
+// Cheap matchers come first because HAProxy stops at the first condition that fails.
 fn rule_cond(rule: &FirewallRule, cfg: &EdgeConfig) -> String {
     let mut parts: Vec<String> = Vec::new();
     if let Some(site) = rule
         .site
         .as_ref()
-        .and_then(|sid| cfg.sites.iter().find(|s| &s.id == sid))
+        .filter(|sid| cfg.sites.iter().any(|s| &s.id == *sid))
     {
-        parts.push(site_cond(site));
+        parts.push(format!("{{ var(txn.site) -m str {site} }}"));
     }
     let m = &rule.matchers;
-    if m.path_regex.is_some() {
-        parts.push(format!("rp_{}", rule.id));
-    }
-    if m.path_prefix.is_some() {
-        parts.push(format!("rb_{}", rule.id));
-    }
     if !m.methods.is_empty() {
         parts.push(format!("{{ method {} }}", m.methods.join(" ")));
-    }
-    if let Some(re) = &m.user_agent_regex {
-        parts.push(format!("{{ req.hdr(user-agent) -m reg -- {re} }}"));
     }
     let cidrs: Vec<String> = m.cidrs.iter().filter_map(|c| parse_cidr(c)).collect();
     if !cidrs.is_empty() {
@@ -269,6 +276,15 @@ fn rule_cond(rule: &FirewallRule, cfg: &EdgeConfig) -> String {
     }
     if let Some(h) = &m.host {
         parts.push(host_inline(h));
+    }
+    if m.path_prefix.is_some() {
+        parts.push(format!("rb_{}", rule.id));
+    }
+    if m.path_regex.is_some() {
+        parts.push(format!("rp_{}", rule.id));
+    }
+    if let Some(re) = &m.user_agent_regex {
+        parts.push(format!("{{ req.hdr(user-agent) -m reg -- {re} }}"));
     }
     parts.join(" ")
 }
@@ -371,6 +387,59 @@ fn action_lines(rule: &FirewallRule, cond: &str, out: &mut String) {
     );
 }
 
+enum Segment<'a> {
+    Map(&'a [Site]),
+    One(&'a Site),
+}
+
+fn is_plain(site: &Site) -> bool {
+    site.path_regex.is_none() && site.hosts.iter().all(|h| !h.starts_with('*'))
+}
+
+// Config order decides which site claims a request, so only neighbouring plain sites share a map.
+fn segments(sites: &[Site]) -> Vec<Segment<'_>> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while let Some(site) = sites.get(i) {
+        if !is_plain(site) {
+            out.push(Segment::One(site));
+            i += 1;
+            continue;
+        }
+        let end = sites[i..]
+            .iter()
+            .position(|s| !is_plain(s))
+            .map_or(sites.len(), |p| i + p);
+        if end - i >= MAP_RUN_MIN {
+            out.push(Segment::Map(&sites[i..end]));
+        } else {
+            out.extend(sites[i..end].iter().map(Segment::One));
+        }
+        i = end;
+    }
+    out
+}
+
+// Keys are the lowercase host plus the run number; site ids never contain '@', so they cannot collide with the id keys.
+fn host_entries(segs: &[Segment<'_>]) -> Vec<(String, String)> {
+    let mut entries = Vec::new();
+    let mut run = 0;
+    for seg in segs {
+        let Segment::Map(sites) = seg else { continue };
+        let mut seen = std::collections::HashSet::new();
+        for site in *sites {
+            for host in &site.hosts {
+                let host = host.to_ascii_lowercase();
+                if seen.insert(host.clone()) {
+                    entries.push((format!("{host}@{run}"), site.id.clone()));
+                }
+            }
+        }
+        run += 1;
+    }
+    entries
+}
+
 struct PageRef {
     file: String,
     status: u16,
@@ -394,7 +463,13 @@ fn page_for(site: &Site, cfg: &EdgeConfig) -> PageRef {
     }
 }
 
-fn render_frontend(cfg: &EdgeConfig, opts: &RenderOptions, tls: bool, out: &mut String) {
+fn render_frontend(
+    cfg: &EdgeConfig,
+    segs: &[Segment<'_>],
+    opts: &RenderOptions,
+    tls: bool,
+    out: &mut String,
+) {
     let s = &cfg.settings;
     let active_path = dir_join(&opts.maps_dir, "active.map");
     let maint_path = dir_join(&opts.maps_dir, "maint.map");
@@ -435,7 +510,8 @@ fn render_frontend(cfg: &EdgeConfig, opts: &RenderOptions, tls: bool, out: &mut 
         out,
         "http-request deny deny_status 400 if { req.fhdr(host) -m sub , }",
     );
-    for site in &cfg.sites {
+    for seg in segs {
+        let Segment::One(site) = seg else { continue };
         for line in host_acl_lines(&format!("host_{}", site.id), &site.hosts) {
             push_in(out, &line);
         }
@@ -448,15 +524,27 @@ fn render_frontend(cfg: &EdgeConfig, opts: &RenderOptions, tls: bool, out: &mut 
         }
     }
     // the first matching site labels the transaction, so blocked and maintenance requests still name a site
-    for site in &cfg.sites {
-        push_in(
-            out,
-            &format!(
-                "http-request set-var(txn.site) str({}) if {} !{{ var(txn.site) -m found }}",
-                site.id,
-                site_cond(site)
+    let mut run = 0;
+    for seg in segs {
+        match seg {
+            Segment::One(site) => push_in(
+                out,
+                &format!(
+                    "http-request set-var(txn.site) str({}) if !{{ var(txn.site) -m found }} {}",
+                    site.id,
+                    site_cond(site)
+                ),
             ),
-        );
+            Segment::Map(_) => {
+                push_in(
+                    out,
+                    &format!(
+                        "http-request set-var(txn.site) var(txn.host),concat(@{run}),map({active_path}) if !{{ var(txn.site) -m found }}"
+                    ),
+                );
+                run += 1;
+            }
+        }
     }
     push_in(
         out,
@@ -492,27 +580,36 @@ fn render_frontend(cfg: &EdgeConfig, opts: &RenderOptions, tls: bool, out: &mut 
         action_lines(rule, &rule_cond(rule, cfg), out);
     }
     // maintenance rules are always emitted; the maint map toggles them at runtime without a reload
+    let mut pages: Vec<(PageRef, Vec<String>)> = Vec::new();
     for site in &cfg.sites {
         let page = page_for(site, cfg);
+        match pages
+            .iter_mut()
+            .find(|(p, _)| p.file == page.file && p.status == page.status)
+        {
+            Some((_, ids)) => ids.push(site.id.clone()),
+            None => pages.push((page, vec![site.id.clone()])),
+        }
+    }
+    for (i, (page, ids)) in pages.iter().enumerate() {
+        for line in chunked_acl(&format!("maint_pg{i}"), "var(txn.site) -m str", ids) {
+            push_in(out, &line);
+        }
         push_in(
             out,
             &format!(
-                "http-request return status {} content-type \"text/html; charset=utf-8\" file {} hdr cache-control no-store if {} {{ str({}),map({maint_path},off) -m str on }}",
+                "http-request return status {} content-type \"text/html; charset=utf-8\" file {} hdr cache-control no-store if maint_pg{i} {{ var(txn.site),map({maint_path},off) -m str on }}",
                 page.status,
                 dir_join(&opts.pages_dir, &page.file),
-                site_cond(site),
-                site.id
             ),
         );
     }
     // the active map picks blue or green, so switching slots is a runtime-API map update
-    for site in &cfg.sites {
+    if !cfg.sites.is_empty() {
         push_in(
             out,
             &format!(
-                "use_backend %[str({}),map({active_path})] if {}",
-                site.id,
-                site_cond(site)
+                "use_backend %[var(txn.site),map({active_path})] if {{ var(txn.site) -m found }}"
             ),
         );
     }
@@ -568,7 +665,8 @@ pub fn render(cfg: &EdgeConfig, opts: &RenderOptions) -> Result<Rendered, Valida
     render_global(cfg, opts, tls, &mut config);
     render_defaults(cfg, &mut config);
     render_resolvers(&mut config);
-    render_frontend(cfg, opts, tls, &mut config);
+    let segs = segments(&cfg.sites);
+    render_frontend(cfg, &segs, opts, tls, &mut config);
     for site in &cfg.sites {
         render_backend(site, Slot::Blue, &mut config);
         render_backend(site, Slot::Green, &mut config);
@@ -581,7 +679,10 @@ pub fn render(cfg: &EdgeConfig, opts: &RenderOptions) -> Result<Rendered, Valida
         .map(|s| (s.id.as_str(), format!("be_{}_{}", s.id, s.active.as_str())))
         .collect();
     active.sort();
-    let active_map: String = active.iter().map(|(k, v)| format!("{k} {v}\n")).collect();
+    let mut active_map: String = active.iter().map(|(k, v)| format!("{k} {v}\n")).collect();
+    for (host, site) in host_entries(&segs) {
+        active_map.push_str(&format!("{host} {site}\n"));
+    }
 
     let mut maint: Vec<(&str, &str)> = cfg
         .sites
@@ -700,8 +801,8 @@ mod tests {
         let r = render(&config(vec![s]), &opts()).unwrap();
         let acls = lines_with(&r, "acl host_a");
         assert_eq!(acls.len(), 2);
-        assert!(acls[0].ends_with("req.hdr(host),field(1,:),lower -m str example.com"));
-        assert!(acls[1].ends_with("req.hdr(host),field(1,:),lower -m end .example.com"));
+        assert!(acls[0].ends_with("var(txn.host) -m str example.com"));
+        assert!(acls[1].ends_with("var(txn.host) -m end .example.com"));
     }
 
     #[test]
@@ -717,7 +818,7 @@ mod tests {
         let route = lines_with(&r, "use_backend");
         assert_eq!(
             route,
-            ["    use_backend %[str(a),map(/run/cite/maps/active.map)] if host_a path_a"]
+            ["    use_backend %[var(txn.site),map(/run/cite/maps/active.map)] if { var(txn.site) -m found }"]
         );
     }
 
@@ -824,9 +925,9 @@ mod tests {
             },
         ));
         let r = render(&cfg, &opts()).unwrap();
-        let line = lines_with(&r, "str(scoped) if host_b")[0];
+        let line = lines_with(&r, "str(scoped) if { var(txn.site) -m str b }")[0];
         assert!(line.ends_with(
-            "if host_b { method TRACE DEBUG } { req.hdr(user-agent) -m reg -- (?i)bot } { src 10.0.0.0/8 2001:db8::1 } { req.hdr(host),field(1,:),lower -m end .a.com }"
+            "if { var(txn.site) -m str b } { method TRACE DEBUG } { src 10.0.0.0/8 2001:db8::1 } { var(txn.host) -m end .a.com } { req.hdr(user-agent) -m reg -- (?i)bot }"
         ));
         let global = lines_with(&r, "str(global) if rp_global");
         assert_eq!(global.len(), 1);
@@ -910,8 +1011,8 @@ mod tests {
         assert_eq!(
             lines_with(&r, "set-var(txn.site)"),
             [
-                "    http-request set-var(txn.site) str(a) if host_a !{ var(txn.site) -m found }",
-                "    http-request set-var(txn.site) str(b) if host_b path_b !{ var(txn.site) -m found }",
+                "    http-request set-var(txn.site) str(a) if !{ var(txn.site) -m found } host_a",
+                "    http-request set-var(txn.site) str(b) if !{ var(txn.site) -m found } host_b path_b",
             ]
         );
         assert!(r.config.contains("%[var(txn.site),url_enc]"));
@@ -948,6 +1049,73 @@ mod tests {
     }
 
     #[test]
+    fn long_runs_of_plain_sites_share_one_host_map_lookup() {
+        let sites: Vec<Site> = (0..6)
+            .map(|i| site(&format!("s{i}"), &format!("S{i}.example.com")))
+            .collect();
+        let r = render(&config(sites), &opts()).unwrap();
+        let labels = lines_with(&r, "set-var(txn.site)");
+        assert_eq!(
+            labels,
+            ["    http-request set-var(txn.site) var(txn.host),concat(@0),map(/run/cite/maps/active.map) if !{ var(txn.site) -m found }"]
+        );
+        assert!(r.config.lines().all(|l| !l.starts_with("    acl host_")));
+        assert!(r.active_map.starts_with("s0 be_s0_blue\n"));
+        assert!(r.active_map.contains("\ns3 be_s3_blue\ns4 be_s4_blue\ns5 be_s5_blue\n"));
+        assert!(r.active_map.ends_with("s0.example.com@0 s0\ns1.example.com@0 s1\ns2.example.com@0 s2\ns3.example.com@0 s3\ns4.example.com@0 s4\ns5.example.com@0 s5\n"));
+    }
+
+    #[test]
+    fn host_map_runs_keep_config_order_around_other_sites() {
+        let plain = |range: std::ops::Range<usize>| -> Vec<Site> {
+            range
+                .map(|i| site(&format!("s{i}"), &format!("s{i}.example.com")))
+                .collect()
+        };
+        let mut wild = site("wild", "wild.example.com");
+        wild.hosts = vec!["*.example.com".into()];
+        let mut sites = plain(0..4);
+        sites.push(wild);
+        sites.extend(plain(4..8));
+        let r = render(&config(sites), &opts()).unwrap();
+        let labels = lines_with(&r, "set-var(txn.site)");
+        assert_eq!(labels.len(), 3);
+        assert!(labels[0].contains("concat(@0)"));
+        assert!(labels[1].contains("str(wild) if !{ var(txn.site) -m found } host_wild"));
+        assert!(labels[2].contains("concat(@1)"));
+        assert!(r.active_map.contains("s3.example.com@0 s3\n"));
+        assert!(r.active_map.contains("s4.example.com@1 s4\n"));
+    }
+
+    #[test]
+    fn duplicate_hosts_in_a_run_go_to_the_first_site() {
+        let sites: Vec<Site> = (0..4)
+            .map(|i| site(&format!("s{i}"), "shared.example.com"))
+            .collect();
+        let r = render(&config(sites), &opts()).unwrap();
+        let entries: Vec<&str> = r
+            .active_map
+            .lines()
+            .filter(|l| l.contains("@0"))
+            .collect();
+        assert_eq!(entries, ["shared.example.com@0 s0"]);
+    }
+
+    #[test]
+    fn long_acl_value_lists_are_split_below_the_line_limit() {
+        let ids: Vec<String> = (0..600).map(|i| format!("site-{i}")).collect();
+        let lines = chunked_acl("maint_pg0", "var(txn.site) -m str", &ids);
+        assert!(lines.len() > 1);
+        assert!(lines.iter().all(|l| l.len() <= MAX_ACL_LINE));
+        assert!(lines.iter().all(|l| l.split(' ').count() <= 60));
+        let joined: Vec<&str> = lines
+            .iter()
+            .flat_map(|l| l.split(" ").skip(5))
+            .collect();
+        assert_eq!(joined.len(), ids.len());
+    }
+
+    #[test]
     fn maintenance_map_and_pages() {
         let mut a = site("a", "a.com");
         a.maintenance.enabled = true;
@@ -962,15 +1130,15 @@ mod tests {
         });
         let r = render(&cfg, &opts()).unwrap();
         assert_eq!(r.maint_map, "a on\nb off\n");
-        let a_line = lines_with(&r, "str(a),map(/run/cite/maps/maint.map,off)")[0];
+        assert_eq!(lines_with(&r, "acl maint_pg0 var(txn.site) -m str a").len(), 1);
+        assert_eq!(lines_with(&r, "acl maint_pg1 var(txn.site) -m str b").len(), 1);
+        let on = "if maint_pg{} { var(txn.site),map(/run/cite/maps/maint.map,off) -m str on }";
+        let a_line = lines_with(&r, "file /run/cite/pages/down.html")[0];
         assert!(a_line.contains("return status 502"));
-        assert!(a_line.contains("file /run/cite/pages/down.html"));
-        assert!(
-            a_line.contains("if host_a { str(a),map(/run/cite/maps/maint.map,off) -m str on }")
-        );
-        let b_line = lines_with(&r, "str(b),map(/run/cite/maps/maint.map,off)")[0];
+        assert!(a_line.ends_with(&on.replace("{}", "0")));
+        let b_line = lines_with(&r, "file /run/cite/pages/_default.html")[0];
         assert!(b_line.contains("return status 503"));
-        assert!(b_line.contains("file /run/cite/pages/_default.html"));
+        assert!(b_line.ends_with(&on.replace("{}", "1")));
         let names: Vec<&str> = r.pages.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, ["_default.html", "down.html"]);
         assert_eq!(r.pages[0].1, DEFAULT_PAGE_HTML);

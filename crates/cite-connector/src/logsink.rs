@@ -154,6 +154,13 @@ impl Sink {
         }
     }
 
+    fn try_recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Sink::Udp(socket) => socket.try_recv_from(buf).map(|(len, _)| len),
+            Sink::Unix(socket) => socket.try_recv(buf),
+        }
+    }
+
     // The default kernel buffer drops bursts; failing to enlarge it only costs headroom.
     fn grow_receive_buffer(&self) {
         let grown = match self {
@@ -196,8 +203,18 @@ async fn receive_loop(sink: Sink, analytics: Arc<Mutex<Analytics>>) {
         tokio::select! {
             received = sink.recv(&mut buf) => match received {
                 Ok(len) => {
-                    if let Some(event) = parse_datagram(&buf[..len], now_ms()) {
+                    let now = now_ms();
+                    if let Some(event) = parse_datagram(&buf[..len], now) {
                         enqueue(&mut batch, event, &mut dropped);
+                    }
+                    // datagrams already queued in the kernel are taken without another trip through the scheduler
+                    for _ in 0..BATCH {
+                        let Ok(len) = sink.try_recv(&mut buf) else {
+                            break;
+                        };
+                        if let Some(event) = parse_datagram(&buf[..len], now) {
+                            enqueue(&mut batch, event, &mut dropped);
+                        }
                     }
                     if batch.len() >= BATCH {
                         flush(&analytics, &mut batch);
@@ -360,6 +377,39 @@ mod tests {
         assert!(events.iter().all(|e| e.site == "shop" && e.status == 200));
         assert_eq!(events[0].path, "/p4");
         assert_eq!(events[0].user_agent, "curl/8");
+        task.abort();
+    }
+
+    // Run with: cargo test -p cite-connector --release perf_unix_receive -- --ignored --nocapture
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore]
+    async fn perf_unix_receive() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log.sock");
+        let sink = Sink::Unix(bind_unix(&path).unwrap());
+        let a = analytics();
+        let task = tokio::spawn(receive_loop(sink, a.clone()));
+        let total = 200_000u64;
+        let target = path.clone();
+        let texts: Vec<String> = (0..97)
+            .map(|i| line(now_ms(), "be_shop_blue", &format!("/p{i}"), 200))
+            .collect();
+        let started = std::time::Instant::now();
+        let sender = std::thread::spawn(move || {
+            let tx = std::os::unix::net::UnixDatagram::unbound().unwrap();
+            for i in 0..total as usize {
+                // a full socket buffer rejects the send, so the sender waits for the sink to drain it
+                while tx.send_to(texts[i % 97].as_bytes(), &target).is_err() {
+                    std::thread::yield_now();
+                }
+            }
+        });
+        sender.join().unwrap();
+        while requests(&a) < total {
+            sleep(Duration::from_millis(5)).await;
+        }
+        let secs = started.elapsed().as_secs_f64();
+        println!("unix receive: {:.0} events/s", total as f64 / secs);
         task.abort();
     }
 

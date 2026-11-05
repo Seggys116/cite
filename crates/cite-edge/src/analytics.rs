@@ -1,5 +1,6 @@
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::hash::{BuildHasherDefault, Hasher};
 use std::io::{self, Write};
 use std::ops::Bound;
 use std::sync::Mutex;
@@ -26,7 +27,7 @@ const LOW_WATER_DIV: usize = 10;
 const KEEP_MINUTES: i64 = 60;
 const KEEP_HOURS: i64 = 24;
 const MAX_CAP_SHIFT: u8 = 3;
-const SPARE_CANDIDATES: usize = 8;
+const SPARE_CANDIDATES: usize = 32;
 const MIN_CAP: usize = 2;
 // Allocator, hash table and String header overhead added to the key bytes of one retained entry.
 const ENTRY_OVERHEAD: usize = 96;
@@ -259,11 +260,44 @@ fn bump32(v: &mut [u32], i: usize) {
     }
 }
 
+// Multiply-rotate hasher for the top-K maps. Their size is capped at a few dozen entries, so crafted
+// collisions cost a bounded probe and SipHash's flooding resistance is not worth its per-key cost.
+#[derive(Default, Clone, Copy)]
+struct KeyHasher(u64);
+
+impl KeyHasher {
+    fn mix(&mut self, word: u64) {
+        self.0 = (self.0.rotate_left(5) ^ word).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+    }
+}
+
+impl Hasher for KeyHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        let (words, rem) = bytes.as_chunks::<8>();
+        for w in words {
+            self.mix(u64::from_le_bytes(*w));
+        }
+        if !rem.is_empty() {
+            self.mix(rem.iter().rev().fold(0u64, |a, &b| a << 8 | u64::from(b)));
+        }
+    }
+
+    fn write_u8(&mut self, i: u8) {
+        self.mix(u64::from(i));
+    }
+
+    fn finish(&self) -> u64 {
+        self.0.rotate_left(26)
+    }
+}
+
+type KeyMap = HashMap<String, (u64, u64), BuildHasherDefault<KeyHasher>>;
+
 // Space-saving top-K: a full map evicts its minimum and the newcomer inherits that count.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct TopK {
     cap: usize,
-    map: HashMap<String, (u64, u64)>,
+    map: KeyMap,
     // Eviction candidates at the minimum count `spare_min`; still minimal while that count holds.
     #[serde(skip)]
     spare: Vec<String>,
@@ -275,7 +309,7 @@ impl TopK {
     fn new(cap: usize) -> Self {
         Self {
             cap,
-            map: HashMap::new(),
+            map: KeyMap::default(),
             spare: Vec::new(),
             spare_min: 0,
         }
@@ -315,10 +349,13 @@ impl TopK {
             return 0;
         }
         if self.map.len() >= self.cap
-            && let Some((victim, count)) = self.take_min()
+            && let Some((mut victim, count)) = self.take_min()
         {
-            self.map.insert(key.to_string(), (count + 1, bytes));
-            return entry_cost(key) as isize - entry_cost(&victim) as isize;
+            let freed = entry_cost(&victim) as isize;
+            victim.clear();
+            victim.push_str(key);
+            self.map.insert(victim, (count + 1, bytes));
+            return entry_cost(key) as isize - freed;
         }
         self.map.insert(key.to_string(), (1, bytes));
         entry_cost(key) as isize
@@ -336,7 +373,7 @@ impl TopK {
         if self.map.len() <= cap && !long {
             return;
         }
-        let mut merged: HashMap<String, (u64, u64)> = HashMap::with_capacity(self.map.len());
+        let mut merged = KeyMap::with_capacity_and_hasher(self.map.len(), Default::default());
         for (k, v) in self.map.drain() {
             let e = merged.entry(cut(&k, key_max).to_string()).or_insert((0, 0));
             e.0 += v.0;

@@ -109,7 +109,7 @@ Everything lives in the `cite_conf` volume, mounted at `/conf`.
 | `analytics.json` | 0600 | Analytics snapshot. |
 | `tls/` | 0700 | `ca.pem`, `ca.key`, `server.pem` and the server key. |
 | `haproxy/haproxy.cfg` | 0644 | Rendered config. Overwritten on every change, do not edit it. |
-| `haproxy/maps/active.map`, `maint.map` | 0644 | Active slot and maintenance flag per site. |
+| `haproxy/maps/active.map`, `maint.map` | 0644 | Active slot and maintenance flag per site. `active.map` also carries `<host>@<run>` keys that route runs of four or more plain sites (exact hosts, no path regex) with one lookup. |
 | `haproxy/pages/` | 0644 | Maintenance pages, including `_default.html`. |
 
 Back up the volume to keep sites, rules and credentials. Treat the backup as a secret.

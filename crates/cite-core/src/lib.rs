@@ -335,7 +335,7 @@ mod workspace_invariants {
         let executor_rust =
             std::fs::read_to_string(root.join("images/executor-rust/Dockerfile")).unwrap();
         assert!(manager.contains("bookworm"));
-        assert!(executor.contains("debian12"));
+        assert!(executor.contains("debian13"));
         assert!(manager.contains("rust:1.98-bookworm"));
         assert!(executor.contains("rust:1.98-bookworm"));
         let release = std::fs::read_to_string(root.join(".github/workflows/release.yml")).unwrap();
