@@ -22,12 +22,19 @@ Before any rule runs, the edge rewrites the request path so that rules see what 
 - `percent-to-uppercase`: `%2f` becomes `%2F`.
 - `percent-decode-unreserved`: escapes of letters, digits, `-`, `.`, `_` and `~` are decoded, so `%6c` becomes `l` and `%2e` becomes `.`.
 - `path-merge-slashes`: `//` becomes `/`.
-- `path-strip-dot` and `path-strip-dotdot`: `/./` and `/a/../` segments are resolved.
+- `path-strip-dot` and `path-strip-dotdot full`: `/./` and `/a/../` segments are resolved, and leading `/../` is dropped instead of being kept.
 - `fragment-strip`: a `#fragment` is removed.
 
 This changes what your upstreams receive: they get the normalised path. Duplicate slashes are merged, dot segments are resolved, and unreserved characters are no longer percent-encoded. Reserved escapes such as `%2F`, `%20` and `%3B` are left alone, so `/a%20b` and `/a/b%2Fc` reach the upstream as sent. The query string is not changed.
 
-Escapes of reserved characters stay encoded, and some origins decode them. Path regexes and path prefixes are therefore tested twice, against the path and against the fully URL-decoded path, and a rule fires if either matches. `/x%2f..%2f.env` is caught this way. Requests containing `%2F` or `%5C` are not rejected, because some applications use them legitimately. The presets also tolerate `;param` suffixes on any segment, which servlet containers strip, so `/actuator;x/env` and `/.git;a=b/config` are caught.
+Escapes of reserved characters stay encoded, and some origins decode them or treat them specially. Rules therefore also see a canonical path, kept in the `txn.cpath` variable. It is built from the normalised path by these steps:
+
+- Path parameters are removed from every segment: `;` (or `%3B`) up to the next `/`. Tomcat and Spring treat `/;x/admin` and `/x/..;/admin` as `/admin`.
+- Backslashes (`\` or `%5C`) become `/`, because IIS and some other servers treat them as separators.
+- The path is normalised again (merged slashes, dot segments, `..` resolved), so `/x/..;/admin` becomes `/admin`.
+- The result is fully URL-decoded.
+
+`path_prefix`, `path_regex` and the preset path rules fire if either the normalised path as sent or the canonical path matches. `/;x/admin`, `/x/..;/admin`, `/.;/admin`, `/%3Bx/admin`, `/\admin`, `/%5cadmin`, `/../admin` and `/x%2f..%2f.env` are all caught by a `/admin` or `/.env` rule. The canonical path is only used for matching. The upstream still receives the normalised path, and the query string is unchanged. Requests containing `%2F`, `%5C` or a raw backslash are not rejected, because some applications use them legitimately; rules just see the backslash as `/`. `/x/%5Cadmin` is therefore not an `/admin` request (it is `/x/admin`).
 
 Firewall rules therefore run before maintenance and routing. A blocked request never reaches a backend, and it is counted in analytics with the rule id that fired.
 
@@ -92,11 +99,12 @@ A preset is a fixed set of rules you add with one call: `POST /api/v1/firewall/p
 
 | Preset | Rule id | Action | Matches |
 |---|---|---|---|
-| `sensitive-files` | `preset-sensitive-files-1` | drop | Dotfiles: `.env`, `.git`, `.svn`, `.hg`, `.htaccess`, `.htpasswd`, `.ds_store` |
-| | `preset-sensitive-files-2` | drop | Private keys: `id_rsa`, `id_dsa`, `id_ecdsa`, `id_ed25519`, with or without `.pub` |
+| `sensitive-files` | `preset-sensitive-files-1` | drop | Dotfiles and anything after the name: `.env` (so `.env~`, `.env-prod`, `.env.local`), `.git`, `.svn`, `.hg`, `.htaccess`, `.htpasswd`, `.ds_store`, `.npmrc`, `.netrc`, `.pypirc`, `.dockerenv`, `.dockerignore`, `.bash_history`, `.aws`, `.ssh` |
+| | `preset-sensitive-files-2` | drop | Private keys and keystores: `id_rsa`, `id_dsa`, `id_ecdsa`, `id_ed25519` with any suffix, `*private*.pem` and `*privkey*.pem`, and files ending in `.key`, `.p12`, `.pfx`, `.jks`, `.keystore`. Other `.pem` files, such as public certificates, are not matched |
 | | `preset-sensitive-files-3` | drop | `wp-config`, `wp-config.php` and variants |
-| | `preset-sensitive-files-4` | drop | Paths ending in `.sql`, `.bak`, `.swp`, `.orig` |
+| | `preset-sensitive-files-4` | drop | Paths ending in `.sql`, `.bak`, `.swp`, `.swo`, `.orig`, `.old`, `.save` or `~` |
 | | `preset-sensitive-files-5` | drop | Archives named `backup`, `dump`, `db`, `database`, `www`, `site` or `public_html` as `.zip`, `.tar`, `.tgz`, `.gz`, `.7z`, `.rar` |
+| | `preset-sensitive-files-6` | drop | `docker-compose*.yml`/`.yaml`, `Dockerfile*`, `composer.json`, `composer.lock`. `package.json` is not matched because some sites serve it |
 | `cms-probes` | `preset-cms-probes-1` | drop | `wp-login.php`, `wp-admin`, `xmlrpc.php` |
 | | `preset-cms-probes-2` | drop | `phpmyadmin`, `pma`, `myadmin`, `mysqladmin` |
 | | `preset-cms-probes-3` | drop | `vendor/phpunit`, `cgi-bin`, `boaform`, `HNAP1` |

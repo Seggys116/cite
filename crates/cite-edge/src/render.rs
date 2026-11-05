@@ -5,6 +5,17 @@ use crate::model::{EdgeConfig, FirewallAction, FirewallRule, Site, Slot};
 use crate::validate::{ValidationError, invalid, parse_cidr, validate_config};
 
 const HOST_FETCH: &str = "var(txn.host)";
+
+// The path is rewritten to its canonical form, normalised again and copied out, then restored so the origin still gets the normalised path.
+const CANONICAL_PATH: [&str; 7] = [
+    "http-request set-path %[path,regsub(;[^/]*,,g),regsub(%3B[^/]*,,g),regsub(\\\\\\\\\\\\\\\\,/,g),regsub(%5C,/,g)]",
+    "http-request normalize-uri path-merge-slashes",
+    "http-request normalize-uri path-strip-dot",
+    "http-request normalize-uri path-strip-dotdot full",
+    "http-request set-var(txn.cpath) path",
+    "http-request set-path %[var(txn.path)]",
+    "http-request set-var(txn.cpath) var(txn.cpath),url_dec",
+];
 // Runs of at least this many plain sites are routed by one map lookup instead of one ACL each.
 const MAP_RUN_MIN: usize = 4;
 // HAProxy cuts configuration lines at 2048 bytes and 64 words, so long pattern lists are split over repeated ACLs.
@@ -241,17 +252,17 @@ fn site_cond(site: &Site) -> String {
     }
 }
 
-// A repeated acl name is an OR, so each path matcher tests the path as sent and as a plain origin would decode it.
+// A repeated acl name is an OR, so each path matcher tests the path as sent and its canonical form.
 fn rule_acl_lines(rule: &FirewallRule) -> Vec<String> {
     let m = &rule.matchers;
     let mut lines = Vec::new();
     if let Some(re) = &m.path_regex {
         lines.push(format!("acl rp_{} path_reg -- {re}", rule.id));
-        lines.push(format!("acl rp_{} path,url_dec -m reg -- {re}", rule.id));
+        lines.push(format!("acl rp_{} var(txn.cpath) -m reg -- {re}", rule.id));
     }
     if let Some(p) = &m.path_prefix {
         lines.push(format!("acl rb_{} path_beg {p}", rule.id));
-        lines.push(format!("acl rb_{} path,url_dec -m beg {p}", rule.id));
+        lines.push(format!("acl rb_{} var(txn.cpath) -m beg {p}", rule.id));
     }
     lines
 }
@@ -485,7 +496,7 @@ fn render_frontend(
         "percent-decode-unreserved",
         "path-merge-slashes",
         "path-strip-dot",
-        "path-strip-dotdot",
+        "path-strip-dotdot full",
         "fragment-strip",
     ] {
         push_in(out, &format!("http-request normalize-uri {normalizer}"));
@@ -499,6 +510,10 @@ fn render_frontend(
         "http-request set-var(txn.ref) req.fhdr(referer)",
         "http-response set-var(txn.ct) res.hdr(content-type)",
     ] {
+        push_in(out, line);
+    }
+    // rules also see the path as a lenient origin would: no path parameters, backslashes as slashes, dot segments resolved
+    for line in CANONICAL_PATH {
         push_in(out, line);
     }
     // a second or comma-joined Host lets a proxy and its origin disagree about the site
@@ -818,7 +833,9 @@ mod tests {
         let route = lines_with(&r, "use_backend");
         assert_eq!(
             route,
-            ["    use_backend %[var(txn.site),map(/run/cite/maps/active.map)] if { var(txn.site) -m found }"]
+            [
+                "    use_backend %[var(txn.site),map(/run/cite/maps/active.map)] if { var(txn.site) -m found }"
+            ]
         );
     }
 
@@ -934,7 +951,7 @@ mod tests {
         assert!(!global[0].contains("host_"));
         assert_eq!(lines_with(&r, "acl rp_global path_reg -- ^/admin").len(), 1);
         assert_eq!(
-            lines_with(&r, "acl rp_global path,url_dec -m reg -- ^/admin").len(),
+            lines_with(&r, "acl rp_global var(txn.cpath) -m reg -- ^/admin").len(),
             1
         );
     }
@@ -955,7 +972,7 @@ mod tests {
         assert!(position(&r, set) < position(&r, act));
         assert_eq!(lines_with(&r, "rb_r1").len(), 3);
         assert_eq!(lines_with(&r, "path_beg /x").len(), 1);
-        assert_eq!(lines_with(&r, "path,url_dec -m beg /x").len(), 1);
+        assert_eq!(lines_with(&r, "var(txn.cpath) -m beg /x").len(), 1);
     }
 
     #[test]
@@ -975,14 +992,45 @@ mod tests {
             "normalize-uri percent-decode-unreserved",
             "normalize-uri path-merge-slashes",
             "normalize-uri path-strip-dot\n",
-            "normalize-uri path-strip-dotdot",
+            "normalize-uri path-strip-dotdot full",
             "normalize-uri fragment-strip",
             "set-var(txn.path) path",
+            "set-path %[path,regsub(",
+            "set-var(txn.cpath) path",
+            "set-path %[var(txn.path)]",
             "acl host_a",
             "set-var(txn.site)",
             "acl rb_r1",
             "set-var(txn.blocked)",
             "use_backend",
+        ];
+        let at: Vec<usize> = order.iter().map(|n| position(&r, n)).collect();
+        assert!(at.windows(2).all(|w| w[0] < w[1]), "{at:?}");
+    }
+
+    #[test]
+    fn canonical_path_strips_parameters_and_backslashes_then_restores_the_path() {
+        let r = render(&config(vec![site("a", "a.com")]), &opts()).unwrap();
+        let set = lines_with(&r, "set-path %[path,regsub(");
+        assert_eq!(set.len(), 1);
+        for part in [
+            "regsub(;[^/]*,,g)",
+            "regsub(%3B[^/]*,,g)",
+            "regsub(%5C,/,g)",
+        ] {
+            assert!(set[0].contains(part), "{part}");
+        }
+        assert!(set[0].contains(r"regsub(\\\\\\\\,/,g)"));
+        assert_eq!(
+            lines_with(&r, "normalize-uri path-strip-dotdot full").len(),
+            2
+        );
+        assert_eq!(lines_with(&r, "normalize-uri path-strip-dotdot").len(), 2);
+        let order = [
+            "set-var(txn.path) path",
+            "set-path %[path,regsub(",
+            "set-var(txn.cpath) path",
+            "set-path %[var(txn.path)]",
         ];
         let at: Vec<usize> = order.iter().map(|n| position(&r, n)).collect();
         assert!(at.windows(2).all(|w| w[0] < w[1]), "{at:?}");
@@ -1057,11 +1105,16 @@ mod tests {
         let labels = lines_with(&r, "set-var(txn.site)");
         assert_eq!(
             labels,
-            ["    http-request set-var(txn.site) var(txn.host),concat(@0),map(/run/cite/maps/active.map) if !{ var(txn.site) -m found }"]
+            [
+                "    http-request set-var(txn.site) var(txn.host),concat(@0),map(/run/cite/maps/active.map) if !{ var(txn.site) -m found }"
+            ]
         );
         assert!(r.config.lines().all(|l| !l.starts_with("    acl host_")));
         assert!(r.active_map.starts_with("s0 be_s0_blue\n"));
-        assert!(r.active_map.contains("\ns3 be_s3_blue\ns4 be_s4_blue\ns5 be_s5_blue\n"));
+        assert!(
+            r.active_map
+                .contains("\ns3 be_s3_blue\ns4 be_s4_blue\ns5 be_s5_blue\n")
+        );
         assert!(r.active_map.ends_with("s0.example.com@0 s0\ns1.example.com@0 s1\ns2.example.com@0 s2\ns3.example.com@0 s3\ns4.example.com@0 s4\ns5.example.com@0 s5\n"));
     }
 
@@ -1093,11 +1146,7 @@ mod tests {
             .map(|i| site(&format!("s{i}"), "shared.example.com"))
             .collect();
         let r = render(&config(sites), &opts()).unwrap();
-        let entries: Vec<&str> = r
-            .active_map
-            .lines()
-            .filter(|l| l.contains("@0"))
-            .collect();
+        let entries: Vec<&str> = r.active_map.lines().filter(|l| l.contains("@0")).collect();
         assert_eq!(entries, ["shared.example.com@0 s0"]);
     }
 
@@ -1108,10 +1157,7 @@ mod tests {
         assert!(lines.len() > 1);
         assert!(lines.iter().all(|l| l.len() <= MAX_ACL_LINE));
         assert!(lines.iter().all(|l| l.split(' ').count() <= 60));
-        let joined: Vec<&str> = lines
-            .iter()
-            .flat_map(|l| l.split(" ").skip(5))
-            .collect();
+        let joined: Vec<&str> = lines.iter().flat_map(|l| l.split(" ").skip(5)).collect();
         assert_eq!(joined.len(), ids.len());
     }
 
@@ -1130,8 +1176,14 @@ mod tests {
         });
         let r = render(&cfg, &opts()).unwrap();
         assert_eq!(r.maint_map, "a on\nb off\n");
-        assert_eq!(lines_with(&r, "acl maint_pg0 var(txn.site) -m str a").len(), 1);
-        assert_eq!(lines_with(&r, "acl maint_pg1 var(txn.site) -m str b").len(), 1);
+        assert_eq!(
+            lines_with(&r, "acl maint_pg0 var(txn.site) -m str a").len(),
+            1
+        );
+        assert_eq!(
+            lines_with(&r, "acl maint_pg1 var(txn.site) -m str b").len(),
+            1
+        );
         let on = "if maint_pg{} { var(txn.site),map(/run/cite/maps/maint.map,off) -m str on }";
         let a_line = lines_with(&r, "file /run/cite/pages/down.html")[0];
         assert!(a_line.contains("return status 502"));

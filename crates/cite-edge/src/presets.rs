@@ -47,6 +47,7 @@ fn sensitive_files() -> Preset {
     let p = "sensitive-files";
     // (?i) keeps the match case-insensitive, which needs a PCRE-enabled haproxy build
     // (;[^/]*)? tolerates path parameters, which servlet containers strip from every segment
+    // the dotfile rule has no terminator on purpose, so .env~, .env-prod, .env.local and .gitignore all match
     Preset {
         name: p,
         title: "Sensitive files",
@@ -57,14 +58,14 @@ fn sensitive_files() -> Preset {
                 1,
                 "Dotfiles",
                 drop,
-                r"(?i)(^|/)\.(env|git|svn|hg|htaccess|htpasswd|ds_store)(;[^/]*)?(/|\.|$)",
+                r"(?i)(^|/)\.(env|git|svn|hg|htaccess|htpasswd|ds_store|npmrc|netrc|pypirc|dockerenv|dockerignore|bash_history|aws|ssh)",
             ),
             path_rule(
                 p,
                 2,
-                "Private keys",
+                "Private keys and keystores",
                 drop,
-                r"(?i)(^|/)id_(rsa|dsa|ecdsa|ed25519)(\.pub)?(;[^/]*)?$",
+                r"(?i)((^|/)id_(rsa|dsa|ecdsa|ed25519)[^/]*|(^|/)[^/]*(privkey|private)[^/]*\.pem|\.(key|p12|pfx|jks|keystore))(;[^/]*)?$",
             ),
             path_rule(
                 p,
@@ -76,9 +77,9 @@ fn sensitive_files() -> Preset {
             path_rule(
                 p,
                 4,
-                "Database and backup files",
+                "Database, backup and editor files",
                 drop,
-                r"(?i)\.(sql|bak|swp|orig)(;[^/]*)?$",
+                r"(?i)(\.(sql|bak|swp|swo|orig|old|save)|~)(;[^/]*)?$",
             ),
             path_rule(
                 p,
@@ -86,6 +87,13 @@ fn sensitive_files() -> Preset {
                 "Backup archives",
                 drop,
                 r"(?i)(^|/)(backup|backups|dump|dumps|db|database|www|site|public_html)[^/]*\.(zip|tar|tgz|gz|7z|rar)(;[^/]*)?$",
+            ),
+            path_rule(
+                p,
+                6,
+                "Build and dependency manifests",
+                drop,
+                r"(?i)(^|/)(docker-compose[^/]*\.ya?ml|dockerfile[^/]*|composer\.(json|lock))(;[^/]*)?$",
             ),
         ],
     }
@@ -254,6 +262,24 @@ mod tests {
             "/db/dump.sql;jsessionid=1",
             "/backup.zip;x",
             "/wp-config;x",
+            "/.env~",
+            "/.env-prod",
+            "/.env.local",
+            "/.env.bak",
+            "/.gitignore",
+            "/.aws/credentials",
+            "/.npmrc",
+            "/.dockerenv",
+            "/id_rsa.bak",
+            "/certs/server.key",
+            "/ssl/privkey.pem",
+            "/config.php~",
+            "/a.php.old",
+            "/docker-compose.yml",
+            "/docker-compose.prod.yaml",
+            "/Dockerfile",
+            "/composer.json",
+            "/composer.lock;x",
         ] {
             assert!(matches("sensitive-files", hit), "{hit} not matched");
         }
@@ -264,6 +290,14 @@ mod tests {
             "/assets/app.js",
             "/docs/git-guide",
             "/images/photo.zip.png",
+            "/a%20b",
+            "/api/v1/users",
+            "/static/app.js",
+            "/docs/environment.html",
+            "/blog/dotenv-guide",
+            "/certs/ca.pem",
+            "/~alice/",
+            "/package.json",
         ] {
             assert!(!matches("sensitive-files", miss), "{miss} wrongly matched");
         }

@@ -66,14 +66,23 @@ fn lat(label: &str, iters: usize, mut f: impl FnMut()) {
         v.push(t.elapsed().as_secs_f64() * 1e3);
     }
     v.sort_by(|a, b| a.total_cmp(b));
-    println!("{label}: p50 {:.3} ms p99 {:.3} ms", v[v.len() / 2], v[v.len() * 99 / 100]);
+    println!(
+        "{label}: p50 {:.3} ms p99 {:.3} ms",
+        v[v.len() / 2],
+        v[v.len() * 99 / 100]
+    );
 }
 
 #[test]
 #[ignore]
 fn ingest() {
-    let n = std::env::var("CITE_PERF_N").ok().and_then(|v| v.parse().ok()).unwrap_or(300_000);
-    let dgs: Vec<Vec<u8>> = (0..n).map(|i| datagram(i, NOW - 1000 + (i as i64 % 1000))).collect();
+    let n = std::env::var("CITE_PERF_N")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(300_000);
+    let dgs: Vec<Vec<u8>> = (0..n)
+        .map(|i| datagram(i, NOW - 1000 + (i as i64 % 1000)))
+        .collect();
     let (mut best_p, mut best_r, mut best_pr) = (0f64, 0f64, 0f64);
     let (mut ap, mut ar, mut apr) = (0.0, 0.0, 0.0);
     for _ in 0..5 {
@@ -112,7 +121,11 @@ fn ingest() {
 fn queries() {
     let t = Instant::now();
     let a = filled();
-    println!("fill 1.5M events: {:.2} s, retained {} MiB", t.elapsed().as_secs_f64(), a.retained_bytes() >> 20);
+    println!(
+        "fill 1.5M events: {:.2} s, retained {} MiB",
+        t.elapsed().as_secs_f64(),
+        a.retained_bytes() >> 20
+    );
     for (name, w) in [("24h", 86_400u64), ("7d", 7 * 86_400), ("30d", 30 * 86_400)] {
         lat(&format!("summary {name}"), 200, || {
             std::hint::black_box(a.summary(w, None, NOW));
@@ -135,13 +148,21 @@ fn queries() {
     lat("requests 5000 (no match path)", 200, || {
         std::hint::black_box(a.requests(&f, 100));
     });
-    let f2 = RequestFilter { path_contains: Some("zzz".into()), ..f };
+    let f2 = RequestFilter {
+        path_contains: Some("zzz".into()),
+        ..f
+    };
     lat("requests 5000 full scan", 200, || {
         std::hint::black_box(a.requests(&f2, 100));
     });
-    let mut big = Analytics::new(Retention { recent_events: 200_000, ..Retention::default() });
+    let mut big = Analytics::new(Retention {
+        recent_events: 200_000,
+        ..Retention::default()
+    });
     for i in 0..200_000 {
-        big.record(parse_datagram(&datagram(i, NOW - 1000 + (i as i64 % 1000)), NOW).expect("parse"));
+        big.record(
+            parse_datagram(&datagram(i, NOW - 1000 + (i as i64 % 1000)), NOW).expect("parse"),
+        );
     }
     let f3 = RequestFilter {
         status: Some(200),
@@ -158,12 +179,21 @@ fn queries() {
     let t = Instant::now();
     let mut buf = Vec::new();
     write_snapshot(&shared, &mut buf).expect("snapshot");
-    println!("snapshot write: {:.3} s, {} MiB, peak extra ~ out buffer", t.elapsed().as_secs_f64(), buf.len() >> 20);
+    println!(
+        "snapshot write: {:.3} s, {} MiB, peak extra ~ out buffer",
+        t.elapsed().as_secs_f64(),
+        buf.len() >> 20
+    );
     let t = Instant::now();
     let snap = serde_json::from_slice(&buf).expect("decode");
     let d1 = t.elapsed().as_secs_f64();
     let r = Analytics::restore(Retention::default(), snap);
-    println!("restore: decode {:.3} s total {:.3} s, retained {} MiB", d1, t.elapsed().as_secs_f64(), r.retained_bytes() >> 20);
+    println!(
+        "restore: decode {:.3} s total {:.3} s, retained {} MiB",
+        d1,
+        t.elapsed().as_secs_f64(),
+        r.retained_bytes() >> 20
+    );
 }
 
 fn opts() -> RenderOptions {
@@ -190,10 +220,23 @@ pub fn big_config(sites: usize, rules: usize) -> EdgeConfig {
     let mut cfg: EdgeConfig = serde_json::from_value(v).expect("cfg");
     for i in 0..rules {
         let m = match i % 4 {
-            0 => Matchers { path_regex: Some(format!("^/admin{i}/.*")), ..Default::default() },
-            1 => Matchers { cidrs: vec![format!("198.51.{}.0/24", i % 250)], ..Default::default() },
-            2 => Matchers { user_agent_regex: Some(format!("(?i)bot{i}")), methods: vec!["POST".into()], ..Default::default() },
-            _ => Matchers { path_prefix: Some(format!("/private{i}")), ..Default::default() },
+            0 => Matchers {
+                path_regex: Some(format!("^/admin{i}/.*")),
+                ..Default::default()
+            },
+            1 => Matchers {
+                cidrs: vec![format!("198.51.{}.0/24", i % 250)],
+                ..Default::default()
+            },
+            2 => Matchers {
+                user_agent_regex: Some(format!("(?i)bot{i}")),
+                methods: vec!["POST".into()],
+                ..Default::default()
+            },
+            _ => Matchers {
+                path_prefix: Some(format!("/private{i}")),
+                ..Default::default()
+            },
         };
         cfg.firewall.push(FirewallRule {
             id: format!("r{i}"),
@@ -201,7 +244,11 @@ pub fn big_config(sites: usize, rules: usize) -> EdgeConfig {
             enabled: true,
             action: FirewallAction::Deny,
             matchers: m,
-            site: if i % 5 == 0 { Some(format!("s{}", i % sites.max(1))) } else { None },
+            site: if i % 5 == 0 {
+                Some(format!("s{}", i % sites.max(1)))
+            } else {
+                None
+            },
         });
     }
     cfg
@@ -216,9 +263,13 @@ fn render_validate() {
             validate_config(&cfg).expect("valid");
         });
         let mut size = 0;
-        lat(&format!("render (incl. validate) {sites} sites"), 10, || {
-            size = render(&cfg, &opts()).expect("render").config.len();
-        });
+        lat(
+            &format!("render (incl. validate) {sites} sites"),
+            10,
+            || {
+                size = render(&cfg, &opts()).expect("render").config.len();
+            },
+        );
         println!("  config bytes {size}");
     }
 }
@@ -228,7 +279,12 @@ fn render_validate() {
 #[test]
 #[ignore]
 fn dump_config() {
-    let env = |k: &str, d: usize| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+    let env = |k: &str, d: usize| {
+        std::env::var(k)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(d)
+    };
     let mut cfg = big_config(env("CITE_PERF_SITES", 1000), env("CITE_PERF_RULES", 200));
     let rate = env("CITE_PERF_RATE", 0) as u32;
     cfg.settings.per_ip_rate_limit = (rate > 0).then_some(rate);
