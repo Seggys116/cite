@@ -66,6 +66,7 @@ impl Inner {
             }
             for d in &dims {
                 tx.execute("DELETE FROM rollup_dim WHERE dim = ?1", params![d])?;
+                tx.execute("DELETE FROM rollup_dim_min WHERE dim = ?1", params![d])?;
             }
             tx.commit()?;
             Ok(tail)

@@ -5,7 +5,7 @@ use cite_edge::analytics::{Point, RequestFilter, SizeBucket, Summary, Timeseries
 use cite_edge::bot::BotSummary;
 use cite_edge::model::LogEvent;
 use rusqlite::types::{Value, ValueRef};
-use rusqlite::{Connection, Row, params, params_from_iter};
+use rusqlite::{Connection, OptionalExtension, Row, params, params_from_iter};
 
 use crate::error::Result;
 use crate::hist::{LAT_LEN, SIZE_LEN, SIZE_LES, lat_index, percentile};
@@ -13,7 +13,7 @@ use crate::limits::{
     HOUR_MS, MAX_REQUEST_LIMIT, MAX_TOP_LIMIT, MAX_WINDOW_SECS, METHOD_CAP, MINUTE_MS,
     MINUTE_STEP_MAX_WINDOW_SECS, ROLLUP_MIN_WINDOW_SECS, TOP_N,
 };
-use crate::schema::{ALL_SITES, dim, kind, series};
+use crate::schema::{ALL_SITES, HOURLY, Level, MINUTELY, dim, kind, series};
 use crate::util::{
     ascii_upper, from_i64, normalize_ctype, split_signals, to_i64, to_u8, to_u16, to_u32,
 };
@@ -121,6 +121,14 @@ fn collect<T>(
     Ok(out)
 }
 
+// Where a window's numbers come from: raw rows, the minute rollups or the hourly rollups.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Source {
+    Raw,
+    Minute,
+    Hour,
+}
+
 // Bucket-aligned time range for a window, as bucket indexes and as milliseconds [from, to).
 pub(crate) struct Window {
     pub(crate) first: i64,
@@ -128,7 +136,7 @@ pub(crate) struct Window {
     pub(crate) step: i64,
     pub(crate) from: i64,
     pub(crate) to: i64,
-    pub(crate) hourly: bool,
+    pub(crate) source: Source,
 }
 
 impl Window {
@@ -143,13 +151,67 @@ impl Window {
             step,
             from: first.saturating_mul(step),
             to: last.saturating_add(1).saturating_mul(step),
-            hourly,
+            source: if hourly { Source::Hour } else { Source::Raw },
         }
     }
 
-    fn for_summary(window_secs: u64, now_ms: i64) -> Self {
-        Self::new(window_secs, now_ms, window_secs > ROLLUP_MIN_WINDOW_SECS)
+    // A minute-step window served by the minute rollups.
+    pub(crate) fn minute(window_secs: u64, now_ms: i64) -> Self {
+        Self {
+            source: Source::Minute,
+            ..Self::new(window_secs, now_ms, false)
+        }
     }
+
+    // Windows of up to six hours read the minute rollups once they cover every minute of the window; longer ones read the hourly rollups, or raw minutes when the chart still steps per minute.
+    pub(crate) fn pick(
+        conn: &Connection,
+        window_secs: u64,
+        now_ms: i64,
+        minute_step: bool,
+    ) -> Result<Self> {
+        if window_secs > ROLLUP_MIN_WINDOW_SECS {
+            let hourly = !minute_step || window_secs > MINUTE_STEP_MAX_WINDOW_SECS;
+            return Ok(Self::new(window_secs, now_ms, hourly));
+        }
+        let win = Self::minute(window_secs, now_ms);
+        if win.first >= valid_from(conn)? && heavy_ready(conn, dim::ANY, &win)? {
+            Ok(win)
+        } else {
+            Ok(Self::new(window_secs, now_ms, false))
+        }
+    }
+
+    fn level(&self) -> &'static Level {
+        if self.source == Source::Hour {
+            &HOURLY
+        } else {
+            &MINUTELY
+        }
+    }
+
+    fn range_frags(&self) -> (&'static str, &'static str) {
+        if self.source == Source::Hour {
+            ("hour >= ?", "hour <= ?")
+        } else {
+            ("minute >= ?", "minute <= ?")
+        }
+    }
+}
+
+// First minute the minute rollups cover completely.
+fn valid_from(conn: &Connection) -> Result<i64> {
+    Ok(conn.query_row("SELECT valid_from FROM rollup_state", [], |r| r.get(0))?)
+}
+
+// Highest request id whose heavy keys are in the minute tables; later rows are read raw.
+fn folded_id(conn: &Connection) -> Result<i64> {
+    Ok(conn.query_row("SELECT folded_id FROM rollup_state", [], |r| r.get(0))?)
+}
+
+// A read snapshot, so the statements of one query see the same rollups and watermark.
+fn snapshot(conn: &Connection) -> Result<rusqlite::Transaction<'_>> {
+    Ok(conn.unchecked_transaction()?)
 }
 
 // Exact client ip match plus the bucket term that lets idx_requests_ip_bucket serve it.
@@ -176,9 +238,9 @@ fn raw_where(win: &Window, site: Option<&str>) -> Where {
 }
 
 fn roll_where(win: &Window, site: Option<&str>) -> Where {
+    let (lo, hi) = win.range_frags();
     let mut w = Where::default();
-    w.and("hour >= ?", [int(win.first)])
-        .and("hour <= ?", [int(win.last)]);
+    w.and(lo, [int(win.first)]).and(hi, [int(win.last)]);
     site_filter(&mut w, site);
     w
 }
@@ -189,8 +251,8 @@ fn scope_where(win: &Window, site: Option<&str>, d: Option<u8>) -> Where {
     if let Some(d) = d {
         w.and("dim = ?", [int(i64::from(d))]);
     }
-    w.and("hour >= ?", [int(win.first)])
-        .and("hour <= ?", [int(win.last)]);
+    let (lo, hi) = win.range_frags();
+    w.and(lo, [int(win.first)]).and(hi, [int(win.last)]);
     match site {
         Some(_) => site_filter(&mut w, site),
         None => {
@@ -288,10 +350,11 @@ fn rollup_top_dict(
 ) -> Result<Vec<TopItem>> {
     let w = scope_where(win, site, Some(d));
     let sql = format!(
-        "WITH g AS MATERIALIZED (SELECT key_id, sum(n) AS n, sum(bytes) AS b FROM rollup_dim{} GROUP BY key_id) \
+        "WITH g AS MATERIALIZED (SELECT key_id, sum(n) AS n, sum(bytes) AS b FROM {}{} GROUP BY key_id) \
          SELECT dc.val, g.n, g.b FROM g JOIN dict dc ON dc.id = g.key_id \
          WHERE g.n >= coalesce((SELECT n FROM g ORDER BY n DESC LIMIT 1 OFFSET ?), 0) \
          ORDER BY 2 DESC, 1 ASC LIMIT ?",
+        win.level().dim,
         w.clause()
     );
     let offset = to_i64(limit.saturating_sub(1) as u64);
@@ -310,7 +373,8 @@ fn rollup_top_path(
 ) -> Result<Vec<TopItem>> {
     let w = scope_where(win, site, None);
     let sql = format!(
-        "SELECT path, sum(n), sum(bytes) FROM rollup_path{} GROUP BY path ORDER BY 2 DESC, 1 ASC LIMIT ?",
+        "SELECT path, sum(n), sum(bytes) FROM {}{} GROUP BY path ORDER BY 2 DESC, 1 ASC LIMIT ?",
+        win.level().path,
         w.clause()
     );
     run_top(conn, &sql, &w.bind([int(to_i64(limit as u64))]))
@@ -325,11 +389,193 @@ fn rollup_top_int(
 ) -> Result<Vec<TopItem>> {
     let w = scope_where(win, site, Some(d));
     let sql = format!(
-        "SELECT x.key_id, sum(x.n), sum(x.bytes) FROM rollup_dim x{} \
+        "SELECT x.key_id, sum(x.n), sum(x.bytes) FROM {} x{} \
          GROUP BY x.key_id ORDER BY 2 DESC, 1 ASC LIMIT ?",
+        win.level().dim,
         w.clause()
     );
     run_top_int(conn, &sql, &w.bind([int(to_i64(limit as u64))]))
+}
+
+// Rows newer than the fold watermark in the window, which the minute tables do not hold yet; readers scan them by id with NOT INDEXED, since the planner would otherwise walk the whole window through the ts index.
+fn tail_where(win: &Window, site: Option<&str>, after: i64) -> Where {
+    let mut w = Where::default();
+    w.and("id > ?", [int(after)]);
+    w.and("ts >= ?", [int(win.from)])
+        .and("ts < ?", [int(win.to)]);
+    site_filter(&mut w, site);
+    w
+}
+
+// False when a minute of the window outgrew the key cap or came in with a backfill, so the tables do not hold it.
+fn heavy_ready(conn: &Connection, d: u8, win: &Window) -> Result<bool> {
+    let over = conn.prepare_cached(
+        "SELECT EXISTS (SELECT 1 FROM rollup_over WHERE dim IN (?1, ?4) AND minute >= ?2 AND minute <= ?3)",
+    )?
+    .query_row(params![d, win.first, win.last, dim::ANY], |r| r.get::<_, bool>(0))?;
+    Ok(!over)
+}
+
+// Largest list the hot-path shortcut answers, and the most keys whose single sightings it looks up.
+const HOT_LIMIT: usize = 100;
+const HOT_CANDIDATES: usize = 400;
+
+// Exact top paths of a minute window: the folded minutes plus the raw rows the fold has not reached.
+fn minute_top_path(
+    conn: &Connection,
+    win: &Window,
+    site: Option<&str>,
+    limit: usize,
+) -> Result<Vec<TopItem>> {
+    if !heavy_ready(conn, dim::PATH, win)? {
+        return raw_top_path(conn, &raw_where(win, site), limit);
+    }
+    if limit <= HOT_LIMIT
+        && let Some(items) = hot_top_path(conn, win, site, limit)?
+    {
+        return Ok(items);
+    }
+    let rolled = scope_where(win, site, None);
+    let mut tail = tail_where(win, site, folded_id(conn)?);
+    tail.and("path <> ''", []);
+    let sql = format!(
+        "SELECT k, sum(n), sum(b) FROM (SELECT path AS k, n, bytes AS b FROM {}{} \
+         UNION ALL SELECT r.path, 1, r.bytes_out FROM requests r NOT INDEXED{}) \
+         GROUP BY k ORDER BY 2 DESC, 1 ASC LIMIT ?",
+        MINUTELY.path,
+        rolled.clause(),
+        tail.clause()
+    );
+    let params = rolled.bind(tail.bind([int(to_i64(limit as u64))]));
+    run_top(conn, &sql, &params)
+}
+
+// A path seen once in a minute is a "single"; it can add at most one per minute to a total. Summing only the paths seen at least twice (plus the unfolded rows) gives a lower bound for every key, and the keys that could still reach the limit-th place are then completed with their singles by point lookups. Returns None when the bound cannot prove the list, and the caller scans every row.
+fn hot_top_path(
+    conn: &Connection,
+    win: &Window,
+    site: Option<&str>,
+    limit: usize,
+) -> Result<Option<Vec<TopItem>>> {
+    let site_id = match site {
+        None => ALL_SITES,
+        Some(s) => {
+            let id = conn
+                .prepare_cached("SELECT id FROM dict WHERE kind = ?1 AND val = ?2")?
+                .query_row(params![kind::SITE, s], |r| r.get::<_, i64>(0))
+                .optional()?;
+            match id {
+                Some(id) => id,
+                None => return Ok(Some(Vec::new())),
+            }
+        }
+    };
+    let mut rolled = scope_where(win, site, None);
+    rolled.and("n >= 2", []);
+    let mut tail = tail_where(win, site, folded_id(conn)?);
+    tail.and("path <> ''", []);
+    let sql = format!(
+        "SELECT k, sum(n), sum(b) FROM (SELECT path AS k, n, bytes AS b FROM {} INDEXED BY idx_rollup_path_min_hot{} \
+         UNION ALL SELECT r.path, 1, r.bytes_out FROM requests r NOT INDEXED{}) \
+         GROUP BY k ORDER BY 2 DESC, 1 ASC",
+        MINUTELY.path,
+        rolled.clause(),
+        tail.clause()
+    );
+    let hot = run_top(conn, &sql, &rolled.bind(tail.bind([])))?;
+    if hot.len() < limit {
+        return Ok(None);
+    }
+    let minutes = u64::try_from(win.last - win.first + 1).unwrap_or(u64::MAX);
+    let cutoff = hot[limit - 1].count;
+    let mut ranked: Vec<TopItem> = hot
+        .into_iter()
+        .take_while(|it| it.count.saturating_add(minutes) >= cutoff)
+        .collect();
+    if ranked.len() > HOT_CANDIDATES {
+        return Ok(None);
+    }
+    let mut single = conn.prepare_cached(
+        "SELECT n, bytes FROM rollup_path_min WHERE site_id = ?1 AND minute = ?2 AND path = ?3 AND n < 2",
+    )?;
+    for it in &mut ranked {
+        for minute in win.first..=win.last {
+            let found = single
+                .query_row(params![site_id, minute, it.key], |r| {
+                    Ok((count_col(r, 0)?, count_col(r, 1)?))
+                })
+                .optional()?;
+            if let Some((n, bytes)) = found {
+                it.count += n;
+                it.bytes += bytes;
+            }
+        }
+    }
+    sort_items(&mut ranked);
+    ranked.truncate(limit);
+    match ranked.last() {
+        Some(last) if last.count > minutes => Ok(Some(ranked)),
+        _ => Ok(None),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn hot_top_path_for_test(
+    conn: &Connection,
+    win: &Window,
+    site: Option<&str>,
+    limit: usize,
+) -> Result<Option<Vec<TopItem>>> {
+    hot_top_path(conn, win, site, limit)
+}
+
+// Same for a dictionary dimension; only_bots keeps the unfolded rows whose class is not human.
+fn minute_top_dict(
+    conn: &Connection,
+    d: u8,
+    col: &'static str,
+    only_bots: bool,
+    win: &Window,
+    site: Option<&str>,
+    limit: usize,
+) -> Result<Vec<TopItem>> {
+    let raw = || {
+        let mut w = raw_where(win, site);
+        if only_bots {
+            w.and(NOT_HUMAN, dict_params(kind::BOT_CLASS, "human"));
+        }
+        raw_top_dict(conn, col, &w, limit)
+    };
+    if !heavy_ready(conn, d, win)? {
+        return raw();
+    }
+    let rolled = scope_where(win, site, Some(d));
+    let mut tail = tail_where(win, site, folded_id(conn)?);
+    tail.and(
+        match col {
+            "client_ip_id" => "client_ip_id IS NOT NULL",
+            "referer_id" => "referer_id IS NOT NULL",
+            _ => "ua_id IS NOT NULL",
+        },
+        [],
+    );
+    if only_bots {
+        tail.and(NOT_HUMAN, dict_params(kind::BOT_CLASS, "human"));
+    }
+    let sql = format!(
+        "WITH g AS MATERIALIZED (SELECT k, sum(n) AS n, sum(b) AS b FROM \
+         (SELECT key_id AS k, n, bytes AS b FROM {}{} \
+         UNION ALL SELECT r.{col}, 1, r.bytes_out FROM requests r NOT INDEXED{}) GROUP BY k) \
+         SELECT dc.val, g.n, g.b FROM g JOIN dict dc ON dc.id = g.k \
+         WHERE g.n >= coalesce((SELECT n FROM g ORDER BY n DESC LIMIT 1 OFFSET ?), 0) \
+         ORDER BY 2 DESC, 1 ASC LIMIT ?",
+        MINUTELY.dim,
+        rolled.clause(),
+        tail.clause()
+    );
+    let offset = to_i64(limit.saturating_sub(1) as u64);
+    let params = rolled.bind(tail.bind([int(offset), int(to_i64(limit as u64))]));
+    run_top(conn, &sql, &params)
 }
 
 // Merges raw content types under their normalised media type.
@@ -410,9 +656,37 @@ pub(crate) fn top(
         return Ok(Vec::new());
     }
     let site = site.filter(|s| !s.is_empty());
-    let win = Window::for_summary(window_secs, now_ms);
-    if win.hourly {
-        match kind {
+    let conn = &snapshot(conn)?;
+    let win = Window::pick(conn, window_secs, now_ms, false)?;
+    match win.source {
+        Source::Raw => {}
+        Source::Minute => match kind {
+            TopKind::Hosts => return rollup_top_dict(conn, dim::HOST, &win, site, limit),
+            TopKind::Languages => return rollup_top_dict(conn, dim::LANGUAGE, &win, site, limit),
+            TopKind::ContentTypes => {
+                return rollup_top_dict(conn, dim::CONTENT_TYPE, &win, site, limit);
+            }
+            TopKind::StatusCodes => return rollup_top_int(conn, dim::STATUS, &win, site, limit),
+            TopKind::Paths => return minute_top_path(conn, &win, site, limit),
+            TopKind::ClientIps => {
+                return minute_top_dict(
+                    conn,
+                    dim::CLIENT_IP,
+                    "client_ip_id",
+                    false,
+                    &win,
+                    site,
+                    limit,
+                );
+            }
+            TopKind::UserAgents => {
+                return minute_top_dict(conn, dim::USER_AGENT, "ua_id", false, &win, site, limit);
+            }
+            TopKind::Referers => {
+                return minute_top_dict(conn, dim::REFERER, "referer_id", false, &win, site, limit);
+            }
+        },
+        Source::Hour => match kind {
             TopKind::Hosts => return rollup_top_dict(conn, dim::HOST, &win, site, limit),
             TopKind::Languages => return rollup_top_dict(conn, dim::LANGUAGE, &win, site, limit),
             TopKind::ContentTypes => {
@@ -431,7 +705,7 @@ pub(crate) fn top(
                 return rollup_top_dict(conn, dim::REFERER, &win, site, limit);
             }
             _ => {}
-        }
+        },
     }
     top_raw(conn, kind, &raw_where(&win, site), limit)
 }
@@ -495,12 +769,13 @@ fn raw_totals(conn: &Connection, w: &Where) -> Result<Totals> {
     Ok(t)
 }
 
-fn rollup_totals(conn: &Connection, rw: &Where) -> Result<Totals> {
+fn rollup_totals(conn: &Connection, l: &Level, rw: &Where) -> Result<Totals> {
     let sql = format!(
         "SELECT coalesce(sum(requests), 0), coalesce(sum(bytes_in), 0), coalesce(sum(bytes_out), 0), \
          coalesce(sum(blocked), 0), coalesce(sum(ms_sum), 0), coalesce(sum(s0), 0), coalesce(sum(s1), 0), \
          coalesce(sum(s2), 0), coalesce(sum(s3), 0), coalesce(sum(s4), 0), coalesce(sum(s5), 0) \
-         FROM rollup{}",
+         FROM {}{}",
+        l.rollup,
         rw.clause()
     );
     let mut t = conn.query_row(&sql, params_from_iter(rw.bind([]).iter()), |r| {
@@ -520,7 +795,8 @@ fn rollup_totals(conn: &Connection, rw: &Where) -> Result<Totals> {
         })
     })?;
     let sql = format!(
-        "SELECT series, bucket, sum(n) FROM rollup_hist{} GROUP BY series, bucket",
+        "SELECT series, bucket, sum(n) FROM {}{} GROUP BY series, bucket",
+        l.hist,
         rw.clause()
     );
     let mut sizes = [0u64; SIZE_LEN];
@@ -605,22 +881,41 @@ pub(crate) fn summary(
     site: Option<&str>,
     now_ms: i64,
 ) -> Result<Summary> {
-    summary_in(conn, &Window::for_summary(window_secs, now_ms), site)
+    let conn = &snapshot(conn)?;
+    summary_in(conn, &Window::pick(conn, window_secs, now_ms, false)?, site)
 }
 
 pub(crate) fn summary_in(conn: &Connection, win: &Window, site: Option<&str>) -> Result<Summary> {
     let site = site.filter(|s| !s.is_empty());
     let raw = raw_where(win, site);
-    if win.hourly {
+    if win.source != Source::Raw {
         let rw = roll_where(win, site);
-        let totals = rollup_totals(conn, &rw)?;
+        let totals = rollup_totals(conn, win.level(), &rw)?;
         let methods = fold_methods(rollup_top_dict(conn, dim::METHOD, win, site, FOLD_FETCH)?);
         let ctypes = rollup_top_dict(conn, dim::CONTENT_TYPE, win, site, TOP_N)?;
         let hosts = rollup_top_dict(conn, dim::HOST, win, site, TOP_N)?;
         let blocked = rollup_top_dict(conn, dim::BLOCKED, win, site, TOP_N)?;
-        let paths = rollup_top_path(conn, win, site, TOP_N)?;
-        let ips = rollup_top_dict(conn, dim::CLIENT_IP, win, site, TOP_N)?;
-        let uas = rollup_top_dict(conn, dim::USER_AGENT, win, site, TOP_N)?;
+        let (paths, ips, uas) = if win.source == Source::Minute {
+            (
+                minute_top_path(conn, win, site, TOP_N)?,
+                minute_top_dict(
+                    conn,
+                    dim::CLIENT_IP,
+                    "client_ip_id",
+                    false,
+                    win,
+                    site,
+                    TOP_N,
+                )?,
+                minute_top_dict(conn, dim::USER_AGENT, "ua_id", false, win, site, TOP_N)?,
+            )
+        } else {
+            (
+                rollup_top_path(conn, win, site, TOP_N)?,
+                rollup_top_dict(conn, dim::CLIENT_IP, win, site, TOP_N)?,
+                rollup_top_dict(conn, dim::USER_AGENT, win, site, TOP_N)?,
+            )
+        };
         return Ok(assemble(
             totals,
             methods,
@@ -650,11 +945,8 @@ pub(crate) fn timeseries(
     site: Option<&str>,
     now_ms: i64,
 ) -> Result<Timeseries> {
-    let win = Window::new(
-        window_secs,
-        now_ms,
-        window_secs > MINUTE_STEP_MAX_WINDOW_SECS,
-    );
+    let conn = &snapshot(conn)?;
+    let win = Window::pick(conn, window_secs, now_ms, true)?;
     timeseries_in(conn, &win, site)
 }
 
@@ -676,12 +968,15 @@ pub(crate) fn timeseries_in(
     {
         return Ok(empty);
     }
-    let map: HashMap<i64, Bucketed> = if win.hourly {
+    let map: HashMap<i64, Bucketed> = if win.source != Source::Raw {
         let rw = roll_where(win, site);
+        let l = win.level();
         let sql = format!(
-            "SELECT hour, sum(requests), sum(bytes_out), sum(s4 + s5), sum(blocked), sum(ms_sum) \
-             FROM rollup{} GROUP BY hour",
-            rw.clause()
+            "SELECT {b}, sum(requests), sum(bytes_out), sum(s4 + s5), sum(blocked), sum(ms_sum) \
+             FROM {}{} GROUP BY {b}",
+            l.rollup,
+            rw.clause(),
+            b = l.bucket
         );
         bucket_rows(conn, &sql, &rw)?
     } else {
@@ -867,13 +1162,15 @@ pub(crate) fn bots(
     now_ms: i64,
 ) -> Result<BotSummary> {
     let site = site.filter(|s| !s.is_empty());
-    let win = Window::for_summary(window_secs, now_ms);
-    if !win.hourly {
+    let conn = &snapshot(conn)?;
+    let win = Window::pick(conn, window_secs, now_ms, false)?;
+    if win.source == Source::Raw {
         return bots_raw(conn, win.from, win.to, site, TOP_N);
     }
     let rw = roll_where(&win, site);
     let sql = format!(
-        "SELECT coalesce(sum(requests), 0), coalesce(sum(bot_requests), 0) FROM rollup{}",
+        "SELECT coalesce(sum(requests), 0), coalesce(sum(bot_requests), 0) FROM {}{}",
+        win.level().rollup,
         rw.clause()
     );
     let (total, bot) = conn.query_row(&sql, params_from_iter(rw.bind([]).iter()), |r| {
@@ -887,7 +1184,11 @@ pub(crate) fn bots(
             *slot = (it.count, it.bytes);
         }
     }
-    let agents = rollup_top_dict(conn, dim::BOT_AGENT, &win, site, TOP_N)?;
+    let agents = if win.source == Source::Minute {
+        minute_top_dict(conn, dim::BOT_AGENT, "ua_id", true, &win, site, TOP_N)?
+    } else {
+        rollup_top_dict(conn, dim::BOT_AGENT, &win, site, TOP_N)?
+    };
     Ok(bot_summary(total, bot, classes, signals, agents, &scores))
 }
 

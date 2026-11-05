@@ -1,8 +1,9 @@
 #![forbid(unsafe_code)]
-//! Embedded SQLite store for HAProxy request events. Every event is kept until age retention removes it; a size budget is opt-in and trims the oldest rows only. Repetitive text lives in a dictionary table, hourly rollups serve long windows, and the request log and short windows read raw rows. Reads go through a small connection pool so queries never wait on ingest.
+//! Embedded SQLite store for HAProxy request events. Every event is kept until age retention removes it; a size budget is opt-in and trims the oldest rows only. Repetitive text lives in a dictionary table, hourly rollups serve long windows, minute rollups serve windows of up to six hours, and the request log reads raw rows. Reads go through a small connection pool so queries never wait on ingest.
 
 mod error;
 mod export;
+mod fold;
 mod gc;
 mod hist;
 mod ingest;

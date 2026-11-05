@@ -9,7 +9,7 @@ use rusqlite::{Connection, OpenFlags};
 use crate::error::{Error, Result};
 
 /// Schema version this build writes; databases with a higher version are refused.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 // Dictionary kinds: each distinct (kind, value) pair gets one integer id in the dict table.
 pub(crate) mod kind {
@@ -54,12 +54,40 @@ pub(crate) mod dim {
     pub const USER_AGENT: u8 = 11;
     pub const REFERER: u8 = 12;
     pub const BOT_AGENT: u8 = 13;
+    pub const PATH: u8 = 14;
+    // In rollup_over: the minute was written without minute rollups at all.
+    pub const ANY: u8 = 0;
 }
 
 // Site scope of rollup_dim and rollup_path rows that sum every site, so unfiltered queries read one narrow range.
 pub(crate) const ALL_SITES: i64 = -1;
 // Heaviest keys kept per (scope, hour, dimension) from each write batch; the rest of a batch's tail is not rolled up.
 pub(crate) const TOP_KEEP: usize = 32;
+
+// Table and column names of one rollup granularity; the minute tables hold the same shapes as the hourly ones.
+pub(crate) struct Level {
+    pub(crate) rollup: &'static str,
+    pub(crate) hist: &'static str,
+    pub(crate) dim: &'static str,
+    pub(crate) path: &'static str,
+    pub(crate) bucket: &'static str,
+}
+
+pub(crate) const HOURLY: Level = Level {
+    rollup: "rollup",
+    hist: "rollup_hist",
+    dim: "rollup_dim",
+    path: "rollup_path",
+    bucket: "hour",
+};
+
+pub(crate) const MINUTELY: Level = Level {
+    rollup: "rollup_min",
+    hist: "rollup_hist_min",
+    dim: "rollup_dim_min",
+    path: "rollup_path_min",
+    bucket: "minute",
+};
 
 pub(crate) mod series {
     pub const LATENCY: u8 = 0;
@@ -229,8 +257,67 @@ CREATE TABLE rollup_path (
     ),
 );
 
+// Minute rollups for windows of up to six hours. rollup_state.folded_id marks the last request id whose heavy keys (paths, client ips, agents, referers) are in the minute tables; newer rows are read raw. valid_from is the first minute the tables cover completely, so windows reaching further back keep reading raw rows. idx_rollup_path_min_hot holds the paths seen at least twice in a minute, which lets the top path query skip the long tail. rollup_over lists minutes whose key count passed the cap and were dropped from the tables.
+const V3: &str = "
+CREATE TABLE rollup_min (
+    minute INTEGER NOT NULL,
+    site_id INTEGER NOT NULL,
+    requests INTEGER NOT NULL,
+    bytes_in INTEGER NOT NULL,
+    bytes_out INTEGER NOT NULL,
+    s0 INTEGER NOT NULL,
+    s1 INTEGER NOT NULL,
+    s2 INTEGER NOT NULL,
+    s3 INTEGER NOT NULL,
+    s4 INTEGER NOT NULL,
+    s5 INTEGER NOT NULL,
+    blocked INTEGER NOT NULL,
+    bot_requests INTEGER NOT NULL,
+    ms_sum INTEGER NOT NULL,
+    PRIMARY KEY (minute, site_id)
+) WITHOUT ROWID;
+CREATE TABLE rollup_hist_min (
+    minute INTEGER NOT NULL,
+    site_id INTEGER NOT NULL,
+    series INTEGER NOT NULL,
+    bucket INTEGER NOT NULL,
+    n INTEGER NOT NULL,
+    PRIMARY KEY (minute, site_id, series, bucket)
+) WITHOUT ROWID;
+CREATE TABLE rollup_dim_min (
+    dim INTEGER NOT NULL,
+    site_id INTEGER NOT NULL,
+    minute INTEGER NOT NULL,
+    key_id INTEGER NOT NULL,
+    n INTEGER NOT NULL,
+    bytes INTEGER NOT NULL,
+    PRIMARY KEY (dim, site_id, minute, key_id)
+) WITHOUT ROWID;
+CREATE TABLE rollup_path_min (
+    site_id INTEGER NOT NULL,
+    minute INTEGER NOT NULL,
+    path TEXT NOT NULL,
+    n INTEGER NOT NULL,
+    bytes INTEGER NOT NULL,
+    PRIMARY KEY (site_id, minute, path)
+) WITHOUT ROWID;
+CREATE INDEX idx_rollup_path_min_hot ON rollup_path_min (site_id, minute, path, n, bytes) WHERE n >= 2;
+CREATE TABLE rollup_over (
+    dim INTEGER NOT NULL,
+    minute INTEGER NOT NULL,
+    PRIMARY KEY (dim, minute)
+) WITHOUT ROWID;
+CREATE TABLE rollup_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    folded_id INTEGER NOT NULL,
+    valid_from INTEGER NOT NULL
+);
+INSERT INTO rollup_state (id, folded_id, valid_from)
+    SELECT 1, coalesce(max(id), 0), coalesce(max(ts) / 60000 + 1, 0) FROM requests;
+";
+
 // Forward-only: entry i upgrades user_version i to i + 1. Never edit a shipped entry, append a new one.
-pub(crate) const MIGRATIONS: &[&str] = &[V1, V2];
+pub(crate) const MIGRATIONS: &[&str] = &[V1, V2, V3];
 
 pub(crate) const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -503,6 +590,7 @@ mod tests {
                 "idx_requests_site_ts",
                 "idx_requests_status_ts",
                 "idx_requests_ts",
+                "idx_rollup_path_min_hot",
             ]
         );
     }

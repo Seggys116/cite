@@ -7,12 +7,15 @@ use rusqlite::params;
 use serde::Serialize;
 
 use crate::error::Result;
-use crate::limits::{DAY_MS, HOUR_MS};
+use crate::fold;
+use crate::limits::{DAY_MS, HOUR_MS, MINUTE_KEEP_MS, MINUTE_MS};
 use crate::store::Inner;
 
 // Each chunk is its own transaction so ingest can interleave between them.
 const EXPIRE_CHUNK: i64 = 50_000;
 const TRIM_CHUNK: i64 = 10_000;
+// Chunks in a row that free no measurable space before trimming gives up for the pass.
+const TRIM_STALLS: u32 = 3;
 const VACUUM_PAGES: i64 = 4096;
 const VACUUM_ROUNDS: usize = 1000;
 // Per-pass share of raw rows a size-cap pass may remove, so a burst cannot erase all history at once.
@@ -21,7 +24,6 @@ const TRIM_PASS_PERCENT: i64 = 25;
 const TRIM_WIDE_MARGIN: u64 = 2;
 // Pause between chunks so the ingest thread, which waits on the same mutex, gets a turn.
 const YIELD: Duration = Duration::from_millis(1);
-// The raw-row table and every index trim can shrink.
 const TRIM_OBJECTS: [&str; 6] = [
     "requests",
     "idx_requests_ts",
@@ -88,6 +90,7 @@ impl Inner {
             bytes_before: self.live_bytes()?,
             ..PruneReport::default()
         };
+        let minute_rows = self.expire_minutes(now_ms)?;
         let days = self.retention_days();
         if days > 0 {
             let cutoff = now_ms.saturating_sub(i64::from(days).saturating_mul(DAY_MS));
@@ -97,13 +100,15 @@ impl Inner {
         if let Some(max) = self.max_bytes() {
             self.trim(max, &mut report)?;
         }
+        // Under a size cap raw rows can go before their minute rollups, which may then be the last reference to a dictionary entry.
+        let changed = !report.is_empty() || (minute_rows > 0 && self.max_bytes().is_some());
         let mut sensitive = false;
-        if !report.is_empty() {
+        if changed {
             let swept = self.sweep_dict()?;
             report.dict_rows_removed = swept.removed;
             sensitive = swept.identifying > 0;
         }
-        if !report.is_empty() {
+        if changed {
             self.reclaim()?;
         }
         let retry = self.wal_dirty.load(std::sync::atomic::Ordering::Relaxed);
@@ -118,10 +123,17 @@ impl Inner {
 
     fn expire(&self, cutoff: i64, report: &mut PruneReport) -> Result<()> {
         loop {
-            let n = self.lock_writer().conn.execute(
-                "DELETE FROM requests WHERE id IN (SELECT id FROM requests WHERE ts < ?1 LIMIT ?2)",
-                params![cutoff, EXPIRE_CHUNK],
-            )?;
+            let n = {
+                let w = self.lock_writer();
+                let tx = w.conn.unchecked_transaction()?;
+                let n = tx.execute(
+                    "DELETE FROM requests WHERE id IN (SELECT id FROM requests WHERE ts < ?1 LIMIT ?2)",
+                    params![cutoff, EXPIRE_CHUNK],
+                )?;
+                fold::clamp(&tx)?;
+                tx.commit()?;
+                n
+            };
             report.expired_rows += n as u64;
             if (n as i64) < EXPIRE_CHUNK {
                 break;
@@ -141,6 +153,13 @@ impl Inner {
         Ok(())
     }
 
+    // The minute tables only serve windows of a few hours, so they are cut at a fixed age whatever the retention period.
+    fn expire_minutes(&self, now_ms: i64) -> Result<u64> {
+        let cutoff = now_ms.saturating_sub(MINUTE_KEEP_MS).div_euclid(MINUTE_MS);
+        let w = self.lock_writer();
+        fold::expire(&w.conn, cutoff)
+    }
+
     fn removable_bytes(&self) -> Result<u64> {
         self.read_long(|c| {
             let mut total = 0i64;
@@ -157,7 +176,14 @@ impl Inner {
 
     // Rollups survive trimming so history stays chartable; nothing is deleted if the data trimming cannot remove already exceeds the budget.
     fn trim(&self, max: u64, report: &mut PruneReport) -> Result<()> {
-        let live = self.live_bytes()?;
+        let mut live = self.live_bytes()?;
+        if live <= max {
+            return Ok(());
+        }
+        // The minute tables only speed up recent windows and readers fall back to raw rows without them, so they go before any raw row does.
+        report.rollup_rows_removed += fold::drop_all(&self.lock_writer().conn)?;
+        self.reclaim()?;
+        live = self.live_bytes()?;
         if live <= max {
             return Ok(());
         }
@@ -178,7 +204,9 @@ impl Inner {
         } else {
             u64::try_from((rows * TRIM_PASS_PERCENT / 100).max(1)).unwrap_or(1)
         };
-        while self.live_bytes()? > max {
+        let mut stalls = 0;
+        let mut measured = self.live_bytes()?;
+        while measured > max {
             if report.trimmed_rows >= allowed {
                 report.trim_limited = true;
                 tracing::warn!(
@@ -188,19 +216,28 @@ impl Inner {
                 );
                 break;
             }
+            let left = rows - i64::try_from(report.trimmed_rows).unwrap_or(rows);
+            if left <= 1 {
+                report.trim_blocked = true;
+                break;
+            }
             let chunk = i64::try_from(allowed - report.trimmed_rows)
                 .unwrap_or(TRIM_CHUNK)
-                .min(TRIM_CHUNK);
+                .min(TRIM_CHUNK)
+                .min(left - 1);
             let w = self.lock_writer();
             let (min, top): (Option<i64>, Option<i64>) = w.conn.query_row(
                 "SELECT min(ts), max(ts) FROM (SELECT ts FROM requests ORDER BY ts, id LIMIT ?1)",
                 params![chunk],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )?;
-            let n = w.conn.execute(
+            let tx = w.conn.unchecked_transaction()?;
+            let n = tx.execute(
                 "DELETE FROM requests WHERE id IN (SELECT id FROM requests ORDER BY ts, id LIMIT ?1)",
                 params![chunk],
             )?;
+            fold::clamp(&tx)?;
+            tx.commit()?;
             drop(w);
             if n == 0 {
                 break;
@@ -215,6 +252,17 @@ impl Inner {
                 (a, b) => a.or(b),
             };
             thread::sleep(YIELD);
+            let now = self.live_bytes()?;
+            stalls = if now < measured { 0 } else { stalls + 1 };
+            measured = now;
+            if stalls >= TRIM_STALLS {
+                report.trim_blocked = true;
+                tracing::warn!(
+                    budget = max,
+                    "deleting raw rows no longer shrinks the analytics database; stopped for this pass"
+                );
+                break;
+            }
         }
         Ok(())
     }

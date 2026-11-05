@@ -573,6 +573,7 @@ fn size_budget_trims_the_oldest_rows_first() {
             .collect();
         s.insert(&batch).expect("insert");
     }
+    s.prune(NOW).expect("settle");
     let before = s.stats().expect("stats");
     assert_eq!(before.rows, total as u64);
     let live = s.inner.live_bytes().expect("live");
@@ -1751,6 +1752,116 @@ fn bench_one_million_events() {
     assert_eq!(st.rows, total);
 }
 
+#[test]
+#[ignore = "throughput benchmark; run with --release --ignored --nocapture"]
+fn bench_busy_last_hour() {
+    fn cpu_secs() -> f64 {
+        let pid = std::process::id().to_string();
+        let out = std::process::Command::new("ps")
+            .args(["-o", "time=", "-p", &pid])
+            .output()
+            .expect("ps");
+        let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let (m, sec) = text.split_once(':').unwrap_or(("0", "0"));
+        m.parse::<f64>().unwrap_or(0.0) * 60.0 + sec.parse::<f64>().unwrap_or(0.0)
+    }
+    // The host is shared, so a query runs ten times and reports the fastest wall time next to the average CPU time.
+    fn timed<T>(label: &str, mut f: impl FnMut() -> T) -> T {
+        let mut best = Duration::MAX;
+        let mut out = None;
+        let cpu = cpu_secs();
+        for _ in 0..10 {
+            let start = Instant::now();
+            out = Some(f());
+            best = best.min(start.elapsed());
+        }
+        let avg = (cpu_secs() - cpu) / 10.0 * 1000.0;
+        println!("{label:<28} wall {best:>10.2?}  cpu {avg:>6.1} ms");
+        out.expect("ran")
+    }
+    let (_d, s) = open();
+    let total = 2_000_000u64;
+    let span = HOUR;
+    let mut state = 0x2545_F491_4F6C_DD1Du64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let start = Instant::now();
+    let cpu_start = cpu_secs();
+    let mut done = 0u64;
+    while done < total {
+        let batch: Vec<LogEvent> = (0..1000u64)
+            .map(|j| {
+                let i = done + j;
+                let r = next();
+                let mut e = ev(NOW - span + i64::try_from(i).expect("i") * span / total as i64);
+                e.client_ip = format!("10.{}.{}.{}", r % 4, (r >> 8) % 32, (r >> 16) % 32);
+                e.host = format!("site{}.example.test", r % 3);
+                e.site = format!("site{}", r % 3);
+                e.path = if (r >> 24) % 10 == 0 {
+                    format!("/tail/{i}")
+                } else {
+                    format!("/hot/{}", ((r >> 32) % 300) * ((r >> 40) % 300) / 300)
+                };
+                e.status = [200u16, 200, 200, 200, 301, 304, 404, 500][((r >> 5) % 8) as usize];
+                e.bytes_out = (r >> 44) % 200_000;
+                e.total_ms = u32::try_from((r >> 12) % 800).expect("ms");
+                e.user_agent = format!("Mozilla/5.0 agent-{}", (r >> 20) % 40);
+                e.referer = format!("https://ref{}.example.test/", (r >> 28) % 30);
+                e.bot_class =
+                    ["human", "human", "human", "crawler", "scraper"][(r % 5) as usize].into();
+                e.bot_score = u8::try_from((r >> 9) % 100).expect("score");
+                e.bot_signals = ["", "headless", "no_referer,no_lang"][(r % 3) as usize].into();
+                e
+            })
+            .collect();
+        s.insert(&batch).expect("insert");
+        done += 1000;
+    }
+    let elapsed = start.elapsed();
+    println!(
+        "insert: {total} events in {elapsed:.2?} = {:.0} events/s, cpu {:.1}s",
+        total as f64 / elapsed.as_secs_f64(),
+        cpu_secs() - cpu_start
+    );
+    let st = s.stats().expect("stats");
+    println!("rows {} db_bytes {}", st.rows, st.db_bytes);
+    let measure = |tag: &str| {
+        println!("-- {tag}");
+        for (label, secs) in [("15m", 900u64), ("1h", 3600)] {
+            timed(&format!("summary {label}"), || {
+                s.summary(secs, None, NOW).expect("q")
+            });
+            for (name, kind) in [
+                ("paths", TopKind::Paths),
+                ("ips", TopKind::ClientIps),
+                ("agents", TopKind::UserAgents),
+                ("referers", TopKind::Referers),
+            ] {
+                timed(&format!("top {name} {label}"), || {
+                    s.top(kind, secs, None, NOW, 20).expect("q")
+                });
+            }
+            timed(&format!("bots {label}"), || {
+                s.bots(secs, None, NOW).expect("q")
+            });
+        }
+        timed("summary 1h site", || {
+            s.summary(3600, Some("site1"), NOW).expect("q")
+        });
+        timed("timeseries 1h", || {
+            s.timeseries(3600, None, NOW).expect("q")
+        });
+    };
+    measure("right after ingest, unfolded rows read raw");
+    while s.inner.lock_writer().fold_now() {}
+    measure("after the periodic fold");
+    assert_eq!(st.rows, total);
+}
+
 fn flood_paths(s: &Store, count: usize, width: usize) {
     let pad = "p".repeat(width);
     for chunk in 0..count.div_ceil(2500) {
@@ -1822,7 +1933,9 @@ fn a_query_past_its_deadline_is_cancelled_with_a_clear_error() {
     for result in [
         s.top(TopKind::Paths, 3600, None, NOW, 100).map(|_| ()),
         s.summary(3600, None, NOW).map(|_| ()),
-        s.bots(3600, None, NOW).map(|_| ()),
+        s.inner
+            .read(|c| queries::bots_raw(c, NOW - HOUR, NOW, None, 20))
+            .map(|_| ()),
         s.requests(&RequestFilter::default(), 100).map(|_| ()),
     ] {
         let err = result.expect_err("deadline");
@@ -1976,7 +2089,7 @@ fn the_dictionary_sweep_spares_ids_inserts_used_after_tracking_began() {
     s.inner
         .lock_writer()
         .conn
-        .execute_batch("DELETE FROM requests; DELETE FROM rollup_dim;")
+        .execute_batch("DELETE FROM requests; DELETE FROM rollup_dim; DELETE FROM rollup_dim_min;")
         .expect("orphan");
     s.inner.lock_writer().track_ids();
     let candidates = s.inner.read_long(crate::gc::unreferenced).expect("scan");
@@ -1985,7 +2098,7 @@ fn the_dictionary_sweep_spares_ids_inserts_used_after_tracking_began() {
     s.inner
         .lock_writer()
         .conn
-        .execute_batch("DELETE FROM requests; DELETE FROM rollup_dim;")
+        .execute_batch("DELETE FROM requests; DELETE FROM rollup_dim; DELETE FROM rollup_dim_min;")
         .expect("orphan again");
     let swept = s.inner.delete_unreferenced(&candidates).expect("sweep");
     s.inner.lock_writer().finish_tracking();
@@ -2044,6 +2157,7 @@ fn a_burst_over_the_budget_is_trimmed_across_passes_not_in_one() {
             .collect();
         s.insert(&batch).expect("insert");
     }
+    s.prune(NOW).expect("settle");
     let live = s.inner.live_bytes().expect("live");
     // At two thirds of the size the database is under 2x over the cap, so the per-pass share limit applies: 25% of 30000 rows.
     let cap = live / 3 * 2;
@@ -2176,4 +2290,585 @@ fn an_incomplete_checkpoint_is_reported_and_retried_by_the_next_prune() {
     s.prune(NOW).expect("prune");
     assert!(!s.inner.wal_dirty.load(std::sync::atomic::Ordering::Relaxed));
     assert!(!db_and_wal_contain(dir.path(), b"203.0.113."));
+}
+
+fn xorshift(seed: u64) -> impl FnMut() -> u64 {
+    let mut state = seed;
+    move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    }
+}
+
+fn busy_event(r: u64, i: u64, ts: i64) -> LogEvent {
+    let mut e = ev(ts);
+    e.site = ["a", "b", ""][(r % 3) as usize].into();
+    e.path = match (r >> 8) % 10 {
+        0..=4 => format!("/hot/{}", (r >> 16) % 25),
+        5..=6 => format!("/warm/{}", (r >> 16) % 400),
+        _ => format!("/tail/{i}"),
+    };
+    e.client_ip = format!("10.1.{}.{}", (r >> 20) % 4, (r >> 24) % 20);
+    e.user_agent = format!("agent-{}", (r >> 30) % 9);
+    e.referer = [
+        "",
+        "https://r1.test/",
+        "https://r2.test/",
+        "https://r3.test/",
+    ][((r >> 34) % 4) as usize]
+        .into();
+    e.bot_class = ["human", "human", "crawler", "scraper"][((r >> 38) % 4) as usize].into();
+    e.bot_score = u8::try_from((r >> 42) % 100).expect("score");
+    e.bot_signals = ["", "headless", "no_referer,no_lang"][((r >> 46) % 3) as usize].into();
+    e.status = [200u16, 200, 404, 500][((r >> 50) % 4) as usize];
+    e.bytes_out = (r >> 52) % 5000;
+    e.total_ms = u32::try_from((r >> 4) % 300).expect("ms");
+    e
+}
+
+fn minute_served(s: &Store, secs: u64) -> bool {
+    s.inner
+        .read(|c| Ok(Window::pick(c, secs, NOW, false)?.source == queries::Source::Minute))
+        .expect("pick")
+}
+
+// Folds at random points so the answer mixes folded minutes with the unfolded tail.
+#[test]
+fn minute_rollups_answer_exactly_like_a_raw_scan() {
+    let (_d, s) = open();
+    let mut next = xorshift(0x1234_5678_9ABC_DEF1);
+    let mut id = 0u64;
+    for _ in 0..40 {
+        let base = NOW - 1 - i64::try_from(next() % (6 * 3600 + 600)).expect("age") * 1000;
+        let batch: Vec<LogEvent> = (0..500)
+            .map(|_| {
+                id += 1;
+                let r = next();
+                let ts = base + i64::try_from(r % 120).expect("offset") * 1000;
+                busy_event(next(), id, ts.min(NOW - 1))
+            })
+            .collect();
+        s.insert(&batch).expect("insert");
+        if next().is_multiple_of(2) {
+            s.inner.lock_writer().fold_now();
+        }
+    }
+    for secs in [60u64, 120, 300, 900, 3600, 3 * 3600, 6 * 3600] {
+        assert!(minute_served(&s, secs), "{secs}");
+        let raw = Window::new(secs, NOW, false);
+        for site in [None, Some("a"), Some("b")] {
+            for kind in [
+                TopKind::Paths,
+                TopKind::ClientIps,
+                TopKind::UserAgents,
+                TopKind::Referers,
+            ] {
+                for limit in [1usize, 3, 20, 100, 150, 600] {
+                    let expect = s
+                        .inner
+                        .read(|c| {
+                            queries::top_raw(
+                                c,
+                                kind,
+                                &queries::range_where(raw.from, raw.to, site),
+                                limit,
+                            )
+                        })
+                        .expect("raw");
+                    let got = s.top(kind, secs, site, NOW, limit).expect("rolled");
+                    assert_eq!(expect, got, "{kind:?} {secs}s {site:?} limit {limit}");
+                }
+            }
+            let (want, bots) = s
+                .inner
+                .read(|c| {
+                    Ok((
+                        queries::summary_in(c, &raw, site)?,
+                        queries::bots_raw(c, raw.from, raw.to, site, 20)?,
+                    ))
+                })
+                .expect("raw summary");
+            assert_eq!(
+                want,
+                s.summary(secs, site, NOW).expect("summary"),
+                "{secs}s {site:?}"
+            );
+            assert_eq!(
+                bots,
+                s.bots(secs, site, NOW).expect("bots"),
+                "bots {secs}s {site:?}"
+            );
+        }
+        let series = s.timeseries(secs, None, NOW).expect("series");
+        let want = s
+            .inner
+            .read(|c| queries::timeseries_in(c, &raw, None))
+            .expect("raw series");
+        assert_eq!(series.points, want.points, "series {secs}s");
+    }
+}
+
+// Rows above the fold watermark are not in the minute tables yet, so readers must add them from the raw table.
+#[test]
+fn unfolded_rows_are_read_exactly_from_the_raw_table() {
+    let (_d, s) = open();
+    let first: Vec<LogEvent> = (0..200)
+        .map(|i| {
+            let mut e = ev(NOW - 1000);
+            e.path = format!("/p{}", i % 4);
+            e
+        })
+        .collect();
+    s.insert(&first).expect("insert");
+    while s.inner.lock_writer().fold_now() {}
+    let more: Vec<LogEvent> = (0..30)
+        .map(|_| {
+            let mut e = ev(NOW - 500);
+            e.path = "/p0".into();
+            e
+        })
+        .collect();
+    s.insert(&more).expect("insert");
+    let (folded, newest): (i64, i64) = s
+        .inner
+        .read(|c| {
+            Ok((
+                c.query_row("SELECT folded_id FROM rollup_state", [], |r| r.get(0))?,
+                c.query_row("SELECT max(id) FROM requests", [], |r| r.get(0))?,
+            ))
+        })
+        .expect("state");
+    assert!(folded < newest, "the second batch must still be unfolded");
+    let top = s.top(TopKind::Paths, 900, None, NOW, 4).expect("top");
+    assert_eq!((top[0].key.as_str(), top[0].count), ("/p0", 80));
+    let ips = s.top(TopKind::ClientIps, 900, None, NOW, 4).expect("ips");
+    assert_eq!(ips[0].count, 230);
+}
+
+// A minute with too many distinct keys is dropped and flagged, so a flood of unique values cannot grow the tables.
+#[test]
+fn a_minute_over_the_key_cap_falls_back_to_raw_rows() {
+    let (_d, s) = open();
+    let cap = usize::try_from(crate::fold::KEY_CAP).expect("cap") + 50;
+    for chunk in 0..cap.div_ceil(5000) {
+        let batch: Vec<LogEvent> = (0..5000.min(cap - chunk * 5000))
+            .map(|j| {
+                let mut e = ev(NOW - 5000);
+                e.path = format!("/u/{}", chunk * 5000 + j);
+                e
+            })
+            .collect();
+        s.insert(&batch).expect("insert");
+    }
+    let mut hot = ev(NOW - 5000);
+    hot.path = "/u/7".into();
+    s.insert(&[hot.clone(), hot]).expect("insert");
+    while s.inner.lock_writer().fold_now() {}
+    let (over, kept): (i64, i64) = s
+        .inner
+        .read(|c| {
+            Ok((
+                c.query_row("SELECT count(*) FROM rollup_over WHERE dim = 14", [], |r| {
+                    r.get(0)
+                })?,
+                c.query_row("SELECT count(*) FROM rollup_path_min", [], |r| r.get(0))?,
+            ))
+        })
+        .expect("state");
+    assert_eq!((over, kept), (1, 0));
+    let top = s.top(TopKind::Paths, 900, None, NOW, 2).expect("top");
+    assert_eq!((top[0].key.as_str(), top[0].count), ("/u/7", 3));
+    let ips = s.top(TopKind::ClientIps, 900, None, NOW, 1).expect("ips");
+    assert_eq!(ips[0].count, cap as u64 + 2);
+}
+
+#[test]
+fn retention_expires_minute_rollups_and_the_dictionary_follows() {
+    let (_d, s) = open();
+    s.set_retention_days(0);
+    let mut old = ev(NOW - 8 * HOUR);
+    old.client_ip = "198.51.100.1".into();
+    old.path = "/old".into();
+    let mut fresh = ev(NOW - 1000);
+    fresh.client_ip = "198.51.100.2".into();
+    fresh.path = "/fresh".into();
+    s.insert(&[old]).expect("insert");
+    s.insert(&[fresh]).expect("insert");
+    while s.inner.lock_writer().fold_now() {}
+    let count = |sql: &str| -> i64 {
+        s.inner
+            .read(|c| Ok(c.query_row(sql, [], |r| r.get(0))?))
+            .expect(sql)
+    };
+    assert_eq!(
+        count("SELECT count(*) FROM rollup_path_min WHERE site_id = -1"),
+        2
+    );
+    s.inner
+        .lock_writer()
+        .conn
+        .execute_batch(&format!(
+            "INSERT INTO rollup_over (dim, minute) VALUES (14, {}), (14, {})",
+            (NOW - 8 * HOUR) / 60_000,
+            (NOW - 1000) / 60_000
+        ))
+        .expect("flags");
+    s.prune(NOW).expect("prune");
+    for table in [
+        "rollup_min",
+        "rollup_hist_min",
+        "rollup_dim_min",
+        "rollup_path_min",
+    ] {
+        let old_rows = count(&format!(
+            "SELECT count(*) FROM {table} WHERE minute < {}",
+            (NOW - 7 * HOUR) / 60_000
+        ));
+        assert_eq!(old_rows, 0, "{table}");
+        assert!(
+            count(&format!("SELECT count(*) FROM {table}")) > 0,
+            "{table}"
+        );
+    }
+    assert_eq!(count("SELECT count(*) FROM rollup_over"), 1);
+    assert_eq!(
+        count("SELECT count(*) FROM rollup_path_min WHERE path = '/old'"),
+        0
+    );
+    assert_eq!(
+        count("SELECT count(*) FROM rollup_path_min WHERE path = '/fresh'"),
+        2
+    );
+    let top = s.top(TopKind::Paths, 3600, None, NOW, 5).expect("top");
+    assert_eq!(top.len(), 1);
+}
+
+#[test]
+fn dictionary_entries_used_only_by_minute_rollups_are_kept() {
+    let (_d, s) = open();
+    let mut e = ev(NOW - 1000);
+    e.client_ip = "198.51.100.77".into();
+    s.insert(&[e]).expect("insert");
+    while s.inner.lock_writer().fold_now() {}
+    s.inner
+        .lock_writer()
+        .conn
+        .execute_batch("DELETE FROM requests; DELETE FROM rollup_dim;")
+        .expect("orphan");
+    let swept = s.inner.sweep_dict().expect("sweep");
+    let present: i64 = s
+        .inner
+        .read(|c| {
+            Ok(c.query_row(
+                "SELECT count(*) FROM dict WHERE val = '198.51.100.77'",
+                [],
+                |r| r.get(0),
+            )?)
+        })
+        .expect("count");
+    assert_eq!(present, 1, "removed {}", swept.removed);
+    s.inner
+        .lock_writer()
+        .conn
+        .execute_batch("DELETE FROM rollup_dim_min;")
+        .expect("orphan");
+    s.inner.sweep_dict().expect("sweep");
+    let present: i64 = s
+        .inner
+        .read(|c| {
+            Ok(c.query_row(
+                "SELECT count(*) FROM dict WHERE val = '198.51.100.77'",
+                [],
+                |r| r.get(0),
+            )?)
+        })
+        .expect("count");
+    assert_eq!(present, 0);
+}
+
+// The minute dimension rows hold ip and agent text too, so the privacy scrub has to clear them.
+#[test]
+fn scrubbing_removes_addresses_and_agents_from_the_minute_rollups() {
+    let (_d, s) = open();
+    let mut e = ev(NOW - 1000);
+    e.bot_class = "crawler".into();
+    for i in 0..50 {
+        let mut x = e.clone();
+        x.client_ip = format!("203.0.113.{i}");
+        x.user_agent = format!("scrub-agent-{i}");
+        s.insert(&[x]).expect("insert");
+    }
+    while s.inner.lock_writer().fold_now() {}
+    let count = |sql: &str| -> i64 {
+        s.inner
+            .read(|c| Ok(c.query_row(sql, [], |r| r.get(0))?))
+            .expect(sql)
+    };
+    assert!(count("SELECT count(*) FROM rollup_dim_min WHERE dim IN (10, 11, 13)") > 0);
+    s.set_privacy(false, true);
+    s.scrub_fields(true, true).expect("scrub");
+    assert_eq!(
+        count("SELECT count(*) FROM rollup_dim_min WHERE dim IN (10, 11, 13)"),
+        0
+    );
+    assert!(count("SELECT count(*) FROM rollup_dim_min WHERE dim = 12") >= 0);
+    assert_eq!(
+        count("SELECT count(*) FROM dict WHERE val LIKE 'scrub-agent-%' OR val LIKE '203.0.113.%'"),
+        0
+    );
+    assert!(
+        s.top(TopKind::ClientIps, 900, None, NOW, 5)
+            .expect("ips")
+            .is_empty()
+    );
+    assert!(
+        s.top(TopKind::UserAgents, 900, None, NOW, 5)
+            .expect("uas")
+            .is_empty()
+    );
+}
+
+#[test]
+fn freed_request_ids_are_folded_when_they_are_handed_out_again() {
+    let (_d, s) = open();
+    s.set_retention_days(1);
+    let mut stale = ev(NOW - 40 * DAY);
+    stale.path = "/stale".into();
+    let mut fresh = ev(NOW - 1000);
+    fresh.path = "/fresh".into();
+    s.insert(&[fresh]).expect("insert");
+    s.insert(&[stale]).expect("insert");
+    while s.inner.lock_writer().fold_now() {}
+    s.prune(NOW).expect("prune");
+    let again: Vec<LogEvent> = (0..5)
+        .map(|_| {
+            let mut e = ev(NOW - 900);
+            e.path = "/again".into();
+            e
+        })
+        .collect();
+    s.insert(&again).expect("insert");
+    let top = s.top(TopKind::Paths, 900, None, NOW, 5).expect("top");
+    let got: Vec<(&str, u64)> = top.iter().map(|t| (t.key.as_str(), t.count)).collect();
+    assert_eq!(got, [("/again", 5), ("/fresh", 1)]);
+    while s.inner.lock_writer().fold_now() {}
+    let top = s.top(TopKind::Paths, 900, None, NOW, 5).expect("top");
+    let got: Vec<(&str, u64)> = top.iter().map(|t| (t.key.as_str(), t.count)).collect();
+    assert_eq!(got, [("/again", 5), ("/fresh", 1)]);
+}
+
+// Builds a v2-shaped file by hand so the forward migration is tested against real older data.
+#[test]
+fn version_two_databases_migrate_to_minute_rollups() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("v2.db");
+    {
+        let conn = rusqlite::Connection::open(&path).expect("raw");
+        conn.execute_batch(crate::schema::MIGRATIONS[0])
+            .expect("v1");
+        conn.execute_batch(crate::schema::MIGRATIONS[1])
+            .expect("v2");
+        conn.execute_batch(&format!(
+            "PRAGMA user_version = 2;
+             INSERT INTO dict (id, kind, val) VALUES (1, 7, 'a'), (2, 20, '1.1.1.1');
+             INSERT INTO requests (ts, client_ip_id, path, query_len, status, bytes_in, bytes_out, total_ms,
+                 site_id, resp_ms, bot_score)
+             VALUES ({}, 2, '/x', 0, 200, 1, 10, 5, 1, 5, 0), ({}, 2, '/x', 0, 200, 1, 10, 5, 1, 5, 0),
+                    ({NOW}, 2, '/y', 0, 200, 1, 10, 5, 1, 5, 0);",
+            NOW - 120_000,
+            NOW - 60_000
+        ))
+        .expect("seed");
+    }
+    let s = Store::open(&path, StoreOptions::default()).expect("migrate");
+    let conn = rusqlite::Connection::open(&path).expect("raw");
+    let one = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).expect(sql) };
+    assert_eq!(one("PRAGMA user_version"), 3);
+    assert_eq!(SCHEMA_VERSION, 3);
+    for table in [
+        "rollup_min",
+        "rollup_hist_min",
+        "rollup_dim_min",
+        "rollup_path_min",
+        "rollup_over",
+        "rollup_state",
+    ] {
+        assert_eq!(
+            one(&format!(
+                "SELECT count(*) FROM sqlite_master WHERE name = '{table}'"
+            )),
+            1,
+            "{table}"
+        );
+    }
+    assert_eq!(one("SELECT folded_id FROM rollup_state"), 3);
+    assert_eq!(one("SELECT valid_from FROM rollup_state"), NOW / 60_000 + 1);
+    let top = s.top(TopKind::Paths, 3600, None, NOW, 5).expect("paths");
+    let got: Vec<(&str, u64)> = top.iter().map(|t| (t.key.as_str(), t.count)).collect();
+    assert_eq!(
+        got,
+        [("/x", 2), ("/y", 1)],
+        "history before the migration reads raw rows"
+    );
+    assert!(!minute_served(&s, 3600));
+    let later = NOW + 10 * 60_000;
+    let mut e = ev(later);
+    e.path = "/z".into();
+    s.insert(&[e.clone(), e]).expect("insert");
+    let fresh = s
+        .inner
+        .read(|c| Ok(Window::pick(c, 300, later, false)?.source))
+        .expect("pick");
+    assert!(fresh == queries::Source::Minute);
+    let top = s.top(TopKind::Paths, 300, None, later, 5).expect("paths");
+    assert_eq!((top[0].key.as_str(), top[0].count), ("/z", 2));
+    while s.inner.lock_writer().fold_now() {}
+    assert_eq!(one("SELECT folded_id FROM rollup_state"), 5);
+    let summary = s.summary(300, None, later).expect("summary");
+    assert_eq!(summary.requests, 2);
+}
+
+// The shortcut sums paths seen at least twice, so single sightings must be added back for the list to stay exact.
+#[test]
+fn the_hot_path_shortcut_completes_keys_with_their_single_sightings() {
+    let (_d, s) = open();
+    let mut batch = Vec::new();
+    for minute in 0..10i64 {
+        let base = NOW - 9 * 60_000 + minute * 60_000;
+        for h in 0..30i64 {
+            let times = if (minute + h) % 2 == 0 { 40 + h } else { 1 };
+            for t in 0..times {
+                let mut e = ev(base + t);
+                e.path = format!("/hot/{h}");
+                e.site = ["a", "b"][(h % 2) as usize].into();
+                batch.push(e);
+            }
+        }
+        let mut e = ev(base + 5);
+        e.path = "/single-every-minute".into();
+        batch.push(e);
+        let mut e = ev(base + 6);
+        e.path = format!("/tail/{minute}");
+        batch.push(e);
+    }
+    s.insert(&batch).expect("insert");
+    while s.inner.lock_writer().fold_now() {}
+    let more: Vec<LogEvent> = (0..7)
+        .map(|_| {
+            let mut e = ev(NOW - 10);
+            e.path = "/hot/3".into();
+            e.site = "b".into();
+            e
+        })
+        .collect();
+    s.insert(&more).expect("insert");
+    let win = Window::minute(900, NOW);
+    for site in [None, Some("a"), Some("b")] {
+        for limit in [1usize, 5, 10] {
+            let proven = s
+                .inner
+                .read(|c| queries::hot_top_path_for_test(c, &win, site, limit))
+                .expect("hot");
+            let raw = s
+                .inner
+                .read(|c| {
+                    queries::top_raw(
+                        c,
+                        TopKind::Paths,
+                        &queries::range_where(win.from, win.to, site),
+                        limit,
+                    )
+                })
+                .expect("raw");
+            assert_eq!(proven.as_ref(), Some(&raw), "{site:?} limit {limit}");
+        }
+    }
+}
+
+// A batch spanning more than ten minutes is a backfill and writes no minute rows, so readers use raw rows for it.
+#[test]
+fn a_backfill_skips_the_minute_rollups_and_stays_exact() {
+    let (_d, s) = open();
+    let mut live = ev(NOW - 1000);
+    live.path = "/live".into();
+    s.insert(&[live.clone(), live]).expect("insert");
+    let mut next = xorshift(7);
+    let history: Vec<LogEvent> = (0..300)
+        .map(|i| {
+            let age = 1800 + i64::try_from(next() % (150 * 60)).expect("age");
+            let mut e = ev(NOW - age * 1000);
+            e.path = format!("/old/{}", i % 5);
+            e
+        })
+        .collect();
+    s.insert(&history).expect("backfill");
+    while s.inner.lock_writer().fold_now() {}
+    let count = |sql: &str| -> i64 {
+        s.inner
+            .read(|c| Ok(c.query_row(sql, [], |r| r.get(0))?))
+            .expect(sql)
+    };
+    assert_eq!(count("SELECT sum(requests) FROM rollup_min"), 2);
+    assert_eq!(
+        count("SELECT count(*) FROM rollup_path_min WHERE path LIKE '/old/%'"),
+        0
+    );
+    assert!(count("SELECT count(*) FROM rollup_over WHERE dim = 0") > 10);
+    assert!(!minute_served(&s, 3 * 3600));
+    let all = s.summary(3 * 3600, None, NOW).expect("summary");
+    assert_eq!(all.requests, 302);
+    let top = s.top(TopKind::Paths, 3 * 3600, None, NOW, 3).expect("top");
+    assert_eq!((top[0].key.as_str(), top[0].count), ("/old/0", 60));
+    assert!(minute_served(&s, 900));
+}
+
+// The cap sits below the minute tables plus half the raw rows, the case that once emptied the whole table in one pass.
+#[test]
+fn a_size_cap_smaller_than_the_minute_tables_still_trims_only_the_oldest_rows() {
+    let (_d, s) = open();
+    s.set_retention_days(0);
+    let total = 30_000i64;
+    for chunk in 0..6 {
+        let batch: Vec<LogEvent> = (0..5000)
+            .map(|j| {
+                let i = chunk * 5000 + j;
+                let mut e = ev(NOW - 18_000_000 + i * 500);
+                e.path = format!("/long/{i}/{}", "x".repeat(300));
+                e.client_ip = format!("10.{}.{}.{}", i % 7, (i / 7) % 250, i % 250);
+                e
+            })
+            .collect();
+        s.insert(&batch).expect("insert");
+        while s.inner.lock_writer().fold_now() {}
+    }
+    s.prune(NOW).expect("settle");
+    let before = s.stats().expect("stats");
+    assert_eq!(before.rows, total as u64);
+    let minute_bytes: u64 = s
+        .inner
+        .read(|c| {
+            Ok(c.query_row(
+                "SELECT coalesce(sum(pgsize), 0) FROM dbstat WHERE name LIKE 'rollup_%_min' OR name = 'rollup_min'",
+                [],
+                |r| r.get(0),
+            )?)
+        })
+        .expect("dbstat");
+    let live = s.inner.live_bytes().expect("live");
+    assert!(minute_bytes > 0);
+    s.set_max_bytes(Some(live - minute_bytes - (live - minute_bytes) / 4));
+    let report = s.prune(NOW).expect("prune");
+    let after = s.stats().expect("stats");
+    assert!(
+        after.rows > 0 && after.rows < total as u64,
+        "{report:?} {after:?}"
+    );
+    assert_eq!(after.newest_ts_ms, before.newest_ts_ms);
+    assert!(after.oldest_ts_ms > before.oldest_ts_ms, "{after:?}");
+    assert_eq!(
+        s.summary(6 * 3600, None, NOW).expect("summary").requests,
+        after.rows
+    );
 }

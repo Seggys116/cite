@@ -1,10 +1,12 @@
 use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 
 use cite_edge::model::LogEvent;
 use rusqlite::{CachedStatement, Connection, OptionalExtension, TransactionBehavior, params};
 
 use crate::error::Result;
-use crate::limits::{BYTES_CLAMP, HOUR_MS};
+use crate::fold::{self, FOLD_EVERY};
+use crate::limits::{BACKFILL_SPAN_MS, BYTES_CLAMP};
 use crate::rollup::Rollups;
 use crate::schema::{dim, kind};
 use crate::util::{ascii_upper, normalize_ctype, score_bucket, split_signals, to_i64};
@@ -117,6 +119,7 @@ pub(crate) struct Privacy {
 pub(crate) struct WriteConn {
     pub(crate) conn: Connection,
     cache: DictCache,
+    last_fold: Option<Instant>,
 }
 
 impl WriteConn {
@@ -124,6 +127,7 @@ impl WriteConn {
         Self {
             conn,
             cache: DictCache::new(),
+            last_fold: None,
         }
     }
 
@@ -156,12 +160,31 @@ impl WriteConn {
         let result = self.try_insert(events, privacy);
         if result.is_err() {
             self.cache.clear();
+        } else if self.last_fold.is_none_or(|at| at.elapsed() >= FOLD_EVERY) {
+            let _ = self.fold_now();
         }
         result
     }
 
+    // The insert is already committed, so a failed fold is only logged: readers cover unfolded rows from the raw table. A pass that leaves rows behind makes the next insert fold again, and reports it.
+    pub(crate) fn fold_now(&mut self) -> bool {
+        self.last_fold = Some(Instant::now());
+        match fold::fold(&mut self.conn) {
+            Ok(more) => {
+                if more {
+                    self.last_fold = None;
+                }
+                more
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "minute rollup fold failed; recent windows read raw rows until the next pass");
+                false
+            }
+        }
+    }
+
     fn try_insert(&mut self, events: &[LogEvent], privacy: Privacy) -> Result<usize> {
-        let Self { conn, cache } = self;
+        let Self { conn, cache, .. } = self;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut roll = Rollups::default();
         warm(&tx, cache, events, privacy)?;
@@ -171,7 +194,10 @@ impl WriteConn {
                 add_event(&tx, cache, &mut ins, &mut roll, ev, privacy)?;
             }
         }
-        roll.apply(&tx)?;
+        let (oldest, newest) = events.iter().fold((i64::MAX, i64::MIN), |(lo, hi), e| {
+            (lo.min(e.ts_ms), hi.max(e.ts_ms))
+        });
+        roll.apply(&tx, newest.saturating_sub(oldest) <= BACKFILL_SPAN_MS)?;
         tx.commit()?;
         Ok(events.len())
     }
@@ -328,12 +354,12 @@ fn add_event(
         bot_signals,
     ])?;
 
-    let hour = ev.ts_ms.div_euclid(HOUR_MS);
+    let ts = ev.ts_ms;
     let scope = site.unwrap_or(0);
     let classified = !ev.bot_class.is_empty();
     let bot = classified && ev.bot_class != "human";
     roll.event(
-        hour,
+        ts,
         scope,
         ev.status,
         ev.total_ms,
@@ -343,51 +369,39 @@ fn add_event(
         bot,
     );
     let upper = ascii_upper(&ev.method);
-    roll.dim(
-        hour,
-        scope,
-        dim::METHOD,
-        id(kind::METHOD, &upper)?,
-        bytes_out,
-    );
+    roll.dim(ts, scope, dim::METHOD, id(kind::METHOD, &upper)?, bytes_out);
     let ctype_norm = normalize_ctype(&ev.content_type);
     roll.dim(
-        hour,
+        ts,
         scope,
         dim::CONTENT_TYPE,
         id(kind::CONTENT_TYPE_NORM, &ctype_norm)?,
         bytes_out,
     );
-    roll.top(hour, scope, dim::CLIENT_IP, client_ip, bytes_out);
-    roll.top(hour, scope, dim::USER_AGENT, ua, bytes_out);
-    roll.top(hour, scope, dim::REFERER, referer, bytes_out);
+    roll.top(ts, scope, dim::CLIENT_IP, client_ip, bytes_out);
+    roll.top(ts, scope, dim::USER_AGENT, ua, bytes_out);
+    roll.top(ts, scope, dim::REFERER, referer, bytes_out);
     if bot {
-        roll.top(hour, scope, dim::BOT_AGENT, ua, bytes_out);
+        roll.top(ts, scope, dim::BOT_AGENT, ua, bytes_out);
     }
-    roll.path(hour, scope, &ev.path, bytes_out);
-    roll.dim(hour, scope, dim::HOST, host, bytes_out);
-    roll.dim(hour, scope, dim::BLOCKED, blocked, bytes_out);
+    roll.path(ts, scope, &ev.path, bytes_out);
+    roll.dim(ts, scope, dim::HOST, host, bytes_out);
+    roll.dim(ts, scope, dim::BLOCKED, blocked, bytes_out);
     roll.dim(
-        hour,
+        ts,
         scope,
         dim::STATUS,
         Some(i64::from(ev.status)),
         bytes_out,
     );
-    roll.dim(hour, scope, dim::LANGUAGE, lang, bytes_out);
-    roll.dim(hour, scope, dim::BOT_CLASS, bot_class, bytes_out);
+    roll.dim(ts, scope, dim::LANGUAGE, lang, bytes_out);
+    roll.dim(ts, scope, dim::BOT_CLASS, bot_class, bytes_out);
     for signal in split_signals(&ev.bot_signals) {
-        roll.dim(
-            hour,
-            scope,
-            dim::SIGNAL,
-            id(kind::SIGNAL, signal)?,
-            bytes_out,
-        );
+        roll.dim(ts, scope, dim::SIGNAL, id(kind::SIGNAL, signal)?, bytes_out);
     }
     if classified {
         let bucket = score_bucket(ev.bot_score) as i64;
-        roll.dim(hour, scope, dim::SCORE, Some(bucket), bytes_out);
+        roll.dim(ts, scope, dim::SCORE, Some(bucket), bytes_out);
     }
     Ok(())
 }

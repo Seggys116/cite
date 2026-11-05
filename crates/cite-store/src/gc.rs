@@ -39,8 +39,10 @@ pub(crate) fn unreferenced(conn: &Connection) -> Result<Vec<(i64, u8)>> {
         }
     }
     {
-        let mut stmt =
-            tx.prepare("SELECT DISTINCT key_id FROM rollup_dim WHERE dim NOT IN (?1, ?2)")?;
+        let mut stmt = tx.prepare(
+            "SELECT key_id FROM rollup_dim WHERE dim NOT IN (?1, ?2) \
+             UNION SELECT key_id FROM rollup_dim_min WHERE dim NOT IN (?1, ?2)",
+        )?;
         let mut rows = stmt.query(params![dim::STATUS, dim::SCORE])?;
         while let Some(r) = rows.next()? {
             used.insert(r.get(0)?);
