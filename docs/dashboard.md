@@ -10,7 +10,18 @@ The console source is in `crates/cite-dashboard/web`. The dashboard server that 
 docker compose -f docker-compose.dashboard.yml up -d
 ```
 
-The console listens on port 8088 (`CITE_DASHBOARD_PORT`) and is published on `127.0.0.1` unless `CITE_DASHBOARD_BIND` says otherwise. Open `http://127.0.0.1:8088` to finish setup in the browser, or run `docker compose -f docker-compose.dashboard.yml run --rm dashboard init` to create the account from the command line.
+The console listens on port 8088 (`CITE_DASHBOARD_PORT`) and is published on `127.0.0.1` unless `CITE_DASHBOARD_BIND` says otherwise. Open `http://127.0.0.1:8088` to finish setup in the browser, or run `docker compose -f docker-compose.dashboard.yml run --rm dashboard init` to create the account from the command line. `scripts/setup.sh --mode dashboard` (or `both`, with a node) installs the same compose file.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `CITE_DASHBOARD_PORT`, `CITE_DASHBOARD_BIND` | `8088`, `127.0.0.1` | Host port and address the compose file publishes. |
+| `CITE_DASHBOARD_ALLOW` | empty | Source addresses or CIDRs allowed to connect. Empty applies no allowlist. |
+| `CITE_DASHBOARD_TLS_CERT`, `CITE_DASHBOARD_TLS_KEY` | empty | PEM certificate and key paths inside the container. Both or neither. The compose file does not mount any, so add a volume of your own. |
+| `CITE_DASHBOARD_COOKIE_SECURE` | on when TLS is configured | Set `true` when a TLS proxy sits in front, so the session cookie is marked Secure. |
+| `CITE_DASHBOARD_SESSION_TTL` | `28800` (8 hours) | Session lifetime in seconds, from 60 to 2592000. Sessions also expire after 60 minutes idle, or sooner when the lifetime is shorter. |
+| `CITE_DASHBOARD_MEM`, `CITE_DASHBOARD_CPUS`, `CITE_DASHBOARD_PIDS` | `256m`, `1.0`, `128` | Container limits. |
+
+Boolean values accept `1`, `true`, `yes`, `on`, `0`, `false`, `no` and `off`. A malformed value stops the dashboard at start.
 
 ## Signing in
 
@@ -24,7 +35,7 @@ Running `init --force` against a live dashboard replaces the account for the run
 
 ## Nodes
 
-A node is a connector. Add one with a name, its connector URL (for example `https://edge.example.com:8443`) and a connector API token. Create the token with `POST /api/v1/tokens` on the connector, using a session from `POST /api/v1/auth/login`. The token is shown once.
+A node is a connector. Add one with a name, its connector URL (for example `https://edge.example.com:8443`), a connector API token and, for a node that uses the CA from `init`, the contents of its `ca.pem`. Create the token with `POST /api/v1/tokens` on the connector, using a session from `POST /api/v1/auth/login`. The token is shown once.
 
 The Nodes view lists the connectors this console manages. A node switcher in the header scopes every other view to one node or to All nodes. Removing a node removes it from the console only; the node keeps serving.
 
@@ -38,12 +49,12 @@ The connector's certificate comes from a self-signed authority created by `init`
 | Nodes | Add and remove connectors. |
 | Sites | A table of sites with node, kind (site or API), hosts, active slot, health and state. Create site opens the form described below. |
 | Site page | Routing, health check settings, a live view of targets in each slot, deploy history, Deploy new version, Switch active slot, Roll back, a maintenance toggle with page choice, and Delete site. |
-| Traffic | Requests over time, status classes, methods, latency (average, p50, p95, p99), response sizes, content types, top paths, client IPs, user agents, hosts and blocking rules, and a live request list that refreshes every 3 seconds. A time window selector offers 15 minutes, 1 hour, 24 hours, 7 days and 30 days. |
-| Firewall | An ordered list of rules ("evaluated in order; the first match wins" in the UI) with path prefix, host, methods and client address matchers, an action and a scope of one site or all. |
-| Maintenance | Custom maintenance pages: a name, a status code and the HTML. |
+| Traffic | Requests over time, status classes, methods, latency (average, p50, p95, p99), response sizes, content types, top paths, client IPs, user agents, hosts and blocking rules, and a live request list that refreshes every 3 seconds. A time window selector offers 15 minutes, 1 hour, 24 hours, 7 days and 30 days, and a site selector narrows every panel to one site. The request list filters by status, method, path, client IP and blocked only, and a request can be turned into a rule that blocks its path or its address. |
+| Firewall | An ordered list of rules ("evaluated in order; the first match wins" in the UI) with path prefix, path regex, user agent regex, host, methods and client address matchers, an action (deny, drop silently or tarpit) and a scope of one site or all. Each row shows its hits over 24 hours and can be switched on or off. Presets sit below the list. |
+| Maintenance | Custom maintenance pages: a name, a status code and the HTML (up to 15000 bytes). A page that a site uses cannot be deleted. |
 | Settings | Data retention, connection limits, API tokens, the audit log (most recent 200 entries), the rendered `haproxy.cfg` with process and backend status, and dashboard appearance and session. |
 
-Connection limit changes apply on the next HAProxy reload. The retention form edits the settings described in [Analytics and retention](analytics.md), including the two privacy flags.
+Connection limit changes apply on the next HAProxy reload. The retention form edits the settings described in [Analytics and retention](analytics.md): recent events, minute and hour history, audit days, the persist interval and the two privacy flags.
 
 A command palette offers shortcuts to views, Create site, Add firewall rule, Add node, switching nodes, toggling the light or dark theme, reloading the view and signing out.
 
@@ -57,9 +68,10 @@ A command palette offers shortcuts to views, Create site, Add firewall rule, Add
 | Blue and green targets | `host:port` addresses for each slot. At least one blue target is required. |
 | Health check path | Must start with `/`. The form sends an interval of 2000 ms, a timeout of 1500 ms, 2 passes to be healthy and 3 failures to be down. |
 | Placement | Selected nodes, or Replicate to all nodes. |
-| GitHub token | Optional, for private repositories. It is sent to the connector beside the site definition, never stored in the site or on the dashboard, and never returned. |
 
-The new site starts with the blue slot active. The form sends one request to the dashboard server with the chosen nodes and the site definition. With Replicate to all nodes the same site is created on every connected node, each with its own targets, so use addresses that mean the same thing on each.
+The form creates a site with no `source`, so it routes to upstreams you run. The new site starts with the blue slot active. The form sends one request to the dashboard server with the chosen nodes and the site definition. With Replicate to all nodes the same site is created on every connected node, so use addresses that mean the same thing on each. The connector rejects targets that are loopback, link-local, unspecified or multicast addresses, or that name the node's own services (see [Firewall and maintenance](firewall.md#targets-and-health-checks)).
+
+A site that the connector builds from GitHub needs a `source`, which the form does not offer. Send it to `POST /api/v1/deployments` with an optional `github_token` (accepted only when the site has a `source`); the dashboard forwards the token to the connector once and neither stores nor returns it. In `each` mode `POST /deployments` also takes `per_node`, a map of node name to `{blue, green}` target lists, so each node can get its own upstreams.
 
 ## How the console talks to connectors
 

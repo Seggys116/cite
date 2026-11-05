@@ -6,11 +6,11 @@ import {
   formatError, slugify, checkRegex,
 } from '../ui.js';
 import { noNodes, listOf } from './common.js';
+import { siteProblem } from '../siteCheck.js';
 
 // Targets are host:port only, with no scheme or path, because they become HAProxy server addresses.
 const ADDR_RE =/^[^\s:/]+:\d{1,5}$/;
 const HOST_RE = /^(\*\.)?[a-z0-9]([a-z0-9.-]*[a-z0-9])?$/i;
-const ID_RE = /^[a-z0-9][a-z0-9-]{0,62}$/;
 
 // Editable list of upstream addresses with weights, shared by site creation and deploy forms
 export function targetEditor({ targets = [] } = {}) {
@@ -135,16 +135,19 @@ export function newSiteView(ctx) {
   const submit = button('Create site', { kind: 'primary', iconName: 'rocket' });
 
   const validate = () => {
-    if (!name.value.trim()) return fail('Give the site a name.');
-    if (!ID_RE.test(id.value)) return fail('The site id must be lowercase letters, digits and dashes.');
-    if (!hosts.get().length) return fail('Add at least one host name.');
-    if (pathTool.error()) return fail('The path regex is not valid.');
-    const problem = blue.validate() || green.validate();
-    if (problem) return fail(problem);
-    if (!blue.get().length) return fail('Add at least one blue target.');
-    if (!healthPath.value.startsWith('/')) return fail('The health check path must start with /.');
-    if (modeEach.checked && !checks.some((c) => c.checked)) return fail('Pick at least one node.');
-    return fail('');
+    const problem = siteProblem({
+      name: name.value,
+      id: id.value,
+      hostCount: hosts.get().length,
+      pathError: pathTool.error(),
+      targetProblem: blue.validate() || green.validate(),
+      blueCount: blue.get().length,
+      healthPath: healthPath.value,
+      pickNodes: modeEach.checked,
+      nodePicked: checks.some((c) => c.checked),
+    });
+    fail(problem || '');
+    return !problem;
   };
 
   submit.addEventListener('click', async () => {
@@ -192,7 +195,7 @@ export function newSiteView(ctx) {
           h('div', {}, h('h4', { class: 'slot-title' }, pill('blue', 'blue'), 'Blue targets'), blue.el),
           h('div', {}, h('h4', { class: 'slot-title' }, pill('green', 'green'), 'Green targets'), green.el)),
         field('Health check path', healthPath, 'Probed on every target to decide readiness.')) }),
-      card({ title: 'Targets', subtitle: 'Place on', body: placement }),
+      card({ title: 'Placement', subtitle: 'Choose which nodes get this site', body: placement }),
       err,
       h('div', { class: 'form-actions' }, h('a', { class: 'btn', href: '#/sites' }, 'Cancel'), submit)));
   syncMode();

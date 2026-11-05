@@ -13,6 +13,7 @@ export function openAddNode(onDone) {
   const name = h('input', { class: 'input mono', type: 'text', placeholder: 'edge-fra-1', autocomplete: 'off', spellcheck: 'false' });
   const url = h('input', { class: 'input mono', type: 'url', placeholder: 'https://edge.example.com:8443', autocomplete: 'off', spellcheck: 'false' });
   const token = h('input', { class: 'input mono', type: 'password', placeholder: 'Connector API token', autocomplete: 'off' });
+  const ca = h('textarea', { class: 'textarea mono', rows: '6', placeholder: '-----BEGIN CERTIFICATE-----', spellcheck: 'false', 'aria-label': 'Connector CA certificate' });
   const err = h('p', { class: 'form-error', role: 'alert', hidden: true });
   const save = button('Add node', { kind: 'primary', iconName: 'plus' });
   let drawer = null;
@@ -26,9 +27,12 @@ export function openAddNode(onDone) {
     if (!NAME_RE.test(name.value.trim())) return fail('Use letters, digits, dot, dash or underscore for the node name.');
     if (!/^https?:\/\/\S+$/i.test(url.value.trim())) return fail('The connector URL must start with http:// or https://.');
     if (!token.value.trim()) return fail('Paste an API token created on the node.');
+    if (ca.value.trim() && !ca.value.includes('-----BEGIN CERTIFICATE-----')) return fail('The CA certificate must be a PEM block starting with BEGIN CERTIFICATE.');
     fail('');
     try {
-      await withBusy(save, () => api.post('/nodes', { name: name.value.trim(), url: url.value.trim(), token: token.value.trim() }));
+      const body = { name: name.value.trim(), url: url.value.trim(), token: token.value.trim() };
+      if (ca.value.trim()) body.ca_pem = ca.value.trim();
+      await withBusy(save, () => api.post('/nodes', body));
       await loadNodes();
       toast(`Node ${name.value.trim()} added`, 'success');
       drawer.close();
@@ -45,6 +49,7 @@ export function openAddNode(onDone) {
       field('Name', name, 'A short label shown in the node switcher.'),
       field('Connector URL', url, 'Base address of the node connector, without /api/v1.'),
       field('API token', token, 'Stored by the dashboard server and never shown again.'),
+      field('CA certificate', ca, 'Optional. The connector ca.pem, needed when the node uses its own certificate authority.'),
       err),
     footer: [button('Cancel', { onClick: () => drawer.close() }), save],
   });

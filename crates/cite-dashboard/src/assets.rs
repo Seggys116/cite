@@ -163,6 +163,15 @@ mod tests {
     }
 
     #[test]
+    fn add_node_form_can_send_a_connector_ca() {
+        let nodes = assets()
+            .get("js/views/nodes.js")
+            .expect("nodes view is embedded");
+        let source = std::str::from_utf8(nodes.body).expect("utf8 source");
+        assert!(source.contains("body.ca_pem"));
+    }
+
+    #[test]
     fn content_types_cover_the_console_assets() {
         assert!(content_type("app.js").starts_with("text/javascript"));
         assert!(content_type("js/views/auth.js").starts_with("text/javascript"));

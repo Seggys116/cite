@@ -19,6 +19,7 @@ const SERIES = [
 const STATUS_ORDER = ['2xx', '3xx', '4xx', '5xx'];
 
 function statusKind(code) {
+  if (!code) return 'muted';
   if (code >= 500) return 'bad';
   if (code >= 400) return 'warn';
   if (code >= 300) return 'info';
@@ -48,7 +49,11 @@ function renderAnalytics({ summary: sm, series }) {
   const donutSegs = statusKeys.map((k) => ({ label: k, value: sm.status[k], cls: 'seg-' + (STATUS_ORDER.includes(k) ? k : 'other') }));
   const methodItems = Object.entries(sm.methods || {}).sort((a, b) => b[1] - a[1]).map(([label, value]) => ({ label, value }));
   const typeItems = Object.entries(sm.content_types || {}).sort((a, b) => b[1] - a[1]).slice(0, 8).map(([label, value]) => ({ label, value }));
-  const sizeBuckets = perBucketSizes(sm.sizes).map((b) => ({ label: typeof b.le === 'number' ? '≤ ' + fmtBytes(b.le) : 'larger', value: b.count }));
+  const sizeBuckets = perBucketSizes(sm.sizes).map((b) => ({
+    label: typeof b.le === 'number' ? fmtBytes(b.le).replace(/\.0 /, ' ').replace(/ B$/, '').replace(/ ([KMGT])B$/, '$1') : 'more',
+    title: typeof b.le === 'number' ? 'Up to ' + fmtBytes(b.le) : 'Larger than the last bound',
+    value: b.count,
+  }));
   const latency = [
     { label: 'Average', value: sm.avg_ms || 0 }, { label: 'p50', value: sm.p50_ms || 0 },
     { label: 'p95', value: sm.p95_ms || 0 }, { label: 'p99', value: sm.p99_ms || 0 },
@@ -147,7 +152,7 @@ function liveLog(node, getSite) {
     { label: 'Host', cls: 'hide-sm', render: (e) => h('span', { class: 'mono muted' }, e.host) },
     { label: 'Path', cls: 'cell-clip', render: (e) => h('span', { class: 'mono clip', title: e.path }, e.path) },
     { label: 'Client', cls: 'hide-sm', render: (e) => h('span', { class: 'mono' }, e.client_ip || '-') },
-    { label: 'Time', align: 'right', render: (e) => h('span', { class: 'mono' }, fmtMs(e.total_ms)) },
+    { label: 'Duration', align: 'right', render: (e) => h('span', { class: 'mono' }, fmtMs(e.total_ms)) },
     { label: 'Size', align: 'right', cls: 'hide-sm', render: (e) => h('span', { class: 'mono muted' }, fmtBytes(e.bytes_out)) },
     { label: '', render: (e) => (e.blocked ? pill('blocked', 'bad') : null) },
   ];

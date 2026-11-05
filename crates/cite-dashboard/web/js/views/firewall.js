@@ -113,6 +113,7 @@ function openRuleEditor(node, rule, sites, onSaved) {
 
 function presetCard(preset, node, reload) {
   const key = Object.keys(PRESET_ICONS).find((k) => preset.name.includes(k));
+  const count = (preset.rules || []).length;
   const apply = button('Apply', { size: 'sm', iconName: 'plus' });
   apply.addEventListener('click', async () => {
     try {
@@ -127,7 +128,7 @@ function presetCard(preset, node, reload) {
     h('div', { class: 'preset-icon' }, icon(PRESET_ICONS[key] || 'shield')),
     h('h3', {}, preset.title),
     h('p', { class: 'muted' }, preset.description),
-    h('footer', {}, pill(`${(preset.rules || []).length} rules`, 'muted'), apply));
+    h('footer', {}, pill(`${count} rule${count === 1 ? '' : 's'}`, 'muted'), apply));
 }
 
 function render({ rules, presets, summary, sites }, reload, node) {
@@ -154,10 +155,10 @@ function render({ rules, presets, summary, sites }, reload, node) {
           },
         }),
       },
-      { label: 'Rule', render: (r) => h('div', { class: 'cell-stack' }, h('b', { class: 'cell-strong' }, r.name), h('span', { class: 'mono muted' }, r.id)) },
-      { label: 'Action', render: (r) => pill(ACTIONS[r.action].label, ACTIONS[r.action].kind) },
-      { label: 'Matches', render: (r) => h('div', { class: 'chips' }, matcherSummary(r.matchers).map((t) => h('span', { class: 'chip chip-static mono', title: t }, t))) },
-      { label: 'Scope', render: (r) => (r.site ? siteName(r.site) : h('span', { class: 'muted' }, 'All sites')) },
+      { label: 'Rule', cls: 'nowrap', render: (r) => h('div', { class: 'cell-stack' }, h('b', { class: 'cell-strong' }, r.name), h('span', { class: 'mono muted' }, r.id)) },
+      { label: 'Action', cls: 'nowrap', render: (r) => pill(ACTIONS[r.action].label, ACTIONS[r.action].kind) },
+      { label: 'Matches', cls: 'cell-clip', render: (r) => h('div', { class: 'chips' }, matcherSummary(r.matchers).map((t) => h('span', { class: 'chip chip-static mono', title: t }, t))) },
+      { label: 'Scope', cls: 'nowrap', render: (r) => (r.site ? siteName(r.site) : h('span', { class: 'muted' }, 'All sites')) },
       { label: 'Hits (24h)', align: 'right', render: (r) => h('span', { class: 'mono' }, fmtInt(hitsFor(r))) },
       {
         label: '',

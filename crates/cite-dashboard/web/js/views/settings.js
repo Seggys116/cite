@@ -146,7 +146,18 @@ function tokensPanel(node) {
       toast(formatError(ex), 'error');
     }
   });
-  reload = loadInto(body, () => nodeApi(node).get('/tokens'), (tokens, again) => dataTable({
+  const createCard = card({ title: 'Create a token', body: h('div', { class: 'inline-form' }, nameIn, create) });
+  // The connector refuses token management to API tokens, which is how the dashboard authenticates, so a 403 means the node owner must do it there.
+  const load = async () => {
+    try {
+      createCard.hidden = false;
+      return await nodeApi(node).get('/tokens');
+    } catch (ex) {
+      if (ex && ex.status === 403) return null;
+      throw ex;
+    }
+  };
+  reload = loadInto(body, load, (tokens, again) => (tokens === null ? restrictedTokens(createCard) : dataTable({
     columns: [
       { label: 'Name', render: (t) => h('b', { class: 'cell-strong' }, t.name) },
       { label: 'Id', render: (t) => h('span', { class: 'mono muted' }, t.id) },
@@ -170,10 +181,17 @@ function tokensPanel(node) {
     ],
     rows: tokens,
     empty: emptyState({ iconName: 'key', title: 'No API tokens', text: 'Create a long-lived token for scripts and CI pipelines.' }),
-  }));
-  return h('div', { class: 'stack' },
-    card({ title: 'Create a token', body: h('div', { class: 'inline-form' }, nameIn, create) }),
-    card({ title: 'Tokens', flush: true, body }));
+  })));
+  return h('div', { class: 'stack' }, createCard, card({ title: 'Tokens', flush: true, body }));
+}
+
+function restrictedTokens(createCard) {
+  createCard.hidden = true;
+  return emptyState({
+    iconName: 'key',
+    title: 'Tokens are managed on the node',
+    text: 'This console signs in to the node with an API token, and the connector does not let an API token create or revoke tokens. Sign in to the node itself to manage them.',
+  });
 }
 
 function auditPanel(node) {
