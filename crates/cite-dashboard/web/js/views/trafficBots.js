@@ -101,7 +101,6 @@ export function botsPanel(sm) {
   const share = h('div', { class: 'donut-wrap' },
     donut(segs, { centerTop: fmtSharePct(sm.bot_share_pct), centerBottom: 'bot share' }),
     h('div', { class: 'stack-sm' },
-      h('div', { class: 'stat-value mono' }, fmtSharePct(sm.bot_share_pct)),
       h('div', { class: 'muted' }, `${fmtInt(sm.bot_requests)} of ${fmtInt(sm.total_requests)} requests were not classed human`)));
   const buckets = scoreBuckets(sm.score_buckets);
   return h('div', { class: 'stack', 'data-panel': 'bots' },
