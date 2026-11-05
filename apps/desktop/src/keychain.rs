@@ -174,4 +174,28 @@ mod tests {
         assert_eq!(s.get("n").expect("get").as_deref(), Some("cite_t"));
         assert_eq!(KEYCHAIN_SERVICE, "dev.seggys116.cite");
     }
+
+    // Uses the real OS keychain under a throwaway service name, so it only runs on request.
+    #[test]
+    #[ignore = "uses the real OS keychain"]
+    fn os_keyring_round_trips_a_secret() {
+        let service = format!("cite-desktop-test-{}", std::process::id());
+        let k = OsKeyring;
+        assert_eq!(k.read(&service, "node").expect("read"), None);
+        k.write(&service, "node", "cite_secret").expect("write");
+        assert_eq!(
+            k.read(&service, "node").expect("read").as_deref(),
+            Some("cite_secret")
+        );
+        k.write(&service, "node", "cite_rotated")
+            .expect("overwrite");
+        assert_eq!(
+            k.read(&service, "node").expect("read").as_deref(),
+            Some("cite_rotated")
+        );
+        k.remove(&service, "node").expect("remove");
+        assert_eq!(k.read(&service, "node").expect("read"), None);
+        k.remove(&service, "node")
+            .expect("removing a missing entry is fine");
+    }
 }
