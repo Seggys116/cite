@@ -163,6 +163,28 @@ function contentTypeFor(path) {
   return 'text/html';
 }
 
+// A rough stand-in for the edge detector: tools and crawlers name themselves, browsers carry the full header set
+function botFields(ua, method, rnd) {
+  const browser = ua.startsWith('Mozilla/5.0') && !/bot/i.test(ua);
+  if (browser) {
+    const odd = rnd() < 0.06;
+    return {
+      http_version: 'HTTP/2', accept: 'text/html,application/xhtml+xml,*/*;q=0.8', accept_language: odd ? '' : 'en-US,en;q=0.9', accept_encoding: 'gzip, deflate, br',
+      sec_fetch_site: odd ? '' : 'same-origin', sec_fetch_mode: odd ? '' : 'navigate', sec_fetch_dest: odd ? '' : 'document',
+      sec_ch_ua: /Chrome/.test(ua) ? '"Chromium";v="130", "Not?A_Brand";v="99"' : '', tls_version: 'TLSv1.3', resp_ms: Math.round(2 + rnd() * 40),
+      bot_score: odd ? 35 + Math.floor(rnd() * 20) : Math.floor(rnd() * 14), bot_class: odd ? 'suspect' : 'human', bot_signals: odd ? 'missing_accept_language,no_sec_fetch' : '',
+    };
+  }
+  const crawler = /bot/i.test(ua);
+  const score = crawler ? 55 + Math.floor(rnd() * 15) : 82 + Math.floor(rnd() * 16);
+  const signals = crawler ? 'ua_googlebot,no_sec_fetch' : /sqlmap|nikto/i.test(ua) ? 'ua_generic_scraper,missing_accept_language,no_sec_fetch' : 'ua_python_requests,missing_accept_language,accept_wildcard_only,no_sec_fetch';
+  return {
+    http_version: 'HTTP/1.1', accept: crawler ? 'text/html' : '*/*', accept_language: '', accept_encoding: crawler ? 'gzip' : 'gzip, deflate',
+    sec_fetch_site: '', sec_fetch_mode: '', sec_fetch_dest: '', sec_ch_ua: '', tls_version: 'TLSv1.3', resp_ms: Math.round(2 + rnd() * 30),
+    bot_score: score, bot_class: crawler ? 'crawler' : method === 'GET' && /curl|python/.test(ua) ? 'tool' : 'bot', bot_signals: signals,
+  };
+}
+
 function makeEvent(node, ts, rnd) {
   const siteId = weighted(rnd, Object.entries(SITE_SHARE));
   const site = node.sites.find((s) => s.id === siteId) || node.sites[0];
@@ -177,10 +199,12 @@ function makeEvent(node, ts, rnd) {
   if (rule) status = BLOCK_STATUS[rule.action] || 403;
   const client = scan ? pick(rnd, IPS.slice(1, 4)) : pick(rnd, IPS);
   const total = Math.max(2, Math.round(Math.exp(2.9 + rnd() * 2.2) * (site.id === 'api' ? 0.8 : 1)));
+  const ua = scan ? pick(rnd, ['sqlmap/1.7.2#stable (https://sqlmap.org)', 'Nikto/2.5.0', AGENTS[3]]) : pick(rnd, AGENTS);
   return {
+    ...botFields(ua, method, rnd),
     ts_ms: ts, client_ip: client, host: pick(rnd, site.hosts), method, path, query_len: rnd() < 0.2 ? Math.floor(rnd() * 90) : 0, status,
     bytes_in: 200 + Math.floor(rnd() * 900), bytes_out: rule ? 0 : status === 304 ? 0 : Math.floor(Math.exp(6.5 + rnd() * 5)),
-    total_ms: rule ? 0 : total, user_agent: scan ? pick(rnd, ['sqlmap/1.7.2#stable (https://sqlmap.org)', 'Nikto/2.5.0', AGENTS[3]]) : pick(rnd, AGENTS),
+    total_ms: rule ? 0 : total, user_agent: ua,
     referer: rnd() < 0.3 ? 'https://' + pick(rnd, site.hosts) + '/' : '', content_type: contentTypeFor(path),
     backend: 'bk_' + site.id, server: `${site.active}-${1 + Math.floor(rnd() * Math.max(1, site[site.active].targets.length))}`, site: site.id,
     blocked: rule ? rule.id : null,
@@ -516,6 +540,97 @@ function collectionRoute(list, label, method, id, body, node, usedCheck) {
   throw new ApiError(405, 'method not allowed');
 }
 
+function eventsIn(node, win, siteId) {
+  tickEvents(node);
+  const [count, step] = WINDOWS[win] || WINDOWS['24h'];
+  const since = Date.now() - count * step * 1000;
+  return node.events.filter((e) => e.ts_ms >= since && (!siteId || e.site === siteId));
+}
+
+function tally(events, keyOf, limit = 100) {
+  const map = new Map();
+  for (const e of events) {
+    const key = keyOf(e);
+    const cur = map.get(key) || { key, count: 0, bytes: 0 };
+    cur.count += 1;
+    cur.bytes += e.bytes_out || 0;
+    map.set(key, cur);
+  }
+  return [...map.values()].sort((a, b) => b.count - a.count).slice(0, limit);
+}
+
+const TOP_FIELDS = {
+  paths: (e) => e.path, hosts: (e) => e.host, referers: (e) => e.referer || '', agents: (e) => e.user_agent, content_types: (e) => e.content_type,
+  statuses: (e) => String(e.status), ips: (e) => e.client_ip, languages: (e) => (e.accept_language || '').split(',')[0].trim(),
+};
+
+function botSummary(events) {
+  const flagged = events.filter((e) => e.bot_class && e.bot_class !== 'human');
+  const signals = new Map();
+  for (const e of events) for (const s of (e.bot_signals || '').split(',').filter(Boolean)) signals.set(s, (signals.get(s) || 0) + 1);
+  const labels = ['0-19', '20-39', '40-59', '60-79', '80-100'];
+  const buckets = labels.map((key, i) => ({ key, count: events.filter((e) => Math.min(4, Math.floor((e.bot_score || 0) / 20)) === i).length, bytes: 0 }));
+  return {
+    total_requests: events.length, bot_requests: flagged.length, bot_share_pct: events.length ? (flagged.length / events.length) * 100 : 0,
+    classes: tally(events, (e) => e.bot_class || 'human'),
+    signals: [...signals].map(([key, count]) => ({ key, count, bytes: 0 })).sort((a, b) => b.count - a.count).slice(0, 10),
+    agents: tally(flagged, (e) => e.user_agent, 10), score_buckets: buckets,
+  };
+}
+
+function csvCell(value) {
+  const text = String(value ?? '');
+  return /[",\n\r]/.test(text) ? '"' + text.replace(/"/g, '""') + '"' : text;
+}
+
+function toRows(rows, format) {
+  if (format === 'ndjson') return rows.map((r) => JSON.stringify(r)).join('\n') + '\n';
+  const cols = rows.length ? Object.keys(rows[0]) : [];
+  return [cols.join(','), ...rows.map((r) => cols.map((c) => csvCell(r[c])).join(','))].join('\n') + '\n';
+}
+
+function exportBody(node, q) {
+  const kind = q.get('kind');
+  const format = q.get('format') || 'csv';
+  if (!['requests', 'hourly', 'bots', 'top'].includes(kind)) throw new ApiError(400, 'unknown export kind');
+  if (!['csv', 'ndjson'].includes(format)) throw new ApiError(400, 'unknown export format');
+  const num = (k) => (q.get(k) ? Number(q.get(k)) : null);
+  const from = num('from');
+  const to = num('to');
+  const limit = num('limit') || 100000;
+  tickEvents(node);
+  const site = q.get('site');
+  const matches = (e) => (!site || e.site === site) && (from === null || e.ts_ms >= from) && (to === null || e.ts_ms <= to)
+    && (num('status_min') === null || e.status >= num('status_min')) && (num('status_max') === null || e.status <= num('status_max'))
+    && (!q.get('bot_class') || e.bot_class === q.get('bot_class')) && (num('min_bot_score') === null || (e.bot_score || 0) >= num('min_bot_score'))
+    && (!q.get('host') || e.host === q.get('host')) && (!q.get('path_prefix') || e.path.startsWith(q.get('path_prefix')))
+    && (!q.get('client_ip') || e.client_ip === q.get('client_ip')) && (!q.get('method') || e.method === q.get('method'));
+  const events = node.events.filter(matches);
+  let rows;
+  if (kind === 'requests') rows = events.slice(0, limit).map((e) => ({ ...e, blocked: e.blocked || '' }));
+  else if (kind === 'top') {
+    const field = TOP_FIELDS[q.get('top')];
+    if (!field) throw new ApiError(400, 'unknown top kind');
+    rows = tally(events, field, limit);
+  } else if (kind === 'bots') {
+    const sm = botSummary(events);
+    rows = [{ section: 'summary', key: 'bot_share_pct', count: sm.bot_share_pct.toFixed(2) }];
+    for (const part of ['classes', 'signals', 'agents', 'score_buckets']) rows.push(...sm[part].map((i) => ({ section: part, key: i.key, count: i.count })));
+  } else {
+    const hours = new Map();
+    for (const e of events) {
+      const hour = Math.floor(e.ts_ms / 3600000) * 3600000;
+      const cur = hours.get(hour) || { hour_ts_ms: hour, requests: 0, bytes_out: 0, errors: 0 };
+      cur.requests += 1;
+      cur.bytes_out += e.bytes_out || 0;
+      cur.errors += e.status >= 400 ? 1 : 0;
+      hours.set(hour, cur);
+    }
+    rows = [...hours.values()].sort((a, b) => a.hour_ts_ms - b.hour_ts_ms).slice(0, limit);
+  }
+  return toRows(rows, format);
+}
+
 async function nodeRoute(node, method, seg, q, body) {
   const [a, b, c] = seg;
   if (a === 'node') return nodeInfo(node);
@@ -541,6 +656,20 @@ async function nodeRoute(node, method, seg, q, body) {
     if (b === 'summary') return summary(node, win, q.get('site'));
     if (b === 'timeseries') return timeseries(node, win, q.get('site'));
     if (b === 'requests') return clone(filterEvents(node, q));
+    if (b === 'bots') return botSummary(eventsIn(node, win, q.get('site')));
+    if (b === 'top') {
+      const field = TOP_FIELDS[q.get('kind')];
+      if (!field) throw new ApiError(400, 'unknown top kind');
+      return { items: tally(eventsIn(node, win, q.get('site')), field, Number(q.get('limit')) || 10) };
+    }
+    if (b === 'stats') {
+      const times = node.events.map((e) => e.ts_ms);
+      return {
+        rows: node.events.length, db_bytes: node.events.length * 612, oldest_ts_ms: times.length ? Math.min(...times) : null,
+        newest_ts_ms: times.length ? Math.max(...times) : null, write_batches: 412, write_errors: 0,
+      };
+    }
+    if (b === 'export') return exportBody(node, q);
   }
   if (a === 'settings') {
     if (method === 'PUT') {

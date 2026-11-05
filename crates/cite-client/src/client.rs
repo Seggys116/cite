@@ -1,7 +1,9 @@
 use std::fmt;
+use std::path::Path;
 use std::time::Duration;
 
-use cite_edge::analytics::{Summary, Timeseries};
+use cite_edge::analytics::{Summary, Timeseries, TopItem};
+use cite_edge::bot::BotSummary;
 use cite_edge::model::{
     Deployment, EdgeSettings, FirewallRule, LogEvent, MaintenancePage, Site, Slot, Target,
 };
@@ -12,6 +14,9 @@ use serde_json::{Map, Value, json};
 
 use crate::config::{NodeConfig, parse_node_url};
 use crate::error::ClientError;
+use crate::export::{
+    AnalyticsStats, EXPORT_TIMEOUT, ExportQuery, ExportReport, ExportStream, validate_top_kind,
+};
 
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -262,6 +267,24 @@ pub struct Forwarded {
     pub status: u16,
     pub content_type: Option<String>,
     pub body: Vec<u8>,
+}
+
+#[derive(Deserialize)]
+struct TopItems {
+    #[serde(default)]
+    items: Vec<TopItem>,
+}
+
+async fn open_stream(req: reqwest::RequestBuilder) -> Res<ExportStream> {
+    let resp = req.send().await.map_err(ClientError::from_reqwest)?;
+    if resp.status().is_success() {
+        return Ok(ExportStream::new(resp));
+    }
+    let (status, _, buf) = read_capped(resp).await?;
+    Err(ClientError::Status {
+        code: status.as_u16(),
+        message: error_message(&buf, status),
+    })
 }
 
 fn analytics_query(window: &str, site: Option<&str>) -> Vec<(&'static str, String)> {
@@ -574,6 +597,76 @@ impl NodeClient {
         query.extend(filter.pairs());
         self.json(Method::GET, "/analytics/requests", &query, None)
             .await
+    }
+
+    pub async fn analytics_bots(&self, window: &str, site: Option<&str>) -> Res<BotSummary> {
+        let query = analytics_query(window, site);
+        self.json(Method::GET, "/analytics/bots", &query, None)
+            .await
+    }
+
+    pub async fn analytics_top(
+        &self,
+        kind: &str,
+        window: &str,
+        site: Option<&str>,
+        limit: Option<usize>,
+    ) -> Res<Vec<TopItem>> {
+        let mut query = analytics_query(window, site);
+        query.push(("kind", validate_top_kind(kind)?.to_string()));
+        if let Some(limit) = limit {
+            query.push(("limit", limit.to_string()));
+        }
+        let wrapped: TopItems = self
+            .json(Method::GET, "/analytics/top", &query, None)
+            .await?;
+        Ok(wrapped.items)
+    }
+
+    pub async fn analytics_stats(&self) -> Res<AnalyticsStats> {
+        self.json(Method::GET, "/analytics/stats", &[], None).await
+    }
+
+    // The body is not read; the caller relays or saves it chunk by chunk.
+    pub async fn analytics_export_stream(&self, query: &ExportQuery) -> Res<ExportStream> {
+        let pairs = query.pairs()?;
+        let req = self
+            .authed_get(format!("{}/api/v1/analytics/export", self.base))
+            .query(&pairs)
+            .timeout(EXPORT_TIMEOUT);
+        open_stream(req).await
+    }
+
+    // Streams into a sibling temp file and renames on success, so memory use stays flat.
+    pub async fn analytics_export_to(
+        &self,
+        query: &ExportQuery,
+        dest: &Path,
+        max_bytes: u64,
+    ) -> Res<ExportReport> {
+        self.analytics_export_stream(query)
+            .await?
+            .save(dest, max_bytes)
+            .await
+    }
+
+    // Callers must validate `rest`; the body is streamed back untouched.
+    pub async fn forward_stream(&self, rest: &str, query: Option<&str>) -> Res<ExportStream> {
+        let mut url = format!("{}/api/v1/{rest}", self.base);
+        if let Some(q) = query.filter(|q| !q.is_empty()) {
+            url.push('?');
+            url.push_str(q);
+        }
+        open_stream(self.authed_get(url).timeout(EXPORT_TIMEOUT)).await
+    }
+
+    fn authed_get(&self, url: String) -> reqwest::RequestBuilder {
+        let req = self.http.get(url);
+        if self.token.is_empty() {
+            req
+        } else {
+            req.bearer_auth(&self.token)
+        }
     }
 
     pub async fn get_settings(&self) -> Res<EdgeSettings> {

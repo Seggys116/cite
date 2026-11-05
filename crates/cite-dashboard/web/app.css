@@ -21,6 +21,7 @@
   --bad: #f85149;
   --info: #58a6ff;
   --ring: #ffd23f;
+  --tool: #a371f7;
   --dither-rgb: 206, 66, 43;
   --topbar-bg: rgba(13, 17, 23, 0.78);
   --shadow: 0 12px 40px rgba(0, 0, 0, 0.45);
@@ -61,6 +62,7 @@
   --warn: #9a6700;
   --bad: #cf222e;
   --info: #0969da;
+  --tool: #8250df;
   --ring: #0969da;
   --dither-rgb: 194, 58, 36;
   --topbar-bg: rgba(255, 255, 255, 0.8);
@@ -87,6 +89,7 @@
     --warn: #9a6700;
     --bad: #cf222e;
     --info: #0969da;
+    --tool: #8250df;
     --ring: #0969da;
     --dither-rgb: 194, 58, 36;
     --topbar-bg: rgba(255, 255, 255, 0.8);
@@ -641,6 +644,33 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); width
 .hist-bar { display: block; width: 100%; border-radius: 4px 4px 0 0; background: linear-gradient(180deg, var(--highlight), var(--accent)); }
 .hist-value { font-size: 10px; color: var(--text-dim); }
 .hist-label { font-size: 10px; color: var(--text-faint); max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* Bot classes and score bands set --bc once; pills, bars, swatches and donut arcs all read it, so colours stay consistent in both themes */
+.bc-human { --bc: var(--ok); }
+.bc-suspect { --bc: var(--warn); }
+.bc-crawler { --bc: var(--blue); }
+.bc-tool { --bc: var(--tool); }
+.bc-bot { --bc: var(--bad); }
+.bc-unknown { --bc: var(--text-faint); }
+.sb-0 { --bc: var(--ok); }
+.sb-1 { --bc: var(--blue); }
+.sb-2 { --bc: var(--warn); }
+.sb-3 { --bc: var(--accent); }
+.sb-4 { --bc: var(--bad); }
+.bc-pill { color: var(--bc); background: color-mix(in srgb, var(--bc) 14%, transparent); border-color: color-mix(in srgb, var(--bc) 30%, transparent); }
+.bc-fill, .hbar-fill.bc-fill, .hist-bar.bc-fill { background: var(--bc); }
+.donut-seg.bc-seg { stroke: var(--bc); }
+.score { color: var(--bc); font-weight: 600; }
+.section-row { display: flex; align-items: center; justify-content: space-between; gap: var(--s2); }
+.section-row .section-title { margin-top: 0; }
+.help-note {
+  padding: var(--s2) var(--s3); border-radius: 8px; font-size: 13px; color: var(--text-dim);
+  background: var(--surface); border: 1px dashed var(--border);
+}
+.filter-box { padding: var(--s3); border-radius: var(--r2); border: 1px solid var(--border); background: var(--surface-2); }
+.filter-box > summary { cursor: pointer; font-size: 13px; font-weight: 600; }
+.filter-box[open] > summary { margin-bottom: var(--s3); }
+.modal .segmented { max-width: 100%; overflow-x: auto; }
 
 @keyframes spin { to { transform: rotate(360deg); } }
 @keyframes shimmer { from { background-position: 100% 0; } to { background-position: -100% 0; } }

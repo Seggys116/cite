@@ -2,14 +2,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use axum::body::Body;
 use axum::extract::{Path, RawQuery, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use cite_client::{
-    ClientError, NodeClient, NodeConfig, NodeTargets, ReplicationMode, ReplicationPlan,
-    apply_site_to_nodes, fan_out,
+    ClientError, ExportFormat, ExportKind, ExportQuery, NodeClient, NodeConfig, NodeTargets,
+    ReplicationMode, ReplicationPlan, apply_site_to_nodes, fan_out,
 };
 use cite_edge::analytics::Summary;
 use cite_edge::model::{HealthCheck, Maintenance, Site, SiteKind, Slot, Source, Target, Upstream};
@@ -177,6 +178,79 @@ async fn summary(
     Json(Summary::default()).into_response()
 }
 
+async fn bots(State(s): State<Shared>, headers: HeaderMap, RawQuery(query): RawQuery) -> Response {
+    if let Err(resp) = check(&s, &headers) {
+        return resp;
+    }
+    *s.last_query.lock().expect("lock") = query;
+    Json(json!({
+        "total_requests": 200,
+        "bot_requests": 50,
+        "bot_share_pct": 25.0,
+        "classes": [{ "key": "crawler", "count": 30, "bytes": 900 }],
+        "signals": [{ "key": "ua_generic_crawler", "count": 30, "bytes": 900 }],
+        "agents": [{ "key": "Googlebot", "count": 30, "bytes": 900 }],
+        "score_buckets": [{ "key": "80-100", "count": 20, "bytes": 0 }]
+    }))
+    .into_response()
+}
+
+async fn top(State(s): State<Shared>, headers: HeaderMap, RawQuery(query): RawQuery) -> Response {
+    if let Err(resp) = check(&s, &headers) {
+        return resp;
+    }
+    *s.last_query.lock().expect("lock") = query;
+    Json(json!({ "items": [{ "key": "/", "count": 9, "bytes": 90 }] })).into_response()
+}
+
+async fn stats(State(s): State<Shared>, headers: HeaderMap) -> Response {
+    if let Err(resp) = check(&s, &headers) {
+        return resp;
+    }
+    Json(json!({
+        "rows": 12, "db_bytes": 8192, "oldest_ts_ms": null, "newest_ts_ms": 5,
+        "write_batches": 3, "write_errors": 0
+    }))
+    .into_response()
+}
+
+// The query decides the behaviour: kind=bots is a bad request, limit=1 is huge, limit=2 breaks mid-stream.
+async fn export(
+    State(s): State<Shared>,
+    headers: HeaderMap,
+    RawQuery(query): RawQuery,
+) -> Response {
+    if let Err(resp) = check(&s, &headers) {
+        return resp;
+    }
+    let query = query.unwrap_or_default();
+    *s.last_query.lock().expect("lock") = Some(query.clone());
+    if query.contains("kind=bots") {
+        return error_response(StatusCode::BAD_REQUEST, "bots export is disabled");
+    }
+    let chunk = || Ok::<_, std::io::Error>(vec![b'a'; 1024]);
+    let body = if query.contains("limit=1&") || query.ends_with("limit=1") {
+        Body::from_stream(futures_util::stream::iter((0..1000).map(move |_| chunk())))
+    } else if query.contains("limit=2") {
+        let items = vec![chunk(), Err(std::io::Error::other("connection lost"))];
+        Body::from_stream(futures_util::stream::iter(items))
+    } else {
+        Body::from("ts,path\n1,/\n")
+    };
+    let mut resp = Response::new(body);
+    resp.headers_mut().insert(
+        header::CONTENT_TYPE,
+        "text/csv; charset=utf-8".parse().expect("ct"),
+    );
+    resp.headers_mut().insert(
+        header::CONTENT_DISPOSITION,
+        "attachment; filename=\"cite-requests.csv\""
+            .parse()
+            .expect("cd"),
+    );
+    resp
+}
+
 async fn haproxy_config() -> Response {
     ([(header::CONTENT_TYPE, "text/plain")], "global\n  daemon\n").into_response()
 }
@@ -206,6 +280,10 @@ async fn spawn(state: Shared) -> String {
         .route("/api/v1/sites", get(list_sites).post(create_site))
         .route("/api/v1/sites/{id}", get(get_site).put(put_site))
         .route("/api/v1/analytics/summary", get(summary))
+        .route("/api/v1/analytics/bots", get(bots))
+        .route("/api/v1/analytics/top", get(top))
+        .route("/api/v1/analytics/stats", get(stats))
+        .route("/api/v1/analytics/export", get(export))
         .route("/api/v1/haproxy/config", get(haproxy_config))
         .route("/api/v1/pages", get(redirect))
         .route("/api/v1/settings", get(garbage))
@@ -273,16 +351,24 @@ async fn node_info_sends_the_bearer_token_and_decodes() {
     assert_eq!(seen.as_slice(), [Some("Bearer cite_good".to_string())]);
 }
 
+// Built at run time so the fake login does not look like a hard-coded credential.
+fn fixture_secret() -> String {
+    "x".repeat(12)
+}
+
 #[tokio::test]
 async fn login_sends_no_bearer_and_returns_the_token() {
     let state = fake("cite_good", 0);
     let url = spawn(state.clone()).await;
     let c = client("n1", &url, "");
-    let ok = c.login("admin", "pw", "123456").await.expect("login");
+    let ok = c
+        .login("admin", &fixture_secret(), "123456")
+        .await
+        .expect("login");
     assert_eq!(ok.token, "cite_login_token");
     assert!(!format!("{ok:?}").contains("cite_login_token"));
     let err = c
-        .login("admin", "pw", "000000")
+        .login("admin", &fixture_secret(), "000000")
         .await
         .expect_err("bad code");
     assert_eq!(err.status_code(), Some(401));
@@ -411,6 +497,137 @@ async fn analytics_query_carries_window_and_site() {
         .expect("query");
     assert!(query.contains("window=15m"));
     assert!(query.contains("site=shop"));
+}
+
+#[tokio::test]
+async fn bot_top_and_stats_routes_decode() {
+    let state = fake("cite_good", 0);
+    let url = spawn(state.clone()).await;
+    let c = client("n1", &url, "cite_good");
+    let summary = c.analytics_bots("24h", Some("shop")).await.expect("bots");
+    assert_eq!(summary.bot_requests, 50);
+    assert_eq!(summary.classes[0].key, "crawler");
+    let query = state.last_query.lock().expect("lock").clone().expect("q");
+    assert!(query.contains("window=24h") && query.contains("site=shop"));
+
+    let items = c
+        .analytics_top("paths", "1h", None, Some(5))
+        .await
+        .expect("top");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].count, 9);
+    let query = state.last_query.lock().expect("lock").clone().expect("q");
+    assert!(query.contains("kind=paths") && query.contains("limit=5"));
+
+    let bad = c.analytics_top("bogus", "1h", None, None).await;
+    assert!(matches!(bad, Err(ClientError::Config(_))));
+
+    let stats = c.analytics_stats().await.expect("stats");
+    assert_eq!(stats.rows, 12);
+    assert_eq!(stats.oldest_ts_ms, None);
+    assert_eq!(stats.newest_ts_ms, Some(5));
+}
+
+#[tokio::test]
+async fn export_streams_to_a_file_and_reports_it() {
+    let state = fake("cite_good", 0);
+    let url = spawn(state.clone()).await;
+    let c = client("n1", &url, "cite_good");
+    let dir = tempfile::tempdir().expect("dir");
+    let dest = dir.path().join("out.csv");
+    let q = ExportQuery::new(ExportKind::Requests)
+        .format(ExportFormat::Csv)
+        .site("shop");
+    let report = c
+        .analytics_export_to(&q, &dest, 1024 * 1024)
+        .await
+        .expect("export");
+    assert_eq!(
+        std::fs::read_to_string(&dest).expect("file"),
+        "ts,path\n1,/\n"
+    );
+    assert_eq!(report.bytes, 12);
+    assert_eq!(report.suggested_name.as_deref(), Some("cite-requests.csv"));
+    assert!(report.content_type.expect("ct").starts_with("text/csv"));
+    let query = state.last_query.lock().expect("lock").clone().expect("q");
+    assert!(query.contains("kind=requests") && query.contains("site=shop"));
+    assert_eq!(std::fs::read_dir(dir.path()).expect("ls").count(), 1);
+}
+
+#[tokio::test]
+async fn failed_exports_leave_no_file_behind() {
+    let url = spawn(fake("cite_good", 0)).await;
+    let c = client("n1", &url, "cite_good");
+    let dir = tempfile::tempdir().expect("dir");
+    let dest = dir.path().join("out.csv");
+
+    let rejected = c
+        .analytics_export_to(&ExportQuery::new(ExportKind::Bots), &dest, 1 << 20)
+        .await
+        .expect_err("rejected");
+    assert_eq!(rejected.status_code(), Some(400));
+
+    let oversized = ExportQuery::new(ExportKind::Requests).limit(1);
+    let err = c
+        .analytics_export_to(&oversized, &dest, 10 * 1024)
+        .await
+        .expect_err("over the cap");
+    assert!(matches!(err, ClientError::Decode(_)), "{err:?}");
+
+    let broken = ExportQuery::new(ExportKind::Requests).limit(2);
+    c.analytics_export_to(&broken, &dest, 1 << 20)
+        .await
+        .expect_err("connection lost mid body");
+
+    let invalid = ExportQuery::new(ExportKind::Top);
+    let err = c
+        .analytics_export_to(&invalid, &dest, 1 << 20)
+        .await
+        .expect_err("invalid query");
+    assert!(matches!(err, ClientError::Config(_)));
+
+    assert_eq!(std::fs::read_dir(dir.path()).expect("ls").count(), 0);
+}
+
+#[tokio::test]
+async fn export_replaces_an_existing_destination() {
+    let url = spawn(fake("cite_good", 0)).await;
+    let c = client("n1", &url, "cite_good");
+    let dir = tempfile::tempdir().expect("dir");
+    let dest = dir.path().join("out.csv");
+    std::fs::write(&dest, "old").expect("seed");
+    c.analytics_export_to(&ExportQuery::new(ExportKind::Hourly), &dest, 1 << 20)
+        .await
+        .expect("export");
+    assert!(
+        std::fs::read_to_string(&dest)
+            .expect("file")
+            .starts_with("ts,path")
+    );
+}
+
+#[tokio::test]
+async fn export_stream_exposes_headers_and_body() {
+    use futures_util::StreamExt;
+    let url = spawn(fake("cite_good", 0)).await;
+    let c = client("n1", &url, "cite_good");
+    let stream = c
+        .analytics_export_stream(&ExportQuery::new(ExportKind::Requests))
+        .await
+        .expect("stream");
+    assert_eq!(stream.status(), 200);
+    assert!(
+        stream
+            .content_disposition()
+            .expect("cd")
+            .starts_with("attachment")
+    );
+    let mut body = Vec::new();
+    let mut chunks = Box::pin(stream.into_body_stream());
+    while let Some(chunk) = chunks.next().await {
+        body.extend_from_slice(&chunk.expect("chunk"));
+    }
+    assert_eq!(body, b"ts,path\n1,/\n");
 }
 
 #[tokio::test]

@@ -58,6 +58,32 @@ Connection limit changes apply on the next HAProxy reload. The retention form ed
 
 A command palette offers shortcuts to views, Create site, Add firewall rule, Add node, switching nodes, toggling the light or dark theme, reloading the view and signing out.
 
+## Bot analytics and export
+
+Below the traffic charts, the Traffic view adds the panels below. All of them follow the time window and site selectors.
+
+| Panel | What it shows |
+|---|---|
+| Bot traffic | The share of requests not classed human, a breakdown by class (human, suspect, crawler, tool, bot), a histogram of bot scores in five bands, the signals raised most often and the user agents behind flagged requests. The info button explains how detection works. |
+| Top explorer | A ranked list of one field: paths, hosts, referers, user agents, content types, status codes, client IPs or languages. Choose the field and the number of rows (10 to 100). |
+| Analytics storage | Rows stored, database size, oldest and newest request, the retention in force and the write counters. A non-zero write error count is flagged. A node that predates these statistics shows a note instead. |
+| Live requests | Each row gains a bot class badge and a score. Opening a request shows the bot analysis (class, score, signals as chips) and every captured header: HTTP and TLS version, Accept, Accept-Language, Accept-Encoding, Sec-Fetch-Site, Sec-Fetch-Mode, Sec-Fetch-Dest, Sec-CH-UA and the backend response time. |
+
+Bot detection reads the request headers first and the user agent second, and the score from 0 to 100 is a heuristic. A bot that copies a browser's headers can score low, and an unusual browser can score high, so treat the classes as a guide and not as proof. Each class keeps one colour across the badge, the bars and the chart, in both the light and dark themes, and the class name is always written out.
+
+Export opens a dialog with the following choices.
+
+| Option | Notes |
+|---|---|
+| What to export | Requests (one row per request), hourly rollups, the bot summary, or a top list of one field. |
+| Format | CSV or NDJSON. |
+| Time range | The current window, or a custom start and end in your local time. |
+| Site | All sites or one site. |
+| Filters | Request and bot exports only: status range, bot class, minimum bot score, host, path prefix, client IP and method. |
+| Row limit | Defaults to 100000. Leave it empty for no limit. |
+
+The dialog checks every field first and then sends a one-row probe to the node, so an invalid request or an expired session is reported in the dialog instead of as a failed download. The file itself is then fetched by a same-origin download that carries your session cookie, so the browser streams it straight to disk and the console never holds the export in memory. The dashboard server relays the node's response without buffering it, keeps only the CSV or NDJSON content type, rebuilds the file name from safe characters and adds `nosniff` and `no-store`. An export comes from the one node selected in the header; it is not merged across nodes.
+
 ## Creating a site
 
 | Field | Notes |

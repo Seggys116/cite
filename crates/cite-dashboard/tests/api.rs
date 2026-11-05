@@ -146,6 +146,30 @@ async fn big(State(f): State<Shared>, headers: HeaderMap) -> Response {
     vec![b'a'; 9 * 1024 * 1024].into_response()
 }
 
+// 12 MiB in 12 chunks, past the buffered proxy cap, with a hostile file name the proxy must rewrite.
+async fn export(
+    State(f): State<Shared>,
+    headers: HeaderMap,
+    RawQuery(query): RawQuery,
+) -> Response {
+    if !authorized(&f, &headers) {
+        return err(StatusCode::UNAUTHORIZED, "unauthorized");
+    }
+    let query = query.unwrap_or_default();
+    if query.contains("kind=nope") {
+        return err(StatusCode::BAD_REQUEST, "unknown export kind");
+    }
+    let chunks = (0..12).map(|_| Ok::<_, std::io::Error>(Bytes::from(vec![b'x'; 1024 * 1024])));
+    let mut resp = Response::new(Body::from_stream(futures_util::stream::iter(chunks)));
+    let h = resp.headers_mut();
+    h.insert(header::CONTENT_TYPE, "text/csv".parse().expect("ct"));
+    h.insert(
+        header::CONTENT_DISPOSITION,
+        "attachment; filename=\"../x y.csv\"".parse().expect("cd"),
+    );
+    resp
+}
+
 async fn list_sites(State(f): State<Shared>, headers: HeaderMap) -> Response {
     if !authorized(&f, &headers) {
         return err(StatusCode::UNAUTHORIZED, "unauthorized");
@@ -214,6 +238,10 @@ async fn spawn_fake(fake: Shared) -> String {
     let app = Router::new()
         .route("/api/v1/node", get(node_info))
         .route("/api/v1/analytics/summary", get(summary))
+        .route("/api/v1/analytics/bots", get(summary))
+        .route("/api/v1/analytics/top", get(summary))
+        .route("/api/v1/analytics/stats", get(summary))
+        .route("/api/v1/analytics/export", get(export))
         .route("/api/v1/settings", any(echo))
         .route("/api/v1/haproxy/stats", get(big))
         .route("/api/v1/sites", get(list_sites).post(create_site))
@@ -1202,6 +1230,67 @@ async fn proxy_bounds_request_and_response_sizes() {
     assert_eq!(request.status, StatusCode::PAYLOAD_TOO_LARGE);
     let response = get_path(&h.app, "/api/v1/nodes/edge-1/haproxy/stats", &s.headers()).await;
     assert_eq!(response.status, StatusCode::BAD_GATEWAY);
+}
+
+#[tokio::test]
+async fn analytics_exports_stream_through_with_safe_download_headers() {
+    let fake = new_fake(NODE_TOKEN);
+    let url = spawn_fake(fake).await;
+    let h = harness_with_nodes(&[("edge-1", url.as_str(), NODE_TOKEN)]);
+    let s = login(&h).await;
+    let uri = "/api/v1/nodes/edge-1/analytics/export?kind=requests&format=csv";
+    let reply = get_path(&h.app, uri, &s.headers()).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    // More than the 8 MiB buffered cap proves the body is relayed rather than collected.
+    assert_eq!(reply.body.len(), 12 * 1024 * 1024);
+    assert_eq!(reply.header("content-type"), "text/csv; charset=utf-8");
+    assert_eq!(
+        reply.header("content-disposition"),
+        "attachment; filename=\"xy.csv\""
+    );
+    assert_eq!(reply.header("x-content-type-options"), "nosniff");
+    assert_eq!(reply.header("cache-control"), "no-store");
+    assert!(
+        reply
+            .header("content-security-policy")
+            .contains("default-src 'self'")
+    );
+
+    let rejected = get_path(
+        &h.app,
+        "/api/v1/nodes/edge-1/analytics/export?kind=nope",
+        &s.headers(),
+    )
+    .await;
+    assert_eq!(rejected.status, StatusCode::BAD_REQUEST);
+    assert_eq!(rejected.json()["error"], "unknown export kind");
+
+    let anonymous = get_path(&h.app, uri, &[]).await;
+    assert_eq!(anonymous.status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn new_analytics_reads_are_proxied_and_other_analytics_routes_are_not() {
+    let fake = new_fake(NODE_TOKEN);
+    let url = spawn_fake(fake).await;
+    let h = harness_with_nodes(&[("edge-1", url.as_str(), NODE_TOKEN)]);
+    let s = login(&h).await;
+    for route in ["bots?window=1h", "top?kind=paths&window=1h", "stats"] {
+        let uri = format!("/api/v1/nodes/edge-1/analytics/{route}");
+        let reply = get_path(&h.app, &uri, &s.headers()).await;
+        assert_eq!(reply.status, StatusCode::OK, "{route}");
+    }
+    let unknown = get_path(&h.app, "/api/v1/nodes/edge-1/analytics/purge", &s.headers()).await;
+    assert_eq!(unknown.status, StatusCode::NOT_FOUND);
+    let post = send_json(
+        &h.app,
+        Method::POST,
+        "/api/v1/nodes/edge-1/analytics/export",
+        &s.headers(),
+        json!({}),
+    )
+    .await;
+    assert_eq!(post.status, StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]

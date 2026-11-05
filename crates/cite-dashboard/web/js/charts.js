@@ -161,7 +161,7 @@ export function hbars(items, { format = fmtNum } = {}) {
 export function histogram(buckets, { format = fmtNum } = {}) {
   const max = Math.max(...buckets.map((b) => b.value), 1);
   return h('div', { class: 'hist', role: 'img', 'aria-label': 'Distribution' }, buckets.map((b) => {
-    const bar = h('i', { class: 'hist-bar' });
+    const bar = h('i', { class: 'hist-bar ' + (b.cls || '') });
     bar.style.setProperty('height', Math.max(2, (b.value / max) * 100).toFixed(1) + '%');
     return h('div', { class: 'hist-col', title: `${b.title || b.label}: ${fmtInt(b.value)}` },
       h('span', { class: 'hist-value mono' }, format(b.value)), h('div', { class: 'hist-track' }, bar), h('span', { class: 'hist-label' }, b.label));

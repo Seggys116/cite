@@ -6,6 +6,7 @@ use axum::extract::{Request, State};
 use axum::http::{Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
+use cite_client::{ClientError, NodeClient, export_file_name};
 
 use crate::error::ApiError;
 use crate::state::AppState;
@@ -18,6 +19,16 @@ const PROXY_TIMEOUT: Duration = Duration::from_secs(30);
 const LONG_TIMEOUT: Duration = Duration::from_secs(700);
 const LONG_ACTIONS: [&str; 4] = ["switch", "rollback", "deploy", "maintenance"];
 const MAX_SEGMENT_LEN: usize = 128;
+const EXPORT_ROUTE: &str = "analytics/export";
+const ANALYTICS_ROUTES: [&str; 7] = [
+    "summary",
+    "timeseries",
+    "requests",
+    "bots",
+    "top",
+    "stats",
+    "export",
+];
 const ALLOWED_PREFIXES: [&str; 9] = [
     "node",
     "settings",
@@ -60,6 +71,67 @@ fn response_content_type(upstream: Option<&str>) -> &'static str {
     }
 }
 
+// Analytics is read only, so unlike the other prefixes it is limited to the routes the console uses.
+fn analytics_route_ok(method: &Method, rest: &str) -> bool {
+    let mut segments = rest.split('/');
+    if segments.next() != Some("analytics") {
+        return true;
+    }
+    method == Method::GET
+        && matches!(segments.next(), Some(route) if ANALYTICS_ROUTES.contains(&route))
+        && segments.next().is_none()
+}
+
+fn export_content_type(upstream: Option<&str>) -> &'static str {
+    match upstream {
+        Some(c) if c.starts_with("text/csv") => "text/csv; charset=utf-8",
+        Some(c) if c.starts_with("application/x-ndjson") => "application/x-ndjson",
+        _ => "application/octet-stream",
+    }
+}
+
+// The node picks the file name, so it is rebuilt from safe characters rather than relayed.
+fn export_disposition(upstream: Option<&str>, content_type: Option<&str>) -> String {
+    let name =
+        export_file_name(upstream, content_type).unwrap_or_else(|| "cite-export.bin".to_string());
+    format!("attachment; filename=\"{name}\"")
+}
+
+fn export_error(err: ClientError) -> ApiError {
+    match err {
+        ClientError::Status {
+            code: code @ (400 | 404 | 422),
+            message,
+        } => ApiError::new(
+            StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_REQUEST),
+            message,
+        ),
+        other => other.into(),
+    }
+}
+
+// The body is relayed chunk by chunk, so a large export never sits in dashboard memory.
+async fn stream_export(
+    client: &NodeClient,
+    rest: &str,
+    query: Option<&str>,
+) -> Result<Response, ApiError> {
+    let stream = client
+        .forward_stream(rest, query)
+        .await
+        .map_err(export_error)?;
+    let status = StatusCode::from_u16(stream.status())
+        .map_err(|_| ApiError::new(StatusCode::BAD_GATEWAY, "node sent an invalid status"))?;
+    let content_type = export_content_type(stream.content_type());
+    let disposition = export_disposition(stream.content_disposition(), stream.content_type());
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CONTENT_DISPOSITION, disposition)
+        .body(Body::from_stream(stream.into_body_stream()))
+        .map_err(ApiError::internal)
+}
+
 fn timeout_for(method: &Method, rest: &str) -> Duration {
     if method == Method::GET {
         return PROXY_TIMEOUT;
@@ -95,7 +167,7 @@ async fn forward(state: &AppState, req: Request) -> Result<Response, ApiError> {
         .ok_or_else(not_found)?;
     let (node, rest) = tail.split_once('/').ok_or_else(not_found)?;
     let rest = clean_rest(rest).ok_or_else(not_found)?;
-    if !allowed(rest) {
+    if !allowed(rest) || !analytics_route_ok(&parts.method, rest) {
         return Err(not_found());
     }
     if !matches!(
@@ -111,6 +183,9 @@ async fn forward(state: &AppState, req: Request) -> Result<Response, ApiError> {
         .client(node)
         .await
         .ok_or_else(|| ApiError::not_found("node is not configured"))?;
+    if rest == EXPORT_ROUTE {
+        return stream_export(&client, rest, parts.uri.query()).await;
+    }
     let payload = if matches!(parts.method, Method::POST | Method::PUT) {
         to_bytes(body, MAX_REQUEST_BODY).await.map_err(|_| {
             ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "request body is too large")
@@ -204,6 +279,55 @@ mod tests {
             assert!(!allowed(bad), "{bad}");
         }
         assert!(allowed("analytics/summary") && allowed("haproxy/reload") && allowed("tokens/x"));
+    }
+
+    #[test]
+    fn analytics_is_limited_to_known_read_routes() {
+        for route in ANALYTICS_ROUTES {
+            assert!(analytics_route_ok(
+                &Method::GET,
+                &format!("analytics/{route}")
+            ));
+            assert!(!analytics_route_ok(
+                &Method::POST,
+                &format!("analytics/{route}")
+            ));
+        }
+        assert!(!analytics_route_ok(&Method::GET, "analytics"));
+        assert!(!analytics_route_ok(&Method::GET, "analytics/purge"));
+        assert!(!analytics_route_ok(&Method::GET, "analytics/export/extra"));
+        assert!(analytics_route_ok(&Method::POST, "sites"));
+    }
+
+    #[test]
+    fn export_headers_are_rebuilt_from_known_values() {
+        assert_eq!(
+            export_content_type(Some("text/csv; charset=utf-8")),
+            "text/csv; charset=utf-8"
+        );
+        assert_eq!(
+            export_content_type(Some("application/x-ndjson")),
+            "application/x-ndjson"
+        );
+        assert_eq!(
+            export_content_type(Some("text/html")),
+            "application/octet-stream"
+        );
+        assert_eq!(
+            export_disposition(
+                Some("attachment; filename=\"a b/../c.exe\""),
+                Some("text/csv")
+            ),
+            "attachment; filename=\"ab.csv\""
+        );
+        assert_eq!(
+            export_disposition(None, Some("application/x-ndjson")),
+            "attachment; filename=\"cite-export.ndjson\""
+        );
+        assert_eq!(
+            export_disposition(Some("attachment; filename=\"a.html\""), Some("text/html")),
+            "attachment; filename=\"cite-export.bin\""
+        );
     }
 
     #[test]

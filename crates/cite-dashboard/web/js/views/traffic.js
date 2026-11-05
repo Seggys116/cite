@@ -9,6 +9,9 @@ import {
 } from '../ui.js';
 import { noNodes, nodeNotice } from './common.js';
 import { perBucketSizes } from '../sizes.js';
+import {
+  botsPanel, botsSkeleton, topExplorer, storageCard, openExportDialog, botDetail, captureRows, botCells,
+} from './trafficBots.js';
 
 const WINDOWS = ['15m', '1h', '24h', '7d', '30d'];
 const SERIES = [
@@ -124,7 +127,9 @@ function openEventSheet(node, ev) {
         ['Total time', mono(fmtMs(ev.total_ms))], ['Bytes in', mono(fmtBytes(ev.bytes_in))], ['Bytes out', mono(fmtBytes(ev.bytes_out))],
         ['Content type', mono(ev.content_type)], ['User agent', mono(ev.user_agent)], ['Referer', mono(ev.referer)],
         ['Site', mono(ev.site)], ['Backend', mono(ev.backend)], ['Server', mono(ev.server)],
-      ])),
+      ]),
+      h('h3', { class: 'section-title' }, 'Bot analysis'), botDetail(ev),
+      h('h3', { class: 'section-title' }, 'Captured headers'), kvList(captureRows(ev))),
     footer: [blockPath, blockIp],
   });
 }
@@ -152,6 +157,8 @@ function liveLog(node, getSite) {
     { label: 'Host', cls: 'hide-sm', render: (e) => h('span', { class: 'mono muted' }, e.host) },
     { label: 'Path', cls: 'cell-clip', render: (e) => h('span', { class: 'mono clip', title: e.path }, e.path) },
     { label: 'Client', cls: 'hide-sm', render: (e) => h('span', { class: 'mono' }, e.client_ip || '-') },
+    { label: 'Bot', render: (e) => botCells(e).badge },
+    { label: 'Score', align: 'right', cls: 'hide-sm', render: (e) => botCells(e).score },
     { label: 'Duration', align: 'right', render: (e) => h('span', { class: 'mono' }, fmtMs(e.total_ms)) },
     { label: 'Size', align: 'right', cls: 'hide-sm', render: (e) => h('span', { class: 'mono muted' }, fmtBytes(e.bytes_out)) },
     { label: '', render: (e) => (e.blocked ? pill('blocked', 'bad') : null) },
@@ -235,11 +242,21 @@ export function trafficView(ctx) {
   if (!WINDOWS.includes(win)) win = '24h';
   let reload = null;
   let log = null;
+  let reloadBots = null;
+  let topEx = null;
+  let storageBox = null;
+  const reloadPanels = () => {
+    reload();
+    reloadBots();
+    topEx.refresh();
+  };
 
+  const siteChoices = () => Array.from(sitePick.options).filter((o) => o.value).map((o) => ({ value: o.value, label: o.textContent }));
   const controls = h('div', { class: 'controls' },
-    segmented({ label: 'Time window', options: WINDOWS.map((w) => ({ value: w, label: w })), value: win, onChange: (v) => { win = v; storage.set('window', v); reload(); } }),
+    segmented({ label: 'Time window', options: WINDOWS.map((w) => ({ value: w, label: w })), value: win, onChange: (v) => { win = v; storage.set('window', v); reloadPanels(); } }),
     sitePick,
-    button('', { iconName: 'refresh', title: 'Refresh', onClick: () => { reload(); if (log) log.refresh(); } }));
+    button('', { iconName: 'refresh', title: 'Refresh', onClick: () => { reloadPanels(); storageBox.refresh(); if (log) log.refresh(); } }),
+    button('Export', { iconName: 'download', title: 'Export analytics', onClick: () => openExportDialog({ node, win, sites: siteChoices(), site: sitePick.value }) }));
   const head = pageHeader({ title: 'Traffic', subtitle: node ? 'Analytics from ' + node : 'Requests, errors and blocked traffic', actions: node ? controls : null });
   ctx.root.append(...[head, nodeNotice(node), body].filter(Boolean));
   if (!node || !state.nodes.length) {
@@ -260,10 +277,17 @@ export function trafficView(ctx) {
     return { summary, series };
   }, renderAnalytics, { skeleton: () => h('div', { class: 'stack' }, skeletonCards(4), skeletonBlock(300)) });
 
+  const botsHost = h('div', {});
+  body.append(botsHost);
+  reloadBots = loadInto(botsHost, () => n.get('/analytics/bots' + qs({ window: win, site: siteId() })), botsPanel, { skeleton: botsSkeleton });
+  topEx = topExplorer(node, () => ({ window: win, site: siteId() }));
+  storageBox = storageCard(node);
+  body.append(topEx.el, storageBox.el);
+
   log = liveLog(node, siteId);
   body.append(log.el);
   sitePick.addEventListener('change', () => {
-    reload();
+    reloadPanels();
     log.refresh();
   });
   return () => log.stop();
