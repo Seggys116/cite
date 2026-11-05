@@ -764,8 +764,7 @@ mod tests {
         cfg.runtime_addr = addr;
         tweak(&mut cfg);
         let store = Store::open(&cfg).await.unwrap();
-        let noproc = dir.path().join("noproc");
-        let haproxy = Arc::new(Haproxy::new(&cfg).with_proc_root(noproc));
+        let haproxy = Arc::new(Haproxy::new(&cfg));
         let short = Duration::from_millis(600);
         let deployer = Deployer::new(store.clone(), haproxy, orchestrator).with_timing(
             Duration::from_millis(300),

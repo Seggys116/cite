@@ -4,7 +4,7 @@ This page covers what a node records about traffic, the privacy settings, every 
 
 ## Where the data comes from
 
-HAProxy writes one log line per request and sends it as a UDP datagram in RFC 5424 format to the connector (`connector:5140` by default, on the internal `cite_edge` network). The connector parses the line and updates in-memory counters. There is no database.
+HAProxy writes one log line per request and sends it as a UDP datagram in RFC 5424 format to the connector (`connector:5140` by default, on the internal `ctl` network). The connector parses the line and updates in-memory counters. There is no database.
 
 Datagrams over 8192 bytes, lines that do not parse, and lines with an invalid client address are discarded. If the connector falls 4096 events behind, further events are dropped and a warning is logged.
 

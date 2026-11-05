@@ -9,6 +9,7 @@ use crate::{ConnectorError, Result};
 const DEFAULT_SESSION_TTL_SECS: u64 = 8 * 3600;
 const MIN_SESSION_TTL_SECS: u64 = 60;
 const MAX_SESSION_TTL_SECS: u64 = 30 * 86_400;
+const DEFAULT_MASTER_PORT: u16 = 9998;
 const MAX_SANS: usize = 32;
 const MAX_NODE_NAME: usize = 64;
 
@@ -23,6 +24,7 @@ pub struct ConnectorConfig {
     pub pages_dir: PathBuf,
     pub haproxy_cfg: PathBuf,
     pub runtime_addr: String,
+    pub master_addr: String,
     pub log_listen: SocketAddr,
     pub log_addr_for_haproxy: String,
     pub haproxy_bin: String,
@@ -58,6 +60,24 @@ fn parse_addr(key: &str, value: &str) -> Result<SocketAddr> {
     value
         .parse::<SocketAddr>()
         .map_err(|_| config_err(format!("{key} must be an ip:port socket address")))
+}
+
+// The master CLI listens next to the runtime socket on the same host.
+fn default_master_addr(runtime_addr: &str) -> Result<String> {
+    let (host, _) = runtime_addr
+        .rsplit_once(':')
+        .filter(|(host, port)| !host.is_empty() && port.parse::<u16>().is_ok())
+        .ok_or_else(|| config_err("CITE_HAPROXY_RUNTIME must be host:port".into()))?;
+    Ok(format!("{host}:{DEFAULT_MASTER_PORT}"))
+}
+
+fn check_host_port(key: &str, value: &str) -> Result<()> {
+    match value.rsplit_once(':') {
+        Some((host, port)) if !host.is_empty() && port.parse::<u16>().is_ok_and(|p| p > 0) => {
+            Ok(())
+        }
+        _ => Err(config_err(format!("{key} must be host:port"))),
+    }
 }
 
 fn bool_or(env: &HashMap<String, String>, key: &str, default: bool) -> Result<bool> {
@@ -164,6 +184,18 @@ impl ConnectorConfig {
             None => DEFAULT_SESSION_TTL_SECS,
         };
 
+        let runtime_addr = get(env, "CITE_HAPROXY_RUNTIME")
+            .unwrap_or("haproxy:9999")
+            .to_string();
+        check_host_port("CITE_HAPROXY_RUNTIME", &runtime_addr)?;
+        let master_addr = match get(env, "CITE_HAPROXY_MASTER") {
+            Some(addr) => {
+                check_host_port("CITE_HAPROXY_MASTER", addr)?;
+                addr.to_string()
+            }
+            None => default_master_addr(&runtime_addr)?,
+        };
+
         // Everything HAProxy reads lives under one directory so it can be a single shared volume.
         let haproxy_dir = data_dir.join("haproxy");
         Ok(Self {
@@ -174,9 +206,8 @@ impl ConnectorConfig {
             pages_dir: haproxy_dir.join("pages"),
             haproxy_cfg: haproxy_dir.join("haproxy.cfg"),
             haproxy_dir,
-            runtime_addr: get(env, "CITE_HAPROXY_RUNTIME")
-                .unwrap_or("haproxy:9999")
-                .to_string(),
+            runtime_addr,
+            master_addr,
             log_listen,
             log_addr_for_haproxy: get(env, "CITE_LOG_ADDR")
                 .unwrap_or("connector:5140")
@@ -231,6 +262,7 @@ mod tests {
         assert_eq!(cfg.haproxy_cfg, PathBuf::from("/conf/haproxy/haproxy.cfg"));
         assert_eq!(cfg.tls_dir, PathBuf::from("/conf/tls"));
         assert_eq!(cfg.runtime_addr, "haproxy:9999");
+        assert_eq!(cfg.master_addr, "haproxy:9998");
         assert_eq!(cfg.log_addr_for_haproxy, "connector:5140");
         assert_eq!(cfg.haproxy_bin, "haproxy");
         assert!(cfg.validate_with_haproxy);
@@ -289,6 +321,19 @@ mod tests {
     }
 
     #[test]
+    fn master_address_follows_the_runtime_host_unless_set() {
+        let mut e = base();
+        e.insert("CITE_HAPROXY_RUNTIME".into(), "172.30.250.3:9999".into());
+        let cfg = ConnectorConfig::from_env_map(&e).expect("config");
+        assert_eq!(cfg.master_addr, "172.30.250.3:9998");
+        e.insert("CITE_HAPROXY_MASTER".into(), "10.1.1.1:7000".into());
+        let cfg = ConnectorConfig::from_env_map(&e).expect("config");
+        assert_eq!(cfg.master_addr, "10.1.1.1:7000");
+        e.insert("CITE_HAPROXY_MASTER".into(), "no-port".into());
+        assert!(ConnectorConfig::from_env_map(&e).is_err());
+    }
+
+    #[test]
     fn hostname_is_used_when_node_name_is_unset() {
         let mut e = base();
         e.insert("HOSTNAME".into(), "box-7".into());
@@ -315,6 +360,8 @@ mod tests {
             ("CITE_SESSION_TTL", "abc"),
             ("CITE_SESSION_TTL", "5"),
             ("CITE_SESSION_TTL", "99999999999"),
+            ("CITE_HAPROXY_RUNTIME", "haproxy"),
+            ("CITE_HAPROXY_MASTER", "haproxy:0"),
         ] {
             let mut e = base();
             e.insert(key.into(), value.into());

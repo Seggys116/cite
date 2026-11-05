@@ -36,7 +36,7 @@ A site with a `source` gets one stack per slot, created when the slot is first u
 
 Both long-running containers have `ReadonlyRootfs`, `no-new-privileges`, all capabilities dropped (the manager gets back `CHOWN`, `SETUID`, `SETGID` and `DAC_READ_SEARCH` to build as an unprivileged user), an init process, a health check every 30 seconds and a 10 MiB by 3 file log cap. They mount only their own named volumes, with subpath mounts matching single-site mode: the executor sees releases and control read-only. No host paths are mounted.
 
-HAProxy reaches the executor at `cite-<id>-<slot>-executor:8080` over `cite_edge`. The connector writes that address into the slot's targets.
+HAProxy reaches the executor at `cite-<id>-<slot>-executor:8080` over `cite_edge`. The connector writes that address into the slot's targets. The connector itself is not on `cite_edge`, and neither HAProxy's admin sockets nor the connector can be reached from an executor: those sit on the separate `ctl` network that executors never join.
 
 These specifications mirror the `manager` and `executor` services in `docker-compose.yml`, so the single-site hardening in [Hardening](hardening.md) applies to each stack.
 

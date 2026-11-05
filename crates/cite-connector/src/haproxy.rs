@@ -24,6 +24,9 @@ use crate::store::now_rfc3339;
 const CHECK_TIMEOUT: Duration = Duration::from_secs(20);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const READ_TIMEOUT: Duration = Duration::from_secs(3);
+const RELOAD_REPLY: Duration = Duration::from_secs(15);
+const MASTER_LABEL: &str = "master CLI";
+const RUNTIME_LABEL: &str = "runtime socket";
 const RELOAD_CONFIRM: Duration = Duration::from_secs(5);
 const RELOAD_POLL: Duration = Duration::from_millis(100);
 const HEALTH_POLL: Duration = Duration::from_millis(500);
@@ -62,20 +65,12 @@ pub struct Haproxy {
     pages_dir: PathBuf,
     haproxy_cfg: PathBuf,
     runtime_addr: String,
+    master_addr: String,
     log_addr: String,
     haproxy_bin: String,
     validate: bool,
-    proc_root: PathBuf,
     apply_lock: Mutex<()>,
     state: StdMutex<State>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ProcEntry {
-    pid: i32,
-    comm: String,
-    cmdline: String,
-    ppid: Option<i32>,
 }
 
 fn internal(err: impl std::fmt::Display) -> ConnectorError {
@@ -195,68 +190,61 @@ fn parse_info_pid(info: &str) -> Option<u64> {
         .and_then(|value| value.trim().parse().ok())
 }
 
-fn parse_ppid(status: &str) -> Option<i32> {
-    status
-        .lines()
-        .find_map(|line| line.strip_prefix("PPid:"))
-        .and_then(|value| value.trim().parse().ok())
-}
-
-fn has_master_flag(cmdline: &str) -> bool {
-    cmdline.split('\0').filter(|a| !a.is_empty()).any(|arg| {
-        arg == "--master-worker"
-            || (arg.starts_with('-') && !arg.starts_with("--") && arg[1..].contains('W'))
-    })
-}
-
-// Workers share the master's command line, so entries whose parent is a candidate are skipped.
-fn pick_master(procs: &[ProcEntry]) -> Option<i32> {
-    let candidates: Vec<&ProcEntry> = procs
-        .iter()
-        .filter(|p| p.comm.trim() == "haproxy" && has_master_flag(&p.cmdline))
-        .collect();
-    candidates
-        .iter()
-        .filter(|p| {
-            !p.ppid
-                .is_some_and(|parent| candidates.iter().any(|c| c.pid == parent))
-        })
-        .map(|p| p.pid)
-        .min()
-}
-
-fn scan_proc(root: &Path) -> Option<i32> {
-    let entries = fs::read_dir(root).ok()?;
-    let mut procs = Vec::new();
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(pid) = name.to_str().and_then(|n| n.parse::<i32>().ok()) else {
-            continue;
-        };
-        let dir = entry.path();
-        let Ok(comm) = fs::read_to_string(dir.join("comm")) else {
-            continue;
-        };
-        if comm.trim() != "haproxy" {
-            continue;
-        }
-        let cmdline = fs::read(dir.join("cmdline")).unwrap_or_default();
-        let status = fs::read_to_string(dir.join("status")).unwrap_or_default();
-        procs.push(ProcEntry {
-            pid,
-            comm,
-            cmdline: String::from_utf8_lossy(&cmdline).into_owned(),
-            ppid: parse_ppid(&status),
-        });
+async fn open(addr: &str, label: &str) -> Result<TcpStream> {
+    let fail = |why: String| ConnectorError::Unavailable(format!("haproxy {label} {addr}: {why}"));
+    match timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
+        Ok(Ok(stream)) => Ok(stream),
+        Ok(Err(err)) => Err(fail(err.to_string())),
+        Err(_) => Err(fail("connect timed out".into())),
     }
-    pick_master(&procs)
 }
 
-fn signal_reload(pid: i32) -> Result<()> {
-    let pid = rustix::process::Pid::from_raw(pid)
-        .ok_or_else(|| internal(format!("invalid haproxy pid {pid}")))?;
-    rustix::process::kill_process(pid, rustix::process::Signal::USR2)
-        .map_err(|err| internal(format!("cannot signal haproxy master: {err}")))
+// HAProxy answers one command per connection and closes it, so EOF marks the end of the reply.
+async fn converse(
+    mut stream: TcpStream,
+    addr: &str,
+    label: &str,
+    cmd: &str,
+    read_timeout: Duration,
+) -> Result<String> {
+    let fail = |why: String| ConnectorError::Unavailable(format!("haproxy {label} {addr}: {why}"));
+    let exchange = async {
+        stream.write_all(cmd.as_bytes()).await?;
+        let mut out = Vec::new();
+        (&mut stream).take(MAX_REPLY).read_to_end(&mut out).await?;
+        Ok::<Vec<u8>, std::io::Error>(out)
+    };
+    match timeout(read_timeout, exchange).await {
+        Ok(Ok(bytes)) => Ok(String::from_utf8_lossy(&bytes).into_owned()),
+        Ok(Err(err)) => Err(fail(err.to_string())),
+        Err(_) => Err(fail("read timed out".into())),
+    }
+}
+
+// The master answers `Success=1` or `Success=0`, then a `--` line and the loader output.
+fn parse_reload_reply(reply: &str) -> std::result::Result<(), String> {
+    let text = reply.trim();
+    match text.lines().next().map(str::trim) {
+        Some("Success=1") => Ok(()),
+        Some("Success=0") => {
+            let detail = text.split_once("--").map_or("", |(_, rest)| rest.trim());
+            Err(format!(
+                "haproxy refused the reload: {}",
+                truncate(detail, MAX_ERROR_TEXT)
+            ))
+        }
+        _ => Err(format!(
+            "unexpected reply to reload: {}",
+            truncate(text, MAX_ERROR_TEXT)
+        )),
+    }
+}
+
+async fn send_reload(stream: TcpStream, addr: &str) -> std::result::Result<(), String> {
+    let reply = converse(stream, addr, MASTER_LABEL, "reload\n", RELOAD_REPLY)
+        .await
+        .map_err(|err| err.to_string())?;
+    parse_reload_reply(&reply)
 }
 
 async fn run_check(bin: &str, cfg_path: &Path) -> Result<()> {
@@ -297,20 +285,13 @@ impl Haproxy {
             pages_dir: cfg.pages_dir.clone(),
             haproxy_cfg: cfg.haproxy_cfg.clone(),
             runtime_addr: cfg.runtime_addr.clone(),
+            master_addr: cfg.master_addr.clone(),
             log_addr: cfg.log_addr_for_haproxy.clone(),
             haproxy_bin: cfg.haproxy_bin.clone(),
             validate: cfg.validate_with_haproxy,
-            proc_root: PathBuf::from("/proc"),
             apply_lock: Mutex::new(()),
             state: StdMutex::new(state),
         }
-    }
-
-    // Tests point this at an empty directory so no real HAProxy process is ever signalled.
-    #[cfg(test)]
-    pub(crate) fn with_proc_root(mut self, root: PathBuf) -> Self {
-        self.proc_root = root;
-        self
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
@@ -416,24 +397,23 @@ impl Haproxy {
         checked
     }
 
-    async fn find_master(&self) -> Option<i32> {
-        let root = self.proc_root.clone();
-        tokio::task::spawn_blocking(move || scan_proc(&root))
-            .await
-            .ok()
-            .flatten()
-    }
-
     async fn reload_master(&self) -> bool {
-        let Some(pid) = self.find_master().await else {
-            self.state().status.running = false;
-            return false;
+        let stream = match open(&self.master_addr, MASTER_LABEL).await {
+            Ok(stream) => stream,
+            Err(err) => {
+                tracing::warn!("haproxy reload skipped: {err}");
+                let mut st = self.state();
+                st.status.running = false;
+                st.status.last_reload_ok = false;
+                st.status.last_error = Some(err.to_string());
+                return false;
+            }
         };
         self.state().status.running = true;
         let before = self.runtime_pid().await;
-        let outcome = match signal_reload(pid) {
+        let outcome = match send_reload(stream, &self.master_addr).await {
             Ok(()) => self.await_reload(before).await,
-            Err(err) => Err(err.to_string()),
+            Err(msg) => Err(msg),
         };
         let mut st = self.state();
         st.status.last_reload_at = Some(now_rfc3339());
@@ -473,27 +453,8 @@ impl Haproxy {
     }
 
     async fn runtime_command(&self, cmd: &str) -> Result<String> {
-        let addr = self.runtime_addr.as_str();
-        let fail = |why: String| {
-            ConnectorError::Unavailable(format!("haproxy runtime socket {addr}: {why}"))
-        };
-        let mut stream = match timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
-            Ok(Ok(stream)) => stream,
-            Ok(Err(err)) => return Err(fail(err.to_string())),
-            Err(_) => return Err(fail("connect timed out".into())),
-        };
-        // HAProxy answers one command per connection and closes it, so EOF marks the end of the reply.
-        let exchange = async {
-            stream.write_all(cmd.as_bytes()).await?;
-            let mut out = Vec::new();
-            (&mut stream).take(MAX_REPLY).read_to_end(&mut out).await?;
-            Ok::<Vec<u8>, std::io::Error>(out)
-        };
-        match timeout(READ_TIMEOUT, exchange).await {
-            Ok(Ok(bytes)) => Ok(String::from_utf8_lossy(&bytes).into_owned()),
-            Ok(Err(err)) => Err(fail(err.to_string())),
-            Err(_) => Err(fail("read timed out".into())),
-        }
+        let stream = open(&self.runtime_addr, RUNTIME_LABEL).await?;
+        converse(stream, &self.runtime_addr, RUNTIME_LABEL, cmd, READ_TIMEOUT).await
     }
 
     // The file is written first so a reload keeps the choice even when the socket is down.
@@ -556,6 +517,7 @@ impl Haproxy {
 mod tests {
     use super::*;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use cite_edge::model::{
         CONFIG_VERSION, EdgeSettings, HealthCheck, Maintenance, Site, SiteKind, Target, Upstream,
@@ -599,19 +561,8 @@ mod tests {
         }
     }
 
-    fn proc_entry(pid: i32, comm: &str, cmdline: &str, ppid: Option<i32>) -> ProcEntry {
-        ProcEntry {
-            pid,
-            comm: comm.into(),
-            cmdline: cmdline.into(),
-            ppid,
-        }
-    }
-
     fn haproxy_in(dir: &TempDir, runtime_addr: &str) -> Haproxy {
         let root = dir.path();
-        let empty_proc = root.join("proc");
-        fs::create_dir_all(&empty_proc).unwrap();
         Haproxy {
             data_dir: root.join("data"),
             haproxy_dir: root.join("haproxy"),
@@ -619,10 +570,10 @@ mod tests {
             pages_dir: root.join("haproxy/pages"),
             haproxy_cfg: root.join("haproxy/haproxy.cfg"),
             runtime_addr: runtime_addr.into(),
+            master_addr: "127.0.0.1:1".into(),
             log_addr: "127.0.0.1:5140".into(),
             haproxy_bin: "true".into(),
             validate: false,
-            proc_root: empty_proc,
             apply_lock: Mutex::new(()),
             state: StdMutex::new(State::default()),
         }
@@ -695,48 +646,7 @@ mod tests {
     }
 
     #[test]
-    fn master_is_the_lowest_matching_pid() {
-        let procs = vec![
-            proc_entry(900, "haproxy", "haproxy\0-W\0-f\0/c.cfg\0", None),
-            proc_entry(40, "haproxy", "haproxy\0-W\0-db\0-f\0/c.cfg\0", None),
-            proc_entry(7, "nginx", "nginx\0-W\0", None),
-            proc_entry(5, "haproxy", "haproxy\0-f\0/c.cfg\0", None),
-        ];
-        assert_eq!(pick_master(&procs), Some(40));
-        assert_eq!(pick_master(&[]), None);
-        assert_eq!(pick_master(&procs[2..]), None);
-    }
-
-    #[test]
-    fn workers_parented_by_a_master_are_skipped() {
-        let procs = vec![
-            proc_entry(30, "haproxy", "haproxy\0-W\0", Some(10)),
-            proc_entry(50, "haproxy", "haproxy\0-W\0", Some(30)),
-            proc_entry(60, "haproxy", "haproxy\0-W\0", Some(1)),
-        ];
-        assert_eq!(pick_master(&procs), Some(30));
-        let wrapped = vec![
-            proc_entry(80, "haproxy", "haproxy\0-W\0", Some(60)),
-            proc_entry(60, "haproxy", "haproxy\0-W\0", Some(1)),
-        ];
-        assert_eq!(pick_master(&wrapped), Some(60));
-    }
-
-    #[test]
-    fn master_flag_detection() {
-        assert!(has_master_flag("haproxy\0-W\0-f\0/c\0"));
-        assert!(has_master_flag("haproxy\0-Ws\0-f\0/c\0"));
-        assert!(has_master_flag("haproxy\0--master-worker\0"));
-        assert!(!has_master_flag("haproxy\0-f\0/Wdir/c.cfg\0"));
-        assert!(!has_master_flag("haproxy\0-db\0-f\0/c\0"));
-        assert!(!has_master_flag(""));
-    }
-
-    #[test]
-    fn proc_text_parsing() {
-        let status = "Name:\thaproxy\nState:\tS (sleeping)\nPPid:\t412\nUid:\t0\n";
-        assert_eq!(parse_ppid(status), Some(412));
-        assert_eq!(parse_ppid("Name:\tx\n"), None);
+    fn info_pid_is_parsed() {
         assert_eq!(
             parse_info_pid("Name: HAProxy\nPid: 77\nUptime: 1d\n"),
             Some(77)
@@ -745,18 +655,20 @@ mod tests {
     }
 
     #[test]
-    fn scan_proc_reads_fake_proc_tree() {
-        let dir = tempfile::tempdir().unwrap();
-        for (pid, comm, ppid) in [(21, "haproxy", 1), (22, "haproxy", 21), (23, "sh", 1)] {
-            let p = dir.path().join(pid.to_string());
-            fs::create_dir_all(&p).unwrap();
-            fs::write(p.join("comm"), format!("{comm}\n")).unwrap();
-            fs::write(p.join("cmdline"), "haproxy\0-W\0-f\0/c.cfg\0").unwrap();
-            fs::write(p.join("status"), format!("Name:\t{comm}\nPPid:\t{ppid}\n")).unwrap();
+    fn reload_replies_are_classified() {
+        assert_eq!(
+            parse_reload_reply("Success=1\n--\n[NOTICE] (1) : Loading success.\n\n"),
+            Ok(())
+        );
+        let refused =
+            parse_reload_reply("Success=0\n--\n[ALERT] bad\n[WARNING] Loading failure!\n\n")
+                .unwrap_err();
+        assert!(refused.contains("[ALERT] bad"), "{refused}");
+        assert!(!refused.contains("Success=0"), "{refused}");
+        for odd in ["", "\n", "Unknown command: 'reload'\n"] {
+            let err = parse_reload_reply(odd).unwrap_err();
+            assert!(err.contains("unexpected reply"), "{err}");
         }
-        fs::create_dir_all(dir.path().join("self")).unwrap();
-        assert_eq!(scan_proc(dir.path()), Some(21));
-        assert_eq!(scan_proc(&dir.path().join("missing")), None);
     }
 
     #[test]
@@ -785,7 +697,7 @@ mod tests {
         assert_eq!(outcome.config_hash.len(), 64);
         let cfg = fs::read_to_string(&hp.haproxy_cfg).unwrap();
         assert!(cfg.contains("backend be_shop_blue"));
-        assert!(cfg.contains("stats socket ipv4@0.0.0.0:9"));
+        assert!(cfg.contains("stats socket ipv4@127.0.0.1:9"));
         let active = fs::read_to_string(hp.maps_dir.join("active.map")).unwrap();
         assert_eq!(active, "shop be_shop_blue\n");
         let maint = fs::read_to_string(hp.maps_dir.join("maint.map")).unwrap();
@@ -795,6 +707,63 @@ mod tests {
         let status = hp.status();
         assert_eq!(status.config_hash, outcome.config_hash);
         assert!(!status.running);
+        assert!(!status.last_reload_ok);
+        let err = status.last_error.unwrap();
+        assert!(err.contains("master CLI 127.0.0.1:1"), "{err}");
+    }
+
+    // The runtime socket reports a new pid once the master has been asked to reload.
+    async fn reloading_haproxy(
+        master_reply: &'static str,
+    ) -> (Haproxy, Arc<StdMutex<Vec<String>>>, TempDir) {
+        let reloads = Arc::new(AtomicU64::new(0));
+        let counter = reloads.clone();
+        let (master, seen) = fake_runtime(move |line| {
+            if line.trim() == "reload" {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
+            master_reply.to_string()
+        })
+        .await;
+        let (runtime, _) = fake_runtime(move |_| {
+            format!(
+                "Name: HAProxy\nPid: {}\n",
+                100 + reloads.load(Ordering::SeqCst)
+            )
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut hp = haproxy_in(&dir, &runtime);
+        hp.master_addr = master;
+        (hp, seen, dir)
+    }
+
+    #[tokio::test]
+    async fn apply_reloads_through_the_master_cli_and_confirms_the_new_pid() {
+        let (hp, seen, _dir) =
+            reloading_haproxy("Success=1\n--\n[NOTICE] Loading success.\n").await;
+        let outcome = hp.apply(&edge(vec![site("shop")])).await.unwrap();
+        assert!(outcome.reloaded);
+        assert_eq!(seen.lock().unwrap().as_slice(), ["reload\n"]);
+        let status = hp.status();
+        assert!(status.running);
+        assert!(status.last_reload_ok);
+        assert!(status.last_reload_at.is_some());
+        assert_eq!(status.last_error, None);
+    }
+
+    #[tokio::test]
+    async fn refused_reload_is_reported_with_the_loader_output() {
+        let reply = "Success=0\n--\n[ALERT] unknown keyword 'bogus'\n[WARNING] Loading failure!\n";
+        let (hp, _seen, _dir) = reloading_haproxy(reply).await;
+        let outcome = hp.apply(&edge(vec![site("shop")])).await.unwrap();
+        assert!(!outcome.reloaded);
+        let status = hp.status();
+        assert!(status.running);
+        assert!(!status.last_reload_ok);
+        let err = status.last_error.unwrap();
+        assert!(err.contains("refused the reload"), "{err}");
+        assert!(err.contains("unknown keyword 'bogus'"), "{err}");
     }
 
     #[tokio::test]

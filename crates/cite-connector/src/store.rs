@@ -545,6 +545,7 @@ pub(crate) mod testing {
             ("CITE_CONNECTOR_TLS", "false"),
             ("CITE_HAPROXY_VALIDATE", "false"),
             ("CITE_HAPROXY_RUNTIME", "127.0.0.1:1"),
+            ("CITE_HAPROXY_MASTER", "127.0.0.1:1"),
             ("CITE_CONNECTOR_LISTEN", "127.0.0.1:0"),
             ("CITE_NODE_NAME", "test-node"),
         ]

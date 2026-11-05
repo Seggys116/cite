@@ -8,7 +8,7 @@ This page covers node mode: who can reach what, which secrets exist and where th
 |---|---|---|
 | HAProxy ports 80 and 443 | Anyone, on `CITE_PUBLIC_BIND` | Firewall rules, rate limit, body size limit |
 | Connector API, port 7443 | Host IP in `CITE_CONNECTOR_BIND` | Allowlist, then TLS, then token |
-| HAProxy runtime socket, `haproxy:9999` | Containers on `cite_edge` and `public`; not published to the host | None. See limits below. |
+| HAProxy runtime socket `172.30.250.3:9999` and master CLI `172.30.250.3:9998` | Containers on the internal `ctl` network: HAProxy and the connector only; not published to the host | Network isolation only. See below. |
 | Docker API through the socket proxy | The connector, on the internal `docker_api` network | Endpoint filter only |
 | Site executors, port 8080 | Containers on `cite_edge` | Network isolation only |
 
@@ -54,15 +54,17 @@ All state is in the `cite_conf` volume, described in [Running a node](node.md#wh
 
 Files are written atomically with mode 0600.
 
-These modes protect less than they appear to. The HAProxy container and the connector both run as uid 10001 and share the `cite_conf` volume. HAProxy mounts it read-only, but the same uid can read files the connector wrote with mode 0600. A compromised HAProxy process could read the credentials, tokens and keys. Keep HAProxy updated, and note that a bug in HAProxy's request parsing is a path to the connector's secrets.
+HAProxy and the connector both run as uid 10001, so file modes alone would not keep HAProxy out of the connector's files. The separation comes from the mounts: HAProxy mounts only the `haproxy` and `certs` subpaths of `cite_conf`, read-only, so `credentials.json`, `tokens.json`, `secrets.json` and the TLS keys under `/conf/tls` are not visible inside the HAProxy container. The two containers also do not share a process namespace, so a compromised HAProxy cannot read the connector's memory or `/proc` entries, or signal it. Site certificates for HAProxy in `/conf/certs` are visible to HAProxy by design.
 
 The credential report from `init` is printed once and not stored. The debug output for credentials and for the report hides the password, the hash and the TOTP secret.
 
-## The HAProxy runtime socket
+## The HAProxy admin sockets
 
-HAProxy is configured with `stats socket` bound to TCP port 9999 at admin level, with no authentication. The connector uses it to switch slots, toggle maintenance and read backend health. The port is not published to the host, and the `cite_edge` network is `internal`, so the internet cannot reach it.
+HAProxy exposes two admin-level TCP listeners with no authentication: the runtime socket on port 9999 (`stats socket`), which the connector uses to switch slots, toggle maintenance and read backend health, and the master CLI on port 9998 (`-S`), which the connector uses to reload. Both are bound to the HAProxy address on the `ctl` network (172.30.250.3) only, not to every interface.
 
-It is reachable from every container attached to `haproxy`'s networks. That includes orchestrated site executors, because executors join `cite_edge` and run the site's own server code. Code in a site's executor could connect to `haproxy:9999` and send admin commands, such as pointing another site's map at a different backend. If you run site code you do not trust on a node, do not rely on the runtime socket being private.
+`ctl` is an internal network, and only HAProxy and the connector join it. Site executors, which run the site's own server code, are on `cite_edge` and cannot reach either socket. The ports are not published to the host. HAProxy is the internet-facing process and does sit on `ctl`, so a compromised HAProxy can also reach its own admin sockets and the connector's ports there. The connector API still applies its allowlist, which rejects the HAProxy address unless you list it, and the log sink only parses datagrams.
+
+The master CLI address in the compose `command` and `CITE_HAPROXY_MASTER` must be kept in step. Reloading no longer needs signals or a shared process namespace.
 
 ## Config injection
 
@@ -98,6 +100,8 @@ What it trades away:
 - GitHub tokens sit in `secrets.json` and in the manager container's environment, readable by anyone who can inspect containers through the API.
 
 What stays in place: the connector itself builds each container with no host mounts, read-only root, all capabilities dropped except the few the manager and init need, memory, CPU and process limits, and no route out for executors. Those are checked by the connector's tests. They limit what site code does, not what the connector can ask Docker to do.
+
+The socket proxy is the only thing between the connector and the Docker daemon, and it filters by API path only. A compromised connector can ask Docker to create containers, including privileged ones, which is close to host root. That is why the orchestrator is opt-in.
 
 If you do not need GitHub builds on the node, leave the overlay off and give sites upstream addresses. The connector then has no Docker access at all.
 
