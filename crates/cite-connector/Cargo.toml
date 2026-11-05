@@ -39,7 +39,6 @@ clap.workspace = true
 rustix.workspace = true
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-rustls-pemfile = "2"
 rcgen = "0.13"
 qrcode = { version = "0.14", default-features = false }
 

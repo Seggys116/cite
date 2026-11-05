@@ -10,7 +10,7 @@ members = [
     "crates/cite-executor",
     "crates/cite-mock-github",
 ]
-exclude = ["fuzz"]
+exclude = ["fuzz", "apps/desktop"]
 
 [workspace.package]
 version = "0.2.0"

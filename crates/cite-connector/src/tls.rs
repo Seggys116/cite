@@ -1,3 +1,4 @@
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use std::fmt::Display;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -157,8 +158,7 @@ pub fn renew_leaf(paths: &TlsPaths, sans: &[String], node_name: &str) -> Result<
 }
 
 fn first_cert_der(pem: &[u8]) -> Result<Vec<u8>> {
-    let mut reader: &[u8] = pem;
-    let cert = rustls_pemfile::certs(&mut reader)
+    let cert = CertificateDer::pem_slice_iter(pem)
         .next()
         .ok_or_else(|| ConnectorError::Internal("no certificate found in PEM".into()))?
         .map_err(|e| tls_err("certificate PEM is invalid", e))?;
@@ -224,8 +224,7 @@ pub fn load_acceptor(dir: &Path) -> Result<TlsAcceptor> {
     };
     let cert_pem = read_limited(&paths.server_pem, MAX_PEM_BYTES).map_err(missing)?;
     let key_pem = read_limited(&paths.server_key, MAX_PEM_BYTES).map_err(missing)?;
-    let mut cert_reader: &[u8] = &cert_pem;
-    let certs = rustls_pemfile::certs(&mut cert_reader)
+    let certs = CertificateDer::pem_slice_iter(&cert_pem)
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|e| tls_err("server.pem is invalid", e))?;
     if certs.is_empty() {
@@ -233,10 +232,8 @@ pub fn load_acceptor(dir: &Path) -> Result<TlsAcceptor> {
             "server.pem has no certificate".into(),
         ));
     }
-    let mut key_reader: &[u8] = &key_pem;
-    let key = rustls_pemfile::private_key(&mut key_reader)
-        .map_err(|e| tls_err("server.key is invalid", e))?
-        .ok_or_else(|| ConnectorError::Internal("server.key has no private key".into()))?;
+    let key = PrivateKeyDer::from_pem_slice(&key_pem)
+        .map_err(|e| tls_err("server.key is invalid or has no private key", e))?;
     let mut config = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)
@@ -249,8 +246,7 @@ pub fn load_acceptor(dir: &Path) -> Result<TlsAcceptor> {
 pub fn client_config_for_ca(ca_pem: &[u8]) -> Result<Arc<rustls::ClientConfig>> {
     install_provider();
     let mut roots = rustls::RootCertStore::empty();
-    let mut reader: &[u8] = ca_pem;
-    for cert in rustls_pemfile::certs(&mut reader) {
+    for cert in CertificateDer::pem_slice_iter(ca_pem) {
         let cert = cert.map_err(|e| tls_err("CA PEM is invalid", e))?;
         roots
             .add(cert)
