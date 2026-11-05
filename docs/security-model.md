@@ -40,6 +40,8 @@ Configuration changes are recorded in the audit log with the actor. API tokens a
 
 The browser signs in to the dashboard with its own username, password and TOTP code, then the dashboard server calls each connector with a stored connector API token. The dashboard is therefore a holder of one token per node. Anyone who gets into the dashboard, or who reads its stored tokens, can act on every node it manages, within the API's limits. Restrict each connector's allowlist to the dashboard's address, and keep the dashboard on an address you control.
 
+Until an account exists the dashboard prints a one-time setup token to its log on every start, and the setup form needs it, so nobody who can merely reach the port can claim the console. It is published on `127.0.0.1` by default. The session cookie is `__Host-cite_session` with `Path=/` and no `Domain` when it is Secure (TLS, or `CITE_DASHBOARD_COOKIE_SECURE=true`), and a request carrying two cookies with that name counts as signed out. Dashboard sign-ins are rate limited per client address, with a dashboard-wide lockout that only attempts naming the real account count toward. Running `init --force` or a connector credential reset takes effect in the running process, which signs everyone out. [Dashboard](dashboard.md#signing-in) has the details. The [desktop app](desktop.md) keeps the same kind of token for each node in the operating system keychain instead.
+
 ## Secrets at rest
 
 All state is in the `cite_conf` volume, described in [Running a node](node.md#what-is-stored).
@@ -73,9 +75,10 @@ The connector builds `haproxy.cfg` from JSON that clients send, so every value i
 - Ids are limited to `[a-z0-9-]`, 40 characters, starting with a letter or digit.
 - Hosts must be valid host names, optionally with a leading `*.`.
 - Patterns and path prefixes are limited to printable ASCII without `#`, `"`, `'`, `$name`, a leading `-`, or HAProxy keywords like `if`, `or`, `{` and `}`. Regexes must compile.
-- Targets must be `host:port` or `[ipv6]:port`.
+- Targets must be `host:port` or `[ipv6]:port`, and may not name loopback, link-local, unspecified or multicast addresses, `localhost`, the stack's own service names, or odd IPv4 spellings. See [Firewall and maintenance](firewall.md#targets-and-health-checks).
+- Firewall rules match both the normalised path and a canonical form with path parameters, backslashes and encoding removed, so encoded or `;`-decorated paths do not slip past a rule.
 - Render options (directories and addresses) accept only letters, digits and `/ . _ -` plus `@ : [ ]` for addresses.
-- Maintenance pages are written to separate files and never placed in the config. The built-in page makes no external requests.
+- Maintenance pages are written to separate files and never placed in the config, and are limited to 15000 bytes. The built-in page makes no external requests.
 - The result is checked with `haproxy -c` on a staged copy before the live file is replaced, and a rejected change restores the previous stored configuration.
 
 Tests render hostile hosts, regexes and ids and check that no extra directive lines appear.
@@ -94,7 +97,7 @@ What the overlay adds:
 - The proxy forwards only the calls the orchestrator makes and rebuilds the expected body for each container, volume and network create, rejecting anything that differs. See [Orchestrator](orchestrator.md#the-docker-proxy) for the full list.
 - The proxy runs as uid 10001 with the socket's group added, a read-only root filesystem, no capabilities, `no-new-privileges`, and memory, CPU and pids limits.
 
-Why a generic socket proxy is not enough: tools such as `tecnativa/docker-socket-proxy` allow or deny whole API sections by path. With containers and POST enabled, a client may create a container with `Privileged`, a `/:/host` bind, host PID or network mode, all capabilities or raw devices, and then start it, which is root on the host. With volumes enabled, a local volume with bind options mounts the host's root. With images enabled, any image from any registry can be pulled. With networks enabled, any container can be attached to the control network. The purpose-built proxy blocks each of these because it checks the body, not just the path.
+Replaced: earlier versions put a generic socket proxy (`tecnativa/docker-socket-proxy`) here. Such proxies allow or deny whole API sections by path. With containers and POST enabled, a client may create a container with `Privileged`, a `/:/host` bind, host PID or network mode, all capabilities or raw devices, and then start it, which is root on the host. With volumes enabled, a local volume with bind options mounts the host's root. With images enabled, any image from any registry can be pulled. With networks enabled, any container can be attached to the control network. `cite-dockerproxy` blocks each of these because it checks the body, not just the path. It also rejects JSON with duplicate keys and forwards a re-encoded copy of the body it validated.
 
 What the connector can still do through the proxy: create, start, stop and remove containers named `cite-<id>-<slot>-<role>` from Cite images in the configured registry with the fixed hardened specification, create and delete the matching `cite.managed` volumes and networks, and attach the HAProxy container to the per-stack networks. It cannot exec into or attach to a container, read logs, copy files, pull other images, bind host paths, use host namespaces, add capabilities, or touch a container, volume or network that lacks the `cite.managed=true` label.
 

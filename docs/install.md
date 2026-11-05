@@ -64,6 +64,10 @@ Default host port is **8080** (container listens on 8080). Set `CITE_PORT=80` if
 
 `.env` is gitignored. It holds the PAT, so keep it out of backups and shared shells. Site build-time and runtime variables go in optional `build.env` and `runtime.env` files; see [config.md](config.md).
 
+## Node mode
+
+This page covers single-site mode. To run HAProxy, the connector and many sites on one host, use `scripts/setup.sh` or `docker-compose.node.yml`; see [Running a node](node.md).
+
 ## Development install
 
 ```bash

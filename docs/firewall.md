@@ -80,9 +80,9 @@ The connector also asks `haproxy -c` to check the final file, so a regex that HA
 A site target is `host:port` or `[ipv6]:port`. The edge refuses targets that would point it at its own control plane or at local services:
 
 - Loopback (`127.0.0.0/8`, `::1`), unspecified (`0.0.0.0`, `::`), `0.0.0.0/8`, link-local (`169.254.0.0/16`, `fe80::/10`, which includes the cloud metadata address), multicast and the IPv4 broadcast address.
-- The control subnet `172.30.250.0/29`, where the HAProxy admin and master listeners sit. A request relayed to them would run as admin commands.
+- `172.30.250.0/29`. HAProxy's admin and master listeners no longer use a network, because they are unix sockets, but the range stays refused.
 - The IPv4-mapped (`::ffff:a.b.c.d`), IPv4-compatible and NAT64 (`64:ff9b::/96`) IPv6 forms of all of the above.
-- The names `localhost`, anything ending in `.localhost`, `haproxy`, `connector`, `dockerproxy` and `socketproxy`.
+- The names `localhost`, anything ending in `.localhost`, and the names of the stack's own services: `haproxy`, `connector` and `dockerproxy` (plus one older proxy name).
 - Decimal, octal, hex and short IPv4 spellings such as `2130706433`, `0177.0.0.1`, `0x7f.1` and `127.1`. A name whose last label is numeric must be a canonical dotted IPv4 address.
 
 Names ending in `.internal` are allowed because they are common for real services. A name is checked as written and not by where it resolves, so keep DNS you do not control out of target names.
@@ -160,7 +160,7 @@ The rendered config never changes when you switch slots or toggle maintenance. I
 
 To change a map the connector first rewrites the file atomically, then sends HAProxy a runtime command on the admin socket (`set map`). Writing the file first means a later reload keeps the choice even if the socket is down. No reload happens.
 
-What does cause a reload is any change to the rendered config or the page files: adding or removing sites, editing hosts, health checks, targets or firewall rules, or changing which page a site uses. The connector computes a hash over the config, both maps and all pages, skips the work when it matches what is installed, and otherwise validates, writes the files and signals the HAProxy master with `SIGUSR2`.
+What does cause a reload is any change to the rendered config or the page files: adding or removing sites, editing hosts, health checks, targets or firewall rules, or changing which page a site uses. The connector computes a hash over the config, both maps and all pages, skips the work when it matches what is installed, and otherwise validates, writes the files and sends `reload` to HAProxy's master CLI socket. The change counts as applied only after `show info` on the admin socket reports a new process. `POST /api/v1/haproxy/reload` forces a reload even when the hash matches, and a refused or unconfirmed reload makes the change fail instead of leaving a stored config HAProxy never loaded.
 
 ### Blue/green deploy sequence
 

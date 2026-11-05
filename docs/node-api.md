@@ -34,7 +34,7 @@ The three `/tokens` routes need a session token from login. An API token gets 40
 | Route | Body | Response |
 |---|---|---|
 | `GET /sites` | none | `[Site]` |
-| `POST /sites` | `Site` without `history` | `Site` |
+| `POST /sites` | `Site` without `history`, plus an optional `github_token` | `Site` |
 | `GET /sites/{id}` | none | `Site` plus `live:{blue:[{addr,status}],green:[...]}` |
 | `PUT /sites/{id}` | `Site` | `Site` |
 | `DELETE /sites/{id}` | none | `{ok:true}` |
@@ -42,6 +42,8 @@ The three `/tokens` routes need a session token from login. An API token gets 40
 | `POST /sites/{id}/switch` | `{slot}` | `Deployment` |
 | `POST /sites/{id}/rollback` | none | `Deployment` |
 | `POST /sites/{id}/maintenance` | `{enabled,page_id?}` | `Site` |
+
+`github_token` is used for a site with a `source`, which needs the orchestrator. It is stored in `secrets.json`, never in the site, and never returned. See [Orchestrator](orchestrator.md#github-token).
 
 `PUT /sites/{id}` changes the name, hosts, `path_regex`, kind, health check and source. The active slot, both slots' targets and the maintenance flag are kept from the stored site, whatever the body says, so a stale copy of a site cannot undo a deploy. Those fields change only through `deploy`, `switch`, `rollback` and `maintenance`. `DELETE /sites/{id}` returns 409 naming the firewall rules while any rule is scoped to the site; delete or change those rules first.
 
@@ -70,7 +72,7 @@ Deploys, switches, rollbacks, site changes and every other change that touches t
 
 ## Analytics
 
-All accept `window` (`15m`, `1h`, `24h`, `7d`, `30d`) and optional `site`.
+All accept `window` (`15m`, `1h`, `24h`, `7d`, `30d`; the default is `1h`) and optional `site`.
 
 | Route | Response |
 |---|---|
@@ -82,4 +84,4 @@ The `sizes` buckets are cumulative: `count` is the number of responses up to and
 
 ## Dashboard server
 
-The dashboard container exposes its own API under `/api/v1` for the browser. `/nodes` lists configured nodes, and `/nodes/{node}/...` proxies to the matching connector route above using the stored token. `POST /session` logs in to the dashboard (`{username,password,totp}`), `GET /nodes/summary` fans out `/node` across all nodes, and `POST /deployments` takes `{nodes:[name],site:Site,mode:"each"\|"replicate"}` and applies the site to every selected node.
+The dashboard container exposes its own API under `/api/v1` for the browser. `/nodes` lists configured nodes, and `/nodes/{node}/...` proxies to the matching connector route above using the stored token. `POST /session` logs in to the dashboard (`{username,password,totp}`), `GET /nodes/summary` fans out `/node` across all nodes, and `POST /deployments` takes `{nodes:[name],site:Site,mode:"each"\|"replicate",per_node?,github_token?}` and applies the site to every selected node. In `each` mode, `per_node` maps a node name to `{blue?,green?}` target lists that replace the site's own for that node; `replicate` ignores it. `github_token` needs a site with a `source`.

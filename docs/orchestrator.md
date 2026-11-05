@@ -8,7 +8,7 @@ This page covers the optional orchestrator: how a node's connector builds and ru
 docker compose -f docker-compose.node.yml -f docker-compose.orchestrator.yml up -d
 ```
 
-Set `DOCKER_GID` in `.env` first: it is the numeric group id that owns `/var/run/docker.sock` on the host (`stat -c %g /var/run/docker.sock`). The proxy runs as uid 10001 and gets that group through `group_add`, so it can open the socket without running as root.
+Set `DOCKER_GID` in `.env` first: it is the numeric group id that owns `/var/run/docker.sock` on the host (`stat -c %g /var/run/docker.sock`). Compose refuses to start the overlay without it. The proxy runs as uid 10001 and gets that group through `group_add`, so it can open the socket without running as root. `scripts/setup.sh --orchestrator` writes `DOCKER_GID` for you.
 
 The overlay adds a `dockerproxy` service (`ghcr.io/seggys116/cite-dockerproxy`) and an internal network `docker_api`. It sets `CITE_DOCKER_HOST=http://dockerproxy:2375` and `CITE_HAPROXY_CONTAINER=cite-node-haproxy` on the connector and attaches the connector to `docker_api`. The proxy is the only container that mounts `/var/run/docker.sock`. The mount is marked read-only, but that does not limit the API: a read-only bind of a unix socket still lets a client send any request. The restriction comes from the proxy's filter, described below. `docker-compose.node.yml` names the HAProxy container `cite-node-haproxy` so the connector and the proxy can refer to it.
 
@@ -20,7 +20,9 @@ Without the overlay, the connector runs no containers. A site can then only rout
 
 `cite-dockerproxy` is a purpose-built filter that sits between the connector and the Docker Engine socket. It is deny-by-default: it forwards only the calls the orchestrator makes, and only when the request body and query match what the orchestrator would send. Everything else gets `403 {"message":"denied"}` and a log line with the method, the normalised path and the reason. Request bodies are never logged.
 
-Generic socket proxies such as `tecnativa/docker-socket-proxy` filter by URL prefix. Allowing container creation there allows every method and every body under `/containers/`, so a compromised connector can create a privileged container with the host's root bind-mounted and start it. Volume creation with bind driver options, image pulls from any registry, and attaching any container to any network are open in the same way. The purpose-built proxy closes those paths by validating what is inside the request.
+A generic socket proxy filters by URL prefix, so allowing container creation allows every body under `/containers/`, including a privileged container with the host's root bind-mounted. Volume creation with bind driver options, image pulls from any registry, and attaching any container to any network are open in the same way. This proxy closes those paths by validating what is inside the request.
+
+JSON bodies are parsed strictly: a duplicate object key at any depth, or two keys that differ only in case, is rejected, because the Docker daemon and the proxy could otherwise read different values. A validated body is then re-encoded and the re-encoded bytes are what the daemon receives, so it decodes exactly what was checked.
 
 | Allowed | Conditions |
 |---|---|
@@ -73,7 +75,7 @@ These specifications mirror the `manager` and `executor` services in `docker-com
 
 Each stack gets its own internal network, `cite-<id>-<slot>-net`, and its executor is the only container on it besides HAProxy. The connector creates the network, then asks Docker (through the proxy) to connect the HAProxy container, named by `CITE_HAPROXY_CONTAINER` (default `cite-node-haproxy`). HAProxy reaches the executor at `cite-<id>-<slot>-executor:8080` over that network, and the connector writes the address into the slot's targets. Because the network is internal and unshared, site A's code cannot reach site B's executor, neither HAProxy's admin sockets nor the connector can be reached from an executor, and an executor has no route out.
 
-On stop, HAProxy is disconnected from the stack's network. The network itself stays so the stopped executor can start again. Removing a stack disconnects HAProxy and deletes both networks. If HAProxy is recreated, it loses its attachments; the connector re-attaches it to every running stack's network the first time it uses the orchestrator after start (and `reconcile_networks` can be called at any time). A container, volume or network that already has the expected name but lacks the `cite.managed=true` label is never adopted, changed or deleted; the connector reports a conflict.
+On stop, HAProxy is disconnected from the stack's network. The network itself stays so the stopped executor can start again. Removing a stack disconnects HAProxy and deletes both networks. If HAProxy is recreated, it loses its attachments; the connector re-attaches it to every running stack's network the first time it uses the orchestrator after start. A container, volume or network that already has the expected name but lacks the `cite.managed=true` label is never adopted, changed or deleted; the connector reports a conflict.
 
 If `CITE_HAPROXY_CONTAINER` is set to an empty value, per-stack networks are off and executors join the shared `cite_edge` network as before. That mode is weaker: all executors on the node can reach each other directly, so one site's code can talk to another site's executor. Use it only for a node whose sites you fully trust. Stacks created in that mode move to their own network the next time they are ensured, because the executor is recreated when its network differs.
 
@@ -105,7 +107,7 @@ Images are pulled only when they are not present locally; a pull can take up to 
 
 ## GitHub token
 
-The token is supplied when the site is created. The connector stores it in `secrets.json` (mode 0600, up to 512 secrets, 16 KiB each) under a name it chooses from the site id, and records only that name in the site. It reaches the manager as `CITE_GITHUB_TOKEN` in the container's environment. It is not in container labels or in `edge.json`. Anyone who can inspect containers through the Docker API can read it, including the connector.
+The token is supplied when the site is created, as a `github_token` string beside the site object in the `POST /api/v1/sites` body (printable ASCII, up to 512 bytes). The connector stores it in `secrets.json` (mode 0600, up to 512 secrets, 16 KiB each) under a name it chooses from the site id, and records only that name in the site. It reaches the manager as `CITE_GITHUB_TOKEN` in the container's environment. It is not in container labels or in `edge.json`. Anyone who can inspect containers through the Docker API can read it, including the connector.
 
 ## Lifecycle
 

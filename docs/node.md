@@ -12,7 +12,7 @@ This page covers installing, configuring and operating one Cite node: HAProxy pl
 
 The two containers do not share a process namespace. They share one small volume, `cite_run`, mounted at `/run/cite` in both, which holds three unix sockets: HAProxy's admin socket (`admin.sock`), the master CLI (`master.sock`, from `-S /run/cite/master.sock,level,admin` on the HAProxy command) and the log datagram socket the connector binds (`log.sock`). The directory is owned by uid 10001 with mode 0750, the admin and log sockets are mode 0600, and no admin listener exists on any network. The connector reloads HAProxy by connecting to the master socket, sending `reload` and reading the reply: `Success=1` or `Success=0` followed by the loader output. It then checks that `show info` on the admin socket reports a new pid. A config counts as applied only after that check passes, so a refused or unconfirmed reload is retried on the next apply and fails the change that caused it. If the master CLI is unreachable (HAProxy is not up yet at first boot), applying a config still succeeds with `reloaded` false and the reason in the status `last_error`. Both containers run as uid 10001 with a read-only root filesystem, `no-new-privileges` and all capabilities dropped.
 
-Two networks exist. `public` is a normal bridge. `cite_edge` is internal, so containers on it have no route out. Orchestrated site executors are on `cite_edge` only, and HAProxy is on it to reach them. The connector stays on `public` only because Docker cannot publish ports from an internal-only network; it is not on `cite_edge`.
+Two networks exist. `public` is a normal bridge. `cite_edge` is internal, so containers on it have no route out, and HAProxy is on it. Orchestrated executors normally sit on a network of their own per site and slot, which the connector creates and HAProxy joins; `cite_edge` is only used when that is switched off (see [Orchestrator](orchestrator.md#site-isolation)). The connector stays on `public` only because Docker cannot publish ports from an internal-only network; it is not on `cite_edge`. The orchestrator overlay adds a third, internal network, `docker_api`, between the connector and the Docker proxy.
 
 ## First start
 
@@ -24,10 +24,13 @@ Set the two required values in `.env`. Compose stops with a message if either is
 | `CITE_CONNECTOR_BIND` | Host IP to publish the connector port on. Use a private interface address where you can. |
 
 ```bash
-docker compose -f docker-compose.node.yml run --rm connector init
+docker compose -f docker-compose.node.yml run --rm --no-deps init
+docker compose -f docker-compose.node.yml run --rm --no-deps connector init
 docker compose -f docker-compose.node.yml up -d
 docker compose -f docker-compose.node.yml ps
 ```
+
+The first command runs the compose `init` service, which fixes the ownership of the volumes. The second runs the connector's `init` subcommand. `scripts/setup.sh --mode node` runs the same steps, writes `.env` for you and keeps its own update, status, logs and uninstall commands; see the [README](../README.md#quickstart-node).
 
 `init` writes `credentials.json` and the TLS material, then prints the following once:
 
@@ -74,7 +77,8 @@ Compose reads `docker-compose.override.yml` automatically only when you run `doc
 | `CITE_LOG_ADDR` | `connector:5140`, or the `CITE_LOG_LISTEN` path for a unix listener | Address HAProxy sends logs to. For a UDP sink it must be an IP literal because HAProxy does not resolve names there; for a unix sink it is the socket path. Compose sets `/run/cite/log.sock`. |
 | `CITE_ANALYTICS_MAX_BYTES` | `134217728` (128 MiB) | Memory budget for analytics, from 8 MiB to 64 GiB. See [analytics](analytics.md). Keep it well below the connector memory limit. |
 | `CITE_DOCKER_HOST` | unset | Enables the orchestrator. The overlay sets `http://dockerproxy:2375`. |
-| `CITE_EDGE_NETWORK` | `cite_edge` | Network that orchestrated executors join. |
+| `CITE_HAPROXY_CONTAINER` | `cite-node-haproxy` | Name of the HAProxy container, which the connector attaches to each stack's network. The overlay sets it. An empty value turns per-stack networks off. |
+| `CITE_EDGE_NETWORK` | `cite_edge` | Shared network that executors join when per-stack networks are off. |
 | `CITE_STACK_VERSION` | the connector's version | Image tag used for orchestrated stacks. |
 | `CITE_REGISTRY` | `ghcr.io/seggys116` | Registry prefix for orchestrated stack images. |
 | `RUST_LOG` | `info` | Log level. |
@@ -122,7 +126,7 @@ Back up the volume to keep sites, rules and credentials. Treat the backup as a s
 | Health | `docker compose -f docker-compose.node.yml ps` (the connector runs `cite-connector healthcheck` every 30 seconds) |
 | View the rendered config | `GET /api/v1/haproxy/config` |
 | Force a reload | `POST /api/v1/haproxy/reload` (reloads even when the config is unchanged) |
-| Lost the password or TOTP device | Run the connector's `reset-credentials` subcommand the same way as `init`, then restart the connector |
+| Lost the password or TOTP device | `docker compose -f docker-compose.node.yml run --rm --no-deps connector reset-credentials`. The running connector picks up the new credentials on its next request, so no restart is needed |
 | Update | Set `CITE_VERSION`, `docker compose -f docker-compose.node.yml pull`, then `up -d` |
 
 The healthcheck requests `/api/v1/healthz` over the container's loopback address. The connector admits loopback peers for `/healthz` only, so the check works whatever the allowlist says.
