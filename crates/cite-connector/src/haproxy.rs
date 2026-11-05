@@ -89,16 +89,19 @@ fn path_str(path: &Path) -> Result<String> {
 }
 
 fn stats_listen(runtime_addr: &str) -> Result<String> {
-    let port = runtime_addr
+    let (host, port) = runtime_addr
         .rsplit_once(':')
-        .and_then(|(_, port)| port.parse::<u16>().ok())
-        .filter(|port| *port > 0)
+        .and_then(|(host, port)| Some((host, port.parse::<u16>().ok().filter(|p| *p > 0)?)))
         .ok_or_else(|| {
             internal(format!(
                 "runtime address {runtime_addr:?} must be host:port"
             ))
         })?;
-    Ok(format!("ipv4@0.0.0.0:{port}"))
+    // an IPv4 literal pins the admin socket to one interface, a name falls back to all
+    let bind = host
+        .parse::<std::net::Ipv4Addr>()
+        .map_or("0.0.0.0".to_string(), |ip| ip.to_string());
+    Ok(format!("ipv4@{bind}:{port}"))
 }
 
 fn truncate(text: &str, max: usize) -> String {
@@ -663,7 +666,7 @@ mod tests {
     #[test]
     fn stats_listen_uses_the_port_of_the_runtime_address() {
         assert_eq!(stats_listen("haproxy:9999").unwrap(), "ipv4@0.0.0.0:9999");
-        assert_eq!(stats_listen("127.0.0.1:1").unwrap(), "ipv4@0.0.0.0:1");
+        assert_eq!(stats_listen("127.0.0.1:1").unwrap(), "ipv4@127.0.0.1:1");
         for bad in ["haproxy", "haproxy:0", "haproxy:x", "haproxy:70000", ""] {
             assert!(stats_listen(bad).is_err(), "{bad:?}");
         }

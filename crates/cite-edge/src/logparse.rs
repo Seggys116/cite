@@ -5,10 +5,10 @@ use crate::model::LogEvent;
 // Space separated fields; free text goes through url_enc so a raw space never appears inside one.
 pub const LOG_FORMAT: &str = concat!(
     "%Ts%ms %ci %b %s ",
-    "%[req.hdr(host),url_enc] %HM %[path,url_enc] %[query,length] ",
+    "%[var(txn.host),url_enc] %HM %[var(txn.path),url_enc] %[var(txn.qlen)] ",
     "%ST %B %U %Tt ",
-    "%[req.hdr(user-agent),url_enc] %[req.hdr(referer),url_enc] ",
-    "%[res.hdr(content-type),url_enc] %[var(txn.blocked),url_enc]"
+    "%[var(txn.ua),url_enc] %[var(txn.ref),url_enc] ",
+    "%[var(txn.ct),url_enc] %[var(txn.blocked),url_enc]"
 );
 
 const MAX_DATAGRAM: usize = 8192;

@@ -186,7 +186,7 @@ fn rule_cond(rule: &FirewallRule, cfg: &EdgeConfig) -> String {
     }
     let m = &rule.matchers;
     if let Some(re) = &m.path_regex {
-        parts.push(format!("{{ path_reg {re} }}"));
+        parts.push(format!("{{ path_reg -- {re} }}"));
     }
     if let Some(p) = &m.path_prefix {
         parts.push(format!("{{ path_beg {p} }}"));
@@ -195,7 +195,7 @@ fn rule_cond(rule: &FirewallRule, cfg: &EdgeConfig) -> String {
         parts.push(format!("{{ method {} }}", m.methods.join(" ")));
     }
     if let Some(re) = &m.user_agent_regex {
-        parts.push(format!("{{ req.hdr(user-agent) -m reg {re} }}"));
+        parts.push(format!("{{ req.hdr(user-agent) -m reg -- {re} }}"));
     }
     let cidrs: Vec<String> = m.cidrs.iter().filter_map(|c| parse_cidr(c)).collect();
     if !cidrs.is_empty() {
@@ -240,12 +240,23 @@ fn render_global(cfg: &EdgeConfig, opts: &RenderOptions, tls: bool, out: &mut St
     push(out, "");
 }
 
+// Names resolve lazily so a stopped standby slot cannot stop HAProxy from loading.
+fn render_resolvers(out: &mut String) {
+    push(out, "resolvers cite");
+    push_in(out, "parse-resolv-conf");
+    push_in(out, "resolve_retries 3");
+    push_in(out, "timeout resolve 1s");
+    push_in(out, "timeout retry 1s");
+    push_in(out, "hold valid 10s");
+    push_in(out, "hold nx 5s");
+    push(out, "");
+}
+
 fn render_defaults(cfg: &EdgeConfig, out: &mut String) {
     let s = &cfg.settings;
     push(out, "defaults");
     push_in(out, "mode http");
     push_in(out, "log global");
-    push_in(out, &format!("log-format {}", quote(LOG_FORMAT)));
     push_in(out, "option forwardfor");
     push_in(out, "option http-keep-alive");
     push_in(out, "option abortonclose");
@@ -304,16 +315,28 @@ fn render_frontend(cfg: &EdgeConfig, opts: &RenderOptions, tls: bool, out: &mut 
     let active_path = dir_join(&opts.maps_dir, "active.map");
     let maint_path = dir_join(&opts.maps_dir, "maint.map");
     push(out, "frontend fe_main");
+    push_in(out, &format!("log-format {}", quote(LOG_FORMAT)));
     push_in(out, &format!("bind :{}", s.http_port));
     if let (true, Some(port), Some(dir)) = (tls, s.https_port, &opts.tls_dir) {
         push_in(out, &format!("bind :{port} ssl crt {dir} alpn h2,http/1.1"));
+    }
+    // request headers are gone by log time, so the fields are copied into variables first
+    for line in [
+        "http-request set-var(txn.host) req.hdr(host),field(1,:),lower",
+        "http-request set-var(txn.path) path",
+        "http-request set-var(txn.qlen) query,length",
+        "http-request set-var(txn.ua) req.hdr(user-agent)",
+        "http-request set-var(txn.ref) req.hdr(referer)",
+        "http-response set-var(txn.ct) res.hdr(content-type)",
+    ] {
+        push_in(out, line);
     }
     for site in &cfg.sites {
         for line in host_acl_lines(&format!("host_{}", site.id), &site.hosts) {
             push_in(out, &line);
         }
         if let Some(re) = &site.path_regex {
-            push_in(out, &format!("acl path_{} path_reg {re}", site.id));
+            push_in(out, &format!("acl path_{} path_reg -- {re}", site.id));
         }
     }
     push_in(
@@ -394,7 +417,7 @@ fn render_backend(site: &Site, slot: Slot, out: &mut String) {
         push_in(
             out,
             &format!(
-                "server t{} {} check inter {}ms rise {} fall {} weight {}",
+                "server t{} {} check inter {}ms rise {} fall {} weight {} resolvers cite init-addr none",
                 i + 1,
                 t.addr,
                 h.interval_ms,
@@ -422,6 +445,7 @@ pub fn render(cfg: &EdgeConfig, opts: &RenderOptions) -> Result<Rendered, Valida
     let mut config = String::new();
     render_global(cfg, opts, tls, &mut config);
     render_defaults(cfg, &mut config);
+    render_resolvers(&mut config);
     render_frontend(cfg, opts, tls, &mut config);
     for site in &cfg.sites {
         render_backend(site, Slot::Blue, &mut config);
@@ -563,7 +587,7 @@ mod tests {
         let mut s = site("a", "a.com");
         s.path_regex = Some("^/api/".into());
         let r = render(&config(vec![s]), &opts()).unwrap();
-        assert_eq!(lines_with(&r, "acl path_a path_reg ^/api/").len(), 1);
+        assert_eq!(lines_with(&r, "acl path_a path_reg -- ^/api/").len(), 1);
         let route = lines_with(&r, "use_backend");
         assert_eq!(
             route,
@@ -594,7 +618,7 @@ mod tests {
         );
         assert!(
             r.config
-                .contains("server t2 10.0.0.6:80 check inter 2000ms rise 2 fall 3 weight 10")
+                .contains("server t2 10.0.0.6:80 check inter 2000ms rise 2 fall 3 weight 10 resolvers cite init-addr none")
         );
         assert!(r.config.contains("option httpchk GET /"));
     }
@@ -676,9 +700,9 @@ mod tests {
         let r = render(&cfg, &opts()).unwrap();
         let line = lines_with(&r, "deny_status 403 if host_b")[0];
         assert!(line.ends_with(
-            "if host_b { method TRACE DEBUG } { req.hdr(user-agent) -m reg (?i)bot } { src 10.0.0.0/8 2001:db8::1 } { req.hdr(host),field(1,:),lower -m end .a.com }"
+            "if host_b { method TRACE DEBUG } { req.hdr(user-agent) -m reg -- (?i)bot } { src 10.0.0.0/8 2001:db8::1 } { req.hdr(host),field(1,:),lower -m end .a.com }"
         ));
-        let global = lines_with(&r, "deny_status 403 if { path_reg ^/admin }");
+        let global = lines_with(&r, "deny_status 403 if { path_reg -- ^/admin }");
         assert_eq!(global.len(), 1);
         assert!(!global[0].contains("host_"));
     }
