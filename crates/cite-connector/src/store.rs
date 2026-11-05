@@ -989,6 +989,11 @@ mod tests {
         PW.get_or_init(|| cite_edge::auth::generate_password().expect("rng"))
     }
 
+    fn wrong_password() -> &'static str {
+        static PW: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        PW.get_or_init(|| cite_edge::auth::generate_password().expect("rng"))
+    }
+
     const NOW: u64 = 1_700_000_000;
 
     async fn open_temp() -> (tempfile::TempDir, Arc<Store>) {
@@ -1317,7 +1322,7 @@ mod tests {
             store
                 .verify_login_gated(
                     "admin",
-                    "wrong password!!",
+                    wrong_password(),
                     "000000",
                     |now: u64| -> std::result::Result<(), u64> {
                         let mut l = lock(&limiter);

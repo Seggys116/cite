@@ -550,7 +550,7 @@ mod tests {
         let hash = hash_password(password()).expect("hash");
         assert!(hash.starts_with("$argon2id$"));
         assert!(verify_password(password(), &hash));
-        assert!(!verify_password("wrong password!!", &hash));
+        assert!(!verify_password(wrong_password(), &hash));
     }
 
     #[test]
@@ -652,8 +652,11 @@ mod tests {
             format!("cite_{id}.{secret} "),
             format!("cite_{}g.{secret}", &id[..15]),
         ];
-        for token in bad {
-            assert!(parse_token(&token).is_none(), "{token:?}");
+        for (index, token) in bad.iter().enumerate() {
+            assert!(
+                parse_token(token).is_none(),
+                "malformed case {index} was accepted"
+            );
         }
     }
 
