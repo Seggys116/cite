@@ -101,6 +101,7 @@ export function loginScreen({ onSuccess }) {
       await withBusy(submitBtn, () => api.post('/session', { username: user.value.trim(), password: pass.value, totp: code.value() }));
       onSuccess(user.value.trim());
     } catch (e) {
+      // One generic message for 401 so the form does not reveal which factor was wrong.
       showError(err, e.status === 401 ? 'Those credentials or that code were not accepted.' : formatError(e));
       code.clear();
       code.focus();
@@ -204,6 +205,7 @@ export function onboardingScreen({ onDone }) {
       },
     });
     const uri = String(res.totp_uri || '');
+    // Only otpauth links are rendered, so a malformed response cannot inject a javascript: href.
     const link = uri.startsWith('otpauth://') ? h('a', { class: 'link', href: uri }, 'Open in authenticator app') : null;
     clear(host);
     host.append(h('h1', { class: 'auth-title' }, 'Scan with your authenticator'),
@@ -220,6 +222,7 @@ export function onboardingScreen({ onDone }) {
   }
 
   function stepDone() {
+    // Index 3 is past the last step, so all three steps show as done.
     mark(3);
     clear(host);
     host.append(h('div', { class: 'done-art' }, icon('check')),

@@ -108,8 +108,7 @@ impl Inner {
         detach(async move { this.mutate_now(&actor, &action, &detail, f).await }).await
     }
 
-    // Validates and dry-renders before persisting, then applies; a failed apply restores the old config
-    // and puts it back into HAProxy.
+    // Validates and dry-renders before persisting, then applies; a failed apply restores the old config in store and HAProxy.
     async fn mutate_now<T>(
         &self,
         actor: &str,

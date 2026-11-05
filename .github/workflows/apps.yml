@@ -6,6 +6,7 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# No default token scopes; each job requests only contents: read.
 permissions: {}
 
 concurrency:
@@ -19,6 +20,7 @@ jobs:
   desktop:
     name: desktop (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
+    # Only the Windows target is marked experimental, so its failure does not fail the workflow.
     continue-on-error: ${{ matrix.experimental }}
     timeout-minutes: 60
     permissions:

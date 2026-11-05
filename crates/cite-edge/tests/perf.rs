@@ -73,6 +73,7 @@ fn lat(label: &str, iters: usize, mut f: impl FnMut()) {
     );
 }
 
+// Events per second for parsing, recording, and both together; the best of 5 rounds is kept because scheduler noise only ever slows a round down
 #[test]
 #[ignore]
 fn ingest() {
@@ -116,6 +117,7 @@ fn ingest() {
     println!("parse+record best {best_pr:.0}/s, {apr:.1} allocs/event");
 }
 
+// Dashboard query latency over 90 days of retained events, as p50 and p99 across repeated runs, plus snapshot write and restore cost
 #[test]
 #[ignore]
 fn queries() {
@@ -274,8 +276,7 @@ fn render_validate() {
     }
 }
 
-// Writes a rendered config tree for a real HAProxy run. Env: CITE_PERF_DUMP (dir), CITE_PERF_SITES,
-// CITE_PERF_RULES, CITE_PERF_RATE (per-IP limit, 0 for none), CITE_PERF_UPSTREAM (host:port every site points at).
+// Writes a rendered config tree for a real HAProxy run. Env: CITE_PERF_DUMP (dir), CITE_PERF_SITES, CITE_PERF_RULES, CITE_PERF_RATE (per-IP limit, 0 for none), CITE_PERF_UPSTREAM (host:port every site points at).
 #[test]
 #[ignore]
 fn dump_config() {

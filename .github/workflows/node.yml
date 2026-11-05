@@ -22,6 +22,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # Copied to .mjs because node --check parses a .js file as CommonJS and would reject import and export.
       - name: Syntax check every dashboard script
         run: |
           tmp="$(mktemp -d)"
@@ -33,6 +34,7 @@ jobs:
           done < <(find crates/cite-dashboard/web -name '*.js' | sort)
           echo "checked $count scripts"
           [ "$count" -gt 0 ] || { echo "::error::no dashboard scripts found"; exit 1; }
+      # The console must stay free of HTML injection sinks, inline scripts and remote assets.
       - name: Static safety rules
         run: |
           web=crates/cite-dashboard/web
@@ -180,6 +182,7 @@ jobs:
         env:
           CITE_SAMPLE_OUT: ${{ runner.temp }}/haproxy
         run: cargo test -p cite-edge --locked --test sample_config
+      # Only HAProxy's own parser can say whether the rendered config is loadable.
       - name: Validate it with the real HAProxy binary
         run: |
           docker run --rm -v "${{ runner.temp }}/haproxy:/conf/haproxy:ro" docker.io/library/haproxy:3.0-bookworm haproxy -c -f /conf/haproxy/haproxy.cfg

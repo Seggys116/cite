@@ -260,8 +260,7 @@ fn bump32(v: &mut [u32], i: usize) {
     }
 }
 
-// Multiply-rotate hasher for the top-K maps. Their size is capped at a few dozen entries, so crafted
-// collisions cost a bounded probe and SipHash's flooding resistance is not worth its per-key cost.
+// Multiply-rotate hasher for the top-K maps: capped at a few dozen entries, so crafted collisions cost a bounded probe.
 #[derive(Default, Clone, Copy)]
 struct KeyHasher(u64);
 

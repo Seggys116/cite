@@ -33,6 +33,7 @@ jobs:
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
           persist-credentials: false
+      # workflow_dispatch accepts free text, so the tag is checked against semver and Cargo.toml before anything is built.
       - id: check
         env:
           TAG: ${{ github.event.inputs.tag || github.ref_name }}
@@ -53,6 +54,7 @@ jobs:
     name: desktop (${{ matrix.target }})
     needs: version
     runs-on: ${{ matrix.runner }}
+    # Only the Windows target is experimental, so its failure does not block the release.
     continue-on-error: ${{ matrix.experimental }}
     timeout-minutes: 60
     permissions:
@@ -157,6 +159,7 @@ jobs:
     needs: [version, desktop, servers]
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # The only job with write access; it is needed to attach files to the release.
     permissions:
       contents: write
     steps:

@@ -3,8 +3,7 @@ use std::net::IpAddr;
 use crate::model::LogEvent;
 use crate::validate::is_valid_id;
 
-// Space separated fields; free text goes through url_enc so a raw space never appears inside one.
-// Fixed-size fields come first and the capped variable-size ones last, so a line that loses its tail keeps the verdict.
+// Fixed-size fields come first and the capped, url_enc'd variable-size ones last, so a line that loses its tail keeps the verdict.
 pub const LOG_FORMAT: &str = concat!(
     "%Ts%ms %ci %b %s %[method,bytes(0,16),url_enc] %ST %B %U %Tt %[var(txn.qlen)] ",
     "%[var(txn.blocked),url_enc] %[var(txn.site),url_enc] ",

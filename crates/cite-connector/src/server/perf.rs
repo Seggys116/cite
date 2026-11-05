@@ -81,6 +81,7 @@ async fn perf_api_500_sites() {
             })
         })
         .collect();
+    // Seeded through the store directly so the timed requests measure only the API paths.
     store
         .update_detailed("perf", "seed", "500 sites", |cfg| {
             cfg.sites = serde_json::from_value(Value::Array(sites.clone()))?;
@@ -109,6 +110,7 @@ async fn perf_api_500_sites() {
 
     {
         let mut a = analytics.lock().expect("lock");
+        // Timestamps spread over 50 minutes so the windowed queries have to read many buckets.
         let now = now_ms();
         for i in 0..300_000i64 {
             a.record(LogEvent {

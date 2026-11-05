@@ -29,9 +29,7 @@ h1 { color: #ffd23f; }
 </html>
 `;
 
-// Renders page html in a fully sandboxed frame (no scripts, no same-origin access) scaled to fit its box.
-// The server hosts the html under its own strict policy so inline styles work; mock mode has no server
-// and falls back to srcdoc.
+// Renders page html in a fully sandboxed frame (no scripts, no same-origin access) scaled to fit its box. The server hosts the html under its own strict policy so inline styles work; mock mode has no server and falls back to srcdoc.
 export function pagePreview(page) {
   const frame = h('iframe', { class: 'preview-frame', sandbox: '', title: `Preview of ${page.name || 'page'}`, tabindex: '-1' });
   const box = h('div', { class: 'preview' }, frame);
@@ -70,6 +68,7 @@ function openEditor(node, existing, onSaved) {
   const status = h('input', { class: 'input mono', type: 'number', min: '100', max: '599', value: String(existing ? existing.status : 503), 'aria-label': 'Status code' });
   const html = h('textarea', { class: 'textarea mono', rows: '14', spellcheck: 'false', 'aria-label': 'Page HTML', value: existing ? existing.html : STARTER_HTML });
   const preview = pagePreview({ name: name.value, html: html.value });
+  // Every preview update posts the html to the server, so typing is debounced; pagePreview drops any reply that is no longer the latest
   html.addEventListener('input', debounce(() => preview.update(html.value), 250));
   const err = h('p', { class: 'form-error', role: 'alert', hidden: true });
   const save = button(existing ? 'Save page' : 'Create page', { kind: 'primary', iconName: 'check' });

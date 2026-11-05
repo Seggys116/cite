@@ -18,6 +18,7 @@ use tower::ServiceExt;
 
 const SECRET: &str = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
 const PASSWORD: &str = "correct horse battery";
+// Slow fake nodes make the summary timing show whether the 20 node calls run concurrently or one after another.
 const NODE_DELAY: Duration = Duration::from_millis(50);
 
 fn now() -> u64 {
@@ -75,6 +76,7 @@ async fn call(
         None => Body::empty(),
     };
     let mut req = builder.body(payload).expect("request");
+    // oneshot skips the listener, so the peer address handlers read from ConnectInfo is inserted by hand.
     req.extensions_mut()
         .insert(ConnectInfo(SocketAddr::from(([203, 0, 113, 9], 5555))));
     let resp = app.clone().oneshot(req).await.expect("response");

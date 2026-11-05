@@ -284,6 +284,7 @@ async fn healthz_is_public_and_carries_security_headers() {
     }
 }
 
+// With no credential every management route answers 401 with a challenge and a no-store header.
 #[tokio::test]
 async fn protected_routes_require_a_bearer_token() {
     let h = start().await;
@@ -305,6 +306,7 @@ async fn protected_routes_require_a_bearer_token() {
     }
 }
 
+// A wrong scheme, an empty bearer or a bare token must not be accepted by lenient header parsing.
 #[tokio::test]
 async fn garbage_and_malformed_credentials_are_rejected() {
     let h = start().await;
@@ -338,6 +340,7 @@ async fn login_issues_a_session_token_that_works() {
     assert!(me["expires_at"].as_str().is_some_and(|s| s.contains('T')));
 }
 
+// A mistyped password must never be persisted, so the audit trail cannot become a list of near-miss secrets.
 #[tokio::test]
 async fn failed_login_is_generic_and_audited_without_the_password() {
     let h = start().await;
@@ -355,6 +358,7 @@ async fn failed_login_is_generic_and_audited_without_the_password() {
     assert!(!entry.detail.contains("wrong password here"));
 }
 
+// Unknown user, wrong password and wrong code return the same body, so the response cannot be used to enumerate accounts.
 #[tokio::test]
 async fn every_credential_failure_looks_the_same() {
     let h = start().await;
@@ -372,6 +376,7 @@ async fn every_credential_failure_looks_the_same() {
     }
 }
 
+// A one-time code that was observed and resubmitted within its validity window must be refused.
 #[tokio::test]
 async fn totp_codes_cannot_be_replayed() {
     let h = start().await;
@@ -393,6 +398,7 @@ async fn totp_codes_cannot_be_replayed() {
     );
 }
 
+// After five failures even correct credentials are refused, which is what stops online guessing.
 #[tokio::test]
 async fn repeated_failures_lock_the_client_out_with_retry_after() {
     let h = start().await;
@@ -408,6 +414,7 @@ async fn repeated_failures_lock_the_client_out_with_retry_after() {
     assert!(body["error"].is_string());
 }
 
+// Logout has to revoke the token on the server, since a client that merely forgets it leaves a stolen copy valid.
 #[tokio::test]
 async fn logout_revokes_the_session() {
     let h = start().await;
@@ -1134,6 +1141,7 @@ async fn a_hand_written_http_1_1_request_is_served() {
     assert!(text.contains("x-content-type-options: nosniff"));
 }
 
+// A password pasted into the username field must not reach the audit log, so only whether the name matched is recorded.
 #[tokio::test]
 async fn failed_login_audit_records_only_whether_the_username_matched() {
     let h = start().await;
@@ -1165,6 +1173,7 @@ async fn failed_login_audit_records_only_whether_the_username_matched() {
     assert!(details.contains(&"peer=127.0.0.1 username_matched=true"));
 }
 
+// Parallel guesses race the limiter: exactly the limit may be processed and audited, and the rest are turned away.
 #[tokio::test]
 async fn concurrent_failed_logins_stop_at_the_per_client_limit() {
     let h = start().await;
@@ -1206,6 +1215,7 @@ async fn concurrent_failed_logins_stop_at_the_per_client_limit() {
     assert_eq!(failures, 5);
 }
 
+// A leaked API token must not be able to mint or revoke tokens, or it could outlive the session that created it.
 #[tokio::test]
 async fn api_tokens_cannot_manage_api_tokens() {
     let h = start().await;

@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# End to end check of the node stack (HAProxy plus connector) against a throwaway compose project.
-# Needs a connector image tagged ghcr.io/seggys116/cite-connector:${CITE_VERSION:-e2e}. E2E_KEEP=1 skips teardown.
+# End to end check of the node stack against a throwaway compose project; needs a connector image tagged ghcr.io/seggys116/cite-connector:${CITE_VERSION:-e2e}. E2E_KEEP=1 skips teardown.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -87,6 +86,7 @@ jq_ok() {
   pass "$1"
 }
 
+# Prints the 30 second step with the code so login() can wait for a fresh step instead of reusing a consumed one.
 totp() {
   python3 -I -c '
 import base64, hashlib, hmac, struct, sys, time
@@ -147,6 +147,7 @@ edge_is() {
   expect "$what" "$want" "$got"
 }
 
+# A firewall drop sends no HTTP reply, so curl exits 28, 52 or 56 instead of reporting a status.
 edge_dropped() {
   local out rc=0
   out=$(edge "$1" --max-time 3 -o /dev/null -w '%{http_code}') || rc=$?
@@ -217,6 +218,7 @@ code_is "audit readable" 200
 PEER=$(printf '%s' "$BODY" | jq -er '[.[] | select(.action == "login.success")] | last | .detail | sub("^peer="; "")')
 [ -n "$PEER" ] || fail "no peer address in the audit log"
 pass "connector sees the host as $PEER"
+# allow-all was only needed to learn the source address; restrict to it so the allowlist is exercised.
 export CITE_CONNECTOR_ALLOW=$PEER
 compose up -d connector >"$WORK/up.log" 2>&1 || fail "connector recreate failed: $(<"$WORK/up.log")"
 wait_api
@@ -230,6 +232,7 @@ code_is "healthz" 200
 jq_ok "healthz reports ok" '.ok == true'
 CONNECTOR_ID=$(compose ps -q connector)
 CONNECTOR_IP=$(docker inspect -f "{{(index .NetworkSettings.Networks \"${PROJECT}_public\").IPAddress}}" "$CONNECTOR_ID")
+# A source outside the allowlist must be cut off during the connection, so a curl error rather than an HTTP status is the pass condition.
 rc=0
 out=$(docker run --rm --network "${PROJECT}_public" docker.io/curlimages/curl:latest -sk --max-time 5 \
   -o /dev/null -w '%{http_code}' "https://$CONNECTOR_IP:7443/api/v1/healthz") || rc=$?
@@ -239,6 +242,7 @@ case $rc in
 esac
 expect "non-allowlisted source got no HTTP status" "000" "$out"
 
+# Each bad factor must produce the same response, so the API cannot be used to learn which of user, password or code was right.
 read -r _ GOOD_CODE < <(totp "$TOTP_SECRET")
 WRONG_CODE=$(printf '%06d' $(((10#$GOOD_CODE + 1) % 1000000)))
 api POST /api/v1/auth/login "$(login_body "$USERNAME" "$PASSWORD" "$WRONG_CODE")" ""

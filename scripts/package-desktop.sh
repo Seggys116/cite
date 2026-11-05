@@ -43,6 +43,7 @@ case $TARGET_OS in
   *) die "unknown target-os: $TARGET_OS (use macos, linux or windows)" ;;
 esac
 
+# The version ends up in file names and Info.plist, so only characters that are safe in both are accepted.
 case $VERSION in
   [0-9]*) ;;
   *) die "version must start with a digit: $VERSION" ;;
@@ -57,6 +58,7 @@ esac
 mkdir -p "$OUT_DIR"
 OUT_DIR=$(cd "$OUT_DIR" && pwd)
 STAGE=$(mktemp -d "${TMPDIR:-/tmp}/cite-desktop.XXXXXX")
+# The staging directory is removed on every exit path, including a failed archive step.
 trap 'rm -rf "$STAGE"' EXIT
 
 case $TARGET_OS in

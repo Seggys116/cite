@@ -1,5 +1,4 @@
-// The analytics API reports response sizes cumulatively: each bucket counts every response up to its bound.
-// Charts need per-bucket counts, so each bucket keeps only what the previous bound did not already include.
+// The API reports response sizes cumulatively; charts need per-bucket counts, so each bucket keeps only what the previous bound missed.
 export function perBucketSizes(sizes) {
   let previous = 0;
   return (sizes || []).map((b) => {

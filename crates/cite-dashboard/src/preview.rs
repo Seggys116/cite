@@ -18,6 +18,7 @@ pub const MAX_ENTRIES: usize = 32;
 pub const TTL_SECS: u64 = 5 * 60;
 const ID_BYTES: usize = 16;
 
+// A bare sandbox blocks scripts and forms in the previewed page; only inline styles and data: assets are allowed.
 pub const PREVIEW_CSP: &str =
     "sandbox; default-src 'none'; style-src 'unsafe-inline'; img-src data:; font-src data:";
 
@@ -117,6 +118,7 @@ pub async fn serve(
         Some(token) => s.validate_session(token, now).await.is_some(),
         None => false,
     };
+    // Knowing the random id is not enough; the html is only for a signed-in session.
     if !signed_in {
         return StatusCode::UNAUTHORIZED.into_response();
     }

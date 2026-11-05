@@ -4,7 +4,6 @@ export function formatError(err) {
   return err && err.message ? err.message : String(err);
 }
 
-// ---- formatting ----
 
 const compact = new Intl.NumberFormat('en', { notation: 'compact', maximumFractionDigits: 1 });
 
@@ -87,6 +86,7 @@ export function newId(prefix) {
   return `${prefix}-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
 }
 
+// A hyphen is left alone because it is only special inside a character class
 export function escapeRegex(text) {
   return String(text).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
@@ -100,7 +100,6 @@ export function checkRegex(source) {
   }
 }
 
-// ---- small building blocks ----
 
 export function pill(text, kind = 'muted', iconName = '') {
   return h('span', { class: 'pill pill-' + kind }, iconName ? icon(iconName) : null, text);
@@ -297,7 +296,6 @@ export function copyText(text, okMessage = 'Copied to clipboard') {
   else fallback();
 }
 
-// ---- states ----
 
 export function skeletonRows(n = 6) {
   return h('div', { class: 'skel-list', 'aria-busy': 'true', 'aria-label': 'Loading' },
@@ -380,14 +378,15 @@ export function dataTable({ columns, rows, onRowClick, empty, rowLabel }) {
   return h('div', { class: 'table-wrap' }, h('table', { class: 't' }, h('thead', {}, head), body));
 }
 
-// ---- toasts ----
 
 export function toast(message, kind = 'info', ms = 4200) {
   const host = document.getElementById('toasts');
   const dismiss = () => {
     el.classList.add('leaving');
+    // Matches the 0.2s fade-out on .toast.leaving
     setTimeout(() => el.remove(), 200);
   };
+  // The message is added as a text node, so server error text can never inject markup
   const el = h('div', { class: 'toast toast-' + kind, role: kind === 'error' ? 'alert' : 'status' },
     icon(kind === 'error' ? 'alert' : kind === 'success' ? 'check' : 'info'),
     h('span', { class: 'toast-msg' }, message),
@@ -396,13 +395,13 @@ export function toast(message, kind = 'info', ms = 4200) {
   setTimeout(dismiss, ms);
 }
 
-// ---- layers: drawers and modals ----
 
 const FOCUSABLE = 'a[href],button:not([disabled]),input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])';
 const layers = [];
 
 function trapTab(e, panel) {
   if (e.key !== 'Tab') return;
+  // Hidden controls have no offsetParent; counting them as first or last would let focus escape the panel
   const items = Array.from(panel.querySelectorAll(FOCUSABLE)).filter((el) => el.offsetParent !== null);
   if (!items.length) {
     e.preventDefault();
@@ -444,6 +443,7 @@ function openLayer(panel, { onClose, focus } = {}) {
     layers.splice(layers.indexOf(handle), 1);
     document.removeEventListener('keydown', onKey);
     wrap.classList.add('closing');
+    // Waits out the 0.16s fade-out on .layer.closing before removing the layer
     setTimeout(() => {
       wrap.remove();
       const idle = !layers.length && (!document.activeElement || document.activeElement === document.body);

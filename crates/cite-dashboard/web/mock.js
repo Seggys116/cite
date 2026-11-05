@@ -42,7 +42,7 @@ function weighted(rnd, entries) {
   return entries[entries.length - 1][0];
 }
 
-// ---- seed data ----
+// Two nodes are seeded so the node picker, per-node health and replicated placement can all be tried.
 
 const PAGE_HTML = (title, text, accent) => `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><title>${title}</title>
@@ -136,7 +136,7 @@ function seedNode(name, url, idx) {
   return node;
 }
 
-// ---- traffic synthesis ----
+// Events come from a generator seeded by the node name, so each node keeps a recognisable traffic mix.
 
 const SITE_SHARE = { shop: 0.55, api: 0.35, docs: 0.1 };
 const WINDOWS = { '15m': [15, 60], '1h': [60, 60], '24h': [96, 900], '7d': [168, 3600], '30d': [120, 21600] };
@@ -215,7 +215,8 @@ function timeseries(node, win, siteId) {
   for (let i = 0; i < count; i += 1) {
     const ts = end - (count - 1 - i) * step;
     const hour = ((ts / 3600) % 24 + 24) % 24;
-    const diurnal = 0.62 + 0.38 * Math.sin(((hour - 8) / 24) * Math.PI * 2);
+    // Traffic peaks in the afternoon and dips overnight, with a rare error spike, so the charts look plausible.
+    const diurnal =0.62 + 0.38 * Math.sin(((hour - 8) / 24) * Math.PI * 2);
     const wobble = 0.85 + 0.3 * noise(ts / step, salt);
     const requests = Math.round((step / 60) * base * diurnal * wobble);
     const spike = noise(ts / step, salt + 7) > 0.93 ? 0.05 : 0;
@@ -230,6 +231,7 @@ function timeseries(node, win, siteId) {
     p.blocked = Math.floor((totalBlocked * weights[i]) / sum);
     left -= p.blocked;
   });
+  // Rounding leaves a remainder; it goes one by one to the heaviest buckets so the total stays exact.
   const order = weights.map((w, i) => [w, i]).sort((a, b) => b[0] - a[0]);
   for (let i = 0; left > 0 && order.length; i = (i + 1) % order.length) {
     points[order[i][1]].blocked += 1;
@@ -312,7 +314,7 @@ function filterEvents(node, q) {
   return out;
 }
 
-// ---- helpers for state changes ----
+// Every change is recorded in the node audit log, as the real connector does, so the audit view has content.
 
 function audit(node, action, detail) {
   node.audit.unshift({ at: iso(Date.now()), actor: state.username, action, detail });
@@ -334,6 +336,7 @@ function pushHistory(site, slot, action, note) {
   return site.history[site.history.length - 1];
 }
 
+// Mirrors the node's own validation so form errors can be seen without a real node.
 function checkSiteShape(site) {
   if (!site || !/^[a-z0-9][a-z0-9-]{0,62}$/.test(site.id || '')) throw new ApiError(400, 'invalid site id');
   if (!site.name || !Array.isArray(site.hosts) || !site.hosts.length) throw new ApiError(400, 'site needs a name and at least one host');
@@ -346,6 +349,7 @@ function checkSiteShape(site) {
   }
 }
 
+// Not scannable: three finder squares plus seeded noise, enough to preview the onboarding layout.
 function fakeQr(seedText) {
   const rnd = mulberry32(hashString(seedText));
   const size = 29;
@@ -384,7 +388,7 @@ function haproxyConfig(node) {
   return lines.join('\n') + '\n';
 }
 
-// ---- routing ----
+// Paths follow the real API layout: /nodes/<name>/... is stripped to the node part and handed to nodeRoute.
 
 function findNode(name) {
   const node = state.nodes.find((n) => n.name === name);
@@ -435,6 +439,7 @@ async function siteRoute(node, method, seg, body) {
     const targets = (body && body.targets) || [];
     if (!targets.length) throw new ApiError(400, 'deploy needs at least one target');
     await sleep(1600);
+    // A target address containing bad or down fails the simulated health gate, so the failure path can be tried by hand.
     const broken = targets.some((t) => /bad|down/i.test(t.addr));
     if (broken) {
       audit(node, 'site.deploy', `site ${id} deploy failed health checks`);

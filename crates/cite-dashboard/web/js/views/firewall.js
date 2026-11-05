@@ -8,7 +8,8 @@ import {
 import { noNodes, nodeNotice, listOf } from './common.js';
 
 const METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS', 'TRACE', 'CONNECT'];
-const CIDR_RE = /^[0-9a-fA-F:.]+(\/\d{1,3})?$/;
+// Loose shape check for fast feedback; the node validates the ranges itself.
+const CIDR_RE =/^[0-9a-fA-F:.]+(\/\d{1,3})?$/;
 
 const ACTIONS = {
   deny: { label: 'Deny', kind: 'bad', text: 'Answer with 403 Forbidden. Clear to the client and cheap for the edge.' },
@@ -77,6 +78,7 @@ function openRuleEditor(node, rule, sites, onSaved) {
     };
     if (!name.value.trim()) return fail('Give the rule a name.');
     if (pathRe.invalid() || uaRe.invalid()) return fail('Fix the invalid regular expression first.');
+    // An empty matcher set would match every request and lock out all traffic.
     if (!matchers.path_regex && !matchers.path_prefix && !matchers.methods.length && !matchers.user_agent_regex && !matchers.cidrs.length && !matchers.host) {
       return fail('A rule needs at least one matcher, otherwise it would block everything.');
     }
@@ -140,6 +142,7 @@ function render({ rules, presets, summary, sites }, reload, node) {
         render: (r) => toggle({
           checked: r.enabled,
           label: `Enable ${r.name}`,
+          // Rethrowing makes the switch snap back when the node rejects the change.
           onChange: async (value) => {
             try {
               await nodeApi(node).put('/firewall/rules/' + encodeURIComponent(r.id), { ...r, enabled: value });

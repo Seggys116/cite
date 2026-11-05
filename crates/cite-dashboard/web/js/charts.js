@@ -124,6 +124,7 @@ export function timeSeriesChart(points, { series }) {
 }
 
 export function donut(segments, { centerTop = '', centerBottom = '', size = 160 } = {}) {
+  // The radius 15.9155 makes the circumference 100, so dash lengths can be written as percentages.
   const total = segments.reduce((sum, seg) => sum + seg.value, 0);
   const svg = s('svg', { class: 'donut', viewBox: '0 0 42 42', width: size, height: size, role: 'img', 'aria-label': 'Breakdown' },
     s('circle', { class: 'donut-ring', cx: 21, cy: 21, r: 15.9155, fill: 'none' }));
@@ -148,7 +149,8 @@ export function hbars(items, { format = fmtNum } = {}) {
   if (!items.length) return h('p', { class: 'muted' }, 'No data in this window.');
   return h('div', { class: 'hbars' }, items.map((item) => {
     const fill = h('i', { class: 'hbar-fill ' + (item.cls || '') });
-    fill.style.setProperty('width', Math.max(2, (item.value / max) * 100).toFixed(1) + '%');
+    // A 2 percent floor keeps small but non-zero values visible.
+    fill.style.setProperty('width',Math.max(2, (item.value / max) * 100).toFixed(1) + '%');
     return h('div', { class: 'hbar' },
       h('span', { class: 'hbar-label', title: item.label }, item.label),
       h('span', { class: 'hbar-track' }, fill),

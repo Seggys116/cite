@@ -39,8 +39,7 @@ pub struct Deployer {
     timing: Timing,
 }
 
-// Runs the operation to completion even when the caller is dropped, so a client disconnect or the
-// request timeout cannot stop a deploy between its steps.
+// Runs to completion even when the caller is dropped, so a disconnect or the request timeout cannot stop a deploy midway.
 pub(crate) async fn detach<T: Send + 'static>(
     op: impl Future<Output = Result<T>> + Send + 'static,
 ) -> Result<T> {
@@ -143,8 +142,7 @@ impl Deployer {
         self
     }
 
-    // Every change to the stored config, its apply and a restore after a failed apply runs under this
-    // one lock, so a restore can never wipe a change another operation made in the meantime.
+    // Config changes, their apply and any restore after a failed apply share this lock, so a restore never wipes another operation's change.
     pub fn config_lock(&self) -> &Mutex<()> {
         &self.config_lock
     }
@@ -297,8 +295,7 @@ impl Deployer {
         });
     }
 
-    // After a restart the drain timers are gone, so idle stacks of orchestrated sites are stopped
-    // once the active slot is confirmed healthy.
+    // After a restart the drain timers are gone, so idle stacks of orchestrated sites are stopped once the active slot is healthy.
     pub async fn reconcile_idle_stacks(&self) {
         let Some(orch) = self.orchestrator.clone() else {
             return;
@@ -456,8 +453,7 @@ impl Deployer {
         detach(async move { this.update_site_inner(&actor, site).await }).await
     }
 
-    // Slots, the active choice and maintenance move only through their own endpoints, so a stale
-    // client copy of the site cannot undo a deploy.
+    // Slots, the active choice and maintenance move only through their own endpoints, so a stale client copy cannot undo a deploy.
     async fn update_site_inner(&self, actor: &str, mut site: Site) -> Result<Site> {
         validate_site(&site)?;
         let id = site.id.clone();

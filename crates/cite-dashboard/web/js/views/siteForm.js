@@ -7,7 +7,8 @@ import {
 } from '../ui.js';
 import { noNodes, listOf } from './common.js';
 
-const ADDR_RE = /^[^\s:/]+:\d{1,5}$/;
+// Targets are host:port only, with no scheme or path, because they become HAProxy server addresses.
+const ADDR_RE =/^[^\s:/]+:\d{1,5}$/;
 const HOST_RE = /^(\*\.)?[a-z0-9]([a-z0-9.-]*[a-z0-9])?$/i;
 const ID_RE = /^[a-z0-9][a-z0-9-]{0,62}$/;
 
@@ -92,6 +93,7 @@ export function newSiteView(ctx) {
   const id = h('input', { class: 'input mono', type: 'text', placeholder: 'storefront', autocomplete: 'off', spellcheck: 'false' });
   const idHint = h('span', { class: 'hint' }, 'Lowercase letters, digits and dashes. Used in URLs and cannot change later.');
   name.addEventListener('input', () => {
+    // Stop deriving the id once the user edits it, since it cannot change after creation.
     if (!idTouched) id.value = slugify(name.value);
   });
   id.addEventListener('input', () => { idTouched = true; });
@@ -161,6 +163,7 @@ export function newSiteView(ctx) {
       source: null,
     };
     const mode = modeAll.checked ? 'replicate' : 'each';
+    // Replicate targets only online nodes, so an offline node cannot fail the whole request.
     const nodes = mode === 'replicate' ? onlineNames : checks.filter((c) => c.checked).map((c) => c.value);
     try {
       const res = await withBusy(submit, () => api.post('/deployments', { nodes, site, mode }));

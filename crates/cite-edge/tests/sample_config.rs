@@ -42,6 +42,7 @@ fn sample() -> EdgeConfig {
         }
     }))
     .expect("sample json");
+    // Every preset is included so the rendered sample covers all the preset rule shapes HAProxy has to accept.
     for p in presets() {
         cfg.firewall.extend(p.rules);
     }
@@ -80,6 +81,7 @@ fn sample_config_renders_and_optionally_dumps() {
         unix.config
             .contains("log /conf/haproxy/log.sock len 8192 format rfc5424 local0")
     );
+    // The CI haproxy job points this at a directory and then runs the real binary over the dump.
     if let Ok(dir) = std::env::var("CITE_SAMPLE_OUT") {
         let dir = std::path::Path::new(&dir);
         std::fs::create_dir_all(dir.join("maps")).expect("maps dir");

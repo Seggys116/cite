@@ -40,6 +40,7 @@ pub struct Provisioned {
     pub reset: bool,
 }
 
+// Secrets are redacted so a stray {:?} cannot leak them into logs.
 impl fmt::Debug for Provisioned {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Provisioned")
@@ -64,6 +65,7 @@ fn resolve_username(
         return Ok(name);
     }
     let default = existing.unwrap_or(DEFAULT_USERNAME);
+    // With no terminal nobody can answer the prompt, so scripts and containers get the default.
     if non_interactive || !std::io::stdin().is_terminal() {
         return Ok(default.to_string());
     }
@@ -103,6 +105,7 @@ pub async fn provision(
 
     let password = generate_password().map_err(auth_failure)?;
     let totp_secret = totp::generate_secret().map_err(auth_failure)?;
+    // Password hashing is deliberately slow, so it runs off the async worker threads.
     let to_hash = password.clone();
     let password_hash = tokio::task::spawn_blocking(move || hash_password(&to_hash))
         .await
@@ -178,6 +181,7 @@ pub fn format_report(p: &Provisioned) -> Result<String> {
     Ok(out)
 }
 
+// Only what a script needs; the otpauth URI and QR code stay in the human readable report.
 pub fn format_json(p: &Provisioned) -> Result<String> {
     let fingerprint = p.tls.as_ref().map(|t| t.fingerprint.as_str());
     serde_json::to_string(&serde_json::json!({

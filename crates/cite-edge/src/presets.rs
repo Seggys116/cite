@@ -45,9 +45,7 @@ fn ua_rule(preset: &str, n: usize, title: &str, action: FirewallAction, re: &str
 fn sensitive_files() -> Preset {
     let drop = FirewallAction::Drop;
     let p = "sensitive-files";
-    // (?i) keeps the match case-insensitive, which needs a PCRE-enabled haproxy build
-    // (;[^/]*)? tolerates path parameters, which servlet containers strip from every segment
-    // the dotfile rule has no terminator on purpose, so .env~, .env-prod, .env.local and .gitignore all match
+    // (?i) needs a PCRE-enabled haproxy build; (;[^/]*)? tolerates path parameters, which servlet containers strip from every segment. The dotfile rule has no terminator on purpose, so .env~, .env-prod, .env.local and .gitignore all match
     Preset {
         name: p,
         title: "Sensitive files",
@@ -100,6 +98,7 @@ fn sensitive_files() -> Preset {
 }
 
 fn cms_probes() -> Preset {
+    // A site that really serves one of these paths, such as WordPress, must not enable this preset
     let drop = FirewallAction::Drop;
     // ids are derived from the preset name and position, so they stay stable across releases
     let p = "cms-probes";
@@ -143,6 +142,7 @@ fn cms_probes() -> Preset {
 fn scanners() -> Preset {
     let tar = FirewallAction::Tarpit;
     let p = "scanners";
+    // Tarpit holds the connection for the 5s tarpit timeout instead of closing it, which ties up the scanner's slot
     Preset {
         name: p,
         title: "Scanners",
@@ -162,6 +162,7 @@ fn scanners() -> Preset {
 
 fn odd_methods() -> Preset {
     let p = "odd-methods";
+    // TRACE and TRACK echo request headers back and CONNECT asks for a tunnel; none belong on a website
     Preset {
         name: p,
         title: "Unusual HTTP methods",

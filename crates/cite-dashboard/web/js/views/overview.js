@@ -29,6 +29,7 @@ async function load() {
   const entries = listOf(await api.get('/nodes/summary')).map(normalize);
   const extra = await Promise.all(entries.filter((e) => e.online).map(async (e) => {
     const n = nodeApi(e.name);
+    // allSettled so one failing call leaves its widget empty instead of hiding the whole node.
     const [sum, series, sites] = await Promise.allSettled([
       n.get('/analytics/summary' + qs({ window: '15m' })),
       n.get('/analytics/timeseries' + qs({ window: '1h' })),

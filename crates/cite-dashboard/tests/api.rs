@@ -34,6 +34,7 @@ fn code(steps_ahead: u64) -> String {
     totp::code_at(SECRET, now() + 30 * steps_ahead).expect("code")
 }
 
+// Found by exclusion from the accepted window, so the test can never hit a valid code by chance.
 fn wrong_code() -> String {
     let valid: Vec<String> = (0..5)
         .filter_map(|i| totp::code_at(SECRET, (now() + 30 * i).saturating_sub(60)))
@@ -141,6 +142,7 @@ async fn big(State(f): State<Shared>, headers: HeaderMap) -> Response {
     if !authorized(&f, &headers) {
         return err(StatusCode::UNAUTHORIZED, "unauthorized");
     }
+    // An oversized answer that the proxy has to refuse instead of buffering.
     vec![b'a'; 9 * 1024 * 1024].into_response()
 }
 
@@ -160,6 +162,7 @@ async fn create_site(
         return err(StatusCode::UNAUTHORIZED, "unauthorized");
     }
     f.created_bodies.lock().expect("lock").push(body.clone());
+    // Recorded as received, then stripped so the stored and echoed site never carries the token.
     if let Some(obj) = body.as_object_mut() {
         obj.remove("github_token");
     }
@@ -333,6 +336,7 @@ async fn call(
         }
         None => Body::empty(),
     };
+    // oneshot has no socket, so a fixed peer from TEST-NET-3 is attached for the allowlist and login limiter.
     let mut req = builder.body(payload).expect("request");
     req.extensions_mut()
         .insert(ConnectInfo(SocketAddr::from(([203, 0, 113, 9], 5555))));
@@ -610,6 +614,7 @@ async fn transport_settings_control_secure_cookies_and_hsts() {
     assert!(reply.header("set-cookie").ends_with("; Secure"));
 }
 
+// Wrong password, unknown user and wrong code answer identically, so an attacker cannot enumerate usernames or learn which factor failed.
 #[tokio::test]
 async fn failed_logins_look_identical_and_lock_out_after_five() {
     let h = harness();
@@ -662,6 +667,7 @@ async fn a_totp_code_cannot_be_replayed() {
     assert_eq!(replay.status, StatusCode::UNAUTHORIZED);
 }
 
+// A made-up session token must be refused exactly like a missing cookie.
 #[tokio::test]
 async fn api_routes_need_a_live_session() {
     let h = harness();
@@ -696,6 +702,7 @@ async fn logout_revokes_the_session_and_clears_the_cookie() {
     assert_eq!(after.status, StatusCode::UNAUTHORIZED);
 }
 
+// A cross-site page can ride the session cookie but cannot read the CSRF token, so writes without it must fail.
 #[tokio::test]
 async fn state_changing_requests_need_the_session_csrf_token() {
     let h = harness();
@@ -727,6 +734,7 @@ async fn state_changing_requests_need_the_session_csrf_token() {
     assert_eq!(read.status, StatusCode::OK);
 }
 
+// A CSRF token taken from one session must not unlock writes on another.
 #[tokio::test]
 async fn csrf_tokens_do_not_transfer_between_sessions() {
     let h = harness();
@@ -750,6 +758,7 @@ async fn csrf_tokens_do_not_transfer_between_sessions() {
     assert_eq!(own.status, StatusCode::NOT_FOUND);
 }
 
+// Form and multipart bodies are what a cross-site HTML form can send without a preflight, so they are refused.
 #[tokio::test]
 async fn request_bodies_must_be_json() {
     let h = harness();
@@ -769,6 +778,7 @@ async fn request_bodies_must_be_json() {
     }
 }
 
+// An Origin that differs from the Host is refused even with a valid session cookie, and login follows the same rule.
 #[tokio::test]
 async fn cross_origin_requests_are_refused() {
     let h = harness();
@@ -792,6 +802,7 @@ async fn cross_origin_requests_are_refused() {
     assert_eq!(ok.status, StatusCode::OK);
 }
 
+// Errors and 404s carry the same policy as pages, so no response is left without the CSP.
 #[tokio::test]
 async fn security_headers_are_on_every_response() {
     let h = harness();
@@ -872,6 +883,7 @@ async fn unknown_paths_fall_back_to_the_spa_but_not_assets_or_api() {
     assert_eq!(post.status, StatusCode::METHOD_NOT_ALLOWED);
 }
 
+// /healthz stays open to any peer so container healthchecks keep working behind the allowlist.
 #[tokio::test]
 async fn the_ip_allowlist_blocks_other_peers_but_not_the_healthcheck() {
     let h = harness_with(onboarded(), &[], &[("CITE_DASHBOARD_ALLOW", "10.0.0.0/8")]);
@@ -1038,6 +1050,7 @@ async fn summary_marks_unreachable_nodes_without_failing_the_request() {
     );
 }
 
+// The browser's own Authorization header and cookies must never reach a node, which only sees the stored node token.
 #[tokio::test]
 async fn proxy_forwards_with_the_stored_token_and_nothing_from_the_browser() {
     let fake = new_fake(NODE_TOKEN);
@@ -1075,6 +1088,7 @@ async fn proxy_forwards_with_the_stored_token_and_nothing_from_the_browser() {
     assert_eq!(put.json()["headers"]["content-type"], "application/json");
 }
 
+// Plain and percent-encoded dot-dot segments model an attempt to reach node endpoints the console does not expose, such as auth.
 #[tokio::test]
 async fn proxy_only_forwards_allowlisted_prefixes() {
     let fake = new_fake(NODE_TOKEN);
@@ -1109,6 +1123,7 @@ async fn proxy_only_forwards_allowlisted_prefixes() {
     assert_eq!(trace.status, StatusCode::METHOD_NOT_ALLOWED);
 }
 
+// The proxy is a write path to the node, so it enforces CSRF itself and the fake node must see nothing.
 #[tokio::test]
 async fn proxy_requires_the_csrf_token_for_writes() {
     let fake = new_fake(NODE_TOKEN);
@@ -1129,6 +1144,7 @@ async fn proxy_requires_the_csrf_token_for_writes() {
     assert!(fake.sites.lock().expect("lock").is_empty());
 }
 
+// The browser sees only name, url, online and version; stored tokens and CA material stay server side.
 #[tokio::test]
 async fn node_tokens_and_trust_material_never_reach_the_browser() {
     let fake = new_fake(NODE_TOKEN);
@@ -1167,6 +1183,7 @@ async fn proxy_reports_a_rejected_stored_token_as_a_gateway_error() {
     );
 }
 
+// A node cannot make the dashboard buffer an unbounded response, and a client cannot push an unbounded request through.
 #[tokio::test]
 async fn proxy_bounds_request_and_response_sizes() {
     let fake = new_fake(NODE_TOKEN);
@@ -1321,6 +1338,7 @@ async fn deployments_validate_their_input() {
     assert!(fake.sites.lock().expect("lock").is_empty());
 }
 
+// The GitHub token travels to the node beside the site but is never echoed to the browser or written to the dashboard config.
 #[tokio::test]
 async fn a_github_token_is_sent_beside_the_site_and_not_echoed() {
     let fake = new_fake(NODE_TOKEN);
@@ -1385,6 +1403,7 @@ async fn deployments_need_a_session_and_the_csrf_token() {
     assert_eq!(no_csrf.status, StatusCode::FORBIDDEN);
 }
 
+// Without the one-time token from the dashboard log nobody can claim a fresh install, and repeated bad tokens lock out even the right one.
 #[tokio::test]
 async fn setup_needs_the_one_time_token_and_failures_lock_out() {
     let h = harness_with(DashboardConfig::default(), &[], &[]);
@@ -1482,6 +1501,7 @@ async fn preview_html_is_capped_at_256_kib() {
     );
 }
 
+// Preview html is untrusted, so it is served only to signed-in users and under a sandbox policy that allows no script.
 #[tokio::test]
 async fn stored_previews_are_served_sandboxed_to_signed_in_users_only() {
     let h = harness();
@@ -1535,6 +1555,7 @@ async fn secure_sessions_name_the_cookie_with_the_host_prefix() {
     assert_eq!(dup.status, StatusCode::UNAUTHORIZED);
 }
 
+// A cookie planted from a sibling origin could shadow the real one, so two session cookies mean no session instead of picking one.
 #[tokio::test]
 async fn a_planted_duplicate_session_cookie_is_unauthenticated() {
     let h = harness();
@@ -1544,6 +1565,7 @@ async fn a_planted_duplicate_session_cookie_is_unauthenticated() {
     assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
 }
 
+// Guessing names from many addresses must not use up the real operator's attempts.
 #[tokio::test]
 async fn failures_for_unknown_usernames_never_lock_the_real_operator() {
     let h = harness();
@@ -1556,6 +1578,7 @@ async fn failures_for_unknown_usernames_never_lock_the_real_operator() {
     let _ok = login(&h).await;
 }
 
+// Peers in one /64 share a limiter key, so rotating the low bits of an address does not dodge the limit.
 #[tokio::test]
 async fn ipv6_peers_in_one_prefix_share_a_limiter_key() {
     let h = harness();
@@ -1574,6 +1597,7 @@ async fn ipv6_peers_in_one_prefix_share_a_limiter_key() {
     );
 }
 
+// A failing login must not wait on the config write gate, or a stuck write could freeze every login.
 #[tokio::test]
 async fn a_slow_login_does_not_hold_the_write_gate() {
     let h = harness();
@@ -1588,6 +1612,7 @@ async fn a_slow_login_does_not_hold_the_write_gate() {
     assert_eq!(reply, StatusCode::UNAUTHORIZED);
 }
 
+// Forty parallel guesses from one peer: only the limit's worth may reach the expensive password hash.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_concurrent_login_burst_is_capped_at_the_limit_before_any_hash_runs() {
     let h = harness();
@@ -1633,6 +1658,7 @@ fn seed_config_file(h: &Harness) {
     ConfigFile::save(&h.config_path, &onboarded()).expect("seed config");
 }
 
+// After credentials are reset from the CLI, a session issued under the old credentials must stop working.
 #[tokio::test]
 async fn a_cli_reset_is_adopted_and_drops_existing_sessions() {
     let h = harness();
@@ -1647,6 +1673,7 @@ async fn a_cli_reset_is_adopted_and_drops_existing_sessions() {
     assert_eq!(admin.username, "ops");
 }
 
+// A stale in-memory config must not write over a reset made on disk meanwhile, or the old credentials would come back.
 #[tokio::test]
 async fn running_state_cannot_overwrite_a_cli_reset() {
     let h = harness();

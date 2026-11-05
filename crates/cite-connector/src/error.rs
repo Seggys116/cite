@@ -34,6 +34,7 @@ impl ConnectorError {
     }
 }
 
+// Validation failures are caused by the request, so they map to 400, not 500.
 impl From<ValidationError> for ConnectorError {
     fn from(e: ValidationError) -> Self {
         Self::BadRequest(e.0)

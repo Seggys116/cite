@@ -186,8 +186,7 @@ fn disk_generation(path: &Path) -> u64 {
         .map_or(0, |g| g.generation)
 }
 
-// Held across a generation check and the rename that follows, in the server and the CLI alike, so a
-// reset can never be overwritten by a write that started from older state.
+// Held across a generation check and the rename after it, in server and CLI alike, so a reset is never overwritten by older state.
 fn lock_auth(path: &Path) -> io::Result<fs::File> {
     let file = fs::OpenOptions::new()
         .create(true)

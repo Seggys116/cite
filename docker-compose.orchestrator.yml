@@ -1,5 +1,4 @@
-# Overlay for docker-compose.node.yml: docker compose -f docker-compose.node.yml -f docker-compose.orchestrator.yml up -d
-# Set DOCKER_GID in .env to the group id that owns /var/run/docker.sock (stat -c %g /var/run/docker.sock).
+# Overlay for docker-compose.node.yml; set DOCKER_GID in .env to the group id that owns /var/run/docker.sock (stat -c %g).
 
 services:
   dockerproxy:

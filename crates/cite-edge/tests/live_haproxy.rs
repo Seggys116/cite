@@ -1,5 +1,4 @@
-// Needs docker and the haproxy:3.0-bookworm, nginx:alpine and curlimages/curl images.
-// Run with: cargo test -p cite-edge --test live_haproxy -- --ignored --nocapture
+// Needs docker and the haproxy:3.0-bookworm, nginx:alpine and curlimages/curl images; run with --ignored.
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 

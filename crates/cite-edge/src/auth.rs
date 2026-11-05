@@ -85,6 +85,7 @@ pub fn hash_password(pw: &str) -> Result<String, AuthError> {
     Ok(hash.to_string())
 }
 
+// Spends the same Argon2 cost as a real check, so an unknown user takes as long as a wrong password.
 pub fn dummy_verify() {
     if let Ok(salt) = SaltString::encode_b64(&[0x5au8; 16]) {
         let _ = hasher().hash_password(b"cite-dummy-password", &salt);
@@ -138,6 +139,7 @@ pub fn random_token() -> Result<String, AuthError> {
     Ok(format!("{TOKEN_PREFIX}{}", to_hex(&bytes)))
 }
 
+// Tokens carry 256 random bits, so a fast hash is enough to keep a leaked table from being usable as credentials.
 pub fn hash_token(token: &str) -> String {
     let digest = Sha256::digest(token.as_bytes());
     to_hex(digest.as_slice())
@@ -178,6 +180,7 @@ impl SessionStore {
 
     pub fn create(&mut self, username: &str, now: u64) -> Result<(String, u64), AuthError> {
         let token = random_token()?;
+        // At capacity dead sessions go first, then the oldest live one, so a login flood cannot grow the table without bound.
         if self.sessions.len() >= MAX_SESSIONS {
             self.sweep(now);
         }
@@ -306,6 +309,7 @@ pub fn authenticate(
     totp: &str,
     now_unix: u64,
 ) -> Result<(), AuthError> {
+    // Constant-time compare plus a dummy hash on failure keep timing alike for every failure, and the length cap stops a huge password from burning CPU.
     let user_ok = bool::from(username.as_bytes().ct_eq(creds.username.as_bytes()));
     let password_ok = if user_ok && password.len() <= MAX_PASSWORD_BYTES {
         verify_password(password, &creds.password_hash)
@@ -313,8 +317,7 @@ pub fn authenticate(
         dummy_verify();
         false
     };
-    // The step is only committed once all three factors pass, so a failed password
-    // attempt cannot burn a valid one-time code.
+    // The step is only committed once all three factors pass, so a wrong password cannot burn a valid code.
     let mut step = creds.totp_last_step;
     let totp_ok = totp::verify(&creds.totp_secret, totp, now_unix, &mut step);
     if user_ok & password_ok & totp_ok {

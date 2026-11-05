@@ -1,6 +1,7 @@
 #!/bin/sh
 # Cite node installer: sets up the connector node and the dashboard with Docker Compose.
 set -eu
+# Everything written here can hold credentials or the allowlist, so new files default to owner-only access.
 umask 077
 
 RAW_BASE="https://raw.githubusercontent.com/seggys116/cite"
@@ -257,6 +258,7 @@ valid_version() {
   return 0
 }
 
+# Refusing ".." and a leading slash keeps the ref from climbing out of the download URL path.
 valid_ref() {
   case $1 in
     ''|*[!A-Za-z0-9._/-]*|*..*|/*) return 1 ;;
@@ -264,6 +266,7 @@ valid_ref() {
   return 0
 }
 
+# DIR is printed inside double-quoted commands the user copies, so characters that would break out of the quotes are refused.
 valid_dir() {
   _nl=$(printf '\n_')
   _nl=${_nl%_}
@@ -283,6 +286,7 @@ check_allow() {
       *) _rest="" ;;
     esac
     valid_cidr "$_item" || { warn "not an IP address or CIDR: $_item"; return 1; }
+    # A zero-length prefix would open the service to everyone, so that has to be spelled allow-all.
     case $_item in
       */0|0.0.0.0|::)
         warn "$_item allows everyone; type allow-all if you really mean that"
@@ -295,6 +299,7 @@ check_allow() {
 
 resolve_allow() {
   if [ "$1" = allow-all ]; then
+    # Open access is only accepted after an explicit confirmation.
     if confirm "Allow ANY address to reach this service? Only the credentials will protect it."; then
       ALLOW="0.0.0.0/0,::/0,allow-all"
       warn "open to every address; make sure a firewall restricts the exposed ports"
@@ -355,6 +360,7 @@ env_get() {
   sed -n "s/^$1=//p" "$ENV_FILE" | sed -n 1p
 }
 
+# The new file is written beside .env and moved over it, so an interrupted run never leaves a half-written .env.
 set_env_key() {
   ENV_TMP=$(mktemp "$DIR/.env.XXXXXX")
   awk -v k="$1" -v v="$2" 'BEGIN { FS = OFS = "="; done = 0 }
@@ -391,6 +397,7 @@ detect_ip() {
       _ip=${_all%% *}
     fi
   fi
+  # A loopback address is no use as a default for other hosts to connect to.
   case $_ip in
     127.*) _ip="" ;;
   esac
@@ -416,6 +423,7 @@ ver_ok() {
   [ "$_maj" -eq "$2" ] && [ "$_min" -ge "$3" ]
 }
 
+# Downloads are limited to https so the compose files cannot be swapped by a downgrade.
 fetch() {
   if command -v curl >/dev/null 2>&1; then
     curl -fsSL --proto '=https' --tlsv1.2 -o "$2" "$1" </dev/null
@@ -460,6 +468,7 @@ print_sha256() {
   say "  sha256 $_sum  $2"
 }
 
+# Run from a checkout's scripts directory, the installer uses the local compose files instead of downloading them.
 find_checkout() {
   [ "$FORCE_REMOTE" != 1 ] || return 0
   case $0 in
@@ -526,6 +535,7 @@ spin_done() {
   printf '\r%s[K' "$ESC"
 }
 
+# Healthy counts as ready, and so does running with no healthcheck defined.
 container_ok() {
   _info=$(docker inspect -f '{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$1" 2>/dev/null) || return 1
   case $_info in
@@ -606,6 +616,7 @@ preflight() {
 
 check_ports() {
   _running=$(docker ps -q --filter label=com.docker.compose.project=cite-node </dev/null 2>/dev/null || true)
+  # A running node already owns its ports, so a rerun or update must not report them as busy.
   if [ -n "$_running" ]; then
     return 0
   fi
@@ -707,6 +718,7 @@ choose_allow() {
     resolve_allow "$ALLOW" || die "invalid --allow value"
     return 0
   fi
+  # Over SSH the client address is the likeliest intended allowlist entry, so it is offered as the default.
   _def=""
   if [ -n "${SSH_CONNECTION:-}" ]; then
     _def=${SSH_CONNECTION%% *}
@@ -778,6 +790,7 @@ choose_orch() {
     ORCH=0
     return 0
   fi
+  # The proxy holds the Docker socket, so the orchestrator is opt-in and off unless confirmed.
   if [ -z "$ORCH" ]; then
     ORCH=0
     if is_interactive; then
@@ -1050,6 +1063,7 @@ do_update() {
       dc_stack "$_s" pull || die "could not pull the $_s images"
     fi
   done
+  # No volume flag here, so the credentials and certificates in the volumes survive an update.
   step "recreating containers"
   for _s in node dashboard; do
     if stack_enabled "$_s"; then
@@ -1093,6 +1107,7 @@ do_uninstall() {
   else
     say "Volumes and the files in $DIR are kept; add --purge to remove them."
   fi
+  # The connector starts site containers itself, outside compose, so compose down does not touch them.
   say "Site containers started by the connector are not compose-managed and are left in place."
   confirm "Continue?" || die "aborted; nothing was removed (use --yes to skip the prompt)"
   for _s in node dashboard; do

@@ -164,9 +164,7 @@ pub fn parse_stat_csv(csv: &str) -> Vec<BackendStat> {
     out
 }
 
-// HAProxy starts every server as UP and reports check_status INI until its first check finishes,
-// so a server only counts as up once its latest check passed. A status such as "UP 1/2" (an
-// earlier check failed, the latest passed) still counts as up.
+// HAProxy reports check_status INI until a server's first check finishes, so only a passed latest check counts as up.
 fn check_passed(check: &str) -> bool {
     matches!(check, "L4OK" | "L6OK" | "L7OK" | "L7OKC")
 }

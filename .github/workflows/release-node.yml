@@ -25,6 +25,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # Stops a tag that disagrees with Cargo.toml from publishing images under the wrong version.
       - id: check
         run: |
           cargo_version="$(awk -F'"' '/^version = /{print $2; exit}' Cargo.toml)"
@@ -70,6 +71,7 @@ jobs:
           build-args: |
             VERSION=${{ needs.version.outputs.version }}
             REVISION=${{ github.sha }}
+          # Each arch is pushed by digest only; the manifests job joins them into the tagged multi-arch image.
           outputs: type=image,name=${{ env.IMAGE_PREFIX }}/${{ matrix.variant.name }},push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha,scope=${{ matrix.variant.key }}-${{ matrix.platform.arch }}
           cache-to: type=gha,mode=max,scope=${{ matrix.variant.key }}-${{ matrix.platform.arch }}

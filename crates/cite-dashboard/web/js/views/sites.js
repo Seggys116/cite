@@ -14,6 +14,7 @@ async function loadSites() {
   }));
   const rows = settled.flatMap((r) => (r.status === 'fulfilled' ? r.value : []));
   const failed = names.filter((_, i) => settled[i].status === 'rejected');
+  // Only a total failure is an error; a partial one is shown as a notice above the table.
   if (failed.length === names.length) throw settled[0].reason;
   return { rows, failed };
 }

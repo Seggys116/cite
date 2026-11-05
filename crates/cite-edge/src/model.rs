@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 pub const CONFIG_VERSION: u32 = 1;
 
+// deny_unknown_fields on the config types makes a misspelled key an error instead of a silently ignored setting.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EdgeConfig {
@@ -16,6 +17,7 @@ pub struct EdgeConfig {
     pub settings: EdgeSettings,
 }
 
+// Each site has two upstream slots; `active` names the one that serves traffic and the other is free for the next deploy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Slot {
@@ -44,6 +46,7 @@ pub struct Site {
     pub id: String,
     pub name: String,
     pub hosts: Vec<String>,
+    // Fields marked default may be omitted by API clients and are filled in on load.
     #[serde(default)]
     pub path_regex: Option<String>,
     #[serde(default)]
@@ -86,6 +89,7 @@ pub struct Target {
     pub weight: u32,
 }
 
+// Weight is relative between the targets of one slot; omitting it gives each target an equal share.
 fn default_weight() -> u32 {
     100
 }
@@ -165,6 +169,7 @@ pub struct MaintenancePage {
     pub status: u16,
 }
 
+// 503 tells clients and crawlers the outage is temporary.
 fn default_status() -> u16 {
     503
 }
@@ -262,6 +267,7 @@ impl Default for Retention {
     }
 }
 
+// Built from parsed HAProxy log lines rather than read from user-supplied config, so unknown fields are not denied.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogEvent {
     pub ts_ms: i64,
