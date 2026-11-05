@@ -7,6 +7,7 @@ import {
 import { actionPill, slotPill, healthKind, healthDots, siteHref } from './common.js';
 import { targetEditor, regexTester } from './siteForm.js';
 import { pagePreview } from './maintenance.js';
+import { gitRefProblem } from '../siteCheck.js';
 
 const TABS = [
   { id: 'overview', label: 'Overview', icon: 'activity' },
@@ -83,13 +84,24 @@ function overviewPanel(site) {
         ['Interval', `${site.health.interval_ms} ms`],
         ['Rise / fall', `${site.health.rise} / ${site.health.fall}`],
         ['Active targets', healthDots(live)],
-      ]) })));
+      ]) })),
+    site.source ? card({ title: 'Source', body: kvList([
+      ['Repository', h('code', { class: 'mono' }, site.source.repo)],
+      ['Branch', h('code', { class: 'mono' }, site.source.branch || 'main')],
+      ['Runtime', site.source.runtime ? `${site.source.runtime}${site.source.node_major ? ' ' + site.source.node_major : ''}` : 'node'],
+      ['Poll interval', site.source.poll_interval || '5m'],
+    ]) }) : null);
 }
 
 function deploymentsPanel(ctx, site, reload) {
   const { node } = ctx;
   const idle = other(site.active);
+  const fromGit = Boolean(site.source);
   const editor = targetEditor({ targets: (site[idle] && site[idle].targets) || [] });
+  const gitRef = h('input', {
+    class: 'input mono', type: 'text', value: (site.source && site.source.branch) || 'main', placeholder: 'main, v1.4.0 or a commit sha',
+    autocomplete: 'off', spellcheck: 'false', 'aria-label': 'Git ref',
+  });
   const note = h('input', { class: 'input', type: 'text', placeholder: 'What changed in this version', 'aria-label': 'Deployment note' });
   const progress = h('div', { class: 'progress-box', hidden: true, role: 'status' });
   const err = h('p', { class: 'form-error', role: 'alert', hidden: true });
@@ -101,7 +113,7 @@ function deploymentsPanel(ctx, site, reload) {
     const elapsed = h('b', { class: 'mono' }, '0s');
     clear(progress);
     progress.append(h('div', { class: 'progress' }, h('i', {})),
-      h('p', {}, `Writing targets to the ${idle} slot and waiting for every health check to pass (up to 60 s). `, elapsed));
+      h('p', {}, fromGit ? `Building the ${idle} slot from ${gitRef.value.trim()} and waiting for every health check to pass. ` : `Writing targets to the ${idle} slot and waiting for every health check to pass (up to 60 s). `, elapsed));
     progress.hidden = false;
     const timer = setInterval(() => { elapsed.textContent = Math.round((Date.now() - started) / 1000) + 's'; }, 500);
     return () => {
@@ -111,16 +123,18 @@ function deploymentsPanel(ctx, site, reload) {
   };
 
   deployBtn.addEventListener('click', async () => {
-    const problem = editor.validate();
+    const problem = fromGit ? gitRefProblem(gitRef.value) : editor.validate();
     err.hidden = true;
-    if (problem || !editor.get().length) {
+    if (problem || (!fromGit && !editor.get().length)) {
       err.textContent = problem || 'Add at least one target to deploy.';
       err.hidden = false;
       return;
     }
+    const payload = fromGit ? { git_ref: gitRef.value.trim() } : { targets: editor.get() };
+    payload.note = note.value.trim() || undefined;
     const stop = showProgress();
     try {
-      await withBusy(deployBtn, () => nodeApi(node).post(`/sites/${encodeURIComponent(site.id)}/deploy`, { targets: editor.get(), note: note.value.trim() || undefined }));
+      await withBusy(deployBtn, () => nodeApi(node).post(`/sites/${encodeURIComponent(site.id)}/deploy`, payload));
       stop();
       toast(`Deployed. ${idle} is now active.`, 'success');
       reload();
@@ -155,8 +169,12 @@ function deploymentsPanel(ctx, site, reload) {
   return h('div', { class: 'stack' },
     card({
       title: 'Deploy new version',
-      subtitle: `Targets are written to the idle ${idle} slot, health checked, then traffic flips over.`,
-      body: h('div', { class: 'form' }, field('Targets for the new version', editor.el, null, { group: true }), field('Note', note), progress, err, h('div', { class: 'form-actions' }, deployBtn)),
+      subtitle: fromGit
+        ? `The ref is built into the idle ${idle} slot, health checked, then traffic flips over.`
+        : `Targets are written to the idle ${idle} slot, health checked, then traffic flips over.`,
+      body: h('div', { class: 'form' }, fromGit
+        ? field('Git ref', gitRef, 'A branch, tag or commit sha from the source repository.')
+        : field('Targets for the new version', editor.el, null, { group: true }), field('Note', note), progress, err, h('div', { class: 'form-actions' }, deployBtn)),
     }),
     card({
       title: 'History',

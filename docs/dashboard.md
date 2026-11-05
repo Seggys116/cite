@@ -65,13 +65,26 @@ A command palette offers shortcuts to views, Create site, Add firewall rule, Add
 | Kind | Site or API. APIs usually route by path prefix, sites by host name. |
 | Hosts | Host names that route to the site. |
 | Path regex | Optional. A built-in tester shows whether the regex is valid and whether a sample path matches. Empty means every path on those hosts. |
-| Blue and green targets | `host:port` addresses for each slot. At least one blue target is required. |
+| Source | Existing upstreams (the default) or Build from GitHub. See below. |
+| Blue and green targets | Existing upstreams only. `host:port` addresses for each slot. At least one blue target is required. |
 | Health check path | Must start with `/`. The form sends an interval of 2000 ms, a timeout of 1500 ms, 2 passes to be healthy and 3 failures to be down. |
 | Placement | Selected nodes, or Replicate to all nodes. |
 
-The form creates a site with no `source`, so it routes to upstreams you run. The new site starts with the blue slot active. The form sends one request to the dashboard server with the chosen nodes and the site definition. With Replicate to all nodes the same site is created on every connected node, so use addresses that mean the same thing on each. The connector rejects targets that are loopback, link-local, unspecified or multicast addresses, or that name the node's own services (see [Firewall and maintenance](firewall.md#targets-and-health-checks)).
+With Existing upstreams the form creates a site with no `source`, so it routes to upstreams you run. The new site starts with the blue slot active. The form sends one request to the dashboard server with the chosen nodes and the site definition. With Replicate to all nodes the same site is created on every connected node, so use addresses that mean the same thing on each. The connector rejects targets that are loopback, link-local, unspecified or multicast addresses, or that name the node's own services (see [Firewall and maintenance](firewall.md#targets-and-health-checks)).
 
-A site that the connector builds from GitHub needs a `source`, which the form does not offer. Send it to `POST /api/v1/deployments` with an optional `github_token` (accepted only when the site has a `source`); the dashboard forwards the token to the connector once and neither stores nor returns it. In `each` mode `POST /deployments` also takes `per_node`, a map of node name to `{blue, green}` target lists, so each node can get its own upstreams.
+Build from GitHub hides the targets, because the connector provisions the stack for the live slot. The form then asks for:
+
+| Field | Notes |
+|---|---|
+| Repository | `owner/name`: two parts of letters, digits, dot, underscore or dash, none starting with a dot. |
+| Branch | Defaults to `main`. |
+| Runtime | `node`, `bun`, `static` or `rust`. Every runtime except `rust` also takes a Node version, 22 or 24. |
+| Poll interval | Defaults to `5m`. A number followed by `s`, `m` or `h`. |
+| GitHub token | Required for private repositories. Sent once as the top-level `github_token` of `POST /api/v1/deployments`, never inside `source`. The dashboard forwards it to the connector and neither stores nor returns it, and the field is emptied as soon as you submit. |
+
+The connector accepts `github_token` only for a site with a `source`. In `each` mode `POST /deployments` also takes `per_node`, a map of node name to `{blue, green}` target lists, so each node can get its own upstreams.
+
+On a site with a `source`, the overview tab lists the repository, branch, runtime and poll interval, and the Deploy new version panel asks for a Git ref (a branch, tag or commit sha, up to 100 characters of letters, digits, dot, underscore, dash and slash, not starting with a dash or containing `..`) instead of targets. It posts `{git_ref, note}` to the node's `/sites/{id}/deploy`.
 
 ## How the console talks to connectors
 

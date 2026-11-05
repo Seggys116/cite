@@ -1377,6 +1377,49 @@ async fn a_github_token_is_sent_beside_the_site_and_not_echoed() {
     assert!(!on_disk.contains("ghp_example_token"));
 }
 
+// Every field of the source is forwarded as given, and the token stays beside the site instead of landing in source.secret.
+#[tokio::test]
+async fn a_source_site_is_forwarded_whole_with_the_token_at_top_level() {
+    let fake = new_fake(NODE_TOKEN);
+    let url = spawn_fake(fake.clone()).await;
+    let h = harness_with_nodes(&[("edge-1", url.as_str(), NODE_TOKEN)]);
+    let s = login(&h).await;
+    let mut built = site("shop");
+    built.blue = Upstream::default();
+    built.source = Some(Source {
+        repo: "acme/shop".into(),
+        branch: Some("release".into()),
+        runtime: Some("bun".into()),
+        node_major: Some(24),
+        poll_interval: Some("30s".into()),
+        secret: None,
+    });
+    let body = json!({
+        "nodes": ["edge-1"],
+        "site": built,
+        "mode": "each",
+        "github_token": "  ghp_private  ",
+    });
+    let reply = send_json(
+        &h.app,
+        Method::POST,
+        "/api/v1/deployments",
+        &s.headers(),
+        body,
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+    let sent = fake.created_bodies.lock().expect("lock")[0].clone();
+    assert_eq!(sent["github_token"], "ghp_private");
+    assert_eq!(sent["source"]["repo"], "acme/shop");
+    assert_eq!(sent["source"]["branch"], "release");
+    assert_eq!(sent["source"]["runtime"], "bun");
+    assert_eq!(sent["source"]["node_major"], 24);
+    assert_eq!(sent["source"]["poll_interval"], "30s");
+    assert!(sent["source"]["secret"].is_null());
+    assert!(!reply.text().contains("ghp_private"));
+}
+
 #[tokio::test]
 async fn deployments_need_a_session_and_the_csrf_token() {
     let h = harness();

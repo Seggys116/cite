@@ -73,7 +73,7 @@ function seedSites(nodeIdx, now) {
       id: 'docs', name: 'Documentation', hosts: ['docs.example.com'], path_regex: null, kind: 'site',
       blue: { targets: [target(3, 11, 3000)], label: null },
       green: { targets: [target(3, 21, 3000)], label: null },
-      active: 'blue', maintenance: { enabled: nodeIdx === 1, page_id: 'scheduled' }, health, source: { repo: 'https://git.example.com/docs.git', branch: 'main' },
+      active: 'blue', maintenance: { enabled: nodeIdx === 1, page_id: 'scheduled' }, health, source: { repo: 'acme/docs', branch: 'main', runtime: 'static', node_major: 22, poll_interval: '5m' },
       history: hist([[400, 'blue', 'promote', 'Initial deploy'], [90, 'green', 'failed', 'Health check timed out']]),
     },
   ];
@@ -436,9 +436,24 @@ async function siteRoute(node, method, seg, body) {
   if (method !== 'POST') throw new ApiError(405, 'method not allowed');
   const idle = site.active === 'blue' ? 'green' : 'blue';
   if (action === 'deploy') {
+    const ref = body && body.git_ref;
     const targets = (body && body.targets) || [];
-    if (!targets.length) throw new ApiError(400, 'deploy needs at least one target');
+    if (site.source) {
+      if (!ref || !/^[A-Za-z0-9._/-]{1,128}$/.test(ref) || ref.startsWith('-') || ref.includes('..')) throw new ApiError(400, 'a valid git_ref is needed to deploy a site built from GitHub');
+    } else if (!targets.length) {
+      throw new ApiError(400, 'deploy needs at least one target');
+    }
     await sleep(1600);
+    if (site.source) {
+      if (/bad|down/i.test(ref)) {
+        audit(node, 'site.deploy', `site ${id} deploy of ${ref} failed health checks`);
+        pushHistory(site, idle, 'failed', (body.note || `Deploy ${ref}`) + ' (health check timed out)');
+        throw new ApiError(409, `deploy failed health checks: the ${idle} slot of ${id} never came up, active slot unchanged`);
+      }
+      site.active = idle;
+      audit(node, 'site.deploy', `site ${id} promoted ${idle} at ${ref}`);
+      return clone(pushHistory(site, idle, 'promote', body.note || `Deploy ${ref}`));
+    }
     // A target address containing bad or down fails the simulated health gate, so the failure path can be tried by hand.
     const broken = targets.some((t) => /bad|down/i.test(t.addr));
     if (broken) {
@@ -629,6 +644,7 @@ async function dashboardRoute(method, seg, q, body) {
       try {
         if (!node) throw new ApiError(404, `node ${name} is not configured`);
         checkSiteShape(body.site);
+        if (typeof body.github_token === 'string' && body.github_token.trim() && !body.site.source) throw new ApiError(400, 'github_token needs a site with a source');
         if (node.sites.some((s) => s.id === body.site.id)) throw new ApiError(409, `site ${body.site.id} already exists`);
         node.sites.push({ ...clone(body.site), history: [] });
         audit(node, 'site.create', `site ${body.site.id} created (${body.mode})`);

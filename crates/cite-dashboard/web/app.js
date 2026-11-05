@@ -23,7 +23,7 @@ const NAV = [
   { id: 'sites', label: 'Sites', icon: 'globe' },
   { id: 'traffic', label: 'Traffic', icon: 'chart' },
   { id: 'firewall', label: 'Firewall', icon: 'shield' },
-  { id: 'maintenance', label: 'Maintenance', icon: 'wrench' },
+  { id: 'maintenance', label: 'Maintenance', navLabel: 'Pages', icon: 'wrench' },
   { id: 'settings', label: 'Settings', icon: 'settings' },
 ];
 
@@ -183,7 +183,8 @@ function buildShell() {
   const searchBtn = h('button', { class: 'search-btn', type: 'button', 'aria-label': 'Open command palette', onClick: togglePalette },
     icon('search'), h('span', { class: 'search-text' }, 'Search or jump to'), h('kbd', {}, navigator.platform.includes('Mac') ? '⌘K' : 'Ctrl K'));
   const content = h('main', { class: 'content', id: 'main', tabindex: '-1' });
-  const nav = h('nav', { class: 'nav', 'aria-label': 'Primary' }, NAV.map((n) => h('a', { class: 'nav-item', href: '#/' + n.id, 'data-nav': n.id }, icon(n.icon), h('span', { class: 'nav-label' }, n.label))));
+  const nav = h('nav', { class: 'nav', 'aria-label': 'Primary' }, NAV.map((n) => h('a', { class: 'nav-item', href: '#/' + n.id, 'data-nav': n.id, 'aria-label': n.label, title: n.label }, icon(n.icon),
+    h('span', { class: 'nav-label' + (n.navLabel ? ' nav-long' : '') }, n.label), n.navLabel ? h('span', { class: 'nav-label nav-short', 'aria-hidden': 'true' }, n.navLabel) : null)));
   const sidebar = h('aside', { class: 'sidebar' },
     h('a', { class: 'brand', href: '#/overview', 'aria-label': 'Cite console home' }, h('img', { src: '/assets/logo.svg', alt: 'Cite', width: '90', height: '30' })),
     nav,
