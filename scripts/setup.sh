@@ -376,7 +376,8 @@ port_busy() {
   if command -v ss >/dev/null 2>&1; then
     ss -ltn 2>/dev/null | awk -v p="$1" '{ n = split($4, a, ":"); if (a[n] == p) f = 1 } END { exit (f ? 0 : 1) }'
   elif command -v lsof >/dev/null 2>&1; then
-    lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1
+    # BusyBox ships an lsof that ignores its arguments, so only a line naming the listening port counts.
+    lsof -nP -iTCP:"$1" -sTCP:LISTEN 2>/dev/null | grep -q ":$1 (LISTEN)"
   else
     return 1
   fi
@@ -833,6 +834,38 @@ docker_socket_gid() {
   printf '%s' "$_gid"
 }
 
+# Connections to a published port arrive from the stack network's gateway, not 127.0.0.1, so a loopback entry gets that gateway added.
+allow_gateway() {
+  _stk=$1
+  case ",$ALLOW," in
+    *,127.*|*,::1,*|*,::1/128,*) ;;
+    *) return 1 ;;
+  esac
+  _svc=dashboard
+  _key=CITE_DASHBOARD_ALLOW
+  if [ "$_stk" = node ]; then
+    _svc=connector
+    _key=CITE_CONNECTOR_ALLOW
+  fi
+  _cid=$(dc_stack "$_stk" ps -q "$_svc" 2>/dev/null | head -n 1)
+  [ -n "$_cid" ] || return 1
+  _list=$(grep "^$_key=" "$ENV_FILE" | head -n 1 | cut -d= -f2-)
+  _new=$_list
+  for _gw in $(docker inspect "$_cid" --format '{{range .NetworkSettings.Networks}}{{.Gateway}} {{end}}' 2>/dev/null); do
+    valid_ip4 "$_gw" || continue
+    case ",$_new," in
+      *",$_gw,"*) ;;
+      *) _new="$_new,$_gw" ;;
+    esac
+  done
+  [ "$_new" != "$_list" ] || return 1
+  _tmp=$(mktemp "$DIR/.env.XXXXXX")
+  awk -v k="$_key" -v v="$_new" 'index($0, k "=") == 1 { print k "=" v; next } { print }' "$ENV_FILE" >"$_tmp"
+  chmod 600 "$_tmp"
+  mv "$_tmp" "$ENV_FILE"
+  ok "$_stk: allowed the Docker gateway so this host can reach it ($_new)"
+}
+
 write_env() {
   if [ -f "$ENV_FILE" ]; then
     confirm "$ENV_FILE already exists. Replace it (a copy is kept as .env.bak)?" \
@@ -972,10 +1005,10 @@ do_install() {
   step "pulling images"
   for _s in node dashboard; do
     if stack_enabled "$_s"; then
-      dc_stack "$_s" pull || die "could not pull the $_s images"
+      pull_stack "$_s"
     fi
   done
-  ok "images pulled"
+  ok "images ready"
 
   step "preparing credentials"
   if stack_enabled node; then
@@ -993,6 +1026,9 @@ do_install() {
   for _s in node dashboard; do
     if stack_enabled "$_s"; then
       dc_stack "$_s" up -d || die "could not start the $_s stack"
+      if allow_gateway "$_s"; then
+        dc_stack "$_s" up -d || die "could not restart the $_s stack"
+      fi
       if wait_ready "$_s"; then
         ok "$_s stack is up"
       else
@@ -1060,7 +1096,7 @@ do_update() {
   step "pulling images"
   for _s in node dashboard; do
     if stack_enabled "$_s"; then
-      dc_stack "$_s" pull || die "could not pull the $_s images"
+      pull_stack "$_s"
     fi
   done
   # No volume flag here, so the credentials and certificates in the volumes survive an update.
@@ -1077,6 +1113,15 @@ do_update() {
   done
   say ""
   say "Volumes were kept; credentials and certificates are unchanged."
+}
+
+# A failed pull is fine when every image the stack needs was built or loaded locally.
+pull_stack() {
+  dc_stack "$1" pull && return 0
+  for _img in $(dc_stack "$1" config --images); do
+    docker image inspect "$_img" >/dev/null 2>&1 || die "could not pull the $1 images"
+  done
+  warn "the registry pull failed; using the images already present locally"
 }
 
 do_logs() {

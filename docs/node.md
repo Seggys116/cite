@@ -30,6 +30,8 @@ docker compose -f docker-compose.node.yml up -d
 docker compose -f docker-compose.node.yml ps
 ```
 
+A connection to a published port reaches the container from its network's gateway, not from `127.0.0.1`, on Linux as well as Docker Desktop. When `--allow` contains a loopback address, `scripts/setup.sh` therefore adds each stack's gateway address to that stack's allowlist, so a console on the same host works. Binding the port to `127.0.0.1` keeps it reachable from this host only.
+
 The first command runs the compose `init` service, which fixes the ownership of the volumes. The second runs the connector's `init` subcommand. `scripts/setup.sh --mode node` runs the same steps, writes `.env` for you and keeps its own update, status, logs and uninstall commands; see the [README](../README.md#quickstart-node).
 
 `init` writes `credentials.json` and the TLS material, then prints the following once:
@@ -113,7 +115,7 @@ Everything lives in the `cite_conf` volume, mounted at `/conf`.
 | `tokens.json` | 0600 | API token hashes, names and last-used times. At most 64 tokens. |
 | `secrets.json` | 0600 | GitHub tokens for orchestrated sites. |
 | `audit.jsonl`, `audit.jsonl.1` | 0600 | Audit log of changes and logins. |
-| `analytics/analytics.db` | 0600 | SQLite analytics database, with its `-wal` and `-shm` files. An old `analytics.json` is imported once and renamed to `analytics.json.migrated`. |
+| `analytics/analytics.db` | 0600 | SQLite analytics database, with its `-wal` and `-shm` files. An old `analytics.json` is imported once and then deleted. |
 | `tls/` | 0700 | `ca.pem`, `ca.key`, `server.pem` and the server key. |
 | `haproxy/haproxy.cfg` | 0644 | Rendered config. Overwritten on every change, do not edit it. |
 | `haproxy/maps/active.map`, `maint.map` | 0644 | Active slot and maintenance flag per site. `active.map` also carries `<host>@<run>` keys that route runs of four or more plain sites (exact hosts, no path regex) with one lookup. |
