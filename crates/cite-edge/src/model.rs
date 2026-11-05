@@ -268,7 +268,7 @@ impl Default for Retention {
 }
 
 // Built from parsed HAProxy log lines rather than read from user-supplied config, so unknown fields are not denied.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogEvent {
     pub ts_ms: i64,
     pub client_ip: String,
@@ -287,4 +287,30 @@ pub struct LogEvent {
     pub server: String,
     pub site: String,
     pub blocked: Option<String>,
+    #[serde(default)]
+    pub http_version: String,
+    #[serde(default)]
+    pub accept: String,
+    #[serde(default)]
+    pub accept_language: String,
+    #[serde(default)]
+    pub accept_encoding: String,
+    #[serde(default)]
+    pub sec_fetch_site: String,
+    #[serde(default)]
+    pub sec_fetch_mode: String,
+    #[serde(default)]
+    pub sec_fetch_dest: String,
+    #[serde(default)]
+    pub sec_ch_ua: String,
+    #[serde(default)]
+    pub tls_version: String,
+    #[serde(default)]
+    pub resp_ms: u32,
+    #[serde(default)]
+    pub bot_score: u8,
+    #[serde(default)]
+    pub bot_class: String,
+    #[serde(default)]
+    pub bot_signals: String,
 }

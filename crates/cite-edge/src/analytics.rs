@@ -1422,6 +1422,7 @@ mod tests {
             server: "app1".into(),
             site: String::new(),
             blocked: None,
+            ..LogEvent::default()
         }
     }
 

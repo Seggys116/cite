@@ -30,7 +30,7 @@ const NOW: i64 = 1_800_000_000_000;
 
 fn datagram(i: usize, ts: i64) -> Vec<u8> {
     format!(
-        "<134>Nov  4 12:00:00 edge haproxy[812]: {ts} 203.0.{}.{} be_site{}_blue app1 GET 200 {} 311 {} 7  site{} site{}.example.com /p/{}/item%20{} Mozilla%2F5.0+%28X11%3B+Linux%29+AppleWebKit%2F537.36 https%3A%2F%2Fexample.org%2Fa text%2Fhtml%3B+charset%3Dutf-8",
+        "<134>Nov  4 12:00:00 edge haproxy[812]: {ts} 203.0.{}.{} be_site{}_blue app1 GET 200 {} 311 {} 7  site{} HTTP/1.1 TLSv1.3 5 site{}.example.com /p/{}/item%20{} Mozilla%2F5.0+%28X11%3B+Linux%29+AppleWebKit%2F537.36 https%3A%2F%2Fexample.org%2Fa text%2Fhtml%3B+charset%3Dutf-8 text%2Fhtml en-GB gzip same-origin navigate document -",
         (i / 250) % 250,
         i % 250,
         i % 20,

@@ -1,6 +1,7 @@
 pub mod allow;
 pub mod analytics;
 pub mod auth;
+pub mod bot;
 pub mod logparse;
 pub mod model;
 pub mod presets;

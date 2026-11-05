@@ -1,5 +1,6 @@
 use std::net::IpAddr;
 
+use crate::bot::{BotInputs, classify};
 use crate::model::LogEvent;
 use crate::validate::is_valid_id;
 
@@ -7,13 +8,21 @@ use crate::validate::is_valid_id;
 pub const LOG_FORMAT: &str = concat!(
     "%Ts%ms %ci %b %s %[method,bytes(0,16),url_enc] %ST %B %U %Tt %[var(txn.qlen)] ",
     "%[var(txn.blocked),url_enc] %[var(txn.site),url_enc] ",
+    "%HV %[ssl_fc_protocol,bytes(0,16),url_enc] %Tr ",
     "%[var(txn.host),bytes(0,255),url_enc] %[var(txn.path),bytes(0,1024),url_enc] ",
     "%[var(txn.ua),bytes(0,512),url_enc] %[var(txn.ref),bytes(0,512),url_enc] ",
-    "%[var(txn.ct),bytes(0,128),url_enc]"
+    "%[var(txn.ct),bytes(0,128),url_enc] ",
+    "%[var(txn.accept),bytes(0,128),url_enc] %[var(txn.alang),bytes(0,64),url_enc] ",
+    "%[var(txn.aenc),bytes(0,64),url_enc] %[var(txn.sfs),bytes(0,24),url_enc] ",
+    "%[var(txn.sfm),bytes(0,24),url_enc] %[var(txn.sfd),bytes(0,24),url_enc] ",
+    "%[var(txn.chua),bytes(0,128),url_enc]"
 );
 
-const FIELD_COUNT: usize = 17;
-const FIRST_VARIABLE: usize = 12;
+const FIELD_COUNT: usize = 27;
+const HTTP_VERSION: usize = 12;
+const TLS_VERSION: usize = 13;
+const RESP_MS: usize = 14;
+const FIRST_VARIABLE: usize = 15;
 const MAX_DATAGRAM: usize = 8192;
 const MAX_LINE: usize = 65536;
 const MAX_FUTURE_MS: i64 = 300_000;
@@ -26,6 +35,12 @@ const MAX_CTYPE: usize = 128;
 const MAX_NAME: usize = 128;
 const MAX_METHOD: usize = 16;
 const MAX_RULE: usize = 64;
+const MAX_VERSION: usize = 16;
+const MAX_ACCEPT: usize = 128;
+const MAX_LANG: usize = 64;
+const MAX_ENCODING: usize = 64;
+const MAX_FETCH: usize = 24;
+const MAX_CH_UA: usize = 128;
 
 pub fn parse_datagram(buf: &[u8], now_ms: i64) -> Option<LogEvent> {
     if buf.is_empty() || buf.len() > MAX_DATAGRAM {
@@ -48,9 +63,17 @@ pub fn parse_line(line: &str, now_ms: i64) -> Option<LogEvent> {
     if n < MIN_FIELDS {
         return None;
     }
+    // the previous 17-field format has the host here, which would shift every later field into the wrong column
+    let http_version = f[HTTP_VERSION];
+    if !(http_version.is_empty()
+        || http_version.starts_with("HTTP/")
+        || http_version.starts_with('<'))
+    {
+        return None;
+    }
     let get = |i: usize| f.get(i).copied().unwrap_or("");
     // a short line was cut by the log target, so its last variable field may be partial and is dropped
-    let cut = n < FIELD_COUNT;
+    let cut = n < FIELD_COUNT || line.len() + 1 >= MAX_DATAGRAM;
     let tail = |i: usize| {
         if cut && i + 1 >= n { "" } else { get(i) }
     };
@@ -83,10 +106,15 @@ pub fn parse_line(line: &str, now_ms: i64) -> Option<LogEvent> {
             site = named;
         }
     }
-    Some(LogEvent {
+    // HAProxy prints "-" for a sample that has no value
+    let value = |raw: &str, max: usize| match decode(raw, max) {
+        v if v == "-" => String::new(),
+        v => v,
+    };
+    let mut event = LogEvent {
         ts_ms,
         client_ip: client_ip.to_string(),
-        host: decode(tail(FIRST_VARIABLE), MAX_HOST),
+        host: value(tail(FIRST_VARIABLE), MAX_HOST),
         method: decode(get(4), MAX_METHOD),
         path: decode(tail(FIRST_VARIABLE + 1), MAX_PATH),
         query_len: get(9)
@@ -96,14 +124,53 @@ pub fn parse_line(line: &str, now_ms: i64) -> Option<LogEvent> {
         bytes_in: bytes_in.max(0) as u64,
         bytes_out: bytes_out.max(0) as u64,
         total_ms: total.clamp(0, u32::MAX as i64) as u32,
-        user_agent: decode(tail(FIRST_VARIABLE + 2), MAX_UA),
-        referer: decode(tail(FIRST_VARIABLE + 3), MAX_REFERER),
-        content_type: decode(tail(FIRST_VARIABLE + 4), MAX_CTYPE),
+        user_agent: value(tail(FIRST_VARIABLE + 2), MAX_UA),
+        referer: value(tail(FIRST_VARIABLE + 3), MAX_REFERER),
+        content_type: value(tail(FIRST_VARIABLE + 4), MAX_CTYPE),
         site,
         backend,
         server: sanitise(get(3), MAX_NAME),
         blocked,
-    })
+        http_version: value(http_version, MAX_VERSION),
+        tls_version: value(get(TLS_VERSION), MAX_VERSION),
+        resp_ms: get(RESP_MS)
+            .parse::<i64>()
+            .map_or(0, |v| v.clamp(0, u32::MAX as i64) as u32),
+        accept: value(tail(FIRST_VARIABLE + 5), MAX_ACCEPT),
+        accept_language: value(tail(FIRST_VARIABLE + 6), MAX_LANG),
+        accept_encoding: value(tail(FIRST_VARIABLE + 7), MAX_ENCODING),
+        sec_fetch_site: value(tail(FIRST_VARIABLE + 8), MAX_FETCH),
+        sec_fetch_mode: value(tail(FIRST_VARIABLE + 9), MAX_FETCH),
+        sec_fetch_dest: value(tail(FIRST_VARIABLE + 10), MAX_FETCH),
+        sec_ch_ua: value(tail(FIRST_VARIABLE + 11), MAX_CH_UA),
+        ..LogEvent::default()
+    };
+    // a cut line is missing request headers and stays unclassified, since scoring that absence would label real visitors as bots
+    if !cut {
+        score_bot(&mut event);
+    }
+    Some(event)
+}
+
+fn score_bot(ev: &mut LogEvent) {
+    let verdict = classify(&BotInputs {
+        user_agent: &ev.user_agent,
+        accept: &ev.accept,
+        accept_language: &ev.accept_language,
+        accept_encoding: &ev.accept_encoding,
+        sec_fetch_site: &ev.sec_fetch_site,
+        sec_fetch_mode: &ev.sec_fetch_mode,
+        sec_fetch_dest: &ev.sec_fetch_dest,
+        sec_ch_ua: &ev.sec_ch_ua,
+        http_version: &ev.http_version,
+        referer: &ev.referer,
+        method: &ev.method,
+        tls_version: &ev.tls_version,
+        path: &ev.path,
+    });
+    ev.bot_score = verdict.score;
+    ev.bot_class = verdict.class.as_str().to_string();
+    ev.bot_signals = verdict.signals.join(",");
 }
 
 fn site_of(backend: &str) -> String {
@@ -246,14 +313,48 @@ mod tests {
             "7",
             "",
             "shop",
+            "HTTP/2.0",
+            "TLSv1.3",
+            "9",
             "shop.example.com",
             "/a%20b%2Fc",
             "Mozilla%2F5.0+%28X11%29",
             "https%3A%2F%2Fexample.org%2F",
             "text%2Fhtml%3B+charset%3Dutf-8",
+            "text%2Fhtml%2Capplication%2Fxhtml%2Bxml",
+            "en-US%2Cen%3Bq%3D0.9",
+            "gzip%2C+deflate%2C+br",
+            "none",
+            "navigate",
+            "document",
+            "%22Chromium%22%3Bv%3D%22124%22",
         ]
         .map(String::from)
         .to_vec()
+    }
+
+    fn enc(s: &str) -> String {
+        s.bytes()
+            .map(|b| {
+                if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+                    (b as char).to_string()
+                } else {
+                    format!("%{b:02X}")
+                }
+            })
+            .collect()
+    }
+
+    const CHROME_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+    const CHROME_CH: &str =
+        "\"Chromium\";v=\"124\", \"Google Chrome\";v=\"124\", \"Not-A.Brand\";v=\"99\"";
+
+    fn chrome_fields() -> Vec<String> {
+        let mut f = fields();
+        f[FIRST_VARIABLE + 2] = enc(CHROME_UA);
+        f[FIRST_VARIABLE + 5] = enc("text/html,application/xhtml+xml,*/*;q=0.8");
+        f[FIRST_VARIABLE + 11] = enc(CHROME_CH);
+        f
     }
 
     fn body() -> String {
@@ -347,7 +448,7 @@ mod tests {
 
     #[test]
     fn tolerates_trimmed_trailing_fields() {
-        let short = "1730721600123 203.0.113.9 be_shop_green app1 GET 404 10 20 3 0  shop h /x";
+        let short = "1730721600123 203.0.113.9 be_shop_green app1 GET 404 10 20 3 0  shop HTTP/1.1 - 5 h /x";
         let ev = parse_line(short, NOW).expect("parsed");
         assert_eq!(ev.status, 404);
         assert_eq!(ev.site, "shop");
@@ -355,6 +456,8 @@ mod tests {
         assert_eq!(ev.path, "");
         assert_eq!(ev.user_agent, "");
         assert_eq!(ev.blocked, None);
+        assert_eq!(ev.http_version, "HTTP/1.1");
+        assert_eq!(ev.resp_ms, 5);
     }
 
     #[test]
@@ -369,9 +472,148 @@ mod tests {
             assert_eq!(ev.site, "shop");
             assert_eq!(ev.status, 200);
         }
-        let ev = parse_line(&f[..14].join(" "), NOW).expect("kept");
+        let ev = parse_line(&f[..FIRST_VARIABLE + 2].join(" "), NOW).expect("kept");
         assert_eq!(ev.host, "shop.example.com");
         assert_eq!(ev.path, "");
+    }
+
+    #[test]
+    fn a_dash_user_agent_is_empty_and_scored_as_missing() {
+        let mut f = fields();
+        f[FIRST_VARIABLE + 2] = "-".into();
+        f[FIRST_VARIABLE + 3] = "-".into();
+        let ev = parse_line(&f.join(" "), NOW).expect("parsed");
+        assert_eq!((ev.user_agent.as_str(), ev.referer.as_str()), ("", ""));
+        assert!(
+            ev.bot_signals.split(',').any(|s| s == "empty_ua"),
+            "{}",
+            ev.bot_signals
+        );
+    }
+
+    #[test]
+    fn a_line_at_the_datagram_limit_stays_unclassified() {
+        let mut f = fields();
+        f[FIRST_VARIABLE + 1] = "a".repeat(8200);
+        let ev = parse_line(&f.join(" "), NOW).expect("parsed");
+        assert_eq!((ev.bot_score, ev.bot_class.as_str()), (0, ""));
+    }
+
+    #[test]
+    fn cut_lines_are_not_scored_as_bots() {
+        let cut = chrome_fields()[..FIRST_VARIABLE + 4].join(" ");
+        let ev = parse_line(&cut, NOW).expect("kept");
+        assert_eq!(ev.user_agent, CHROME_UA);
+        assert_eq!((ev.bot_score, ev.bot_class.as_str()), (0, ""));
+        assert_eq!(ev.bot_signals, "");
+        assert_eq!(ev.accept, "");
+    }
+
+    #[test]
+    fn full_line_fills_every_new_field() {
+        let ev = parse_line(&body(), NOW).expect("parsed");
+        assert_eq!(ev.http_version, "HTTP/2.0");
+        assert_eq!(ev.tls_version, "TLSv1.3");
+        assert_eq!(ev.resp_ms, 9);
+        assert_eq!(ev.accept, "text/html,application/xhtml+xml");
+        assert_eq!(ev.accept_language, "en-US,en;q=0.9");
+        assert_eq!(ev.accept_encoding, "gzip, deflate, br");
+        assert_eq!(ev.sec_fetch_site, "none");
+        assert_eq!(ev.sec_fetch_mode, "navigate");
+        assert_eq!(ev.sec_fetch_dest, "document");
+        assert_eq!(ev.sec_ch_ua, "\"Chromium\";v=\"124\"");
+        assert_eq!(ev.host, "shop.example.com");
+        assert_eq!(ev.content_type, "text/html; charset=utf-8");
+    }
+
+    #[test]
+    fn real_chrome_line_scores_human_and_curl_scores_tool() {
+        let line = format!(
+            "<134>Nov  4 12:00:00 edge haproxy[812]: {}",
+            chrome_fields().join(" ")
+        );
+        let ev = parse_line(&line, NOW).expect("parsed");
+        assert_eq!(ev.user_agent, CHROME_UA);
+        assert_eq!(ev.sec_ch_ua, CHROME_CH);
+        assert_eq!(ev.bot_score, 0, "{}", ev.bot_signals);
+        assert_eq!(ev.bot_class, "human");
+        assert_eq!(ev.bot_signals, "");
+
+        let mut f = fields();
+        f[HTTP_VERSION] = "HTTP/1.1".into();
+        f[TLS_VERSION] = String::new();
+        f[FIRST_VARIABLE + 2] = enc("curl/8.5.0");
+        f[FIRST_VARIABLE + 3] = String::new();
+        f[FIRST_VARIABLE + 5] = enc("*/*");
+        for v in &mut f[FIRST_VARIABLE + 6..] {
+            v.clear();
+        }
+        let ev = parse_line(&f.join(" "), NOW).expect("parsed");
+        assert_eq!(ev.tls_version, "");
+        assert_eq!(ev.bot_class, "tool");
+        assert!(ev.bot_score >= 70);
+        assert!(ev.bot_signals.ends_with("ua_curl"), "{}", ev.bot_signals);
+        assert!(ev.bot_signals.starts_with("missing_accept_language"));
+    }
+
+    #[test]
+    fn dash_samples_become_empty() {
+        let mut f = fields();
+        f[TLS_VERSION] = "-".into();
+        f[FIRST_VARIABLE + 5] = "-".into();
+        let ev = parse_line(&f.join(" "), NOW).expect("parsed");
+        assert_eq!((ev.tls_version.as_str(), ev.accept.as_str()), ("", ""));
+    }
+
+    #[test]
+    fn old_format_lines_are_rejected() {
+        let mut f = fields();
+        f.drain(HTTP_VERSION..FIRST_VARIABLE);
+        f.truncate(17);
+        assert_eq!(f.len(), 17);
+        assert!(parse_line(&f.join(" "), NOW).is_none());
+        assert!(parse_line(&f[..13].join(" "), NOW).is_none());
+    }
+
+    #[test]
+    fn hostile_headers_cannot_add_fields_or_control_characters() {
+        let hostile = [
+            "a b\r\n\0 injected 200 5120 311 12".to_string(),
+            "\u{202e}\u{feff}\u{e9}\u{1F600}\x1b[31m".to_string(),
+            "%00%0d%0a %zz %".to_string(),
+            "x".repeat(5_000),
+        ];
+        let base = parse_line(&body(), NOW).expect("parsed");
+        for h in hostile {
+            let mut f = fields();
+            for v in &mut f[FIRST_VARIABLE + 5..] {
+                *v = enc(&h);
+            }
+            let line = f.join(" ");
+            assert_eq!(line.split(' ').count(), FIELD_COUNT);
+            let ev = parse_line(&line, NOW).expect("parsed");
+            assert_eq!(ev.status, base.status);
+            assert_eq!(ev.host, base.host);
+            assert_eq!(ev.path, base.path);
+            assert_eq!(ev.user_agent, base.user_agent);
+            assert_eq!(ev.resp_ms, base.resp_ms);
+            for v in [
+                &ev.accept,
+                &ev.accept_language,
+                &ev.accept_encoding,
+                &ev.sec_fetch_site,
+                &ev.sec_fetch_mode,
+                &ev.sec_fetch_dest,
+                &ev.sec_ch_ua,
+            ] {
+                assert!(!v.chars().any(char::is_control), "{v:?}");
+            }
+            assert!(ev.accept.len() <= MAX_ACCEPT);
+            assert!(ev.accept_language.len() <= MAX_LANG);
+            assert!(ev.sec_fetch_mode.len() <= MAX_FETCH);
+            assert!(ev.sec_ch_ua.len() <= MAX_CH_UA);
+            assert!(ev.bot_score <= 100);
+        }
     }
 
     #[test]
@@ -379,7 +621,7 @@ mod tests {
         let mut f = fields();
         f[2] = "fe_main".into();
         assert_eq!(parse_line(&f.join(" "), NOW).expect("parsed").site, "shop");
-        f[11] = "Bad Site".into();
+        f[11] = "Bad!Site".into();
         assert_eq!(parse_line(&f.join(" "), NOW).expect("parsed").site, "");
         f[11] = String::new();
         assert_eq!(parse_line(&f.join(" "), NOW).expect("parsed").site, "");
@@ -489,6 +731,18 @@ mod tests {
         );
         let tail: Vec<&str> = LOG_FORMAT.split(' ').skip(FIRST_VARIABLE).collect();
         assert!(tail.iter().all(|f| f.contains("bytes(0,")), "{tail:?}");
+        let at = |i: usize| LOG_FORMAT.split(' ').nth(i).unwrap_or("");
+        assert_eq!(at(HTTP_VERSION), "%HV");
+        assert!(at(TLS_VERSION).contains("ssl_fc_protocol"));
+        assert_eq!(at(RESP_MS), "%Tr");
+        let order = ["host", "path", "ua", "ref", "ct", "accept", "alang"];
+        let rest = ["aenc", "sfs", "sfm", "sfd", "chua"];
+        for (k, name) in order.iter().chain(rest.iter()).enumerate() {
+            assert!(
+                at(FIRST_VARIABLE + k).contains(&format!("var(txn.{name})")),
+                "{name}"
+            );
+        }
     }
 
     proptest! {

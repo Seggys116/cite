@@ -508,6 +508,13 @@ fn render_frontend(
         "http-request set-var(txn.qlen) query,length",
         "http-request set-var(txn.ua) req.fhdr(user-agent)",
         "http-request set-var(txn.ref) req.fhdr(referer)",
+        "http-request set-var(txn.accept) req.fhdr(accept)",
+        "http-request set-var(txn.alang) req.fhdr(accept-language)",
+        "http-request set-var(txn.aenc) req.fhdr(accept-encoding)",
+        "http-request set-var(txn.sfs) req.fhdr(sec-fetch-site)",
+        "http-request set-var(txn.sfm) req.fhdr(sec-fetch-mode)",
+        "http-request set-var(txn.sfd) req.fhdr(sec-fetch-dest)",
+        "http-request set-var(txn.chua) req.fhdr(sec-ch-ua)",
         "http-response set-var(txn.ct) res.hdr(content-type)",
     ] {
         push_in(out, line);
@@ -1052,6 +1059,28 @@ mod tests {
     }
 
     #[test]
+    fn bot_headers_are_copied_into_vars_and_logged() {
+        let r = render(&config(vec![]), &opts()).unwrap();
+        let pairs = [
+            ("accept", "accept"),
+            ("alang", "accept-language"),
+            ("aenc", "accept-encoding"),
+            ("sfs", "sec-fetch-site"),
+            ("sfm", "sec-fetch-mode"),
+            ("sfd", "sec-fetch-dest"),
+            ("chua", "sec-ch-ua"),
+        ];
+        for (var, header) in pairs {
+            let set = format!("http-request set-var(txn.{var}) req.fhdr({header})");
+            assert_eq!(lines_with(&r, &set).len(), 1, "{set}");
+            assert!(LOG_FORMAT.contains(&format!("%[var(txn.{var}),bytes(0,")));
+            assert!(position(&r, &set) < position(&r, "default_backend"));
+        }
+        assert!(r.config.contains("%HV"));
+        assert!(r.config.contains("ssl_fc_protocol"));
+    }
+
+    #[test]
     fn site_label_is_set_for_the_first_matching_site() {
         let mut b = site("b", "b.com");
         b.path_regex = Some("^/api".into());
@@ -1410,7 +1439,7 @@ mod tests {
                     let ok = line.is_empty()
                         || line.starts_with("    ")
                         || line.starts_with('#')
-                        || ["global", "defaults", "frontend ", "backend "]
+                        || ["global", "defaults", "resolvers ", "frontend ", "backend "]
                             .iter()
                             .any(|k| line.starts_with(k));
                     prop_assert!(ok, "stray line {:?}", line);
