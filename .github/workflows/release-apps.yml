@@ -1,0 +1,173 @@
+name: release-apps
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to build and attach artifacts to, for example v0.2.0
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: release-apps-${{ github.event.inputs.tag || github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.check.outputs.tag }}
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+          persist-credentials: false
+      - id: check
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
+            echo "tag ${TAG} is not a version tag" >&2
+            exit 1
+          fi
+          cargo_version="$(awk -F'"' '/^version = /{print $2; exit}' Cargo.toml)"
+          if [[ "${TAG#v}" != "$cargo_version" ]]; then
+            echo "tag ${TAG} does not match Cargo.toml version ${cargo_version}" >&2
+            exit 1
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${cargo_version}" >> "$GITHUB_OUTPUT"
+
+  desktop:
+    name: desktop (${{ matrix.target }})
+    needs: version
+    runs-on: ${{ matrix.runner }}
+    continue-on-error: ${{ matrix.experimental }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            target: aarch64-apple-darwin
+            os: macos
+            exe: ""
+            experimental: false
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            os: macos
+            exe: ""
+            experimental: false
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            os: linux
+            exe: ""
+            experimental: false
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            os: windows
+            exe: ".exe"
+            experimental: true
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ needs.version.outputs.tag }}
+          persist-credentials: false
+      - name: Install Linux build dependencies
+        if: matrix.os == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-x11-dev libxkbcommon-dev libwayland-dev libxcb1-dev libfontconfig-dev libasound2-dev libssl-dev libvulkan-dev mesa-vulkan-drivers pkg-config cmake clang
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: apps/desktop
+      - name: Build
+        working-directory: apps/desktop
+        run: cargo build --release --locked
+      - name: Package
+        env:
+          TARGET_OS: ${{ matrix.os }}
+          EXE: ${{ matrix.exe }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: sh scripts/package-desktop.sh "$TARGET_OS" "apps/desktop/target/release/cite-desktop${EXE}" dist "$VERSION"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cite-desktop-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  servers:
+    name: servers (${{ matrix.target }})
+    needs: version
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - runner: macos-14
+            target: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ needs.version.outputs.tag }}
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo build --release --locked -p cite-connector -p cite-dashboard
+      - name: Collect binaries
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          mkdir -p dist
+          for bin in cite-connector cite-dashboard; do
+            cp "target/release/${bin}" "dist/${bin}-${TARGET}"
+            if command -v sha256sum >/dev/null 2>&1; then
+              (cd dist && sha256sum "${bin}-${TARGET}" > "${bin}-${TARGET}.sha256")
+            else
+              (cd dist && shasum -a 256 "${bin}-${TARGET}" > "${bin}-${TARGET}.sha256")
+            fi
+          done
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cite-servers-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: [version, desktop, servers]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: cite-*
+          merge-multiple: true
+          path: dist
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          tag_name: ${{ needs.version.outputs.tag }}
+          files: dist/*
+          body: Desktop builds attached to this release are unsigned and not notarised.
+          append_body: true

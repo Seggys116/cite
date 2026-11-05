@@ -1,0 +1,122 @@
+name: apps
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: apps-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  desktop:
+    name: desktop (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    continue-on-error: ${{ matrix.experimental }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            target: aarch64-apple-darwin
+            os: macos
+            exe: ""
+            experimental: false
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            os: macos
+            exe: ""
+            experimental: false
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            os: linux
+            exe: ""
+            experimental: false
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            os: windows
+            exe: ".exe"
+            experimental: true
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Note that the build is unsigned
+        run: echo "Desktop build for ${{ matrix.target }}. Artifacts are unsigned and not notarised." >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Linux build dependencies
+        if: matrix.os == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-x11-dev libxkbcommon-dev libwayland-dev libxcb1-dev libfontconfig-dev libasound2-dev libssl-dev libvulkan-dev mesa-vulkan-drivers pkg-config cmake clang
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: apps/desktop
+      - name: Build
+        working-directory: apps/desktop
+        run: cargo build --release --locked
+      - name: Package
+        env:
+          TARGET_OS: ${{ matrix.os }}
+          EXE: ${{ matrix.exe }}
+        run: |
+          version="$(awk -F'"' '/^version = /{print $2; exit}' Cargo.toml)"
+          sh scripts/package-desktop.sh "$TARGET_OS" "apps/desktop/target/release/cite-desktop${EXE}" dist "$version"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cite-desktop-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  servers:
+    name: servers (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - runner: macos-14
+            target: aarch64-apple-darwin
+    steps:
+      - name: Note that the build is unsigned
+        run: echo "Server binaries for ${{ matrix.target }}. Artifacts are unsigned." >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo build --release --locked -p cite-connector -p cite-dashboard
+      - name: Collect binaries
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          mkdir -p dist
+          for bin in cite-connector cite-dashboard; do
+            cp "target/release/${bin}" "dist/${bin}-${TARGET}"
+            if command -v sha256sum >/dev/null 2>&1; then
+              (cd dist && sha256sum "${bin}-${TARGET}" > "${bin}-${TARGET}.sha256")
+            else
+              (cd dist && shasum -a 256 "${bin}-${TARGET}" > "${bin}-${TARGET}.sha256")
+            fi
+          done
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cite-servers-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error

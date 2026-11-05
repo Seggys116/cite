@@ -1,0 +1,185 @@
+name: node
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: node-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  web:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Syntax check every dashboard script
+        run: |
+          tmp="$(mktemp -d)"
+          count=0
+          while IFS= read -r f; do
+            cp "$f" "$tmp/check.mjs"
+            node --check "$tmp/check.mjs" || { echo "::error file=$f::syntax error"; exit 1; }
+            count=$((count + 1))
+          done < <(find crates/cite-dashboard/web -name '*.js' | sort)
+          echo "checked $count scripts"
+          [ "$count" -gt 0 ] || { echo "::error::no dashboard scripts found"; exit 1; }
+      - name: Static safety rules
+        run: |
+          web=crates/cite-dashboard/web
+          fail=0
+          report() {
+            if [ -n "$2" ]; then
+              echo "::error::$1"
+              printf '%s\n' "$2"
+              fail=1
+            fi
+          }
+          hits="$(grep -rnE 'innerHTML[[:space:]]*\+?=' "$web" --include='*.js' --include='*.html' | grep -Ev '^[^:]+/qr\.js:' || true)"
+          report "innerHTML assignment outside the QR sanitiser (qr.js)" "$hits"
+          hits="$(grep -rnE '(^|[^A-Za-z0-9_.])eval[[:space:]]*\(|new[[:space:]]+Function[[:space:]]*\(' "$web" --include='*.js' --include='*.html' || true)"
+          report "eval or new Function is not allowed" "$hits"
+          hits="$(grep -nE '<script' "$web/index.html" | grep -v 'src=' || true)"
+          report "inline script bodies are not allowed in index.html" "$hits"
+          hits="$(grep -nEi '[[:space:]]on[a-z]+[[:space:]]*=' "$web/index.html" || true)"
+          report "inline event handler attributes are not allowed in index.html" "$hits"
+          hits="$(grep -rnE '(src|href|action)=["'"'"'](https?:)?//|url\(["'"'"']?(https?:)?//|@import[^;]*https?://|(from|import\(|fetch\(|new URL\()[[:space:]]*["'"'"'`]https?://' "$web" --include='*.html' --include='*.css' --include='*.js' || true)"
+          report "external resources are not allowed; assets must be served locally" "$hits"
+          exit "$fail"
+
+  compose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      CITE_CONNECTOR_ALLOW: 192.0.2.1
+      CITE_CONNECTOR_BIND: 127.0.0.1
+      CITE_DASHBOARD_ALLOW: 192.0.2.1
+      CITE_DASHBOARD_BIND: 127.0.0.1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Validate compose files
+        run: |
+          docker compose -f docker-compose.node.yml config -q
+          docker compose -f docker-compose.node.yml -f docker-compose.orchestrator.yml config -q
+          docker compose -f docker-compose.dashboard.yml config -q
+      - name: Docker socket is only mounted by the socket proxy
+        run: |
+          socks() {
+            docker compose "$@" config --format json \
+              | jq -r '[.services | to_entries[] | select((.value.volumes // []) | map(.source // "") | any(test("docker\\.sock"))) | .key] | sort | join(",")'
+          }
+          node_only="$(socks -f docker-compose.node.yml)"
+          overlay="$(socks -f docker-compose.node.yml -f docker-compose.orchestrator.yml)"
+          dashboard="$(socks -f docker-compose.dashboard.yml)"
+          [ -z "$node_only" ] || { echo "::error::docker-compose.node.yml mounts the Docker socket in: $node_only"; exit 1; }
+          [ -z "$dashboard" ] || { echo "::error::docker-compose.dashboard.yml mounts the Docker socket in: $dashboard"; exit 1; }
+          [ "$overlay" = "socketproxy" ] || { echo "::error::the Docker socket must be mounted only by socketproxy, found: '$overlay'"; exit 1; }
+
+  shell:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Lint installer scripts
+        run: |
+          for f in scripts/setup.sh scripts/package-desktop.sh; do
+            sh -n "$f"
+            shellcheck --shell=sh "$f"
+          done
+      - name: Installer help and dry runs
+        run: |
+          sh scripts/setup.sh help > /dev/null
+          work="$(mktemp -d)"
+          sh scripts/setup.sh --mode node --allow 192.0.2.1 --bind 127.0.0.1 \
+            --port 17443 --http-port 18080 --https-port 18443 \
+            --dir "$work/node" --yes --no-start
+          env_file="$work/node/.env"
+          [ "$(stat -c %a "$env_file")" = "600" ] || { echo "::error::.env is not mode 600"; exit 1; }
+          [ "$(stat -c %a "$work/node")" = "700" ] || { echo "::error::install dir is not mode 700"; exit 1; }
+          for key in CITE_VERSION CITE_CONNECTOR_ALLOW CITE_CONNECTOR_BIND CITE_CONNECTOR_PORT CITE_HTTP_PORT CITE_HTTPS_PORT; do
+            grep -q "^${key}=" "$env_file" || { echo "::error::$key missing from .env"; exit 1; }
+          done
+          grep -q '^CITE_CONNECTOR_ALLOW=192.0.2.1$' "$env_file"
+          grep -q '^CITE_CONNECTOR_PORT=17443$' "$env_file"
+          sh scripts/setup.sh --mode both --orchestrator --allow 192.0.2.1,198.51.100.0/24 --bind 127.0.0.1 \
+            --port 17444 --http-port 18081 --https-port 18444 --dashboard-port 19000 \
+            --dir "$work/both" --yes --no-start
+          [ -f "$work/both/docker-compose.orchestrator.yml" ]
+          grep -q '^CITE_SETUP_ORCHESTRATOR=1$' "$work/both/.env"
+          grep -q '^CITE_DASHBOARD_PORT=19000$' "$work/both/.env"
+      - name: Installer rejects unsafe input
+        run: |
+          work="$(mktemp -d)"
+          if sh scripts/setup.sh --mode node --allow 0.0.0.0/0 --bind 127.0.0.1 --dir "$work/a" --yes --no-start; then
+            echo "::error::0.0.0.0/0 must be refused without allow-all"
+            exit 1
+          fi
+          if sh scripts/setup.sh --mode node --allow '192.0.2.1 evil' --bind 127.0.0.1 --dir "$work/b" --yes --no-start; then
+            echo "::error::an allow list with whitespace must be refused"
+            exit 1
+          fi
+          if sh scripts/setup.sh --mode node --allow 192.0.2.1 --bind 127.0.0.1 --port 70000 --dir "$work/c" --yes --no-start; then
+            echo "::error::an out-of-range port must be refused"
+            exit 1
+          fi
+
+  images:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [connector, dashboard]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: hadolint/hadolint-action@06be81baf89a55ffd0e24b8f04a4185738dd3387 # v3.5.0
+        with:
+          dockerfile: images/${{ matrix.image }}/Dockerfile
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: images/${{ matrix.image }}/Dockerfile
+          load: true
+          tags: cite-${{ matrix.image }}:ci
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
+
+  haproxy-config:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Render the sample config
+        env:
+          CITE_SAMPLE_OUT: ${{ runner.temp }}/haproxy
+        run: cargo test -p cite-edge --locked --test sample_config
+      - name: Validate it with the real HAProxy binary
+        run: |
+          docker run --rm -v "${{ runner.temp }}/haproxy:/conf/haproxy:ro" docker.io/library/haproxy:3.0-bookworm haproxy -c -f /conf/haproxy/haproxy.cfg
