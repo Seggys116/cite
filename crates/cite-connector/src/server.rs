@@ -12,7 +12,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use cite_edge::allow::IpAllowlist;
 use cite_edge::model::EdgeConfig;
-use cite_edge::ratelimit::LoginLimiter;
+use cite_edge::ratelimit::{LoginLimiter, client_key};
 use cite_edge::render::{RenderOptions, render};
 use cite_edge::validate::validate_config;
 use hyper::body::Incoming;
@@ -30,7 +30,7 @@ use crate::deploy::{Deployer, detach};
 use crate::haproxy::Haproxy;
 use crate::logsink::{self, IngestStats};
 use crate::orchestrator::Orchestrator;
-use crate::store::{Store, now_unix, unix_to_rfc3339};
+use crate::store::{Store, TokenOutcome, now_unix, unix_to_rfc3339};
 use crate::{ConnectorError, Result, tls};
 
 mod archives;
@@ -68,6 +68,7 @@ pub struct Inner {
     ingest: Arc<IngestStats>,
     exports: Arc<Semaphore>,
     limiter: StdMutex<LoginLimiter>,
+    token_limiter: StdMutex<LoginLimiter>,
     render_opts: RenderOptions,
     started: Instant,
 }
@@ -100,6 +101,7 @@ impl Inner {
             ingest,
             exports: Arc::new(Semaphore::new(MAX_EXPORTS)),
             limiter: StdMutex::new(LoginLimiter::new()),
+            token_limiter: StdMutex::new(LoginLimiter::new()),
             render_opts,
             started: Instant::now(),
         })
@@ -360,7 +362,7 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
     usable.then_some(token)
 }
 
-async fn principal_for(st: &Inner, token: &str) -> Option<Principal> {
+async fn principal_for(st: &Inner, token: &str, peer_key: &str) -> Option<Principal> {
     if let Some(info) = st.store.validate_session(token, now_unix()) {
         return Some(Principal {
             name: info.username,
@@ -369,18 +371,42 @@ async fn principal_for(st: &Inner, token: &str) -> Option<Principal> {
             session_token: Some(token.to_string()),
         });
     }
-    st.store.verify_api_token(token).await.map(|t| Principal {
-        name: t.name,
-        kind: "api",
-        expires_at: None,
-        session_token: None,
-    })
+    // The attempt is counted in the same lock as the check and only forgiven once the hash passes, so bursts and dropped connections cannot get free guesses.
+    let ticket = StdMutex::new(None);
+    let admit = || {
+        let now = now_unix();
+        let mut limiter = lock_std(&st.token_limiter);
+        if limiter.check(peer_key, now).is_err() {
+            return false;
+        }
+        *lock_std(&ticket) = Some(limiter.record_provisional(peer_key, now));
+        true
+    };
+    let forgive = || {
+        let taken = lock_std(&ticket).take();
+        if let Some(t) = taken {
+            lock_std(&st.token_limiter).forgive(t);
+        }
+    };
+    match st.store.verify_api_token_gated(token, admit, forgive).await {
+        TokenOutcome::Accepted(t) => Some(Principal {
+            name: t.name,
+            kind: "api",
+            expires_at: None,
+            session_token: None,
+        }),
+        TokenOutcome::WrongSecret | TokenOutcome::Rejected => None,
+    }
 }
 
 async fn require_auth(State(st): State<AppState>, mut req: Request, next: Next) -> Response {
+    let peer_key = req
+        .extensions()
+        .get::<Peer>()
+        .map_or_else(String::new, |p| client_key(p.addr.ip()));
     // Every rejection is the same bare 401 so a caller learns nothing about why.
     let principal = match bearer(req.headers()) {
-        Some(token) => principal_for(&st, token).await,
+        Some(token) => principal_for(&st, token, &peer_key).await,
         None => None,
     };
     let Some(principal) = principal else {

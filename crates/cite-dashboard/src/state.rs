@@ -6,7 +6,7 @@ use cite_client::{
     ConfigError, ConfigFile, DEFAULT_FAN_OUT_LIMIT, DashboardConfig, NodeClient, TokenStore,
     fan_out,
 };
-use cite_edge::auth::{SessionInfo, SessionStore, hash_token};
+use cite_edge::auth::{SessionInfo, SessionStore};
 use cite_edge::ratelimit::LoginLimiter;
 use serde::Serialize;
 use subtle::ConstantTimeEq;
@@ -60,12 +60,12 @@ pub struct AppState {
     pub limiter: Mutex<LoginLimiter>,
     pub pending: Mutex<Option<PendingSetup>>,
     pub previews: Mutex<PreviewStore>,
-    // Only the hash of the one-time setup token is kept; the plaintext goes to the log once.
-    setup_token_hash: Mutex<Option<String>>,
+    // The one-time setup token lives only in memory and is cleared once setup completes.
+    setup_token: Mutex<Option<String>>,
     // Held across config mutations and logins so read-modify-write cycles never interleave.
     pub write_gate: tokio::sync::Mutex<()>,
     // Bounds concurrent Argon2 runs so a login burst cannot exhaust memory.
-    pub login_permits: tokio::sync::Semaphore,
+    pub login_permits: Arc<tokio::sync::Semaphore>,
     tokens: Arc<dyn TokenStore>,
     config: RwLock<DashboardConfig>,
     disk_key: Mutex<Option<FileKey>>,
@@ -104,9 +104,9 @@ impl AppState {
             limiter: Mutex::new(LoginLimiter::new()),
             pending: Mutex::new(None),
             previews: Mutex::new(PreviewStore::new()),
-            setup_token_hash: Mutex::new(None),
+            setup_token: Mutex::new(None),
             write_gate: tokio::sync::Mutex::new(()),
-            login_permits: tokio::sync::Semaphore::new(LOGIN_CONCURRENCY),
+            login_permits: Arc::new(tokio::sync::Semaphore::new(LOGIN_CONCURRENCY)),
             tokens,
             config: RwLock::new(config),
             disk_key: Mutex::new(disk_key),
@@ -122,21 +122,20 @@ impl AppState {
         let mut bytes = [0u8; SETUP_TOKEN_BYTES];
         getrandom::fill(&mut bytes).map_err(ApiError::internal)?;
         let token: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-        *lock(&self.setup_token_hash) = Some(hash_token(&token));
+        *lock(&self.setup_token) = Some(token.clone());
         Ok(token)
     }
 
     pub fn setup_token_matches(&self, presented: &str) -> bool {
-        let stored = lock(&self.setup_token_hash).clone();
+        let stored = lock(&self.setup_token).clone();
         let Some(stored) = stored else {
             return false;
         };
-        let presented = hash_token(presented.trim());
-        bool::from(presented.as_bytes().ct_eq(stored.as_bytes()))
+        bool::from(presented.trim().as_bytes().ct_eq(stored.as_bytes()))
     }
 
     pub fn clear_setup_token(&self) {
-        *lock(&self.setup_token_hash) = None;
+        *lock(&self.setup_token) = None;
     }
 
     pub async fn config_snapshot(&self) -> DashboardConfig {

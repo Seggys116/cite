@@ -17,7 +17,6 @@ sha2.workspace = true
 subtle.workspace = true
 time.workspace = true
 argon2 = "0.5"
-blake2 = "0.10"
 hmac = "0.12"
 sha1 = "0.10"
 getrandom = "0.3"

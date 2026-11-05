@@ -9,6 +9,7 @@ use axum::{Extension, Json};
 use cite_edge::analytics::{RequestFilter, window_from_str};
 use cite_edge::model::{EdgeSettings, FirewallRule, MaintenancePage, Site, Slot, Target};
 use cite_edge::presets::{preset, presets};
+use cite_edge::ratelimit::client_key;
 use cite_edge::validate::{is_valid_id, validate_page, validate_rule, validate_site};
 use cite_store::TopKind;
 use serde::{Deserialize, Serialize};
@@ -93,16 +94,24 @@ pub(super) async fn login(
     JsonBody(req): JsonBody<LoginReq>,
 ) -> ApiResult<Response> {
     let ip = peer.addr.ip().to_canonical().to_string();
-    // The limiter is checked and updated inside the store's login lock so a burst cannot all pass the check.
+    let key = client_key(peer.addr.ip());
+    // The attempt is counted before the hash runs, inside the store's login lock, so neither a burst nor a dropped connection gets free guesses; a correct login takes it back.
+    let ticket = std::sync::Mutex::new(None);
+    let admit = |now: u64| -> std::result::Result<(), u64> {
+        let mut limiter = lock_std(&st.limiter);
+        limiter.check(&key, now)?;
+        *lock_std(&ticket) = Some(limiter.record_provisional_global(&key, now));
+        Ok(())
+    };
+    let forgive = || {
+        let taken = lock_std(&ticket).take();
+        if let Some(t) = taken {
+            lock_std(&st.limiter).forgive(t);
+        }
+    };
     let outcome = st
         .store
-        .verify_login_gated(
-            &req.username,
-            &req.password,
-            &req.totp,
-            |now| lock_std(&st.limiter).check(&ip, now),
-            |now| lock_std(&st.limiter).record_failure(&ip, now),
-        )
+        .verify_login_gated(&req.username, &req.password, &req.totp, admit, forgive)
         .await?;
     match outcome {
         LoginOutcome::Blocked(retry) => return Err(ApiError::too_many(retry)),
@@ -118,7 +127,7 @@ pub(super) async fn login(
         }
         LoginOutcome::Accepted => {}
     }
-    lock_std(&st.limiter).record_success(&ip);
+    lock_std(&st.limiter).record_success(&key);
     let (token, expires) = st.store.create_session(&req.username, now_unix())?;
     st.store
         .audit(&req.username, "login.success", &format!("peer={ip}"))
