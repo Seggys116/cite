@@ -43,6 +43,8 @@ pub(crate) fn snapshot_secret(site_id: &str, kind: EnvKind) -> String {
     }
 }
 
+pub const SERVICE_TOKEN_PREFIX: &str = "dp.st.";
+
 /// A Doppler service or personal token: wiped on drop, never printed.
 #[derive(Clone)]
 pub struct DopplerToken(Zeroizing<String>);
@@ -61,6 +63,11 @@ impl DopplerToken {
 
     pub(crate) fn expose(&self) -> &str {
         &self.0
+    }
+
+    /// A service token is scoped to one project and config, so it alone can name what a site reads.
+    pub fn is_service_token(&self) -> bool {
+        self.0.starts_with(SERVICE_TOKEN_PREFIX)
     }
 
     fn scrub(&self, text: &str) -> String {
@@ -388,10 +395,13 @@ impl DopplerSource for DopplerClient {
         config: &'a str,
     ) -> BoxFuture<'a, Result<Downloaded, DopplerError>> {
         Box::pin(async move {
-            let url = self.url(
-                "/v3/configs/config/secrets/download",
-                &[("project", project), ("config", config), ("format", "json")],
-            )?;
+            // A service token is scoped to one config, so a token-only binding names neither.
+            let query: &[(&str, &str)] = if project.is_empty() && config.is_empty() {
+                &[("format", "json")]
+            } else {
+                &[("project", project), ("config", config), ("format", "json")]
+            };
+            let url = self.url("/v3/configs/config/secrets/download", query)?;
             let body = Zeroizing::new(self.get(token, url).await?);
             parse_download(&body)
         })
@@ -613,6 +623,8 @@ pub(crate) mod mock {
         pub mode: Mutex<Mode>,
         pub downloads: AtomicUsize,
         pub queries: Mutex<Vec<String>>,
+        // The (project, config) query parameters of each download, None where a parameter was absent.
+        pub download_params: Mutex<Vec<(Option<String>, Option<String>)>>,
     }
 
     impl MockState {
@@ -727,6 +739,10 @@ pub(crate) mod mock {
         if q.0.get("format").map(String::as_str) != Some("json") {
             return (StatusCode::BAD_REQUEST, "{}").into_response();
         }
+        s.download_params
+            .lock()
+            .unwrap()
+            .push((q.0.get("project").cloned(), q.0.get("config").cloned()));
         let key = (
             q.0.get("project").cloned().unwrap_or_default(),
             q.0.get("config").cloned().unwrap_or_default(),
@@ -744,6 +760,7 @@ pub(crate) mod mock {
             mode: Mutex::new(Mode::Normal),
             downloads: AtomicUsize::new(0),
             queries: Mutex::default(),
+            download_params: Mutex::default(),
         });
         let app = Router::new()
             .route("/v3/projects", get(projects))

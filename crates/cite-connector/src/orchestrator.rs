@@ -3,9 +3,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use cite_core::parse_poll_interval;
-use cite_edge::model::{Site, Slot, Source, Target};
+use cite_edge::model::{Site, Slot, Source, Target, VOLUME_PREFIX, volume_docker_name};
 use cite_edge::status::{BuildEnvPatch, LogLine, ManagerReport};
-use cite_edge::validate::is_valid_id;
+use cite_edge::validate::{is_valid_id, is_valid_volume_name, validate_volumes};
 use reqwest::Method;
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -399,6 +399,31 @@ chown 0:0 /data/releases /data/releases/blue /data/releases/green /data/control 
 chown 65532:65532 /data/status && \
 chmod 0755 /data/releases /data/control /data/status && chmod 0750 /data/state";
 
+// A fresh volume is root-owned; the marker makes it non-empty so Docker never copies image content (and its owner) over it.
+fn volume_init_step(name: &str) -> String {
+    format!(
+        " && if [ \"$(stat -c %u /vols/{name})\" != 65532 ]; then touch /vols/{name}/.cite-init && chown -R 65532:65532 /vols/{name} && chmod 0750 /vols/{name}; fi"
+    )
+}
+
+fn init_script(volume_names: &[String]) -> String {
+    let mut script = INIT_SCRIPT.to_string();
+    for name in volume_names {
+        script.push_str(&volume_init_step(name));
+    }
+    script
+}
+
+/// A persistent site volume as Docker reports it, joined by the caller with the declared list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SiteVolumeInfo {
+    pub name: String,
+    pub docker_name: String,
+    pub size_bytes: Option<u64>,
+    pub created_at: Option<String>,
+    pub mounted: bool,
+}
+
 struct RuntimeRow {
     runtime: &'static str,
     manager: &'static str,
@@ -461,6 +486,21 @@ pub struct Orchestrator {
     limits: Limits,
     forge: Forge,
     reconciled: AtomicBool,
+    // Mirrors the proxy's CITE_STACK_EXECUTOR_EGRESS, so an outbound site is refused before anything is removed.
+    executor_egress: bool,
+}
+
+const EXECUTOR_EGRESS_KEY: &str = "CITE_STACK_EXECUTOR_EGRESS";
+
+pub fn executor_egress_from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<bool> {
+    match get(EXECUTOR_EGRESS_KEY).as_deref().map(str::trim) {
+        None | Some("") => Ok(true),
+        Some(v) if v.eq_ignore_ascii_case("true") || v == "1" => Ok(true),
+        Some(v) if v.eq_ignore_ascii_case("false") || v == "0" => Ok(false),
+        Some(_) => Err(ConnectorError::BadRequest(format!(
+            "{EXECUTOR_EGRESS_KEY} must be true or false"
+        ))),
+    }
 }
 
 // Everything besides the site itself that shapes a stack; `isolate` gives each stack its own network.
@@ -483,6 +523,7 @@ pub struct SpecSet {
     pub executor: Value,
     pub init: Value,
     pub volumes: Vec<String>,
+    pub site_volumes: Vec<String>,
     pub networks: Vec<String>,
 }
 
@@ -502,6 +543,7 @@ pub fn stack_specs(
     }
     Ok(SpecSet {
         volumes: names.volumes().iter().map(|v| v.to_string()).collect(),
+        site_volumes: plan.site_volumes.into_iter().map(|(docker, _)| docker).collect(),
         manager_name: names.manager,
         executor_name: names.executor,
         init_name: names.init,
@@ -532,6 +574,48 @@ struct Inspected {
     exit_code: Option<i32>,
     oom_killed: bool,
     report_text: String,
+    site_mounts: Vec<(String, String)>,
+    // Sorted names of the networks the container is attached to.
+    networks: Vec<String>,
+}
+
+// Static runtimes ignore the setting: they have no server process that could make a request.
+fn wants_outbound(site: &Site) -> bool {
+    site.outbound
+        && site
+            .source
+            .as_ref()
+            .is_some_and(cite_edge::validate::runs_server)
+}
+
+fn endpoint_names(endpoints: &Value) -> Vec<String> {
+    let mut names: Vec<String> = endpoints
+        .as_object()
+        .map(|m| m.keys().cloned().collect())
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+// The (volume, target) pairs of the site volumes a spec or an inspected HostConfig mounts, sorted.
+fn site_mounts_of(host: &Value) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = host["Mounts"]
+        .as_array()
+        .map(|mounts| {
+            mounts
+                .iter()
+                .filter_map(|m| {
+                    let source = m["Source"].as_str()?;
+                    let target = m["Target"].as_str()?;
+                    source
+                        .starts_with(VOLUME_PREFIX)
+                        .then(|| (source.to_string(), target.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    out.sort();
+    out
 }
 
 impl Inspected {
@@ -562,6 +646,8 @@ impl Inspected {
             && self.network == network
             && limit_ok("Memory", self.memory)
             && limit_ok("NanoCpus", self.nano_cpus)
+            && self.site_mounts == site_mounts_of(&spec["HostConfig"])
+            && self.networks == endpoint_names(&spec["NetworkingConfig"]["EndpointsConfig"])
     }
 }
 
@@ -580,6 +666,12 @@ pub struct SlotInspect {
     pub manager_nano_cpus: i64,
     pub executor_memory: i64,
     pub executor_nano_cpus: i64,
+    /// The (Docker volume, mount path) pairs of the site volumes the executor mounts, sorted.
+    pub executor_volumes: Vec<(String, String)>,
+    /// False while the slot has no executor container, so a first build is not reported as stale.
+    pub executor_present: bool,
+    /// True when the executor is attached to its stack's egress network.
+    pub executor_outbound: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -644,6 +736,8 @@ struct Plan {
     manager: Value,
     executor: Value,
     init: Value,
+    // (Docker volume, declared name) of each site volume, in declaration order.
+    site_volumes: Vec<(String, String)>,
 }
 
 impl Orchestrator {
@@ -656,7 +750,10 @@ impl Orchestrator {
                 .and_then(|o| {
                     Ok(o.with_default_token(cfg.github_token.clone())
                         .with_limits(Limits::from_env()?)
-                        .with_forge(Forge::from_env()?))
+                        .with_forge(Forge::from_env()?)
+                        .with_executor_egress(executor_egress_from_lookup(|k| {
+                            std::env::var(k).ok()
+                        })?))
                 })
                 .map(Some),
         }
@@ -700,12 +797,23 @@ impl Orchestrator {
             limits: Limits::default(),
             forge: Forge::default(),
             reconciled: AtomicBool::new(false),
+            executor_egress: true,
         })
     }
 
     pub fn with_forge(mut self, forge: Forge) -> Orchestrator {
         self.forge = forge;
         self
+    }
+
+    pub fn with_executor_egress(mut self, allowed: bool) -> Orchestrator {
+        self.executor_egress = allowed;
+        self
+    }
+
+    /// Whether executors may join their stack's egress network for outbound requests.
+    pub fn executor_egress(&self) -> bool {
+        self.executor_egress
     }
 
     pub fn with_limits(mut self, limits: Limits) -> Orchestrator {
@@ -807,6 +915,8 @@ impl Orchestrator {
         for volume in names.volumes() {
             self.create_volume(volume, &names.id, names.slot).await?;
         }
+        self.create_site_volumes(&names.id, &plan.site_volumes)
+            .await?;
         self.create_network(&names.egress, &names.id, names.slot, false)
             .await?;
         if self.isolated() {
@@ -864,6 +974,8 @@ impl Orchestrator {
         for volume in names.volumes() {
             self.create_volume(volume, &names.id, names.slot).await?;
         }
+        self.create_site_volumes(&names.id, &plan.site_volumes)
+            .await?;
         self.create_network(&names.egress, &names.id, names.slot, false)
             .await?;
         let manager = self.inspect_owned(&names.manager).await?;
@@ -883,7 +995,13 @@ impl Orchestrator {
         let names = StackNames::new(site_id, slot)?;
         let manager = self.inspect_owned(&names.manager).await?;
         let executor = self.inspect_owned(&names.executor).await?;
-        let (exec_memory, exec_cpus) = executor.map_or((0, 0), |e| (e.memory, e.nano_cpus));
+        let exec_present = executor.is_some();
+        let exec_outbound = executor
+            .as_ref()
+            .is_some_and(|e| e.networks.contains(&names.egress));
+        let (exec_memory, exec_cpus, exec_volumes) = executor.map_or((0, 0, Vec::new()), |e| {
+            (e.memory, e.nano_cpus, e.site_mounts)
+        });
         let Some(m) = manager else {
             return Ok(SlotInspect {
                 state: "missing".to_string(),
@@ -897,6 +1015,9 @@ impl Orchestrator {
                 manager_nano_cpus: 0,
                 executor_memory: exec_memory,
                 executor_nano_cpus: exec_cpus,
+                executor_volumes: exec_volumes,
+                executor_present: exec_present,
+                executor_outbound: exec_outbound,
             });
         };
         Ok(SlotInspect {
@@ -918,6 +1039,9 @@ impl Orchestrator {
             manager_nano_cpus: m.nano_cpus,
             executor_memory: exec_memory,
             executor_nano_cpus: exec_cpus,
+            executor_volumes: exec_volumes,
+            executor_present: exec_present,
+            executor_outbound: exec_outbound,
         })
     }
 
@@ -936,8 +1060,19 @@ impl Orchestrator {
         want.sort();
         have.sort();
         let limits = self.limits.for_source(source);
+        // A changed volume set shows as a pending redeploy, like any other stored setting.
+        let mut volumes: Vec<(String, String)> = site
+            .volumes
+            .iter()
+            .map(|v| (v.docker_name(&site.id), v.mount_path.clone()))
+            .collect();
+        volumes.sort();
+        let executor_current = !inspected.executor_present
+            || (volumes == inspected.executor_volumes
+                && wants_outbound(site) == inspected.executor_outbound);
         inspected.state != "missing"
             && want == have
+            && executor_current
             && inspected.manager_memory == limits.manager_memory
             && inspected.manager_nano_cpus == limits.manager_nano_cpus
             && inspected.executor_memory == limits.executor_memory
@@ -1075,6 +1210,166 @@ impl Orchestrator {
                     .await?;
                 }
             }
+        }
+        Ok(())
+    }
+
+    // Site volumes are shared by both slots, so they carry no slot label and are never removed with a stack.
+    async fn create_site_volumes(&self, site_id: &str, volumes: &[(String, String)]) -> Result<()> {
+        for (docker, name) in volumes {
+            match self.managed_label("volumes", docker).await? {
+                Some(true) => continue,
+                Some(false) => return self.require_managed("volumes", docker).await,
+                None => {}
+            }
+            let body = json!({
+                "Name": docker,
+                "Labels": {
+                    "cite.managed": "true",
+                    "cite.site": site_id,
+                    "cite.volume": name,
+                },
+            });
+            let reply = self
+                .send(
+                    Method::POST,
+                    &format!("{API}/volumes/create"),
+                    &[],
+                    Some(&body),
+                    REQUEST_TIMEOUT,
+                    &[409],
+                )
+                .await?;
+            if reply.status == 409 {
+                self.require_managed("volumes", docker).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Every persistent volume Docker holds for the site, declared or left over from an earlier volume list.
+    pub async fn site_volumes(&self, site_id: &str) -> Result<Vec<SiteVolumeInfo>> {
+        if !is_valid_id(site_id) {
+            return Err(ConnectorError::BadRequest(format!(
+                "site id {site_id:?} is not a valid slug"
+            )));
+        }
+        let filters = json!({ "label": ["cite.managed=true", format!("cite.site={site_id}")] })
+            .to_string();
+        let reply = self
+            .send(
+                Method::GET,
+                &format!("{API}/volumes"),
+                &[("filters", filters.as_str())],
+                None,
+                REQUEST_TIMEOUT,
+                &[],
+            )
+            .await?;
+        let v: Value = serde_json::from_slice(&reply.body)?;
+        let mut mounted: Vec<String> = Vec::new();
+        for slot in [Slot::Blue, Slot::Green] {
+            let names = StackNames::new(site_id, slot)?;
+            if let Some(exec) = self.inspect_owned(&names.executor).await?
+                && exec.running
+            {
+                mounted.extend(exec.site_mounts.into_iter().map(|(source, _)| source));
+            }
+        }
+        let prefix = volume_docker_name(site_id, "");
+        let mut out: Vec<SiteVolumeInfo> = v["Volumes"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| {
+                        let docker = item["Name"].as_str()?;
+                        let name = docker.strip_prefix(&prefix)?;
+                        let labelled = item["Labels"]["cite.site"].as_str() == Some(site_id)
+                            && item["Labels"]["cite.volume"].as_str() == Some(name);
+                        (labelled && is_valid_volume_name(name)).then(|| SiteVolumeInfo {
+                            name: name.to_string(),
+                            docker_name: docker.to_string(),
+                            size_bytes: item["UsageData"]["Size"]
+                                .as_i64()
+                                .and_then(|n| u64::try_from(n).ok()),
+                            created_at: item["CreatedAt"].as_str().map(str::to_string),
+                            mounted: mounted.iter().any(|m| m == docker),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(out)
+    }
+
+    /// Deletes a site volume and its data; refused while a running container could still be writing to it.
+    pub async fn remove_site_volume(&self, site_id: &str, name: &str, declared: bool) -> Result<()> {
+        if !is_valid_id(site_id) || !is_valid_volume_name(name) {
+            return Err(ConnectorError::BadRequest(format!(
+                "volume {name:?} is not a valid volume name"
+            )));
+        }
+        let docker = volume_docker_name(site_id, name);
+        match self.managed_label("volumes", &docker).await? {
+            None => {
+                return Err(ConnectorError::NotFound(format!(
+                    "volume {name} of site {site_id}"
+                )));
+            }
+            Some(false) => {
+                return Err(ConnectorError::Conflict(format!(
+                    "volume {docker} exists and is not managed by cite"
+                )));
+            }
+            Some(true) => {}
+        }
+        for slot in [Slot::Blue, Slot::Green] {
+            let names = StackNames::new(site_id, slot)?;
+            for ctr in [&names.executor, &names.manager] {
+                let Some(c) = self.inspect_owned(ctr).await? else {
+                    continue;
+                };
+                let mounts_it = c.site_mounts.iter().any(|(source, _)| *source == docker);
+                if c.running && (declared || mounts_it) {
+                    return Err(ConnectorError::Conflict(format!(
+                        "volume {name} is still in use by the running {} slot; remove it from the site's volumes and redeploy, or stop the site, before deleting its data",
+                        slot.as_str()
+                    )));
+                }
+            }
+        }
+        self.send(
+            Method::DELETE,
+            &format!("{API}/volumes/{docker}"),
+            &[],
+            None,
+            REQUEST_TIMEOUT,
+            &[404],
+        )
+        .await
+        .map(|_| ())
+        .map_err(|e| match e {
+            ConnectorError::Conflict(_) => ConnectorError::Conflict(format!(
+                "volume {name} is still attached to a stopped container of the site; redeploy or delete the site first"
+            )),
+            other => other,
+        })
+    }
+
+    /// Removes every persistent volume of a deleted site; only called when the delete asked for a purge.
+    pub async fn remove_site_volumes(&self, site_id: &str) -> Result<()> {
+        for volume in self.site_volumes(site_id).await? {
+            self.send(
+                Method::DELETE,
+                &format!("{API}/volumes/{}", volume.docker_name),
+                &[],
+                None,
+                REQUEST_TIMEOUT,
+                &[404],
+            )
+            .await?;
         }
         Ok(())
     }
@@ -1464,6 +1759,8 @@ impl Orchestrator {
                 .and_then(|entry| entry["Output"].as_str())
                 .unwrap_or_default()
                 .to_string(),
+            site_mounts: site_mounts_of(&v["HostConfig"]),
+            networks: endpoint_names(&v["NetworkSettings"]["Networks"]),
         }))
     }
 
@@ -1482,6 +1779,16 @@ impl Orchestrator {
             ConnectorError::Internal(m) if m.starts_with("docker api 4") && mentions_limits(&m) => {
                 ConnectorError::Internal(format!(
                     "{m} (the docker proxy refused the stack limits; raise CITE_STACK_MAX_MEM or CITE_STACK_MAX_CPUS on the proxy or lower the site's limits)"
+                ))
+            }
+            ConnectorError::Internal(m)
+                if m.starts_with("docker api 403")
+                    && spec["NetworkingConfig"]["EndpointsConfig"]
+                        .as_object()
+                        .is_some_and(|e| e.len() > 1) =>
+            {
+                ConnectorError::Internal(format!(
+                    "{m} (the docker proxy refused the executor's outbound network; set CITE_STACK_EXECUTOR_EGRESS to the same value on the proxy and the connector, or turn outbound off for the site)"
                 ))
             }
             other => other,
@@ -1551,6 +1858,15 @@ impl Orchestrator {
         let mut specs = vec![("manager", &plan.manager)];
         if executor {
             env_check(&opts.runtime_env, true).map_err(|why| refuse("executor", why))?;
+            let outbound = plan.executor["NetworkingConfig"]["EndpointsConfig"]
+                .get(plan.names.egress.as_str())
+                .is_some();
+            if outbound && !self.executor_egress {
+                return Err(refuse(
+                    "executor",
+                    "outbound network access is disabled on this node (CITE_STACK_EXECUTOR_EGRESS=false); turn outbound off for this site".to_string(),
+                ));
+            }
             specs.push(("executor", &plan.executor));
         }
         for (what, spec) in specs {
@@ -2196,6 +2512,18 @@ fn plan_stack_with(
     } else {
         *limits
     };
+    // The stored list is checked again here because its names reach the init script.
+    validate_volumes(site).map_err(|e| ConnectorError::BadRequest(e.0))?;
+    let site_volumes: Vec<(String, String)> = site
+        .volumes
+        .iter()
+        .map(|v| (v.docker_name(&site.id), v.name.clone()))
+        .collect();
+    let site_mounts: Vec<Value> = site
+        .volumes
+        .iter()
+        .map(|v| volume_mount(&v.docker_name(&site.id), &v.mount_path, None, false))
+        .collect();
     Ok(Plan {
         manager: manager_spec(&names, &manager_image, &manager_env, &limits),
         executor: executor_spec(
@@ -2204,11 +2532,14 @@ fn plan_stack_with(
             &executor_env,
             &executor_network,
             &limits,
+            &site_mounts,
+            wants_outbound(site).then_some(names.egress.as_str()),
         ),
-        init: init_spec(&names, &manager_image),
+        init: init_spec(&names, &manager_image, &site_volumes),
         names,
         manager_image,
         executor_image,
+        site_volumes,
     })
 }
 
@@ -2294,8 +2625,25 @@ fn executor_spec(
     env: &[String],
     network: &str,
     limits: &Limits,
+    site_mounts: &[Value],
+    egress: Option<&str>,
 ) -> Value {
     let data = names.data.as_str();
+    // The egress bridge only adds a default route; HAProxy still resolves the alias on the internal network alone.
+    let mut endpoints = serde_json::Map::new();
+    endpoints.insert(
+        network.to_string(),
+        json!({ "Aliases": [names.executor.as_str()] }),
+    );
+    if let Some(egress) = egress {
+        endpoints.insert(egress.to_string(), json!({}));
+    }
+    let mut mounts = vec![
+        volume_mount(data, "/var/lib/cite/releases", Some("releases"), true),
+        volume_mount(data, "/var/lib/cite/control", Some("control"), true),
+        volume_mount(data, "/var/lib/cite/status", Some("status"), false),
+    ];
+    mounts.extend(site_mounts.iter().cloned());
     json!({
         "Image": image,
         "User": "65532:65532",
@@ -2308,11 +2656,7 @@ fn executor_spec(
             "SecurityOpt": ["no-new-privileges:true"],
             "CapDrop": ["ALL"],
             "Tmpfs": { "/tmp": "size=64m,mode=1777,noexec,nosuid,nodev" },
-            "Mounts": [
-                volume_mount(data, "/var/lib/cite/releases", Some("releases"), true),
-                volume_mount(data, "/var/lib/cite/control", Some("control"), true),
-                volume_mount(data, "/var/lib/cite/status", Some("status"), false),
-            ],
+            "Mounts": mounts,
             "NetworkMode": network,
             "Memory": limits.executor_memory,
             "MemorySwap": limits.executor_memory,
@@ -2321,19 +2665,23 @@ fn executor_spec(
             "RestartPolicy": { "Name": "unless-stopped" },
             "LogConfig": log_config(),
         },
-        "NetworkingConfig": {
-            "EndpointsConfig": { network: { "Aliases": [names.executor.as_str()] } }
-        },
+        "NetworkingConfig": { "EndpointsConfig": endpoints },
     })
 }
 
-// One-shot that lays out the data volume; it has no network and only the caps chown needs.
-fn init_spec(names: &StackNames, image: &str) -> Value {
+// One-shot that lays out the data volume and hands fresh site volumes to the executor user; no network, only the caps chown needs.
+fn init_spec(names: &StackNames, image: &str, site_volumes: &[(String, String)]) -> Value {
+    let mut mounts = vec![volume_mount(&names.data, "/data", None, false)];
+    let mut volume_names = Vec::new();
+    for (docker, name) in site_volumes {
+        mounts.push(volume_mount(docker, &format!("/vols/{name}"), None, false));
+        volume_names.push(name.clone());
+    }
     json!({
         "Image": image,
         "User": "0:0",
         "Entrypoint": ["/bin/sh", "-c"],
-        "Cmd": [INIT_SCRIPT],
+        "Cmd": [init_script(&volume_names)],
         "Labels": labels(&names.id, names.slot, "init"),
         "Healthcheck": { "Test": ["NONE"] },
         "HostConfig": {
@@ -2341,7 +2689,7 @@ fn init_spec(names: &StackNames, image: &str) -> Value {
             "SecurityOpt": ["no-new-privileges:true"],
             "CapDrop": ["ALL"],
             "CapAdd": ["CHOWN", "FOWNER"],
-            "Mounts": [volume_mount(&names.data, "/data", None, false)],
+            "Mounts": mounts,
             "NetworkMode": "none",
             "Memory": INIT_MEMORY,
             "MemorySwap": INIT_MEMORY,
@@ -2593,6 +2941,33 @@ pub(crate) mod tests {
                 );
                 (201, "{\"Id\":\"n\"}".to_string())
             }
+            ("GET", "/volumes") => {
+                let filters = query_param(query, "filters").unwrap_or_default();
+                let wanted: Value = serde_json::from_str(&filters).unwrap_or_default();
+                let wanted: Vec<(String, String)> = wanted["label"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|l| l.as_str()?.split_once('='))
+                            .map(|(k, v)| (k.to_string(), v.to_string()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let list: Vec<Value> = f
+                    .volumes
+                    .iter()
+                    .filter(|(_, labels)| wanted.iter().all(|(k, v)| labels[k.as_str()] == v.as_str()))
+                    .map(|(name, labels)| {
+                        json!({
+                            "Name": name,
+                            "Labels": labels,
+                            "CreatedAt": "2026-11-01T10:00:00Z",
+                            "UsageData": { "Size": 4096, "RefCount": 1 },
+                        })
+                    })
+                    .collect();
+                (200, json!({ "Volumes": list }).to_string())
+            }
             ("GET", p) if p.starts_with("/volumes/") => {
                 match f.volumes.get(&p["/volumes/".len()..]) {
                     Some(labels) => (200, json!({ "Labels": labels }).to_string()),
@@ -2719,6 +3094,10 @@ pub(crate) mod tests {
                                     "NetworkMode": c.spec["HostConfig"]["NetworkMode"],
                                     "Memory": c.spec["HostConfig"]["Memory"],
                                     "NanoCpus": c.spec["HostConfig"]["NanoCpus"],
+                                    "Mounts": c.spec["HostConfig"]["Mounts"],
+                                },
+                                "NetworkSettings": {
+                                    "Networks": c.spec["NetworkingConfig"]["EndpointsConfig"],
                                 },
                             })
                             .to_string(),
@@ -2893,6 +3272,8 @@ pub(crate) mod tests {
             source: Some(source_with(runtime, json!({}))),
             history: Vec::new(),
             access: Default::default(),
+            volumes: Vec::new(),
+            outbound: true,
         }
     }
 
@@ -3105,12 +3486,12 @@ pub(crate) mod tests {
         let endpoints = p.executor["NetworkingConfig"]["EndpointsConfig"]
             .as_object()
             .unwrap();
-        assert_eq!(endpoints.len(), 1);
+        assert_eq!(endpoints.len(), 2, "outbound is on by default");
         assert_eq!(
             endpoints["cite_edge"]["Aliases"],
             json!(["cite-shop-blue-executor"])
         );
-        assert!(!p.executor.to_string().contains("egress"));
+        assert_eq!(endpoints["cite-shop-blue-egress"], json!({}));
         let mounts = hc["Mounts"].as_array().unwrap();
         for target in ["/var/lib/cite/releases", "/var/lib/cite/control"] {
             let m = mounts.iter().find(|m| m["Target"] == target).unwrap();
@@ -3887,11 +4268,12 @@ pub(crate) mod tests {
         let endpoints = p.executor["NetworkingConfig"]["EndpointsConfig"]
             .as_object()
             .unwrap();
-        assert_eq!(endpoints.len(), 1);
+        assert_eq!(endpoints.len(), 2);
         assert_eq!(
             endpoints["cite-shop-blue-net"]["Aliases"],
             json!(["cite-shop-blue-executor"])
         );
+        assert_eq!(endpoints["cite-shop-blue-egress"], json!({}));
         assert!(!p.executor.to_string().contains("cite_edge"));
         assert_eq!(
             p.manager["HostConfig"]["NetworkMode"],
@@ -5041,5 +5423,249 @@ pub(crate) mod tests {
         assert_eq!(count(&fake, "CREATE cite-shop-blue-manager"), 4);
         assert_eq!(count(&fake, "CREATE cite-shop-blue-executor"), 1);
         assert!(!container_env(&fake, "cite-shop-blue-manager").contains("CITE_FORGE"));
+    }
+
+    fn with_volumes(mut s: Site, vols: &[(&str, &str)]) -> Site {
+        s.volumes = vols
+            .iter()
+            .map(|(n, p)| cite_edge::model::Volume {
+                name: (*n).to_string(),
+                mount_path: (*p).to_string(),
+            })
+            .collect();
+        s
+    }
+
+    fn site_mount_pairs(spec: &Value) -> Vec<(String, String)> {
+        site_mounts_of(&spec["HostConfig"])
+    }
+
+    #[test]
+    fn both_slots_mount_the_same_site_volumes_read_write() {
+        let s = with_volumes(site("shop", None), &[("data", "/data"), ("uploads", "/srv/up")]);
+        let env = stack_env("ghcr.io/seggys116", "0.2.0", false);
+        let blue = plan_stack(&s, Slot::Blue, None, TOKEN, &env).unwrap();
+        let green = plan_stack(&s, Slot::Green, None, TOKEN, &env).unwrap();
+        let want = vec![
+            ("cite-vol-shop_data".to_string(), "/data".to_string()),
+            ("cite-vol-shop_uploads".to_string(), "/srv/up".to_string()),
+        ];
+        assert_eq!(site_mount_pairs(&blue.executor), want);
+        assert_eq!(site_mount_pairs(&green.executor), want);
+        let mounts = blue.executor["HostConfig"]["Mounts"].as_array().unwrap();
+        assert_eq!(mounts.len(), 5);
+        for m in &mounts[3..] {
+            assert_eq!(m["Type"], "volume");
+            assert_eq!(m["ReadOnly"], false);
+            assert!(m.get("VolumeOptions").is_none());
+        }
+        assert!(site_mount_pairs(&blue.manager).is_empty(), "the manager never sees site data");
+        let init_mounts = blue.init["HostConfig"]["Mounts"].as_array().unwrap();
+        assert_eq!(init_mounts.len(), 3);
+        assert_eq!(init_mounts[1]["Target"], "/vols/data");
+        assert_eq!(init_mounts[2]["Source"], "cite-vol-shop_uploads");
+        let script = blue.init["Cmd"][0].as_str().unwrap();
+        assert!(script.starts_with(INIT_SCRIPT));
+        assert!(script.contains("chown -R 65532:65532 /vols/data"));
+        assert!(script.contains("touch /vols/uploads/.cite-init"));
+        assert_eq!(blue.init["HostConfig"]["NetworkMode"], "none");
+    }
+
+    #[test]
+    fn sites_without_volumes_keep_the_plain_specs() {
+        let p = plan(Some("static"), None).unwrap();
+        assert_eq!(p.executor["HostConfig"]["Mounts"].as_array().unwrap().len(), 3);
+        assert_eq!(p.init["Cmd"][0], INIT_SCRIPT);
+        assert_eq!(p.init["HostConfig"]["Mounts"].as_array().unwrap().len(), 1);
+        assert!(p.site_volumes.is_empty());
+    }
+
+    #[test]
+    fn a_static_site_with_volumes_is_refused_at_plan_time() {
+        let s = with_volumes(site("docs", Some("static")), &[("data", "/data")]);
+        let env = stack_env("ghcr.io/seggys116", "0.2.0", false);
+        let err = plan_stack(&s, Slot::Blue, None, TOKEN, &env)
+            .err()
+            .expect("refused")
+            .to_string();
+        assert!(err.contains("server runtime"), "{err}");
+        let bad = with_volumes(site("shop", None), &[("data", "/var/lib/cite/x")]);
+        assert!(plan_stack(&bad, Slot::Blue, None, TOKEN, &env).is_err());
+    }
+
+    #[tokio::test]
+    async fn site_volumes_are_created_once_and_shared_by_both_slots() {
+        let (orch, fake) = start_fake().await;
+        let s = with_volumes(site("shop", None), &[("data", "/data")]);
+        orch.ensure_stack(&s, Slot::Blue, None, TOKEN)
+            .await
+            .unwrap();
+        orch.ensure_stack(&s, Slot::Green, None, TOKEN)
+            .await
+            .unwrap();
+        {
+            let f = fake.lock().unwrap();
+            let labels = &f.volumes["cite-vol-shop_data"];
+            assert_eq!(labels["cite.managed"], "true");
+            assert_eq!(labels["cite.site"], "shop");
+            assert_eq!(labels["cite.volume"], "data");
+            assert!(labels.get("cite.slot").is_none());
+            for slot in ["blue", "green"] {
+                let spec = &f.containers[&format!("cite-shop-{slot}-executor")].spec;
+                assert_eq!(
+                    site_mount_pairs(spec),
+                    vec![("cite-vol-shop_data".to_string(), "/data".to_string())]
+                );
+            }
+        }
+        assert_eq!(count(&fake, "POST /volumes/create"), 7);
+        let listed = orch.site_volumes("shop").await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "data");
+        assert!(listed[0].mounted);
+        assert_eq!(listed[0].size_bytes, Some(4096));
+    }
+
+    #[tokio::test]
+    async fn a_changed_volume_set_recreates_the_executor_and_shows_as_unsettled() {
+        let (orch, fake) = start_fake().await;
+        let s = site("shop", None);
+        orch.ensure_stack(&s, Slot::Blue, None, TOKEN)
+            .await
+            .unwrap();
+        let seen = orch.inspect_slot("shop", Slot::Blue).await.unwrap();
+        assert!(orch.settings_current(&s, &seen));
+        let changed = with_volumes(s.clone(), &[("data", "/data")]);
+        assert!(!orch.settings_current(&changed, &seen), "volume change, redeploy needed");
+        orch.ensure_stack(&changed, Slot::Blue, None, TOKEN)
+            .await
+            .unwrap();
+        assert_eq!(count(&fake, "CREATE cite-shop-blue-executor"), 2);
+        let seen = orch.inspect_slot("shop", Slot::Blue).await.unwrap();
+        assert!(orch.settings_current(&changed, &seen));
+    }
+
+    #[tokio::test]
+    async fn site_volumes_survive_a_delete_unless_purged() {
+        let (orch, fake) = start_fake().await;
+        let s = with_volumes(site("shop", None), &[("data", "/data")]);
+        orch.ensure_stack(&s, Slot::Blue, None, TOKEN)
+            .await
+            .unwrap();
+        orch.remove_stack("shop", true).await.unwrap();
+        assert!(fake.lock().unwrap().volumes.contains_key("cite-vol-shop_data"));
+        let left = orch.site_volumes("shop").await.unwrap();
+        assert!(!left[0].mounted);
+        orch.remove_site_volumes("shop").await.unwrap();
+        assert!(fake.lock().unwrap().volumes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn deleting_a_volume_a_running_slot_uses_is_refused() {
+        let (orch, fake) = start_fake().await;
+        let s = with_volumes(site("shop", None), &[("data", "/data")]);
+        orch.ensure_stack(&s, Slot::Blue, None, TOKEN)
+            .await
+            .unwrap();
+        for declared in [true, false] {
+            let err = orch
+                .remove_site_volume("shop", "data", declared)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, ConnectorError::Conflict(_)), "{err}");
+        }
+        let missing = orch.remove_site_volume("shop", "other", false).await;
+        assert!(matches!(missing, Err(ConnectorError::NotFound(_))));
+        let bad = orch.remove_site_volume("shop", "../x", false).await;
+        assert!(matches!(bad, Err(ConnectorError::BadRequest(_))));
+        orch.stop_stack("shop", Slot::Blue).await.unwrap();
+        orch.remove_site_volume("shop", "data", true).await.unwrap();
+        assert!(!fake.lock().unwrap().volumes.contains_key("cite-vol-shop_data"));
+    }
+
+    fn endpoints_of(spec: &Value) -> Vec<String> {
+        endpoint_names(&spec["NetworkingConfig"]["EndpointsConfig"])
+    }
+
+    #[test]
+    fn outbound_adds_only_the_stacks_own_egress_network() {
+        let env = stack_env("ghcr.io/seggys116", "0.2.0", true);
+        let on = plan_stack(&site("shop", None), Slot::Green, None, TOKEN, &env).unwrap();
+        assert_eq!(
+            endpoints_of(&on.executor),
+            vec!["cite-shop-green-egress", "cite-shop-green-net"]
+        );
+        assert_eq!(on.executor["HostConfig"]["NetworkMode"], "cite-shop-green-net");
+        let mut closed = site("shop", None);
+        closed.outbound = false;
+        let off = plan_stack(&closed, Slot::Green, None, TOKEN, &env).unwrap();
+        assert_eq!(endpoints_of(&off.executor), vec!["cite-shop-green-net"]);
+        assert!(!off.executor.to_string().contains("egress"));
+        let docs = plan_stack(&site("docs", Some("static")), Slot::Blue, None, TOKEN, &env).unwrap();
+        assert_eq!(endpoints_of(&docs.executor), vec!["cite-docs-blue-net"], "static ignores it");
+    }
+
+    #[tokio::test]
+    async fn the_backend_address_stays_on_the_internal_network() {
+        let (orch, fake) = start_fake().await;
+        let targets = orch
+            .ensure_stack(&site("shop", None), Slot::Blue, None, TOKEN)
+            .await
+            .unwrap();
+        assert_eq!(targets[0].addr, "cite-shop-blue-executor:8080");
+        let f = fake.lock().unwrap();
+        let spec = &f.containers["cite-shop-blue-executor"].spec;
+        let eps = &spec["NetworkingConfig"]["EndpointsConfig"];
+        assert_eq!(eps["cite-shop-blue-net"]["Aliases"], json!(["cite-shop-blue-executor"]));
+        assert!(eps["cite-shop-blue-egress"].get("Aliases").is_none());
+        assert!(!f.networks["cite-shop-blue-egress"].members.contains(HAPROXY));
+    }
+
+    #[tokio::test]
+    async fn toggling_outbound_recreates_the_executor_and_is_a_pending_setting() {
+        let (orch, fake) = start_fake().await;
+        let s = site("shop", None);
+        orch.ensure_stack(&s, Slot::Blue, None, TOKEN)
+            .await
+            .unwrap();
+        let seen = orch.inspect_slot("shop", Slot::Blue).await.unwrap();
+        assert!(seen.executor_outbound && orch.settings_current(&s, &seen));
+        let mut closed = s.clone();
+        closed.outbound = false;
+        assert!(!orch.settings_current(&closed, &seen));
+        orch.ensure_stack(&closed, Slot::Blue, None, TOKEN)
+            .await
+            .unwrap();
+        assert_eq!(count(&fake, "CREATE cite-shop-blue-executor"), 2);
+        let seen = orch.inspect_slot("shop", Slot::Blue).await.unwrap();
+        assert!(!seen.executor_outbound && orch.settings_current(&closed, &seen));
+    }
+
+    #[tokio::test]
+    async fn a_node_without_executor_egress_refuses_an_outbound_site_before_touching_it() {
+        let (orch, fake) = start_fake().await;
+        let orch = orch.with_executor_egress(false);
+        let err = orch
+            .ensure_stack(&site("shop", None), Slot::Blue, None, TOKEN)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("CITE_STACK_EXECUTOR_EGRESS"), "{err}");
+        assert!(fake.lock().unwrap().containers.is_empty());
+        let mut closed = site("shop", None);
+        closed.outbound = false;
+        orch.ensure_stack(&closed, Slot::Blue, None, TOKEN)
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn the_executor_egress_switch_defaults_to_on() {
+        let get = |v: Option<&str>| executor_egress_from_lookup(|_| v.map(str::to_string));
+        assert!(get(None).unwrap());
+        assert!(get(Some("")).unwrap());
+        assert!(get(Some("true")).unwrap() && get(Some("1")).unwrap());
+        assert!(!get(Some("false")).unwrap() && !get(Some("0")).unwrap());
+        assert!(get(Some("maybe")).is_err());
     }
 }

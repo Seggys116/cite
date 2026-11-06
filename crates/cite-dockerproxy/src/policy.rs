@@ -16,6 +16,8 @@ const MAX_LOG_SINCE: usize = 20;
 // Matches the slug rule of site ids (lowercase, digits, dashes, at most 40 characters).
 const ID: &str = "[a-z0-9][a-z0-9-]{0,39}";
 const VERSION: &str = "[0-9]+\\.[0-9]+\\.[0-9]+";
+// The underscore never occurs in a site id, so a site volume name always splits one way.
+const VOLUME_NAME: &str = "[a-z0-9][a-z0-9-]{0,30}";
 const MAX_STOP_GRACE: u32 = 60;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 const WAIT_TIMEOUT: Duration = Duration::from_secs(300);
@@ -40,6 +42,7 @@ pub enum Route {
     ImagePull,
     ImageInspect,
     VolumeCreate,
+    VolumeList,
     VolumeInspect(String),
     VolumeDelete(String),
     NetworkCreate,
@@ -111,8 +114,10 @@ pub struct Policy {
     pub(crate) forge_api_url: Option<String>,
     pub(crate) max_memory: i64,
     pub(crate) max_nano_cpus: i64,
+    pub(crate) executor_egress: bool,
     container: Regex,
     volume: Regex,
+    site_volume: Regex,
     network: Regex,
     manager_image: Regex,
     executor_image: Regex,
@@ -137,8 +142,12 @@ impl Policy {
             forge_api_url: cfg.forge_api_url.clone(),
             max_memory: cfg.max_memory,
             max_nano_cpus: cfg.max_nano_cpus,
+            executor_egress: cfg.executor_egress,
             container: stack("manager|executor|init"),
             volume: stack("data|work|cache"),
+            site_volume: build(format!(
+                "^cite-vol-(?<id>{ID})_(?<name>{VOLUME_NAME})$"
+            )),
             network: stack("net|egress"),
             manager_image: build(format!(
                 "^{reg}/(cite-manager:{VERSION}-node(22|24)|cite-manager-rust:{VERSION})$"
@@ -177,6 +186,23 @@ impl Policy {
         Self::parse(&self.network, "network", name)
     }
 
+    /// (site id, volume name) of a persistent site volume.
+    pub fn site_volume(&self, name: &str) -> Result<(String, String), String> {
+        let caps = self
+            .site_volume
+            .captures(name)
+            .ok_or_else(|| "volume name is not a cite site volume name".to_string())?;
+        Ok((caps["id"].to_string(), caps["name"].to_string()))
+    }
+
+    // Stack volumes and site volumes are the only volumes the connector may touch.
+    fn any_volume(&self, name: &str) -> Result<(), String> {
+        if name.starts_with("cite-vol-") && self.site_volume(name).is_ok() {
+            return Ok(());
+        }
+        self.volume(name).map(|_| ())
+    }
+
     pub fn is_manager_image(&self, image: &str) -> bool {
         self.manager_image.is_match(image)
     }
@@ -210,14 +236,18 @@ impl Policy {
                 allow_keys(q, &[], &[])?;
                 Route::VolumeCreate
             }
+            ("GET", ["volumes"]) => {
+                check_label_filters(q, &[])?;
+                Route::VolumeList
+            }
             ("GET", ["volumes", name]) => {
                 allow_keys(q, &[], &[])?;
-                self.volume(name)?;
+                self.any_volume(name)?;
                 Route::VolumeInspect(name.to_string())
             }
             ("DELETE", ["volumes", name]) => {
                 allow_keys(q, &[], &[])?;
-                self.volume(name)?;
+                self.any_volume(name)?;
                 Route::VolumeDelete(name.to_string())
             }
             ("POST", ["networks", "create"]) => {
@@ -409,8 +439,15 @@ fn check_logs(q: &BTreeMap<String, String>) -> Result<(), String> {
 
 // The listing must be pinned to cite-managed containers by its label filter.
 fn check_list(q: &BTreeMap<String, String>) -> Result<(), String> {
-    allow_keys(q, &["all", "filters"], &["filters"])?;
-    bool_value(q, "all")?;
+    check_label_filters(q, &["all"])?;
+    bool_value(q, "all")
+}
+
+// Container and volume listings both carry a mandatory label filter that includes cite.managed=true.
+fn check_label_filters(q: &BTreeMap<String, String>, extra: &[&str]) -> Result<(), String> {
+    let mut allowed = vec!["filters"];
+    allowed.extend_from_slice(extra);
+    allow_keys(q, &allowed, &["filters"])?;
     let filters: Value =
         serde_json::from_str(&q["filters"]).map_err(|_| "filters is not json".to_string())?;
     let obj = filters.as_object().ok_or("filters is not an object")?;

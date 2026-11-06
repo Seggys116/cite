@@ -36,6 +36,21 @@ actions!(
 
 const LINE_HEIGHT: f32 = 18.0;
 
+// A focused single-line field scrolls to keep the caret visible; an unfocused one shows its start.
+fn scroll_for(cursor_x: Pixels, scroll: Pixels, width: Pixels, focused: bool) -> Pixels {
+    if !focused {
+        return px(0.);
+    }
+    let mut scroll = scroll;
+    if cursor_x - scroll > width - px(4.) {
+        scroll = cursor_x - width + px(4.);
+    }
+    if cursor_x < scroll {
+        scroll = cursor_x;
+    }
+    scroll.max(px(0.))
+}
+
 // Bindings are scoped to the TextInput context so they never fire elsewhere.
 pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
@@ -145,6 +160,7 @@ impl TextInput {
         let end = self.content.len();
         self.selected_range = end..end;
         self.marked_range = None;
+        self.scroll_x = px(0.);
         cx.emit(InputEvent::Changed);
         cx.notify();
     }
@@ -673,17 +689,10 @@ impl Element for TextElement {
             let l = &lines[cursor_line];
             l.shaped.x_for_index(input.to_display(l.start, cursor))
         };
-        // Single-line fields scroll horizontally to keep the cursor visible.
         let mut scroll_x = input.scroll_x;
         if !input.is_multiline() {
-            let width = bounds.size.width;
-            if cursor_x - scroll_x > width - px(4.) {
-                scroll_x = cursor_x - width + px(4.);
-            }
-            if cursor_x < scroll_x {
-                scroll_x = cursor_x;
-            }
-            scroll_x = scroll_x.max(px(0.));
+            let focused = input.focus_handle.is_focused(window);
+            scroll_x = scroll_for(cursor_x, scroll_x, bounds.size.width, focused);
         }
         let mut selections = Vec::new();
         let sel = &input.selected_range;
@@ -812,6 +821,30 @@ impl Render for TextInput {
         if self.mono {
             root = root.font_family(MONO);
         }
-        root.child(TextElement { input: cx.entity() })
+        // Clipping on the inner box keeps scrolled text out of the padding.
+        root.child(
+            div()
+                .w_full()
+                .overflow_hidden()
+                .child(TextElement { input: cx.entity() }),
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_unfocused_field_always_shows_its_start() {
+        assert_eq!(scroll_for(px(300.), px(120.), px(100.), false), px(0.));
+    }
+
+    #[test]
+    fn a_focused_field_keeps_the_caret_in_view() {
+        assert_eq!(scroll_for(px(50.), px(0.), px(100.), true), px(0.));
+        assert_eq!(scroll_for(px(300.), px(0.), px(100.), true), px(204.));
+        assert_eq!(scroll_for(px(10.), px(204.), px(100.), true), px(10.));
+        assert_eq!(scroll_for(px(250.), px(204.), px(100.), true), px(204.));
     }
 }

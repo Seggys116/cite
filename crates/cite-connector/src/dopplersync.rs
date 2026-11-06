@@ -336,8 +336,14 @@ impl DopplerSync {
         };
         Ok(DopplerView {
             bound: binding.is_some(),
-            project: binding.as_ref().map(|b| b.project.clone()),
-            config: binding.as_ref().map(|b| b.config.clone()),
+            project: binding
+                .as_ref()
+                .filter(|b| !b.token_only())
+                .map(|b| b.project.clone()),
+            config: binding
+                .as_ref()
+                .filter(|b| !b.token_only())
+                .map(|b| b.config.clone()),
             build: binding.as_ref().is_some_and(|b| b.build),
             runtime: binding.as_ref().is_some_and(|b| b.runtime),
             token_source: token_source.to_string(),
@@ -595,6 +601,17 @@ impl DopplerSync {
         let kept_token = store.get_secret(&token_name).await.map(Zeroizing::new);
         if token.is_none() && kept_token.is_none() && self.node_token.is_none() {
             return Err(DopplerError::NoToken.into());
+        }
+        if binding.token_only() {
+            let site_token = token.as_deref().or(kept_token.as_deref());
+            let service = site_token
+                .and_then(|t| DopplerToken::parse(t).ok())
+                .is_some_and(|t| t.is_service_token());
+            if !service {
+                return Err(ConnectorError::BadRequest(
+                    "a binding without a project and config needs a Doppler service token (dp.st.) for this site; create one under Project > Config > Access > Service Tokens".into(),
+                ));
+            }
         }
         let kept_binding = binding_of(&site);
         let kept_state = self.state(id);

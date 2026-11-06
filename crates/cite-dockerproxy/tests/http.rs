@@ -43,6 +43,8 @@ fn manager_spec() -> (String, Value) {
         }),
         history: Vec::new(),
         access: Default::default(),
+        volumes: Vec::new(),
+        outbound: true,
     };
     let env = StackEnv {
         registry: common::REGISTRY,

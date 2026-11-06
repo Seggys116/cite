@@ -86,6 +86,9 @@ Proxy settings, all on the `dockerproxy` service:
 | `CITE_STACK_FORGE_API_URL` | unset | The one forge API URL a manager may be given as `CITE_FORGE_API_URL`. `https` only, with the same shape rules as the GitHub API URL. |
 | `CITE_STACK_MAX_MEM` | `16g` | Largest `Memory` a manager or executor create body may ask for. A whole number with an optional `k`, `m`, `g` or `t` suffix (powers of 1024, optionally followed by `b` or `ib`). Between `256m` and `1t`. |
 | `CITE_STACK_MAX_CPUS` | `8` | Largest `NanoCpus` (as a CPU count such as `4` or `0.5`, at most nine decimals) a manager or executor create body may ask for. Between `0.25` and `1024`. |
+| `CITE_STACK_EXECUTOR_EGRESS` | `true` | Whether an executor create body may also join its own stack's `cite-<id>-<slot>-egress` network (see [Outbound network access](#outbound-network-access)). `true`/`1` or `false`/`0`. The overlay passes the same value to the connector, which then refuses an outbound site before touching its stack and reports `executor_egress` in `GET /api/v1/node`. |
+
+Persistent site volumes add these rules (see [Persistent volumes](#persistent-volumes)). `POST /volumes/create` also accepts a `cite-vol-<id>_<name>` volume whose labels are exactly `cite.managed=true`, `cite.site=<id>` and `cite.volume=<name>`; no driver or options. `GET` and `DELETE /volumes/<name>` accept those names, and `DELETE` still requires the `cite.managed` label on the existing volume. `GET /volumes` is allowed only with a `filters` label list that contains `cite.managed=true`. An executor create body may carry, after its three fixed mounts, at most 8 extra entries of `Type` `volume` whose `Source` is `cite-vol-<its own site>_<name>`, `ReadOnly` false, with no `VolumeOptions`, bind, tmpfs or driver settings; each `Target` follows the mount path rule below and no two may repeat or nest. An init create body may carry the same volumes at exactly `/vols/<name>`, and its script must be the fixed layout script followed by the fixed ownership step for exactly those names.
 
 Because the stack version becomes an image tag, `CITE_STACK_VERSION` must be a plain `x.y.z` version. The overlay passes it from `.env` to the connector; when it is unset the connector uses its own version. The connector uses Docker Engine API v1.45, which is why Docker Engine 26 or newer is required.
 
@@ -97,7 +100,7 @@ A site with a `source` gets one stack per slot, created when the slot is first u
 |---|---|---|---|
 | `init` | Lays out the data volume, then exits | none | 128 MiB, 64 pids, caps `CHOWN` and `FOWNER` only |
 | `manager` | Polls the repo, builds, promotes into the stack's own volume | `cite-<id>-<slot>-egress`, its own network | 2 GiB, 2 CPUs, 2048 pids |
-| `executor` | Serves the built site on port 8080 | `cite-<id>-<slot>-net` (internal), alias `cite-<id>-<slot>-executor` | 1 GiB, 1 CPU, 256 pids, runs as 65532 |
+| `executor` | Serves the built site on port 8080 | `cite-<id>-<slot>-net` (internal), alias `cite-<id>-<slot>-executor`; also `cite-<id>-<slot>-egress` when the site is outbound | 1 GiB, 1 CPU, 256 pids, runs as 65532 |
 
 Both long-running containers have `ReadonlyRootfs`, `no-new-privileges`, all capabilities dropped (the manager gets back `CHOWN`, `SETUID`, `SETGID` and `DAC_READ_SEARCH` to build as an unprivileged user), an init process, a health check every 30 seconds and a 10 MiB by 3 file log cap. They mount only their own named volumes, with subpath mounts matching single-site mode: the executor sees releases and control read-only. No host paths are mounted.
 
@@ -105,13 +108,36 @@ These specifications mirror the `manager` and `executor` services in `docker-com
 
 ## Site isolation
 
-Each stack gets its own internal network, `cite-<id>-<slot>-net`, and its executor is the only container on it besides HAProxy. The connector creates the network, then asks Docker (through the proxy) to connect the HAProxy container, named by `CITE_HAPROXY_CONTAINER` (default `cite-node-haproxy`). HAProxy reaches the executor at `cite-<id>-<slot>-executor:8080` over that network, and the connector writes the address into the slot's targets. Because the network is internal and unshared, site A's code cannot reach site B's executor, neither HAProxy's admin sockets nor the connector can be reached from an executor, and an executor has no route out.
+Each stack gets its own internal network, `cite-<id>-<slot>-net`, and its executor is the only container on it besides HAProxy. The connector creates the network, then asks Docker (through the proxy) to connect the HAProxy container, named by `CITE_HAPROXY_CONTAINER` (default `cite-node-haproxy`). HAProxy reaches the executor at `cite-<id>-<slot>-executor:8080` over that network, and the connector writes the address into the slot's targets. Because the network is internal and unshared, site A's code cannot reach site B's executor, neither HAProxy's admin sockets nor the connector can be reached from an executor, and an executor whose site has `outbound` off has no route out (see [Outbound network access](#outbound-network-access)).
 
 On stop, HAProxy is disconnected from the stack's network. The network itself stays so the stopped executor can start again. Removing a stack disconnects HAProxy and deletes both networks. If HAProxy is recreated, it loses its attachments; the connector re-attaches it to every running stack's network when it starts, before it waits for any site to turn healthy, and again the first time it uses the orchestrator. A container, volume or network that already has the expected name but lacks the `cite.managed=true` label is never adopted, changed or deleted; the connector reports a conflict.
 
 If `CITE_HAPROXY_CONTAINER` is set to an empty value, per-stack networks are off and executors join the shared `cite_edge` network as before. That mode is weaker: all executors on the node can reach each other directly, so one site's code can talk to another site's executor. Use it only for a node whose sites you fully trust. Stacks created in that mode move to their own network the next time they are ensured, because the executor is recreated when its network differs.
 
 The manager keeps its own `cite-<id>-<slot>-egress` network so it can reach GitHub and the package registries. That network is not shared with other stacks.
+
+## Outbound network access
+
+A site's `outbound` flag (default `true`; sites saved before 0.4.1 read as `true`) lets server-side code make outbound requests, for example to the App Store, GitHub or a payment API. When it is on, and the runtime runs a server (not `static`, not `rendering: static`), the executor is created on its internal `cite-<id>-<slot>-net` network as before and is also attached to its own stack's `cite-<id>-<slot>-egress` bridge, the same network its manager uses. Nothing else changes for HAProxy: the executor's alias exists only on the internal network, HAProxy is attached only to that network, and the slot target stays `cite-<id>-<slot>-executor:8080`. The executor publishes no ports. An internal network has no gateway, so Docker takes the container's default route from the egress bridge. With per-stack networks off (`CITE_HAPROXY_CONTAINER` empty) the executor joins `cite_edge` and the egress bridge.
+
+With `outbound: false` the executor is on the internal network only and has no route out. Static sites ignore the flag. A change takes effect on the next deploy: until then the site status reports the settings as not current, and running slots keep their current networks. The connector compares each executor's networks with what it wants, so the next deploy recreates the executor.
+
+The proxy accepts the egress variant only while `CITE_STACK_EXECUTOR_EGRESS` is true, and only for the stack's own egress network. With it false, an outbound site is refused by the connector before anything is removed ("outbound network access is disabled on this node"); turn `outbound` off for the site, or enable the setting. Keep the value equal on the proxy and the connector; a mismatch shows as a proxy refusal naming the setting.
+
+## Persistent volumes
+
+A site whose runtime runs a server (`node`, `bun`, `rust` with SSR, or any site with a `start_command`) can declare up to 8 named volumes in `volumes: [{ "name": "data", "mount_path": "/data" }]`. A static site with volumes is refused with 400. Rules, checked on create and update (a stored site is never judged when the config loads, but its volumes are checked again before a deploy):
+
+- `name` matches `^[a-z0-9][a-z0-9-]{0,30}$` and is unique in the site.
+- `mount_path` is absolute and normalised: 2 to 255 characters of letters, digits, `.`, `_`, `-` and `/`, no trailing slash, no empty, `.` or `..` segment.
+- No two mount paths are equal or nested.
+- A mount path may not equal, sit under or contain any path the executor or the system uses: `/var/lib/cite` (releases, control and status), `/cite-executor`, `/nodejs`, `/tmp`, `/proc`, `/sys`, `/dev`, `/etc`, `/run`, `/var/run`, `/usr`, `/bin`, `/sbin`, `/lib`, `/lib32`, `/lib64`, `/libx32`, `/root` and `/boot`. So `/var` and `/` are refused too.
+
+Each volume is a Docker named volume `cite-vol-<id>_<name>` labelled `cite.managed=true`, `cite.site=<id>` and `cite.volume=<name>`. The underscore cannot occur in a site id, so one site can never name another site's volume. The volume carries no slot: both the blue and green executor mount it read-write at `mount_path`, so data survives deploys, rollbacks and slot switches. During a deploy both slots run at once and see the same files, so an application that writes must tolerate a second instance briefly (use SQLite WAL, file locks or a write-once layout). The manager never mounts site volumes.
+
+Volumes are created before the new slot starts. The executor runs as uid 65532 on a read-only root, and a fresh volume is owned by root, so the existing one-shot `init` container (manager image, root, caps `CHOWN` and `FOWNER` only, no network) also mounts each site volume at `/vols/<name>`. When the volume root is not yet owned by 65532 it writes a `.cite-init` marker, runs `chown -R 65532:65532` and sets mode 0750; afterwards the step is skipped. The marker keeps the volume non-empty, so Docker never copies image content (and its owner) over it on first mount.
+
+Changing the list takes effect on the next deploy; until then the site status shows the settings as not current. Removing a volume from the list stops mounting it but keeps its data. Delete the data with `DELETE /api/v1/sites/{id}/volumes/{name}`; it is refused with 409 while the volume is still declared and the site has a running container, or while a running slot still mounts it. Remove it from the list, redeploy, then delete. Deleting a site keeps its volumes unless the request carries `?purge_volumes=true`; volumes left over from an earlier list are reported by `GET /api/v1/sites/{id}/volumes` with `declared: false`. Sizes come from Docker's usage data when the engine reports it, and are `null` otherwise (the proxy does not open `/system/df`).
 
 ## Source settings
 
@@ -125,7 +151,7 @@ The `source` object on a site:
 | `node_major` | `22` | `22` or `24`. Ignored by the `rust` runtime. |
 | `poll_interval` | `5m` | How often the manager checks GitHub. Minimum 60 seconds. |
 | `secret` | none | Set by the connector. A value sent by a client is discarded. |
-| `doppler` | none | `{project,config,build,runtime}`, set only through `PUT /sites/{id}/doppler`. A value sent when creating a site is discarded, and `PUT /sites/{id}` keeps the stored one. See [Doppler](#doppler). |
+| `doppler` | none | `{project,config,build,runtime}`, set only through `PUT /sites/{id}/doppler`; `project` and `config` are both empty for a service-token binding. A value sent when creating a site is discarded, and `PUT /sites/{id}` keeps the stored one. See [Doppler](#doppler). |
 
 Images come from `CITE_REGISTRY` (default `ghcr.io/seggys116`) at tag `CITE_STACK_VERSION`:
 
@@ -175,7 +201,7 @@ The URL must be `http` or `https`, at most 200 characters, with a plain host (op
 | Switch, rollback | Restart the target slot's stack if it was stopped, check health, flip. |
 | After a switch | The previous slot's stack stays up for a 30 second drain delay, then the executor and manager are stopped (the executor first). Volumes are kept so a rollback is fast. If the site has moved back in the meantime, nothing is stopped. |
 | Update | Replaces the site's fields and keeps history and the stored secret. |
-| Delete | Removes the site from HAProxy, then removes its stacks and deletes volumes and the stored secret. |
+| Delete | Removes the site from HAProxy, then removes its stacks and deletes the stack volumes and the stored secret. Persistent site volumes are kept unless the request asks for `?purge_volumes=true`. |
 
 The connector compares each running container's image and environment with what it wants. A changed branch or token recreates only the manager. Containers it did not create are never adopted or removed: a name clash is reported as a conflict.
 

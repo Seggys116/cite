@@ -312,7 +312,22 @@ impl Console {
         let mut out = Vec::new();
         out.extend(self.env_section(false, cx));
         out.extend(self.env_section(true, cx));
-        out.extend(self.doppler_card(data, cx));
+        if let Some(card) = self.doppler_card(data, cx) {
+            out.push(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.))
+                    .pt(px(8.))
+                    .child(strong("Doppler").text_size(px(16.)))
+                    .child(
+                        text_dim("Sync this site's variables from a Doppler config with a service token instead of typing them.")
+                            .text_size(px(12.)),
+                    )
+                    .into_any_element(),
+            );
+            out.push(card);
+        }
         if out.is_empty() {
             out.push(
                 text_dim("This node does not offer build or runtime variables.")

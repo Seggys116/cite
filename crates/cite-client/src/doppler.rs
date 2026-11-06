@@ -101,10 +101,33 @@ pub fn validate_doppler_slug(slug: &str) -> Res<&str> {
     }
 }
 
+/// The prefix of a Doppler service token, which is scoped to exactly one project and config.
+pub const DOPPLER_SERVICE_TOKEN_PREFIX: &str = "dp.st.";
+
 impl DopplerBindRequest {
+    /// Empty project and config bind through a service token alone; the node then needs a `dp.st.` token for the site, here or already stored.
+    pub fn token_only(&self) -> bool {
+        self.project.is_empty() && self.config.is_empty()
+    }
+
     pub fn validate(&self) -> Res<()> {
-        validate_doppler_slug(&self.project)?;
-        validate_doppler_slug(&self.config)?;
+        if self.project.is_empty() != self.config.is_empty() {
+            return Err(invalid(
+                "set both the Doppler project and config, or leave both empty to take them from a service token",
+            ));
+        }
+        if !self.token_only() {
+            validate_doppler_slug(&self.project)?;
+            validate_doppler_slug(&self.config)?;
+        } else if self
+            .token
+            .as_deref()
+            .is_some_and(|t| !t.starts_with(DOPPLER_SERVICE_TOKEN_PREFIX))
+        {
+            return Err(invalid(
+                "binding without a project and config needs a Doppler service token (dp.st.)",
+            ));
+        }
         if !self.build && !self.runtime {
             return Err(invalid(
                 "choose the build variables, the runtime variables or both",
@@ -155,6 +178,26 @@ mod tests {
         let mut neither = request(None);
         neither.build = false;
         assert!(neither.validate().is_err());
+    }
+
+    #[test]
+    fn a_service_token_alone_can_name_the_project_and_config() {
+        let token = ["dp.st.", "prd.", "secretvalue"].concat();
+        let mut req = request(Some(&token));
+        req.project.clear();
+        req.config.clear();
+        assert!(req.token_only());
+        req.validate().expect("token-only bind");
+        req.token = None;
+        req.validate().expect("a stored service token is checked by the node");
+        req.token = Some(["dp.pt.", "personal"].concat());
+        assert!(req.validate().is_err(), "a personal token names no config");
+        let mut half = request(Some(&token));
+        half.config.clear();
+        assert!(half.validate().is_err());
+        let mut other_half = request(None);
+        other_half.project.clear();
+        assert!(other_half.validate().is_err());
     }
 
     #[test]

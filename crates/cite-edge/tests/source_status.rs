@@ -720,14 +720,15 @@ fn every_copy_of_the_environment_limits_says_128_keys_and_24_kib() {
 }
 
 #[test]
-fn capabilities_are_the_fourteen_known_names() {
-    assert_eq!(CAPABILITIES.len(), 14);
+fn capabilities_are_the_sixteen_known_names() {
+    assert_eq!(CAPABILITIES.len(), 16);
     assert!(CAPABILITIES.contains(&"site-status") && CAPABILITIES.contains(&"forges"));
     assert!(CAPABILITIES.contains(&"analytics-filters") && CAPABILITIES.contains(&"doppler"));
+    assert!(CAPABILITIES.contains(&"volumes") && CAPABILITIES.contains(&"outbound"));
     let mut sorted = CAPABILITIES.to_vec();
     sorted.sort_unstable();
     sorted.dedup();
-    assert_eq!(sorted.len(), 14);
+    assert_eq!(sorted.len(), 16);
 }
 
 fn binding(project: &str, config: &str, build: bool, runtime: bool) -> DopplerBinding {
@@ -754,12 +755,12 @@ fn doppler_bindings_are_validated_as_part_of_the_source() {
     }
     let too_long = "a".repeat(101);
     for (project, config, field) in [
-        ("", "prd", "doppler project"),
+        ("", "prd", "both be set"),
         (too_long.as_str(), "prd", "doppler project"),
         ("shop web", "prd", "doppler project"),
         ("shop/x", "prd", "doppler project"),
         ("sh\u{f6}p", "prd", "doppler project"),
-        ("shop", "", "doppler config"),
+        ("shop", "", "both be set"),
         ("shop", "p?r", "doppler config"),
         ("shop", too_long.as_str(), "doppler config"),
     ] {
@@ -773,6 +774,19 @@ fn doppler_bindings_are_validated_as_part_of_the_source() {
         "doppler",
     );
     assert!(is_valid_doppler_slug("prd") && !is_valid_doppler_slug("a b"));
+}
+
+#[test]
+fn a_token_only_binding_leaves_both_names_empty() {
+    let b = binding("", "", true, false);
+    assert!(b.token_only());
+    validate_doppler_binding(&b).expect("token-only binding");
+    validate_source(&with(|s| s.doppler = Some(b))).expect("valid source");
+    refused(
+        &with(|s| s.doppler = Some(binding("", "", false, false))),
+        "doppler",
+    );
+    assert!(!binding("shop", "prd", true, false).token_only());
 }
 
 #[test]

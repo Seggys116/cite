@@ -298,6 +298,8 @@ mod tests {
             }),
             history,
             access: SiteAccess::default(),
+            volumes: Vec::new(),
+            outbound: true,
         }
     }
 

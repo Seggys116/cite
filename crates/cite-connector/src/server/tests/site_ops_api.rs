@@ -229,7 +229,9 @@ async fn node_capabilities_follow_what_the_node_can_do() {
         assert!(caps.contains(cap), "{cap} should always be offered");
     }
     for cap in &caps {
-        for needs_stack in ["logs", "token", "env", "build", "doppler"] {
+        for needs_stack in [
+            "logs", "token", "env", "build", "doppler", "volumes", "outbound",
+        ] {
             assert!(!cap.contains(needs_stack), "{cap} needs an orchestrator");
         }
     }

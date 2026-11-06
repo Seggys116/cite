@@ -1,5 +1,5 @@
 use cite_client::{
-    DopplerBindRequest, DopplerBinding, DopplerConfig, DopplerInfo, DopplerProject, NodeInfo,
+    ClientError, DopplerBindRequest, DopplerBinding, DopplerConfig, DopplerInfo, DopplerProject, NodeInfo,
 };
 use gpui::{AnyElement, Context, Entity, div, prelude::*, px};
 
@@ -8,7 +8,7 @@ use crate::app::{Confirm, Console, new_input};
 use crate::certs::wipe;
 use crate::demo_ops;
 use crate::siteops::{CAP_DOPPLER, clock, has_cap};
-use crate::theme::{Tone, c};
+use crate::theme::{DIVIDER, Tone, c};
 use crate::ui::detail::Data;
 use crate::ui::input::TextInput;
 use crate::ui::widgets::{
@@ -53,7 +53,8 @@ impl NodeHandle {
     pub(crate) async fn dp_bind(&self, site: &str, req: &DopplerBindRequest) -> Res<DopplerBinding> {
         match self {
             Self::Live(c) => c.site_doppler_set(site, req).await,
-            Self::Demo(n, _) => Ok(demo_ops::doppler_bind(n, site, req, crate::demo::now_ms())),
+            Self::Demo(n, _) => demo_ops::doppler_bind(n, site, req, crate::demo::now_ms())
+                .map_err(|message| ClientError::Status { code: 400, message }),
         }
     }
 
@@ -133,6 +134,8 @@ pub struct DopplerState {
     pub busy: bool,
     // Bumped on every config list request, so an answer for a project picked earlier is dropped.
     pub configs_gen: u64,
+    // The disclosure with the project and config pickers is open.
+    pub advanced: bool,
     pub token: Entity<TextInput>,
     pub project_in: Entity<TextInput>,
     pub config_in: Entity<TextInput>,
@@ -155,7 +158,8 @@ impl DopplerState {
             runtime: true,
             busy: false,
             configs_gen: 0,
-            token: new_input(cx, "Doppler service token (optional)", |i| i.masked().mono()),
+            advanced: false,
+            token: new_input(cx, "dp.st.", |i| i.masked().mono()),
             project_in: new_input(cx, "Project slug", |i| i.mono()),
             config_in: new_input(cx, "Config name, such as prd", |i| i.mono()),
         }
@@ -176,6 +180,7 @@ impl DopplerState {
         self.runtime = true;
         self.busy = false;
         self.configs_gen += 1;
+        self.advanced = false;
         for input in [self.token.clone(), self.project_in.clone(), self.config_in.clone()] {
             input.update(cx, |i, cx| i.set_text("", cx));
         }
@@ -190,6 +195,7 @@ impl DopplerState {
                 if b.bound {
                     self.project = b.project.clone();
                     self.config = b.config.clone();
+                    self.advanced |= b.project.is_some();
                     self.build = b.build;
                     self.runtime = b.runtime;
                 }
@@ -266,24 +272,52 @@ pub fn token_line(source: &str) -> &'static str {
     }
 }
 
-// Why the binding cannot be saved yet, or None when it can.
+pub const SERVICE_TOKEN_PREFIX: &str = "dp.st.";
+const TOKEN_HELP: &str = "Create a service token in Doppler (Project > Config > Access > Service Tokens), paste it here. It is stored encrypted on the node and only used to fetch this config's variables.";
+const ADVANCED_LABEL: &str = "Advanced: use the node's token and pick a project and config";
+
+// What the card names the project and config when the token alone chose them.
+pub fn binding_scope(b: &DopplerBinding) -> String {
+    let name = |v: &Option<String>| v.as_deref().filter(|t| !t.is_empty()).map(str::to_string);
+    match (name(&b.project), name(&b.config)) {
+        (None, None) => "From the token".to_string(),
+        (p, c) => format!(
+            "{} / {}",
+            p.unwrap_or_else(|| "-".to_string()),
+            c.unwrap_or_else(|| "-".to_string())
+        ),
+    }
+}
+
+// Why the binding cannot be saved yet, or None when it can. A blank project and config mean the service token picks them, so only a service token will do.
 pub fn bind_problem(
     project: &str,
     config: &str,
     build: bool,
     runtime: bool,
-    has_token: bool,
+    typed_token: &str,
+    node_token: bool,
+    site_token: bool,
 ) -> Option<&'static str> {
-    if project.trim().is_empty() {
-        return Some("Pick a project.");
-    }
-    if config.trim().is_empty() {
-        return Some("Pick a config.");
-    }
     if !build && !runtime {
         return Some("Sync build variables, runtime variables or both.");
     }
-    if !has_token {
+    let (project, config, typed) = (project.trim(), config.trim(), typed_token.trim());
+    if project.is_empty() && config.is_empty() {
+        return match typed {
+            t if t.starts_with(SERVICE_TOKEN_PREFIX) => None,
+            "" if site_token => None,
+            "" => Some("Paste a service token, or open Advanced to pick a project and config."),
+            _ => Some("A service token starts with dp.st.: create one in Doppler for this project and config."),
+        };
+    }
+    if project.is_empty() {
+        return Some("Pick a project.");
+    }
+    if config.is_empty() {
+        return Some("Pick a config.");
+    }
+    if typed.is_empty() && !node_token && !site_token {
         return Some("The node has no Doppler token: paste a service token for this site.");
     }
     None
@@ -295,9 +329,12 @@ impl Console {
         Some((self.handle_named(&self.detail.node)?, site))
     }
 
-    // Picks come from the lists when the node can list them, otherwise from the typed fields.
+    // Picks come from the lists when the node can list them, otherwise from the typed fields; with Advanced closed the token chooses.
     fn doppler_picks(&self, cx: &Context<Self>) -> (String, String) {
         let d = &self.ops.doppler;
+        if !d.advanced {
+            return (String::new(), String::new());
+        }
         let project = match &d.projects {
             Some(_) => d.project.clone().unwrap_or_default(),
             None => d.project_in.read(cx).text().trim().to_string(),
@@ -309,11 +346,27 @@ impl Console {
         (project, config)
     }
 
-    fn doppler_has_token(&self, cx: &Context<Self>) -> bool {
+    fn doppler_node_token(&self) -> bool {
+        self.ops.doppler.node.as_ref().is_some_and(|n| n.configured)
+    }
+
+    fn doppler_site_token(&self) -> bool {
         let d = &self.ops.doppler;
-        d.node.as_ref().is_some_and(|n| n.configured)
-            || d.binding.as_ref().is_some_and(|b| b.token_source == "site")
-            || !d.token.read(cx).text().trim().is_empty()
+        d.binding.as_ref().is_some_and(|b| b.token_source == "site")
+    }
+
+    fn doppler_problem(&self, cx: &Context<Self>) -> Option<&'static str> {
+        let d = &self.ops.doppler;
+        let (project, config) = self.doppler_picks(cx);
+        bind_problem(
+            &project,
+            &config,
+            d.build,
+            d.runtime,
+            d.token.read(cx).text(),
+            self.doppler_node_token(),
+            self.doppler_site_token(),
+        )
     }
 
     fn pick_project(&mut self, project: String, cx: &mut Context<Self>) {
@@ -384,7 +437,7 @@ impl Console {
         };
         let (project, config) = self.doppler_picks(cx);
         let (build, runtime) = (self.ops.doppler.build, self.ops.doppler.runtime);
-        if let Some(p) = bind_problem(&project, &config, build, runtime, self.doppler_has_token(cx)) {
+        if let Some(p) = self.doppler_problem(cx) {
             self.ops.doppler.error = Some(p.to_string());
             return;
         }
@@ -458,33 +511,13 @@ impl Console {
             return None;
         }
         let mut body = div().flex().flex_col().gap(px(14.));
-        match &d.node {
-            Some(n) if n.configured => {
-                body = body.child(
-                    text_dim(format!("The node has a Doppler token ({}).", n.source)).text_size(px(12.)),
-                );
-            }
-            _ => {
-                body = body.child(notice(
-                    "The node has no Doppler token. Set CITE_DOPPLER_TOKEN on the node, or paste a service token for this site below: it is write-only and never shown again.",
-                    Tone::Warn,
-                ));
-            }
-        }
         if let Some(b) = d.binding.as_ref().filter(|b| b.bound) {
             let (line, tone) = sync_line(b);
             let mut status = div()
                 .flex()
                 .flex_col()
                 .gap(px(4.))
-                .child(
-                    strong(format!(
-                        "{} / {}",
-                        b.project.as_deref().unwrap_or("-"),
-                        b.config.as_deref().unwrap_or("-")
-                    ))
-                    .text_size(px(13.)),
-                )
+                .child(strong(binding_scope(b)).text_size(px(13.)))
                 .child(div().text_size(px(12.)).text_color(c(tone.color())).child(line))
                 .child(text_dim(token_line(&b.token_source)).text_size(px(11.)));
             if b.status == "error"
@@ -495,7 +528,22 @@ impl Console {
             }
             body = body.child(status);
         }
-        let mut picker = div().flex().flex_col().gap(px(12.));
+        let mut picker = div()
+            .flex()
+            .flex_col()
+            .gap(px(12.))
+            .pl(px(12.))
+            .border_l_1()
+            .border_color(c(DIVIDER));
+        picker = match &d.node {
+            Some(n) if n.configured => picker.child(
+                text_dim(format!("The node has a Doppler token ({}).", n.source)).text_size(px(12.)),
+            ),
+            _ => picker.child(notice(
+                "The node has no Doppler token. Set CITE_DOPPLER_TOKEN on the node, or paste a service token above.",
+                Tone::Warn,
+            )),
+        };
         match (&d.projects, &d.projects_error) {
             (Some(list), _) if !list.is_empty() => {
                 picker = picker.child(field(
@@ -572,7 +620,12 @@ impl Console {
                 })))
                 .child(div().text_size(px(12.)).child(label))
         };
-        picker = picker.child(
+        body = body.child(field(
+            "Service token",
+            Some(TOKEN_HELP),
+            d.token.clone(),
+        ));
+        body = body.child(
             div()
                 .flex()
                 .flex_wrap()
@@ -580,14 +633,19 @@ impl Console {
                 .child(switch("build", "Sync build variables", d.build, |t| t.ops.doppler.build = !t.ops.doppler.build, cx))
                 .child(switch("runtime", "Sync runtime variables", d.runtime, |t| t.ops.doppler.runtime = !t.ops.doppler.runtime, cx)),
         );
-        picker = picker.child(field(
-            "Service token for this site",
-            Some("Optional when the node has a token. Write-only: it is sent once and never shown again."),
-            d.token.clone(),
+        let advanced_label = if d.advanced { "Hide advanced options" } else { ADVANCED_LABEL };
+        body = body.child(div().flex().child(
+            btn(id("dp", "advanced"), advanced_label, BtnKind::Plain).on_click(cx.listener(
+                |this, _, _, cx| {
+                    this.ops.doppler.advanced = !this.ops.doppler.advanced;
+                    cx.notify();
+                },
+            )),
         ));
-        body = body.child(picker);
-        let (project, config) = self.doppler_picks(cx);
-        let problem = bind_problem(&project, &config, d.build, d.runtime, self.doppler_has_token(cx));
+        if d.advanced {
+            body = body.child(picker);
+        }
+        let problem = self.doppler_problem(cx);
         let bound = d.binding.as_ref().is_some_and(|b| b.bound);
         let label = if bound { "Save" } else { "Connect" };
         let mut actions = div().flex().flex_wrap().items_center().gap(px(8.));
@@ -639,8 +697,8 @@ impl Console {
         }
         Some(
             card(
-                Some("Doppler"),
-                Some("Pull this site's variables from a Doppler config. When they change in Doppler, the node syncs them and redeploys the site automatically."),
+                Some("Doppler service token"),
+                Some("The node pulls this site's variables from the token's config. When they change in Doppler, it syncs them and redeploys the site automatically."),
                 body,
             )
             .into_any_element(),
@@ -682,13 +740,42 @@ mod tests {
 
     #[test]
     fn a_binding_needs_a_project_a_config_a_target_and_a_token() {
-        assert_eq!(bind_problem("", "prd", true, true, true), Some("Pick a project."));
-        assert_eq!(bind_problem("web", " ", true, true, true), Some("Pick a config."));
-        assert!(bind_problem("web", "prd", false, false, true).unwrap().contains("both"));
-        assert!(bind_problem("web", "prd", true, false, false).unwrap().contains("service token"));
-        assert_eq!(bind_problem("web", "prd", false, true, true), None);
+        assert_eq!(bind_problem("", "prd", true, true, "", true, false), Some("Pick a project."));
+        assert_eq!(bind_problem("web", " ", true, true, "", true, false), Some("Pick a config."));
+        assert!(bind_problem("web", "prd", false, false, "", true, false).unwrap().contains("both"));
+        assert!(bind_problem("web", "prd", true, false, "", false, false).unwrap().contains("service token"));
+        assert_eq!(bind_problem("web", "prd", false, true, "", true, false), None);
+        assert_eq!(bind_problem("web", "prd", true, true, "dp.pt.x", false, false), None);
+        assert_eq!(bind_problem("web", "prd", true, true, "", false, true), None);
         assert!(token_line("site").contains("this site"));
         assert!(token_line("node").contains("node"));
         assert!(token_line("none").contains("No Doppler token"));
+    }
+
+    #[test]
+    fn a_blank_project_and_config_need_a_service_token() {
+        let token_only = |typed: &str, node: bool, site: bool| bind_problem("", "", true, false, typed, node, site);
+        assert_eq!(token_only("dp.st.abc", false, false), None);
+        assert_eq!(token_only(" dp.st.abc ", false, false), None);
+        assert!(token_only("", true, false).unwrap().contains("Paste a service token"));
+        assert_eq!(token_only("", false, true), None);
+        assert!(token_only("dp.pt.abc", true, true).unwrap().contains("dp.st."));
+        assert!(token_only("dp.st.abc", true, true).is_none());
+        assert!(bind_problem("", "", false, false, "dp.st.abc", false, false).unwrap().contains("both"));
+        assert_eq!(bind_problem("web", "", true, true, "dp.st.abc", false, false), Some("Pick a config."));
+    }
+
+    #[test]
+    fn a_token_only_binding_reads_from_the_token() {
+        let mut b = binding("synced", 3);
+        assert_eq!(binding_scope(&b), "web / prd");
+        b.project = None;
+        b.config = None;
+        assert_eq!(binding_scope(&b), "From the token");
+        b.project = Some(String::new());
+        b.config = Some(String::new());
+        assert_eq!(binding_scope(&b), "From the token");
+        b.config = Some("prd".into());
+        assert_eq!(binding_scope(&b), "- / prd");
     }
 }

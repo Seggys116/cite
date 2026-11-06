@@ -17,7 +17,9 @@ use crate::model::{
     rel_time, site_change, source_deploy_request,
 };
 use crate::scope::{error_survives, foreign_notice};
-use crate::siteops::{CAP_BUILD_ENV, CAP_LOGS, CAP_RUNTIME_ENV, has_cap, is_busy_phase};
+use crate::siteops::{
+    CAP_BUILD_ENV, CAP_LOGS, CAP_RUNTIME_ENV, CAP_VOLUMES, has_cap, is_busy_phase,
+};
 use crate::theme::{BORDER, CARD_RADIUS, DIM, ROW_RADIUS, SURFACE, Tone, c, tint};
 use crate::ui::certs::{access_body, access_controls};
 use crate::ui::input::TextInput;
@@ -44,6 +46,8 @@ pub(crate) mod env;
 pub(crate) mod logs;
 #[path = "tabs.rs"]
 pub(crate) mod tabs;
+#[path = "volumes.rs"]
+pub(crate) mod volumes;
 
 use self::tabs::{SiteTab, TabMemory, TabOffer, shown_tab, visible_tabs};
 
@@ -197,6 +201,7 @@ impl Console {
                 source,
                 env: true,
                 logs: true,
+                volumes: volumes::volumes_apply(&data.site),
             };
         }
         let caps = &self.ops.extras.caps;
@@ -206,6 +211,7 @@ impl Console {
                 || has_cap(caps, CAP_RUNTIME_ENV)
                 || self.ops.doppler.offered,
             logs: has_cap(caps, CAP_LOGS),
+            volumes: has_cap(caps, CAP_VOLUMES) && volumes::volumes_apply(&data.site),
         }
     }
 
@@ -351,6 +357,7 @@ impl Console {
             self.detail.edit.load(&draft_from_site(&site), cx);
             self.detail.edit_base = Some(site);
         }
+        self.ops.volumes.clear_edits();
         self.clear_error();
     }
 
@@ -363,7 +370,7 @@ impl Console {
         };
         let draft = self.detail.edit.draft(cx);
         let edited = match edit_site(&existing, &draft) {
-            Ok(s) => s,
+            Ok(s) => self.ops.volumes.apply_to(s),
             Err(e) => {
                 self.fail(e, None);
                 return;
@@ -413,6 +420,9 @@ impl Console {
                     Ok((reveal, deploy)) => (reveal, save_outcome(deploy.as_ref())),
                     Err(e) => (None, Err(e.to_string())),
                 };
+                if here && saved {
+                    this.ops.volumes.clear_edits();
+                }
                 if here && saved && ask_rebuild {
                     this.ops.rebuild_prompt = true;
                 }
@@ -456,7 +466,7 @@ impl Console {
     fn form_state(&self, data: &Data, cx: &mut Context<Self>) -> FormState {
         let draft = self.detail.edit.draft(cx);
         let problems = field_problems(&draft, false);
-        let edited = edit_site(&data.site, &draft);
+        let edited = edit_site(&data.site, &draft).map(|e| self.ops.volumes.apply_to(e));
         let change = edited
             .as_ref()
             .map(|e| site_change(&data.site, e))
@@ -1014,6 +1024,10 @@ impl Console {
                 body.push(self.save_bar(data, &form, cx));
             }
             SiteTab::Environment => body.extend(self.env_tab(data, cx)),
+            SiteTab::Volumes => {
+                let bar = self.save_bar(data, &form, cx);
+                body.extend(self.volumes_tab(data, bar, cx));
+            }
             SiteTab::Logs => {
                 if self.ops.loaded {
                     body.push(self.logs_panel(data, cx));
@@ -1043,6 +1057,7 @@ impl Console {
             SiteTab::Access => {
                 body.push(self.access_card(data, cx));
                 body.extend(self.token_card(data, cx));
+                body.extend(self.outbound_card(data, cx));
                 body.push(self.save_bar(data, &form, cx));
             }
             SiteTab::Danger => {

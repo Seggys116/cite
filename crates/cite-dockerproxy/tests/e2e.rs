@@ -30,6 +30,8 @@ fn site(id: &str, runtime: &str) -> Site {
         }),
         history: Vec::new(),
         access: Default::default(),
+        volumes: Vec::new(),
+        outbound: true,
     }
 }
 

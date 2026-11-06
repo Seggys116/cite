@@ -16,6 +16,126 @@ chown 0:0 /data/releases /data/releases/blue /data/releases/green /data/control 
 chown 65532:65532 /data/status && \
 chmod 0755 /data/releases /data/control /data/status && chmod 0750 /data/state";
 
+// Kept byte-identical with the connector's volume_init_step; the specs tests compare both.
+fn volume_init_step(name: &str) -> String {
+    format!(
+        " && if [ \"$(stat -c %u /vols/{name})\" != 65532 ]; then touch /vols/{name}/.cite-init && chown -R 65532:65532 /vols/{name} && chmod 0750 /vols/{name}; fi"
+    )
+}
+
+const MAX_SITE_VOLUMES: usize = 8;
+const MAX_MOUNT_PATH: usize = 255;
+const RESERVED_MOUNT_PATHS: [&str; 19] = [
+    "/var/lib/cite",
+    "/cite-executor",
+    "/nodejs",
+    "/tmp",
+    "/proc",
+    "/sys",
+    "/dev",
+    "/etc",
+    "/run",
+    "/var/run",
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/lib",
+    "/lib32",
+    "/lib64",
+    "/libx32",
+    "/root",
+    "/boot",
+];
+
+fn path_within(inner: &str, outer: &str) -> bool {
+    inner == outer
+        || inner
+            .strip_prefix(outer)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+// Same rule as cite-edge's mount_path_problem, restated here because the proxy trusts no caller.
+pub fn mount_path_ok(p: &str) -> bool {
+    (2..=MAX_MOUNT_PATH).contains(&p.len())
+        && p.starts_with('/')
+        && !p.ends_with('/')
+        && p.bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'/' | b'-'))
+        && !p[1..]
+            .split('/')
+            .any(|seg| seg.is_empty() || seg == "." || seg == "..")
+        && !RESERVED_MOUNT_PATHS
+            .iter()
+            .any(|r| path_within(p, r) || path_within(r, p))
+}
+
+// Mounts after the fixed ones must be this site's own volumes, read-write, at distinct non-overlapping targets.
+fn site_mounts(
+    policy: &Policy,
+    role: Role,
+    c: &Stack,
+    host: &Map<String, Value>,
+) -> Result<Vec<(String, String)>, String> {
+    let fixed = match role {
+        Role::Manager => return Ok(Vec::new()),
+        Role::Executor => 3,
+        Role::Init => 1,
+    };
+    let Some(mounts) = host.get("Mounts").and_then(Value::as_array) else {
+        return Ok(Vec::new());
+    };
+    let extra = mounts.get(fixed..).unwrap_or_default();
+    if extra.len() > MAX_SITE_VOLUMES {
+        return Err("HostConfig.Mounts has too many site volumes".to_string());
+    }
+    let mut out: Vec<(String, String)> = Vec::new();
+    for m in extra {
+        if m.get("Type").and_then(Value::as_str) != Some("volume") {
+            return Err("HostConfig.Mounts may only add volume mounts".to_string());
+        }
+        let source = m.get("Source").and_then(Value::as_str).unwrap_or_default();
+        let (id, name) = policy.site_volume(source)?;
+        if id != c.id {
+            return Err("HostConfig.Mounts names another site's volume".to_string());
+        }
+        let target = m.get("Target").and_then(Value::as_str).unwrap_or_default();
+        let target_ok = match role {
+            Role::Init => target == format!("/vols/{name}"),
+            _ => mount_path_ok(target),
+        };
+        if !target_ok {
+            return Err("HostConfig.Mounts target is not allowed".to_string());
+        }
+        for (other_source, other_target) in &out {
+            if *other_source == source
+                || path_within(target, other_target)
+                || path_within(other_target, target)
+            {
+                return Err("HostConfig.Mounts repeats or nests a site volume".to_string());
+            }
+        }
+        out.push((source.to_string(), target.to_string()));
+    }
+    Ok(out)
+}
+
+// The executor may add its own stack's egress network to the internal one, and only when the operator allows it.
+fn executor_egress(policy: &Policy, role: Role, c: &Stack, body: &Value) -> Result<bool, String> {
+    let own = format!("cite-{}-{}-egress", c.id, c.slot);
+    let asks = body["NetworkingConfig"]["EndpointsConfig"]
+        .as_object()
+        .is_some_and(|e| e.contains_key(&own));
+    if !asks || role != Role::Executor {
+        return Ok(false);
+    }
+    if !policy.executor_egress {
+        return Err(
+            "executor egress is disabled on this node (CITE_STACK_EXECUTOR_EGRESS=false)".to_string(),
+        );
+    }
+    Ok(true)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Role {
     Manager,
@@ -139,6 +259,7 @@ fn mount(source: &str, target: &str, subpath: Option<&str>, read_only: bool) -> 
 }
 
 // Rebuilds the full create body the connector would emit; only the checked variable parts come from the request.
+#[allow(clippy::too_many_arguments)]
 fn expected(
     role: Role,
     c: &Stack,
@@ -147,6 +268,8 @@ fn expected(
     limits: &Limits,
     network: &str,
     name: &str,
+    site: &[(String, String)],
+    egress: bool,
 ) -> Value {
     let base = format!("cite-{}-{}", c.id, c.slot);
     let (data, work, cache) = (
@@ -193,23 +316,35 @@ fn expected(
                 healthcheck(&["CMD", "/cite-executor", "healthcheck"], 10_000_000_000);
             host["Init"] = json!(true);
             host["Tmpfs"] = json!({ "/tmp": "size=64m,mode=1777,noexec,nosuid,nodev" });
-            host["Mounts"] = json!([
+            let mut mounts = vec![
                 mount(&data, "/var/lib/cite/releases", Some("releases"), true),
                 mount(&data, "/var/lib/cite/control", Some("control"), true),
                 mount(&data, "/var/lib/cite/status", Some("status"), false),
-            ]);
+            ];
+            mounts.extend(site.iter().map(|(s, t)| mount(s, t, None, false)));
+            host["Mounts"] = json!(mounts);
             host["NanoCpus"] = json!(limits.nano_cpus);
             host["RestartPolicy"] = json!({ "Name": "unless-stopped" });
-            body["NetworkingConfig"] =
-                json!({ "EndpointsConfig": { network: { "Aliases": [name] } } });
+            let mut endpoints = json!({ network: { "Aliases": [name] } });
+            if egress {
+                endpoints[format!("{base}-egress")] = json!({});
+            }
+            body["NetworkingConfig"] = json!({ "EndpointsConfig": endpoints });
         }
         Role::Init => {
+            let mut script = INIT_SCRIPT.to_string();
+            let mut mounts = vec![mount(&data, "/data", None, false)];
+            for (source, target) in site {
+                let vol = target.strip_prefix("/vols/").unwrap_or_default();
+                script.push_str(&volume_init_step(vol));
+                mounts.push(mount(source, target, None, false));
+            }
             body["User"] = json!("0:0");
             body["Entrypoint"] = json!(["/bin/sh", "-c"]);
-            body["Cmd"] = json!([INIT_SCRIPT]);
+            body["Cmd"] = json!([script]);
             body["Healthcheck"] = json!({ "Test": ["NONE"] });
             host["CapAdd"] = json!(["CHOWN", "FOWNER"]);
-            host["Mounts"] = json!([mount(&data, "/data", None, false)]);
+            host["Mounts"] = json!(mounts);
             host["RestartPolicy"] = json!({ "Name": "no" });
         }
     }
@@ -392,7 +527,11 @@ pub fn validate_container(policy: &Policy, name: &str, body: &Value) -> Result<(
         .and_then(Value::as_str)
         .ok_or("NetworkMode is missing")?;
     check_network_mode(policy, role, &stack, mode)?;
-    let want = expected(role, &stack, image, &env, &limits, mode, name);
+    let site = site_mounts(policy, role, &stack, host)?;
+    let egress = executor_egress(policy, role, &stack, body)?;
+    let want = expected(
+        role, &stack, image, &env, &limits, mode, name, &site, egress,
+    );
     match first_difference("body", &want, body) {
         Some(reason) => Err(reason),
         None => Ok(()),
@@ -420,6 +559,13 @@ pub fn validate_volume(policy: &Policy, body: &Value) -> Result<(), String> {
     let obj = object(body, "body")?;
     exact_keys(obj, &["Name", "Labels"])?;
     let name = obj["Name"].as_str().ok_or("Name is not a string")?;
+    if let Ok((id, volume)) = policy.site_volume(name) {
+        let want = json!({ "cite.managed": "true", "cite.site": id, "cite.volume": volume });
+        return match first_difference("Labels", &want, &obj["Labels"]) {
+            Some(reason) => Err(reason),
+            None => Ok(()),
+        };
+    }
     let stack = policy.volume(name)?;
     check_labels(obj, &stack, "volume")
 }

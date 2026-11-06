@@ -39,6 +39,8 @@ fn site(id: &str, runtime: &str, node_major: Option<u8>) -> Site {
         }),
         history: Vec::new(),
         access: Default::default(),
+        volumes: Vec::new(),
+        outbound: true,
     }
 }
 
@@ -300,6 +302,9 @@ fn executor_may_join_only_its_own_or_the_edge_network() {
     body["NetworkingConfig"]["EndpointsConfig"] =
         json!({ "cite_edge": {}, "cite-shop-blue-egress": {} });
     denied(accepts(&s.executor_name, &body));
+    let mut other = s.executor.clone();
+    other["NetworkingConfig"]["EndpointsConfig"]["cite-other-blue-egress"] = json!({});
+    denied(accepts(&s.executor_name, &other));
 }
 
 #[test]

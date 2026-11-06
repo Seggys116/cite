@@ -255,3 +255,83 @@ async fn binding_requests_are_validated_strictly() {
     let (status, _) = h.get(&t, "/sites/Bad%20Id/doppler").await;
     assert_eq!(status, 400);
 }
+
+#[tokio::test]
+async fn a_service_token_alone_binds_without_naming_a_project_or_config() {
+    let h = start().await;
+    let t = h.token().await;
+    seed_source_site(&h, "app").await;
+    let server = with_mock(&h).await;
+    server
+        .state
+        .set("", "", json!({ "API_KEY": SECRET_VALUE, "PUBLIC_URL": "https://shop" }));
+    let (status, view) = h
+        .put(
+            &t,
+            "/sites/app/doppler",
+            json!({ "project": "", "config": "", "runtime": true, "token": DOPPLER_TOKEN }),
+        )
+        .await;
+    assert_eq!(status, 200, "{view}");
+    assert_eq!(view["bound"], true);
+    assert_eq!(view["project"], Value::Null);
+    assert_eq!(view["config"], Value::Null);
+    assert_eq!(view["token_source"], "site");
+    assert_eq!(view["keys"], 2);
+    assert_eq!(
+        *server.state.download_params.lock().unwrap(),
+        vec![(None, None)],
+        "the service token implies the project and config"
+    );
+    let text = view.to_string();
+    assert!(!text.contains(SECRET_VALUE) && !text.contains("routesecretvalue"));
+    let (_, site) = h.get(&t, "/sites/app").await;
+    assert_eq!(site["source"]["doppler"]["project"], "");
+    assert!(!site.to_string().contains("routesecretvalue"));
+
+    let (status, view) = h.post(&t, "/sites/app/doppler/sync", json!({})).await;
+    assert_eq!(status, 200, "{view}");
+    assert_eq!(server.state.download_params.lock().unwrap().len(), 2);
+
+    let (status, view) = h.delete(&t, "/sites/app/doppler").await;
+    assert_eq!(status, 200, "{view}");
+    assert_eq!(view["token_source"], "none", "clearing the binding deletes the site token");
+}
+
+#[tokio::test]
+async fn a_token_only_binding_needs_a_site_service_token() {
+    let h = start_with_node_token().await;
+    let t = h.token().await;
+    seed_source_site(&h, "app").await;
+    let server = with_mock(&h).await;
+    for (bad, why) in [
+        (json!({ "project": "", "config": "", "build": true }), "node token only"),
+        (
+            json!({ "project": "", "config": "", "build": true, "token": "dp.pt.personalsecret" }),
+            "personal token",
+        ),
+        (json!({ "project": "shop", "config": "", "build": true, "token": DOPPLER_TOKEN }), "half"),
+        (json!({ "project": "", "config": "prd", "build": true, "token": DOPPLER_TOKEN }), "half"),
+        (json!({ "project": "", "config": "", "token": DOPPLER_TOKEN }), "no target"),
+    ] {
+        let (status, body) = h.put(&t, "/sites/app/doppler", bad.clone()).await;
+        assert_eq!(status, 400, "{why}: {bad}: {body}");
+        assert!(!body.to_string().contains("personalsecret"), "{body}");
+    }
+    assert_eq!(server.state.downloads(), 0, "nothing reached Doppler");
+    let (_, view) = h.get(&t, "/sites/app/doppler").await;
+    assert_eq!(view["bound"], false);
+    let (status, view) = h
+        .put(
+            &t,
+            "/sites/app/doppler",
+            json!({ "project": "shop", "config": "prd", "build": true }),
+        )
+        .await;
+    assert_eq!(status, 200, "a named binding still works with the node token: {view}");
+    assert_eq!(view["token_source"], "node");
+    assert_eq!(
+        *server.state.download_params.lock().unwrap(),
+        vec![(Some("shop".to_string()), Some("prd".to_string()))]
+    );
+}

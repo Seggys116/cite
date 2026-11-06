@@ -16,6 +16,8 @@ pub const CAP_ASYNC_DEPLOY: &str = "deploy-async";
 pub const CAP_SOURCE_BUILD: &str = "source-build";
 pub const CAP_FORGES: &str = "forges";
 pub const CAP_DOPPLER: &str = "doppler";
+pub const CAP_VOLUMES: &str = "volumes";
+pub const CAP_OUTBOUND: &str = "outbound";
 
 // A feature is offered only when the node says it has it, so nodes older than 0.4.0 show none of the new cards.
 pub fn has_cap(caps: &[String], name: &str) -> bool {
@@ -27,6 +29,8 @@ pub fn has_cap(caps: &[String], name: &str) -> bool {
 pub struct NodeExtras {
     pub caps: Vec<String>,
     pub api_host: Option<String>,
+    // Whether the node lets site containers reach the internet; None when it does not say.
+    pub executor_egress: Option<bool>,
     pub status: Option<SiteStatus>,
     pub status_error: Option<String>,
     pub token: Option<TokenStatus>,

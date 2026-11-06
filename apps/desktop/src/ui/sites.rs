@@ -460,6 +460,8 @@ mod tests {
             source: None,
             history: Vec::new(),
             access: Default::default(),
+            volumes: Vec::new(),
+            outbound: true,
         }
     }
 

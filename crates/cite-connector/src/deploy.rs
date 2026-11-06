@@ -791,6 +791,7 @@ impl Deployer {
         // Build settings are not part of the HAProxy config, so changing only them is a store write that waits for the next deploy.
         let mut routing = site.clone();
         routing.source = existing.source.clone();
+        routing.volumes = existing.volumes.clone();
         let source_only = routing == existing && site.source.is_some() && existing.source.is_some();
         let sid = id.clone();
         if source_only {
@@ -812,12 +813,33 @@ impl Deployer {
         self.get_site(&id)
     }
 
-    pub async fn delete_site(self: &Arc<Self>, actor: &str, id: &str) -> Result<()> {
-        let (this, actor, id) = (Arc::clone(self), actor.to_string(), id.to_string());
-        detach(async move { this.delete_site_inner(&actor, &id).await }).await
+    /// Deletes the data of one site volume under the site lock, so no deploy can mount it meanwhile.
+    pub async fn delete_site_volume(&self, id: &str, name: &str) -> Result<()> {
+        let lock = self.site_lock(id);
+        let _guard = lock.lock().await;
+        let site = self.get_site(id)?;
+        let declared = site.volumes.iter().any(|v| v.name == name);
+        self.orchestrator()?
+            .remove_site_volume(id, name, declared)
+            .await
     }
 
-    async fn delete_site_inner(&self, actor: &str, id: &str) -> Result<()> {
+    pub async fn delete_site(self: &Arc<Self>, actor: &str, id: &str) -> Result<()> {
+        self.delete_site_with(actor, id, false).await
+    }
+
+    /// Persistent site volumes survive a delete unless `purge_volumes` is set.
+    pub async fn delete_site_with(
+        self: &Arc<Self>,
+        actor: &str,
+        id: &str,
+        purge_volumes: bool,
+    ) -> Result<()> {
+        let (this, actor, id) = (Arc::clone(self), actor.to_string(), id.to_string());
+        detach(async move { this.delete_site_inner(&actor, &id, purge_volumes).await }).await
+    }
+
+    async fn delete_site_inner(&self, actor: &str, id: &str, purge_volumes: bool) -> Result<()> {
         let lock = self.site_lock(id);
         let guard = lock.lock().await;
         let site = self.get_site(id)?;
@@ -844,6 +866,12 @@ impl Deployer {
             && let Err(err) = orch.remove_stack(id, true).await
         {
             tracing::warn!("stacks of deleted site {id} could not be removed: {err}");
+        }
+        if purge_volumes
+            && let Some(orch) = &self.orchestrator
+            && let Err(err) = orch.remove_site_volumes(id).await
+        {
+            tracing::warn!("volumes of deleted site {id} could not be removed: {err}");
         }
         self.drop_secret(site.source.as_ref().and_then(|s| s.secret.as_deref()))
             .await;
@@ -1466,6 +1494,9 @@ mod tests {
                 manager_nano_cpus: limits.manager_nano_cpus,
                 executor_memory: limits.executor_memory,
                 executor_nano_cpus: limits.executor_nano_cpus,
+                executor_volumes: Vec::new(),
+                executor_present: false,
+                executor_outbound: false,
             };
             if self.orch.slot_ref(site_id, slot).await?.is_none() {
                 return Ok(seen);
@@ -1631,6 +1662,8 @@ mod tests {
             source: None,
             history: vec![],
             access: Default::default(),
+            volumes: Vec::new(),
+            outbound: true,
         }
     }
 
@@ -2824,6 +2857,9 @@ mod tests {
             manager_nano_cpus: 0,
             executor_memory: 0,
             executor_nano_cpus: 0,
+            executor_volumes: Vec::new(),
+            executor_present: false,
+            executor_outbound: false,
         }
     }
 

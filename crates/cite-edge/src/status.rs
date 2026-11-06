@@ -8,7 +8,7 @@ use crate::model::Slot;
 use crate::validate::{ValidationError, invalid};
 
 /// Features a node advertises so a client can hide controls the node cannot serve.
-pub const CAPABILITIES: [&str; 14] = [
+pub const CAPABILITIES: [&str; 16] = [
     "site-status",
     "site-logs",
     "source-build",
@@ -23,6 +23,8 @@ pub const CAPABILITIES: [&str; 14] = [
     "forges",
     "analytics-filters",
     "doppler",
+    "volumes",
+    "outbound",
 ];
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

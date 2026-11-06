@@ -1,6 +1,6 @@
 use std::future::Future;
 
-use cite_client::ClientError;
+use cite_client::{ClientError, VolumeInfo};
 use cite_edge::model::BotPolicy;
 use cite_edge::status::SiteStatus;
 use gpui::{AnyElement, ClipboardItem, Context, Div, Entity, div, prelude::*, px};
@@ -14,7 +14,7 @@ use crate::model::{
 use crate::scope::{Sequence, foreign_notice};
 use crate::siteops::{
     CAP_ASYNC_DEPLOY, CAP_BUILD_ENV, CAP_FORGES, CAP_LOGS, CAP_RUNTIME_ENV, CAP_SOURCE_BUILD,
-    CAP_STATUS, CAP_TOKEN, NodeExtras, STATUS_TICKS, auto_placeholder, bot_trust, clock,
+    CAP_STATUS, CAP_TOKEN, CAP_VOLUMES, NodeExtras, STATUS_TICKS, auto_placeholder, bot_trust, clock,
     detected_value, forge_note, has_cap, is_busy_phase, outcome_rows, phase_label, phase_tone,
     ref_problem, report_lines, should_poll_logs, slot_rows, status_reason, token_detail,
     token_summary,
@@ -25,6 +25,7 @@ use crate::ui::detail::doppler::{DopplerLoad, DopplerState, load_doppler};
 use crate::ui::detail::env::EnvState;
 use crate::ui::detail::logs::LogView;
 use crate::ui::detail::tabs::SiteTab;
+use crate::ui::detail::volumes::VolumeState;
 use crate::ui::input::TextInput;
 use crate::ui::widgets::{
     BtnKind, Col, btn, btn_off, card, empty_state, field, form_grid, id, mono, notice, pill,
@@ -46,6 +47,7 @@ pub struct OpsState {
     pub git_ref: Entity<TextInput>,
     pub env: EnvState,
     pub doppler: DopplerState,
+    pub volumes: VolumeState,
 }
 
 impl OpsState {
@@ -64,6 +66,7 @@ impl OpsState {
             git_ref: new_input(cx, "main, a tag or a commit", |i| i.mono()),
             env: EnvState::new(cx),
             doppler: DopplerState::new(cx),
+            volumes: VolumeState::new(cx),
         }
     }
 }
@@ -71,6 +74,7 @@ impl OpsState {
 struct Loaded {
     extras: NodeExtras,
     doppler: DopplerLoad,
+    volumes: Option<Result<Vec<VolumeInfo>, String>>,
 }
 
 // Reads what the node offers for one site. Anything a node cannot serve is left out instead of failing the page.
@@ -84,10 +88,11 @@ async fn load_extras(h: NodeHandle, site: String, has_source: bool) -> Result<Lo
         .as_ref()
         .and_then(|i| i.github.as_ref())
         .and_then(|g| g.api_host.clone());
+    let executor_egress = info.as_ref().and_then(|i| i.executor_egress);
     let dp_offered = has_source && h.offers_doppler(&caps);
     let dp_node = h.doppler_node(info);
     let want = |cap: &str| has_source && has_cap(&caps, cap);
-    let (status, token, build_env, runtime_env, rules, doppler) = tokio::join!(
+    let (status, token, build_env, runtime_env, rules, doppler, volumes) = tokio::join!(
         async {
             if want(CAP_STATUS) {
                 Some(h.site_status(&site).await)
@@ -118,6 +123,13 @@ async fn load_extras(h: NodeHandle, site: String, has_source: bool) -> Result<Lo
         },
         async { h.list_rules().await.ok() },
         load_doppler(&h, &site, dp_offered, dp_node),
+        async {
+            if want(CAP_VOLUMES) {
+                Some(h.vol_list(&site).await.map_err(|e| e.to_string()))
+            } else {
+                None
+            }
+        },
     );
     let (status, status_error) = match status {
         Some(Ok(s)) => (Some(s), None),
@@ -128,6 +140,7 @@ async fn load_extras(h: NodeHandle, site: String, has_source: bool) -> Result<Lo
         extras: NodeExtras {
             caps,
             api_host,
+            executor_egress,
             status,
             status_error,
             token,
@@ -136,6 +149,7 @@ async fn load_extras(h: NodeHandle, site: String, has_source: bool) -> Result<Lo
             rules,
         },
         doppler,
+        volumes,
     })
 }
 
@@ -184,6 +198,7 @@ impl Console {
         self.ops.env.build.reset(cx);
         self.ops.env.runtime.reset(cx);
         self.ops.doppler.reset(cx);
+        self.ops.volumes.reset(cx);
         self.detail.edit.build.show_detected(None, cx);
     }
 
@@ -220,6 +235,7 @@ impl Console {
                     .show_detected(loaded.extras.status.as_ref(), cx);
                 this.ops.extras = loaded.extras;
                 this.ops.doppler.apply(loaded.doppler);
+                this.ops.volumes.existing = loaded.volumes;
                 this.ops.loaded = true;
                 if this.site_tab() == SiteTab::Logs {
                     this.open_logs(cx);

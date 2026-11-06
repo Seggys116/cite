@@ -258,6 +258,7 @@ pub(super) async fn node(State(st): State<AppState>) -> ApiResult<Response> {
             "source": st.cfg.doppler_token.as_ref().map_or("none", |t| t.source().as_str()),
         },
         "capabilities": site_ops::capabilities(st.orchestrator.is_some()),
+        "executor_egress": st.orchestrator.as_ref().is_some_and(|o| o.executor_egress()),
         "analytics": analytics,
     }))
     .into_response())
@@ -493,10 +494,28 @@ pub(super) async fn delete_site(
     State(st): State<AppState>,
     Extension(p): Extension<Principal>,
     Path(id): Path<String>,
+    Params(q): Params,
 ) -> ApiResult<Response> {
     check_id(&id)?;
+    if let Some(unknown) = q.keys().find(|k| k.as_str() != "purge_volumes") {
+        return Err(ApiError::bad(format!(
+            "unknown query parameter {unknown:?}"
+        )));
+    }
+    let purge_volumes = match q.get("purge_volumes").map(String::as_str) {
+        None | Some("false") => false,
+        Some("true") => true,
+        Some(_) => return Err(ApiError::bad("purge_volumes must be true or false")),
+    };
     find_site(&st, &id)?;
-    st.deployer.delete_site(&p.actor(), &id).await?;
+    st.deployer
+        .delete_site_with(&p.actor(), &id, purge_volumes)
+        .await?;
+    if purge_volumes {
+        st.store
+            .audit(&p.actor(), "site.volumes.purge", &format!("site={id}"))
+            .await;
+    }
     Ok(ok_flag())
 }
 

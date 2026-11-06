@@ -46,6 +46,7 @@ mod perf;
 mod site_ops;
 #[cfg(test)]
 mod tests;
+mod volumes;
 mod zone_secret;
 
 pub use health::healthcheck;
@@ -527,6 +528,7 @@ pub fn router(state: AppState) -> Router {
         .merge(certificates::issue_routes())
         .merge(alerts::routes())
         .merge(doppler_api::routes())
+        .merge(volumes::routes())
         .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
     Router::new()
         .merge(public)

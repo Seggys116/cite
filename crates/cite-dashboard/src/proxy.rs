@@ -180,13 +180,14 @@ fn bulk_route_ok(method: &Method, rest: &str) -> bool {
 }
 
 // Site status, logs, token, environment and Doppler routes are exact (method, route) pairs; the other site actions keep prefix-level access.
-const SITE_OPS: [&str; 6] = [
+const SITE_OPS: [&str; 7] = [
     "status",
     "logs",
     "github-token",
     "build-env",
     "runtime-env",
     "doppler",
+    "volumes",
 ];
 
 fn site_ops_action(rest: &str) -> Option<&str> {
@@ -205,6 +206,7 @@ fn site_ops_route_ok(method: &Method, rest: &str) -> bool {
     let (id, sub) = match segments.as_slice() {
         [_, id, _] => (*id, None),
         [_, id, "doppler", "sync"] => (*id, Some("sync")),
+        [_, id, "volumes", name] => (*id, Some(*name)),
         _ => return false,
     };
     if validate_site_id(id).is_err() {
@@ -212,6 +214,10 @@ fn site_ops_route_ok(method: &Method, rest: &str) -> bool {
     }
     match (action, sub) {
         ("doppler", Some(_)) => method == Method::POST,
+        ("volumes", Some(name)) => {
+            method == Method::DELETE && cite_edge::validate::is_valid_volume_name(name)
+        }
+        ("volumes", None) => method == Method::GET,
         (_, Some(_)) => false,
         ("status" | "logs", None) => method == Method::GET,
         ("github-token" | "doppler", None) => {
@@ -729,6 +735,30 @@ mod tests {
         assert!(is_no_store("sites/shop/status") && is_no_store("sites/shop/github-token"));
         assert!(is_no_store("sites/shop/logs") && is_no_store("certificates/acme"));
         assert!(!is_no_store("sites/shop") && !is_no_store("sites/shop/deploy"));
+    }
+
+    #[test]
+    fn volume_routes_are_a_listing_and_a_named_delete() {
+        for (method, rest) in [
+            (Method::GET, "sites/shop/volumes"),
+            (Method::DELETE, "sites/shop/volumes/data"),
+            (Method::DELETE, "sites/shop/volumes/uploads-2"),
+        ] {
+            assert!(route_ok(&method, rest), "{method} {rest}");
+            assert!(is_no_store(rest), "{rest}");
+        }
+        for (method, rest) in [
+            (Method::POST, "sites/shop/volumes"),
+            (Method::DELETE, "sites/shop/volumes"),
+            (Method::GET, "sites/shop/volumes/data"),
+            (Method::PUT, "sites/shop/volumes/data"),
+            (Method::DELETE, "sites/shop/volumes/Data"),
+            (Method::DELETE, "sites/shop/volumes/a_b"),
+            (Method::DELETE, "sites/shop/volumes/data/extra"),
+            (Method::DELETE, "sites/Bad_Id/volumes/data"),
+        ] {
+            assert!(!route_ok(&method, rest), "{method} {rest}");
+        }
     }
 
     #[test]

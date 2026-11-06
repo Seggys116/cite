@@ -3,9 +3,9 @@ use std::sync::{Mutex, OnceLock};
 
 use cite_client::{
     DopplerBindRequest, DopplerBinding, DopplerConfig, DopplerInfo, DopplerProject, EnvPatch,
-    TokenStatus,
+    TokenStatus, VolumeInfo,
 };
-use cite_edge::model::{Site, Slot};
+use cite_edge::model::{Site, Slot, Volume};
 use cite_edge::status::{
     DeployOutcome, LastFailure, LogLine, LogsResponse, ManagerReport, SiteStatus, SlotStatus,
 };
@@ -193,21 +193,101 @@ pub fn log_total(elapsed_secs: u64) -> u64 {
     BASE_LINES + elapsed_secs / 2
 }
 
+// A volume the demo node holds data for, whether or not the site still declares it.
+#[derive(Clone, Debug)]
+struct DemoVolume {
+    name: String,
+    mount_path: String,
+    size_bytes: u64,
+    created_ms: i64,
+}
+
 #[derive(Default)]
 pub struct DemoOps {
     site_tokens: BTreeSet<String>,
     build_env: BTreeMap<String, BTreeSet<String>>,
     runtime_env: BTreeMap<String, BTreeSet<String>>,
+    volumes: BTreeMap<String, Vec<DemoVolume>>,
 }
+
+const MIB: u64 = 1024 * 1024;
 
 impl DemoOps {
     pub fn seeded() -> Self {
         let names = |list: &[&str]| list.iter().map(|n| n.to_string()).collect::<BTreeSet<_>>();
+        let now = crate::demo::now_ms();
+        let day = 86_400_000;
+        let volume = |name: &str, path: &str, size: u64, days: i64| DemoVolume {
+            name: name.into(),
+            mount_path: path.into(),
+            size_bytes: size,
+            created_ms: now - days * day,
+        };
         Self {
             site_tokens: BTreeSet::new(),
             build_env: BTreeMap::from([("docs".to_string(), names(&["PUBLIC_SITE_URL"]))]),
             runtime_env: BTreeMap::from([("docs".to_string(), names(&["SEARCH_INDEX"]))]),
+            volumes: BTreeMap::from([(
+                "docs".to_string(),
+                vec![
+                    volume("data", "/data", 148 * MIB, 12),
+                    volume("old-cache", "/cache", 12 * MIB, 40),
+                ],
+            )]),
         }
+    }
+
+    // What the node reports: every volume it holds, mounted when the site declares it.
+    pub fn volume_infos(&self, site: &str, declared: &[Volume]) -> Vec<VolumeInfo> {
+        self.volumes
+            .get(site)
+            .map(|list| {
+                list.iter()
+                    .map(|v| {
+                        let live = declared.iter().find(|d| d.name == v.name);
+                        VolumeInfo {
+                            name: v.name.clone(),
+                            mount_path: live.map_or_else(|| v.mount_path.clone(), |d| d.mount_path.clone()),
+                            size_bytes: Some(v.size_bytes),
+                            mounted: live.is_some(),
+                            created_at: Some(iso(v.created_ms)),
+                            declared: live.is_some(),
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    // Saving a site creates the volumes it newly declares and updates the paths of the ones it keeps.
+    pub fn declare_volumes(&mut self, site: &str, declared: &[Volume], now_ms: i64) {
+        let list = self.volumes.entry(site.to_string()).or_default();
+        for d in declared {
+            match list.iter_mut().find(|v| v.name == d.name) {
+                Some(v) => v.mount_path = d.mount_path.clone(),
+                None => list.push(DemoVolume {
+                    name: d.name.clone(),
+                    mount_path: d.mount_path.clone(),
+                    size_bytes: 0,
+                    created_ms: now_ms,
+                }),
+            }
+        }
+        list.sort_by(|a, b| a.name.cmp(&b.name));
+    }
+
+    // Like the node, data of a volume the site still declares cannot be deleted.
+    pub fn delete_volume(&mut self, site: &str, declared: &[Volume], name: &str) -> Result<(), String> {
+        if declared.iter().any(|d| d.name == name) {
+            return Err(format!("volume {name} is still declared by the site"));
+        }
+        let list = self.volumes.entry(site.to_string()).or_default();
+        let before = list.len();
+        list.retain(|v| v.name != name);
+        if list.len() == before {
+            return Err(format!("volume {name} not found"));
+        }
+        Ok(())
     }
 
     pub fn token_status(&self, site: &str, node_token: bool) -> TokenStatus {
@@ -323,8 +403,8 @@ fn render(b: Option<&DemoBinding>) -> DopplerBinding {
     match b {
         Some(b) => DopplerBinding {
             bound: true,
-            project: Some(b.project.clone()),
-            config: Some(b.config.clone()),
+            project: Some(b.project.clone()).filter(|p| !p.is_empty()),
+            config: Some(b.config.clone()).filter(|c| !c.is_empty()),
             build: b.build,
             runtime: b.runtime,
             token_source: if b.own_token { "site" } else { "node" }.into(),
@@ -357,10 +437,28 @@ pub fn doppler_binding(node: &str, site: &str) -> DopplerBinding {
     render(store.get(&store_key(node, site)))
 }
 
-pub fn doppler_bind(node: &str, site: &str, req: &DopplerBindRequest, now_ms: i64) -> DopplerBinding {
+// Like the node: a blank project and config are taken from a service token (dp.st.), so only one will do.
+pub fn doppler_bind(
+    node: &str,
+    site: &str,
+    req: &DopplerBindRequest,
+    now_ms: i64,
+) -> Result<DopplerBinding, String> {
     let mut store = bindings().lock().unwrap_or_else(|e| e.into_inner());
-    let own_token = req.token.as_deref().is_some_and(|t| !t.trim().is_empty())
-        || store.get(&store_key(node, site)).is_some_and(|b| b.own_token);
+    let typed = req.token.as_deref().map(str::trim).filter(|t| !t.is_empty());
+    let token_only = req.project.trim().is_empty() && req.config.trim().is_empty();
+    let kept_token = store.get(&store_key(node, site)).is_some_and(|b| b.own_token);
+    let token_ok = match typed {
+        Some(t) => t.starts_with("dp.st."),
+        None => kept_token,
+    };
+    if token_only && !token_ok {
+        return Err("a blank project and config need a service token (dp.st.)".into());
+    }
+    if req.project.trim().is_empty() != req.config.trim().is_empty() {
+        return Err("project and config must be given together, or both left blank".into());
+    }
+    let own_token = typed.is_some() || kept_token;
     let b = DemoBinding {
         project: req.project.clone(),
         config: req.config.clone(),
@@ -370,7 +468,7 @@ pub fn doppler_bind(node: &str, site: &str, req: &DopplerBindRequest, now_ms: i6
         synced_at: now_ms,
     };
     store.insert(store_key(node, site), b.clone());
-    render(Some(&b))
+    Ok(render(Some(&b)))
 }
 
 pub fn doppler_clear(node: &str, site: &str) -> DopplerBinding {
@@ -415,6 +513,8 @@ mod tests {
             }),
             history: Vec::new(),
             access: Default::default(),
+            volumes: Vec::new(),
+            outbound: true,
         }
     }
 
@@ -509,7 +609,7 @@ mod tests {
             runtime: false,
             token: None,
         };
-        let b = doppler_bind(node, "docs", &req, 1_700_000_000_000);
+        let b = doppler_bind(node, "docs", &req, 1_700_000_000_000).unwrap();
         assert!(b.bound && b.build && !b.runtime && b.status == "synced");
         assert_eq!(b.token_source, "node");
         assert!(b.keys >= 6);
@@ -524,9 +624,65 @@ mod tests {
             runtime: false,
             token: Some("dp.st.x".into()),
         };
-        assert_eq!(doppler_bind(node, "docs", &own, 0).token_source, "site");
+        assert_eq!(doppler_bind(node, "docs", &own, 0).unwrap().token_source, "site");
         assert!(!doppler_clear(node, "docs").bound);
         assert!(!doppler_sync(node, "docs", 0).bound);
+    }
+
+    #[test]
+    fn demo_doppler_takes_project_and_config_from_a_service_token() {
+        let node = "demo-doppler-token-only";
+        let req = |project: &str, config: &str, token: Option<&str>| DopplerBindRequest {
+            project: project.into(),
+            config: config.into(),
+            build: true,
+            runtime: true,
+            token: token.map(str::to_string),
+        };
+        assert!(doppler_bind(node, "docs", &req("", "", None), 0).is_err());
+        assert!(doppler_bind(node, "docs", &req("", "", Some("dp.pt.x")), 0).is_err());
+        assert!(doppler_bind(node, "docs", &req("web", "", Some("dp.st.x")), 0).is_err());
+        assert!(!doppler_binding(node, "docs").bound);
+        let b = doppler_bind(node, "docs", &req("", "", Some("dp.st.x")), 5).unwrap();
+        assert!(b.bound && b.project.is_none() && b.config.is_none());
+        assert_eq!(b.token_source, "site");
+        assert!(b.keys >= 6);
+        let again = doppler_bind(node, "docs", &req("", "", None), 6).unwrap();
+        assert_eq!(again.token_source, "site");
+        assert!(!doppler_clear(node, "docs").bound);
+    }
+
+    #[test]
+    fn demo_volumes_are_created_kept_and_deleted_like_the_node_does() {
+        let mut ops = DemoOps::seeded();
+        let data = Volume {
+            name: "data".into(),
+            mount_path: "/data".into(),
+        };
+        let infos = ops.volume_infos("docs", std::slice::from_ref(&data));
+        let by = |n: &str| infos.iter().position(|i| i.name == n).expect(n);
+        assert!(infos[by("data")].mounted && infos[by("data")].size_bytes.is_some());
+        assert!(!infos[by("old-cache")].mounted);
+        assert!(ops.volume_infos("shop", &[]).is_empty());
+        let fresh = Volume {
+            name: "uploads".into(),
+            mount_path: "/srv/uploads".into(),
+        };
+        ops.declare_volumes("shop", std::slice::from_ref(&fresh), 1_700_000_000_000);
+        let shop = ops.volume_infos("shop", std::slice::from_ref(&fresh));
+        assert_eq!((shop.len(), shop[0].size_bytes, shop[0].mounted), (1, Some(0), true));
+        assert_eq!(shop[0].created_at, Some(iso(1_700_000_000_000)));
+        assert!(ops.delete_volume("docs", std::slice::from_ref(&data), "data").unwrap_err().contains("still declared"));
+        assert!(ops.delete_volume("docs", &[], "missing").unwrap_err().contains("not found"));
+        assert!(ops.delete_volume("docs", &[], "old-cache").is_ok());
+        let after = ops.volume_infos("docs", std::slice::from_ref(&data));
+        assert_eq!(after.len(), 1);
+        let moved = Volume {
+            name: "data".into(),
+            mount_path: "/srv/data".into(),
+        };
+        ops.declare_volumes("docs", std::slice::from_ref(&moved), 0);
+        assert_eq!(ops.volume_infos("docs", std::slice::from_ref(&moved))[0].mount_path, "/srv/data");
     }
 
     #[test]
