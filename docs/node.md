@@ -6,9 +6,9 @@ This page covers installing, configuring and operating one Cite node: HAProxy pl
 
 | Service | Image | Role |
 |---|---|---|
-| `init` | `ghcr.io/seggys116/cite-connector:${CITE_VERSION:-0.3.0}` | One-shot. Creates `/conf/haproxy`, `/conf/certs` and `/conf/state` in the `cite_conf` volume owned by uid 10001, and sets the owner and mode of the `cite_run` volume at `/run/cite`, then exits. No network. |
+| `init` | `ghcr.io/seggys116/cite-connector:${CITE_VERSION:-0.3.1}` | One-shot. Creates `/conf/haproxy`, `/conf/certs` and `/conf/state` in the `cite_conf` volume owned by uid 10001, and sets the owner and mode of the `cite_run` volume at `/run/cite`, then exits. No network. |
 | `haproxy` | `docker.io/library/haproxy:3.2-bookworm` | Public listener on ports 80 and 443. Reads its config from the `haproxy` and `certs` subpaths of `cite_conf`, mounted read-only. It cannot see the connector's credentials, tokens, secrets or TLS keys. |
-| `connector` | `ghcr.io/seggys116/cite-connector:${CITE_VERSION:-0.3.0}` | Authenticated API on 7443, renders the HAProxy config, receives HAProxy's logs, runs the optional orchestrator. |
+| `connector` | `ghcr.io/seggys116/cite-connector:${CITE_VERSION:-0.3.1}` | Authenticated API on 7443, renders the HAProxy config, receives HAProxy's logs, runs the optional orchestrator. |
 
 The two containers do not share a process namespace. They share one small volume, `cite_run`, mounted at `/run/cite` in both, which holds three unix sockets: HAProxy's admin socket (`admin.sock`), the master CLI (`master.sock`, from `-S /run/cite/master.sock,level,admin` on the HAProxy command) and the log datagram socket the connector binds (`log.sock`). The directory is owned by uid 10001 with mode 0750, the admin and log sockets are mode 0600, and no admin listener exists on any network. The connector reloads HAProxy by connecting to the master socket, sending `reload` and reading the reply: `Success=1` or `Success=0` followed by the loader output. It then checks that `show info` on the admin socket reports a new pid. A config counts as applied only after that check passes, so a refused or unconfirmed reload is retried on the next apply and fails the change that caused it. If the master CLI is unreachable (HAProxy is not up yet at first boot), applying a config still succeeds with `reloaded` false and the reason in the status `last_error`. Both containers run as uid 10001 with a read-only root filesystem, `no-new-privileges` and all capabilities dropped.
 
@@ -46,6 +46,8 @@ The first command runs the compose `init` service, which fixes the ownership of 
 Save all of it. It cannot be shown again. `init` refuses to run when credentials exist and tells you to pass `--force` or use `reset-credentials`. A reset issues new credentials and revokes every API token. `reset-credentials` and `init --force` write a new generation number into `credentials.json` and `tokens.json`. A running connector notices the change on its next request, adopts the new credentials, drops the old API tokens and signs out every session, so no restart is needed. The CLI and the running connector take the same file lock (`auth.lock` in the data directory) around every credential and token write, and a connector write that started from older state is refused, so a reset cannot be undone by a request that was in flight.
 
 The connector API will not start without credentials, but it still writes the HAProxy config first so HAProxy can boot.
+
+HAProxy needs a config file to start, and only the connector writes the real one. The `init` service therefore also writes a small bootstrap `/conf/haproxy/haproxy.cfg` when none exists (owner 10001, mode 0640): one frontend on port 80 that answers 404 "no sites configured yet". HAProxy starts and stays up on it, and the connector's first apply replaces the file and reloads HAProxy through the master socket like any other change. A node that already has a `haproxy.cfg` keeps it. `init` also creates any of `/conf/haproxy`, `/conf/certs` and `/conf/state` that a volume from an older release lacks, because HAProxy mounts them by subpath and cannot be created without them.
 
 ## Connector settings
 
@@ -95,7 +97,7 @@ Boolean values accept `1`, `true`, `yes`, `on`, `0`, `false`, `no`, `off`. The c
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `CITE_VERSION` | `0.3.0` | Connector image tag. |
+| `CITE_VERSION` | `0.3.1` | Connector image tag. |
 | `CITE_HTTP_PORT` | `80` | Host port for HTTP. |
 | `CITE_HTTPS_PORT` | `443` | Host port for HTTPS. |
 | `CITE_PUBLIC_BIND` | `0.0.0.0` | Host IP for the two public ports. |
@@ -153,6 +155,8 @@ When something changed and the result validates, the connector first copies the 
 The backup holds the values from before the migration, including any firewall header-secret values, and the connector never removes it. Check the result, then delete it.
 
 One case is not repaired: a site whose `path_regex` is refused. The connector will not guess a site's routing, so it stops with an error naming the site and the field. Edit that site's `path_regex` in `edge.json` (or remove the site) and start again; `edge.json.pre-migration` holds the original if you need it.
+
+**If the connector will not start.** `docker compose logs connector` shows the reason as a line starting `error:`. When `edge.json` is refused (for example a site `path_regex` that cannot be repaired) the connector exits before it writes anything, and HAProxy keeps serving the `haproxy.cfg` it already has, so running sites stay up. To recover, edit `/conf/edge.json` in the `cite_conf` volume (for example `docker run --rm -u 10001 -v cite-node_cite_conf:/conf alpine vi /conf/edge.json`), fix or remove the `path_regex` of the site named in the error, and restart the connector. If a migration had already run, `edge.json.pre-migration` next to it holds the file as it was before; copy it back over `edge.json` to undo the migration, then fix the one site.
 
 Applying a preset again (`POST /api/v1/firewall/presets/{name}/apply`) refreshes any rule with the same id to the current definition instead of skipping it, again keeping `enabled` and the site scope.
 

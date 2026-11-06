@@ -445,7 +445,7 @@ impl Store {
                 } else {
                     if let Some(bad) = bad_site {
                         return Err(ConnectorError::Internal(format!(
-                            "edge.json: site {} has a path_regex the current rules refuse, and it cannot be fixed automatically; edit the path_regex of that site in edge.json, or remove it, then start again (see docs/node.md, Upgrading from an older release)",
+                            "edge.json: site {} has a path_regex the current rules refuse, and it cannot be fixed automatically; the connector did not start and HAProxy keeps serving the last haproxy.cfg; edit the path_regex of that site in /conf/edge.json (or remove the site), then restart the connector (see docs/node.md, Upgrading from an older release)",
                             bad.id
                         )));
                     }
@@ -1130,7 +1130,7 @@ mod tests {
             enabled: true,
             action: Some(cite_edge::model::FirewallAction::Deny),
             matchers: cite_edge::model::Matchers {
-                user_agent_regex: Some(regex.into()),
+                user_agent_regexes: vec![regex.into()],
                 ..Default::default()
             },
             ..Default::default()
@@ -1163,7 +1163,7 @@ mod tests {
         let bot = rules.iter().find(|r| r.id == "old-bot");
         assert!(
             bot.is_none_or(
-                |r| !r.enabled || r.matchers.user_agent_regex.as_deref() != Some(".*bot.*")
+                |r| !r.enabled || r.matchers.user_agent_regexes != [".*bot.*".to_string()]
             ),
             "the refused rule must not stay enabled as it was"
         );
@@ -1207,6 +1207,84 @@ mod tests {
         );
     }
 
+    // The exact regexes the previous release's stock presets stored, as listed in cite-edge's migration table.
+    const OLD_PRESET_REGEXES: [(&str, &str); 6] = [
+        (
+            "preset-sensitive-files-2",
+            r"(?i)((^|/)id_(rsa|dsa|ecdsa|ed25519)[^/]*|(^|/)[^/]*(privkey|private)[^/]*\.pem|\.(key|p12|pfx|jks|keystore))(;[^/]*)?$",
+        ),
+        (
+            "preset-sensitive-files-4",
+            r"(?i)(\.(sql|bak|swp|swo|orig|old|save)|~)(;[^/]*)?$",
+        ),
+        (
+            "preset-sensitive-files-5",
+            r"(?i)(^|/)(backup|backups|dump|dumps|db|database|www|site|public_html)[^/]*\.(zip|tar|tgz|gz|7z|rar)(;[^/]*)?$",
+        ),
+        (
+            "preset-sensitive-files-6",
+            r"(?i)(^|/)(docker-compose[^/]*\.ya?ml|dockerfile[^/]*|composer\.(json|lock))(;[^/]*)?$",
+        ),
+        (
+            "preset-cms-probes-2",
+            r"(?i)/(phpmyadmin|pma|myadmin|mysqladmin)(;[^/]*)?(/|$)",
+        ),
+        (
+            "preset-cms-probes-4",
+            r"(?i)/(actuator|solr|manager(;[^/]*)?/html)(;[^/]*)?(/|$)",
+        ),
+    ];
+
+    #[tokio::test]
+    async fn a_node_that_applied_the_previous_releases_presets_opens_migrated_and_stays_so() {
+        let rules: Vec<_> = OLD_PRESET_REGEXES
+            .iter()
+            .map(|(id, regex)| {
+                let mut rule = ua_rule(id, "unused");
+                rule.matchers.user_agent_regexes.clear();
+                rule.matchers.path_regexes = vec![(*regex).to_string()];
+                rule
+            })
+            .collect();
+        let (_dir, cfg) = seeded(&old_config(rules));
+        let original = fs::read(cfg.data_dir.join("edge.json")).unwrap();
+
+        let store = Store::open(&cfg)
+            .await
+            .expect("the old presets must not stop the start");
+        validate_config(&store.config()).expect("the migrated config validates");
+        for (id, old) in OLD_PRESET_REGEXES {
+            let rule = store
+                .config()
+                .firewall
+                .iter()
+                .find(|r| r.id == id)
+                .cloned()
+                .unwrap();
+            assert!(rule.enabled, "{id} stays on");
+            assert!(
+                rule.matchers.path_regexes != [old.to_string()],
+                "{id} kept its old regex"
+            );
+        }
+        let backup = cfg.data_dir.join("edge.json.pre-migration");
+        assert_eq!(fs::read(&backup).unwrap(), original);
+        let migrated = store.config().firewall.clone();
+        drop(store);
+
+        let again = Store::open(&cfg).await.expect("reopens");
+        assert_eq!(again.config().firewall, migrated);
+        let entries = again.audit_tail(50).await;
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|e| e.action == "config.migrated")
+                .count(),
+            1
+        );
+        assert_eq!(fs::read(&backup).unwrap(), original);
+    }
+
     #[tokio::test]
     async fn the_command_line_open_leaves_edge_json_byte_identical() {
         let mut config = old_config(vec![ua_rule("old-bot", ".*bot.*")]);
@@ -1216,7 +1294,7 @@ mod tests {
             "active": "blue"
         }))
         .unwrap();
-        site.path_regex = Some("(unclosed".into());
+        site.path_regexes = vec!["(unclosed".into()];
         config.sites.push(site);
         let (_dir, cfg) = seeded(&config);
         let edge = cfg.data_dir.join("edge.json");
@@ -1308,7 +1386,7 @@ mod tests {
             "active": "blue"
         }))
         .unwrap();
-        site.path_regex = Some("(unclosed".into());
+        site.path_regexes = vec!["(unclosed".into()];
         config.sites.push(site);
         let (_dir, cfg) = seeded(&config);
         let err = Store::open(&cfg).await.err().expect("must refuse");

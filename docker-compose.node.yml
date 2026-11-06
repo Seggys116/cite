@@ -4,7 +4,7 @@ name: cite-node
 
 services:
   init:
-    image: ghcr.io/seggys116/cite-connector:${CITE_VERSION:-0.3.0}
+    image: ghcr.io/seggys116/cite-connector:${CITE_VERSION:-0.3.1}
     restart: "no"
     user: "0:0"
     read_only: true
@@ -15,15 +15,26 @@ services:
     cap_add:
       - CHOWN
       - FOWNER
+      # Needed only to reach into /conf once it belongs to 10001, so a volume from an older release can still get its missing directories.
+      - DAC_OVERRIDE
     entrypoint: ["/bin/sh", "-c"]
-    # /run/cite is fixed on every start. Children of /conf first, /conf last: once /conf is chowned the capability-less root cannot traverse it, so a finished volume is left alone.
+    # /run/cite is fixed on every start. A new volume gets its directories and ownership once; the loop then adds any directory a volume from an older release lacks, because HAProxy mounts them by subpath and its container cannot be created when one is missing.
+    # With no haproxy.cfg yet, a bootstrap config is written so HAProxy starts and answers 404 on port 80 until the connector's first apply replaces it; it is the only copy of that text (a connector test checks it with haproxy -c).
     command:
       - >-
         chown 10001:10001 /run/cite && chmod 0750 /run/cite && (
         [ "$$(stat -c %u /conf)" = 10001 ] || (
         mkdir -p /conf/haproxy /conf/certs /conf/state &&
         chmod 0750 /conf/haproxy /conf/certs /conf/state /conf &&
-        chown 10001:10001 /conf/haproxy /conf/certs /conf/state /conf ) )
+        chown 10001:10001 /conf/haproxy /conf/certs /conf/state /conf ) ) &&
+        for d in haproxy certs state; do
+        [ -d "/conf/$$d" ] || ( mkdir "/conf/$$d" && chmod 0750 "/conf/$$d" && chown 10001:10001 "/conf/$$d" );
+        done &&
+        ( [ -e /conf/haproxy/haproxy.cfg ] || (
+        printf '%s\n' 'global' '    maxconn 256' 'defaults' '    mode http' '    timeout connect 5s' '    timeout client 30s' '    timeout server 30s' 'frontend fe_boot' '    bind :80' '    http-request return status 404 content-type text/plain string "no sites configured yet"' > /conf/haproxy/.haproxy.cfg.boot &&
+        chown 10001:10001 /conf/haproxy/.haproxy.cfg.boot &&
+        chmod 0640 /conf/haproxy/.haproxy.cfg.boot &&
+        mv /conf/haproxy/.haproxy.cfg.boot /conf/haproxy/haproxy.cfg ) )
     volumes:
       - type: volume
         source: cite_conf
@@ -96,7 +107,7 @@ services:
         max-file: "3"
 
   connector:
-    image: ghcr.io/seggys116/cite-connector:${CITE_VERSION:-0.3.0}
+    image: ghcr.io/seggys116/cite-connector:${CITE_VERSION:-0.3.1}
     restart: unless-stopped
     depends_on:
       init:

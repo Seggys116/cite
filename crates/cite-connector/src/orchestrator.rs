@@ -9,7 +9,7 @@ use reqwest::Method;
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use crate::config::ConnectorConfig;
+use crate::config::{ConnectorConfig, NodeToken};
 use crate::error::{ConnectorError, Result};
 
 // Volume subpath mounts need Engine API 1.45 (Docker Engine 26).
@@ -110,6 +110,8 @@ pub struct Orchestrator {
     stack_version: String,
     registry: String,
     github_api_url: Option<String>,
+    // The token sites fall back to; resolved when a container is planned and never stored.
+    default_token: Option<NodeToken>,
     reconciled: AtomicBool,
 }
 
@@ -252,7 +254,7 @@ impl Orchestrator {
             Some(host) => Self::new(host, &cfg.edge_network, &cfg.stack_version, &cfg.registry)?
                 .with_haproxy_container(&cfg.haproxy_container)?
                 .with_github_api_url(cfg.github_api_url.as_deref())
-                .map(Some),
+                .map(|o| Some(o.with_default_token(cfg.github_token.clone()))),
         }
     }
 
@@ -290,8 +292,19 @@ impl Orchestrator {
             stack_version: stack_version.to_string(),
             registry: registry.to_string(),
             github_api_url: None,
+            default_token: None,
             reconciled: AtomicBool::new(false),
         })
+    }
+
+    pub fn with_default_token(mut self, token: Option<NodeToken>) -> Orchestrator {
+        self.default_token = token;
+        self
+    }
+
+    // The node-wide token for sites that carry none of their own.
+    pub fn default_token(&self) -> Option<&str> {
+        self.default_token.as_ref().map(NodeToken::expose)
     }
 
     // Managers send the GitHub token to this URL, so it is validated before any stack can carry it.
@@ -1691,6 +1704,11 @@ pub(crate) mod tests {
         }
     }
 
+    // The Env array a created container was given, as text, for checking where a token ended up.
+    pub(crate) fn container_env(fake: &Arc<Mutex<Fake>>, name: &str) -> String {
+        fake.lock().unwrap().containers[name].spec["Env"].to_string()
+    }
+
     pub(crate) async fn start_fake() -> (Orchestrator, Arc<Mutex<Fake>>) {
         start_fake_with(HAPROXY).await
     }
@@ -1766,7 +1784,8 @@ pub(crate) mod tests {
             id: id.to_string(),
             name: id.to_string(),
             hosts: vec![format!("{id}.example.com")],
-            path_regex: None,
+            path_regexes: Vec::new(),
+            path_prefixes: Vec::new(),
             kind: SiteKind::Site,
             blue: Upstream::default(),
             green: Upstream::default(),

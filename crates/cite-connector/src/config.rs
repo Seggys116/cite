@@ -70,6 +70,85 @@ pub struct ConnectorConfig {
     // The directory HAProxy loads `ssl crt` certificates from; one combined PEM per certificate.
     pub certs_dir: PathBuf,
     pub certs_mode: u32,
+    // The node-wide GitHub token; sites without their own token use it. It is held in memory only.
+    pub github_token: Option<NodeToken>,
+}
+
+const MAX_NODE_TOKEN_BYTES: usize = 512;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenSource {
+    Env,
+    File,
+}
+
+impl TokenSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TokenSource::Env => "env",
+            TokenSource::File => "file",
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct NodeToken {
+    value: zeroize::Zeroizing<String>,
+    source: TokenSource,
+}
+
+impl NodeToken {
+    pub fn new(value: &str, source: TokenSource) -> Result<Self> {
+        if value.is_empty()
+            || value.len() > MAX_NODE_TOKEN_BYTES
+            || !value.bytes().all(|b| b.is_ascii_graphic())
+        {
+            return Err(config_err(
+                "the GitHub token must be printable ASCII without spaces, at most 512 bytes".into(),
+            ));
+        }
+        Ok(Self {
+            value: zeroize::Zeroizing::new(value.to_string()),
+            source,
+        })
+    }
+
+    pub fn expose(&self) -> &str {
+        &self.value
+    }
+
+    pub fn source(&self) -> TokenSource {
+        self.source
+    }
+}
+
+impl std::fmt::Debug for NodeToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "NodeToken(<redacted>, {})", self.source.as_str())
+    }
+}
+
+// The environment variable wins over the file; an unset or blank variable means "not given".
+fn node_token(env: &HashMap<String, String>) -> Result<Option<NodeToken>> {
+    if let Some(raw) = get(env, "CITE_GITHUB_TOKEN") {
+        return NodeToken::new(raw, TokenSource::Env)
+            .map(Some)
+            .map_err(|e| config_err(format!("CITE_GITHUB_TOKEN: {e}")));
+    }
+    let Some(path) = get(env, "CITE_GITHUB_TOKEN_FILE") else {
+        return Ok(None);
+    };
+    let mut bytes = Vec::new();
+    // one byte past the limit plus room for a trailing newline, so an oversized file is refused rather than slurped
+    std::fs::File::open(path)
+        .and_then(|f| std::io::Read::read_to_end(&mut std::io::Read::take(f, 1024), &mut bytes))
+        .map_err(|e| config_err(format!("cannot read CITE_GITHUB_TOKEN_FILE {path}: {e}")))?;
+    let text = String::from_utf8(bytes)
+        .map_err(|_| config_err("CITE_GITHUB_TOKEN_FILE is not valid text".into()))?;
+    let text = zeroize::Zeroizing::new(text);
+    NodeToken::new(text.trim(), TokenSource::File)
+        .map(Some)
+        .map_err(|e| config_err(format!("CITE_GITHUB_TOKEN_FILE: {e}")))
 }
 
 // Startup misconfiguration is reported through Internal; it never reaches an HTTP response.
@@ -422,6 +501,7 @@ impl ConnectorConfig {
             tls_dir: data_dir.join("tls"),
             certs_dir: data_dir.join("certs"),
             certs_mode,
+            github_token: node_token(env)?,
             data_dir,
         })
     }
@@ -450,6 +530,69 @@ mod tests {
         };
         assert!(addr.ip().is_loopback());
         assert_eq!(addr.port(), 5140);
+    }
+
+    fn token_cfg(extra: &[(&str, &str)]) -> Result<Option<NodeToken>> {
+        let mut e = base();
+        e.extend(env(extra));
+        ConnectorConfig::from_env_map(&e).map(|c| c.github_token)
+    }
+
+    #[test]
+    fn the_node_github_token_comes_from_the_environment_then_a_file() {
+        assert!(token_cfg(&[]).unwrap().is_none());
+        assert!(token_cfg(&[("CITE_GITHUB_TOKEN", "  ")]).unwrap().is_none());
+        let from_env = token_cfg(&[("CITE_GITHUB_TOKEN", "ghp_env")])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (from_env.expose(), from_env.source()),
+            ("ghp_env", TokenSource::Env)
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token");
+        std::fs::write(&path, "ghp_file\n").unwrap();
+        let path = path.display().to_string();
+        let from_file = token_cfg(&[("CITE_GITHUB_TOKEN_FILE", &path)])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (from_file.expose(), from_file.source()),
+            ("ghp_file", TokenSource::File)
+        );
+        let both = token_cfg(&[
+            ("CITE_GITHUB_TOKEN", "ghp_env"),
+            ("CITE_GITHUB_TOKEN_FILE", &path),
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            (both.expose(), both.source()),
+            ("ghp_env", TokenSource::Env)
+        );
+    }
+
+    #[test]
+    fn a_bad_node_github_token_is_refused_without_printing_it() {
+        let long = "a".repeat(513);
+        for bad in ["has space", long.as_str(), "caf\u{e9}"] {
+            let err = token_cfg(&[("CITE_GITHUB_TOKEN", bad)])
+                .unwrap_err()
+                .to_string();
+            assert!(!err.contains(bad), "{err}");
+        }
+        assert!(token_cfg(&[("CITE_GITHUB_TOKEN_FILE", "/nonexistent/cite-token")]).is_err());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big");
+        std::fs::write(&path, "a".repeat(4096)).unwrap();
+        assert!(token_cfg(&[("CITE_GITHUB_TOKEN_FILE", &path.display().to_string())]).is_err());
+    }
+
+    #[test]
+    fn the_node_github_token_never_prints() {
+        let cfg = token_cfg(&[("CITE_GITHUB_TOKEN", "ghp_secret_value")]).unwrap();
+        assert!(!format!("{cfg:?}").contains("ghp_secret_value"));
     }
 
     #[test]
