@@ -246,7 +246,7 @@ export function certificatesPanel(node) {
   uploadBtn.addEventListener('click', () => openCertificateDialog({ node, onDone: done('Uploaded') }));
   return card({
     title: 'Certificates',
-    subtitle: 'TLS certificates the node serves for HTTPS. Sites set to Flexible SSL behind Cloudflare do not need one.',
+    subtitle: 'TLS certificates the node serves for HTTPS. Sites where Cloudflare handles HTTPS do not need one.',
     actions: [uploadBtn],
     body: h('div', { class: 'stack-sm' }, host, status),
   });
@@ -314,7 +314,7 @@ export function cloudflarePanel(node) {
     return h('div', { class: 'stack' },
       card({
         title: 'Active ranges',
-        subtitle: 'Sites set to Only accept traffic from Cloudflare accept requests from these addresses and no others.',
+        subtitle: 'Sites set to Only allow traffic through the Cloudflare proxy accept requests from these addresses and no others.',
         body: h('div', { class: 'stack-sm' },
           kvList([
             ['Source', pill(custom ? 'Custom list' : 'Built-in list', 'muted')],

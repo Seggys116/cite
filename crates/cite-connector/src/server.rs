@@ -456,6 +456,7 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/firewall/rules/{id}",
             axum::routing::put(h::put_rule).delete(h::delete_rule),
         )
+        .route("/api/v1/firewall/bulk", post(h::bulk_rules))
         .route("/api/v1/firewall/presets", get(h::list_presets))
         .route(
             "/api/v1/firewall/presets/{name}/apply",

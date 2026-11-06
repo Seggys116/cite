@@ -15,8 +15,8 @@ const MAX_NAME_CHARS: usize = 64;
 const COVERS_SHOWN: usize = 3;
 const CERT_LABEL: &str = "CERTIFICATE";
 
-pub const FULL_HELP: &str = "Full: Cloudflare and visitors reach this node over HTTPS, so a certificate that covers the host is needed.";
-pub const FLEXIBLE_HELP: &str = "Flexible: Cloudflare terminates HTTPS and talks plain HTTP to this node. No certificate is needed here. Use it together with Cloudflare only.";
+pub const FULL_HELP: &str = "Visitors and Cloudflare reach the node over HTTPS, so a certificate that covers the host is needed. Upload one in Settings.";
+pub const FLEXIBLE_HELP: &str = "Cloudflare serves the certificate to visitors and talks to your server over plain http. Pick this if you do not want to upload a certificate. Traffic between Cloudflare and your server is not encrypted.";
 
 // The desktop's own view of the node's certificate data, so only api.rs knows the client types.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -805,18 +805,30 @@ pub fn bots_warning(policy: BotPolicy) -> Option<&'static str> {
 
 pub const BOTS_NOTE: &str = "Bots are recognised by their User-Agent header, which a scraper can fake, so this is not a security boundary. Blocked requests still appear in analytics.";
 
-pub fn zone_lock_help(cloudflare_only: bool) -> &'static str {
-    if cloudflare_only {
-        "Refuses requests that lack a secret header set by a Transform Rule in your own Cloudflare zone, so other Cloudflare customers cannot reach this site."
-    } else {
-        "Needs Only accept traffic from Cloudflare to be on."
+pub const PROXY_LABEL: &str = "Only allow traffic through the Cloudflare proxy";
+pub const PROXY_HELP: &str = "Visitors must come through Cloudflare (orange cloud on). Direct requests to your server address are refused. You do not need to create any Cloudflare rule for this.";
+pub const FULL_LABEL: &str = "Node serves HTTPS";
+pub const FLEXIBLE_LABEL: &str = "Cloudflare handles HTTPS (no certificate on the node)";
+pub const ZONE_LABEL: &str =
+    "Also require that requests come from MY Cloudflare account (advanced)";
+pub const ZONE_HELP: &str = "Without this, anyone using Cloudflare could send traffic to your server address. This adds a secret header that you set once in a Cloudflare Transform Rule. Optional.";
+const ZONE_OFF_HINT: &str =
+    "Optional extra check against other Cloudflare customers reaching your server address.";
+const ZONE_NEEDS_PROXY: &str = "Turn on the Cloudflare proxy option first.";
+
+// The Transform Rule and header are explained only once the zone check itself is ticked.
+pub fn zone_lock_help(cloudflare_only: bool, zone_lock: bool) -> &'static str {
+    match (cloudflare_only, zone_lock) {
+        (false, _) => ZONE_NEEDS_PROXY,
+        (true, false) => ZONE_OFF_HINT,
+        (true, true) => ZONE_HELP,
     }
 }
 
 // Flexible without the Cloudflare restriction leaves plain HTTP reachable by anyone who finds the node.
 pub fn flexible_warning(cloudflare_only: bool, flexible: bool) -> Option<&'static str> {
     (flexible && !cloudflare_only).then_some(
-        "Flexible without Cloudflare only sends plain HTTP that anyone can reach directly, bypassing Cloudflare. Turn on Only accept traffic from Cloudflare.",
+        "Cloudflare handles HTTPS only works safely together with the Cloudflare proxy option: otherwise anyone can reach your server over plain http, bypassing Cloudflare. Turn on Only allow traffic through the Cloudflare proxy.",
     )
 }
 
@@ -1439,8 +1451,9 @@ mod tests {
         assert!(bots_warning(BotPolicy::BlockBad).is_none());
         assert!(bots_warning(BotPolicy::Allow).is_none());
         assert!(BOTS_NOTE.contains("fake") && BOTS_NOTE.contains("analytics"));
-        assert!(zone_lock_help(false).contains("Needs"));
-        assert!(zone_lock_help(true).contains("Transform Rule"));
+        assert!(zone_lock_help(false, false).contains("first"));
+        assert!(zone_lock_help(false, true).contains("first"));
+        assert!(zone_lock_help(true, true).contains("Transform Rule"));
     }
 
     #[test]
@@ -1449,6 +1462,41 @@ mod tests {
         assert!(flexible_warning(true, true).is_none());
         assert!(flexible_warning(false, false).is_none());
         assert!(flexible_warning(true, false).is_none());
-        assert!(FLEXIBLE_HELP.contains("plain HTTP"));
+        assert!(FLEXIBLE_HELP.contains("plain http") && FLEXIBLE_HELP.contains("not encrypted"));
+    }
+
+    #[test]
+    fn the_proxy_option_never_mentions_the_zone_secret() {
+        let plain = [
+            PROXY_LABEL,
+            PROXY_HELP,
+            FULL_LABEL,
+            FLEXIBLE_LABEL,
+            FULL_HELP,
+            FLEXIBLE_HELP,
+        ];
+        for text in plain {
+            let lower = text.to_lowercase();
+            for word in ["transform", "secret", "header"] {
+                assert!(!lower.contains(word), "{text}");
+            }
+        }
+        for zone_off in [zone_lock_help(true, false), zone_lock_help(false, false)] {
+            let lower = zone_off.to_lowercase();
+            assert!(
+                !lower.contains("transform")
+                    && !lower.contains("secret")
+                    && !lower.contains("header")
+            );
+        }
+        assert!(PROXY_HELP.contains("You do not need to create any Cloudflare rule"));
+        assert!(ZONE_LABEL.contains("MY Cloudflare account") && ZONE_LABEL.contains("advanced"));
+        assert!(ZONE_HELP.contains("Transform Rule") && ZONE_HELP.contains("Optional"));
+        assert!(FLEXIBLE_LABEL.contains("no certificate on the node"));
+        assert!(
+            flexible_warning(false, true)
+                .expect("warn")
+                .contains("Cloudflare proxy")
+        );
     }
 }

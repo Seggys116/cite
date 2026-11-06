@@ -443,7 +443,7 @@ fn secret_rule(equals: &str) -> Value {
         "name": "Header gate",
         "enabled": true,
         "action": "deny",
-        "matchers": { "header": { "name": "X-Token", "equals": equals, "negate": true, "secret": true } }
+        "matchers": { "headers": [{ "name": "X-Token", "equals": equals, "negate": true, "secret": true }] }
     })
 }
 
@@ -454,26 +454,26 @@ async fn secret_header_values_are_write_only() {
     let value = "user-secret-value-0123456789abcdef0123456789";
     let (status, created) = h.post(&t, "/firewall/rules", secret_rule(value)).await;
     assert_eq!(status, 200, "{created}");
-    assert_eq!(created["matchers"]["header"]["equals"], "");
+    assert_eq!(created["matchers"]["headers"][0]["equals"], "");
     assert!(!created.to_string().contains(value));
     let stored = |h: &Harness| {
         h.state.store.config().firewall[0]
             .matchers
-            .header
-            .as_ref()
+            .headers
+            .first()
             .and_then(|m| m.equals.clone())
     };
     assert_eq!(stored(&h).as_deref(), Some(value));
 
     let (_, listed) = h.get(&t, "/firewall/rules").await;
-    assert_eq!(listed[0]["matchers"]["header"]["equals"], "");
+    assert_eq!(listed[0]["matchers"]["headers"][0]["equals"], "");
     assert!(!listed.to_string().contains(value));
     assert!(!haproxy_text(&h, &t).await.contains(value));
 
     let (status, kept) = h.put(&t, "/firewall/rules/hdr", secret_rule("")).await;
     assert_eq!(status, 200, "{kept}");
     assert_eq!(stored(&h).as_deref(), Some(value));
-    assert_eq!(kept["matchers"]["header"]["equals"], "");
+    assert_eq!(kept["matchers"]["headers"][0]["equals"], "");
 
     let replacement = "another-secret-value-0123456789abcdef012345";
     let (status, _) = h

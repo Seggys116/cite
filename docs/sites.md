@@ -130,6 +130,8 @@ A site can be reachable only through the Cloudflare proxy, and can be put in a m
 | `tls` | `"full"` (default), `"flexible"` | `full` keeps today's behaviour. `flexible` means Cloudflare talks plain HTTP to the origin. |
 | `bots` | `"allow"` (default), `"block_bad"`, `"block_all"` | Answers 403 to requests whose User-Agent names a bot. See [Bot policy](#bot-policy). |
 
+The consoles name these options in plain words. `cloudflare_only` is "Only allow traffic through the Cloudflare proxy", and turning it on alone needs no Cloudflare rule, secret or header. `tls` is a choice between "Certificate on the node" (`full`) and "Cloudflare handles HTTPS (no certificate on the node)" (`flexible`). `zone_lock` is "Also require that requests come from MY Cloudflare account (advanced)", the only option that asks you to create a Cloudflare Transform Rule.
+
 ### Cloudflare only
 
 With `cloudflare_only` on, the edge compares the TCP peer address (`fc_src`) with the Cloudflare range list. A client cannot forge that address the way it can forge a header, so a request sent straight to your origin address is refused. The refusal is logged with the rule label `cloudflare-only`, which appears in the Traffic blocked-by-rule table.
@@ -185,6 +187,21 @@ The rule id is `zone-<site>` when that fits in 40 characters, otherwise `zone-` 
 Blocked requests still count in analytics: they are logged with the label `bots-bad` or `bots-all`, their user agent, and the bot class and score computed from it, exactly like firewall blocks. User-agent matching is advisory because clients choose their own header, so it stops honest tools and lazy scripts only. `block_all` also removes the site from search results and link previews; do not use it on a site that needs search traffic. The token lists are shared with the Traffic bot classifier, so they cannot drift apart.
 
 Other per-site rules such as redirects (add or remove `www.`, force HTTPS), response headers and CORS are firewall rules scoped to the site; see [the firewall page](firewall.md#rules).
+
+## Routing by path
+
+Several sites can share a host and be told apart by path. A site takes a request when its host matches and either it has no path restriction, or the path starts with any of its `path_prefixes`, or matches any of its `path_regexes` (prefixes and regexes are alternatives for a site; in a firewall rule they are both required). Each list holds at most 16 distinct entries; regexes follow the [regex subset](firewall.md#regex-subset) and their combined cost is bounded. A path over 2048 bytes can only be taken by a prefix, never by a regex. The first site in the configuration order that matches wins.
+
+```json
+{"id": "docs", "name": "Docs", "hosts": ["example.com"],
+ "path_prefixes": ["/docs", "/guide"], "path_regexes": ["^/v[0-9]+/help$"]}
+```
+
+Configurations saved with the single `path_regex` still load: it becomes a one-entry `path_regexes`, and the node writes only the list names (empty lists are left out).
+
+## GitHub token for builds
+
+A site built from GitHub (a `source` on the site) needs a token for private repositories. Set `CITE_GITHUB_TOKEN` on the node once and every such site uses it. `GET /api/v1/node` reports `github.token_configured` so a console can tell whether the node already has one, and the Create site wizard then hides its token field behind "Use a different token for this site". When a node has none, the wizard asks for a fine-grained token with Contents: read for the repository and sends it once with the site (`github_token`); the node stores it and never returns it. When several nodes are picked, a token is required only if some picked node has none.
 
 ## Memory
 

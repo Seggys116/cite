@@ -147,7 +147,7 @@ pub fn needs_live_haproxy(before: &EdgeConfig, after: &EdgeConfig) -> bool {
                 .is_none_or(|b| b.access != site.access)
     });
     let sensitive = |r: &FirewallRule| {
-        r.enabled && (r.action.is_some() || r.matchers.header.as_ref().is_some_and(|h| h.secret))
+        r.enabled && (r.action.is_some() || r.matchers.headers.iter().any(|h| h.secret))
     };
     site_changed
         || after
@@ -194,11 +194,7 @@ fn scrub_error(err: ConnectorError, secrets: &[String]) -> ConnectorError {
 // Every secret a rendered config can hold: the node's zone secrets and the values of user rules marked secret.
 fn secret_values(edge: &EdgeConfig, zones: &ZoneStore) -> Vec<String> {
     let mut out = zones.all_secrets();
-    for header in edge
-        .firewall
-        .iter()
-        .filter_map(|r| r.matchers.header.as_ref())
-    {
+    for header in edge.firewall.iter().flat_map(|r| r.matchers.headers.iter()) {
         if header.secret {
             out.extend(header.equals.iter().chain(header.regex.iter()).cloned());
         }
@@ -881,7 +877,8 @@ mod tests {
             id: id.into(),
             name: id.into(),
             hosts: vec![format!("{id}.example.com")],
-            path_regex: None,
+            path_regexes: Vec::new(),
+            path_prefixes: Vec::new(),
             kind: SiteKind::Site,
             blue: Upstream {
                 targets: vec![Target {
@@ -1904,5 +1901,81 @@ mod tests {
         let err = hp.apply(&cfg).await.unwrap_err();
         assert!(matches!(err, ConnectorError::BadRequest(_)), "{err:?}");
         assert_eq!(fs::read_to_string(&hp.haproxy_cfg).unwrap(), live);
+    }
+
+    // The init step in docker-compose.node.yml writes these lines when no haproxy.cfg exists yet.
+    const BOOTSTRAP: [&str; 10] = [
+        "global",
+        "    maxconn 256",
+        "defaults",
+        "    mode http",
+        "    timeout connect 5s",
+        "    timeout client 30s",
+        "    timeout server 30s",
+        "frontend fe_boot",
+        "    bind :80",
+        "    http-request return status 404 content-type text/plain string \"no sites configured yet\"",
+    ];
+
+    #[test]
+    fn the_compose_bootstrap_matches_the_text_checked_here() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let compose = fs::read_to_string(root.join("docker-compose.node.yml")).unwrap();
+        for line in BOOTSTRAP {
+            assert!(
+                compose.contains(&format!("'{line}'")),
+                "missing from the init command: {line}"
+            );
+        }
+        assert_eq!(
+            compose.matches("fe_boot").count(),
+            1,
+            "the bootstrap text lives in one place"
+        );
+    }
+
+    #[test]
+    fn the_bootstrap_config_passes_haproxy_check() {
+        let found = std::env::var_os("PATH").and_then(|paths| {
+            std::env::split_paths(&paths)
+                .map(|dir| dir.join("haproxy"))
+                .find(|candidate| candidate.is_file())
+        });
+        let Some(bin) = found else {
+            eprintln!("skipped: no haproxy binary in PATH");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("boot.cfg");
+        fs::write(&path, format!("{}\n", BOOTSTRAP.join("\n"))).unwrap();
+        let out = std::process::Command::new(bin)
+            .arg("-c")
+            .arg("-f")
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bootstrap_file_on_disk_never_counts_as_an_applied_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let hp = haproxy_in(&dir, "127.0.0.1:9");
+        fs::create_dir_all(hp.haproxy_cfg.parent().unwrap()).unwrap();
+        fs::write(&hp.haproxy_cfg, format!("{}\n", BOOTSTRAP.join("\n"))).unwrap();
+        let first = hp.apply(&edge(Vec::new())).await.unwrap();
+        let written = fs::read_to_string(&hp.haproxy_cfg).unwrap();
+        assert!(
+            !written.contains("fe_boot") && written.contains("be_notfound"),
+            "{written}"
+        );
+        // with no HAProxy to confirm a load, the same config is tried again rather than skipped
+        assert!(!first.reloaded);
+        let again = hp.apply(&edge(Vec::new())).await.unwrap();
+        assert!(!again.reloaded && hp.state().applied.is_none());
     }
 }

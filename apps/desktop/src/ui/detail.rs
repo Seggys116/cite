@@ -8,12 +8,15 @@ use serde_json::Value;
 use crate::app::{Confirm, Console, Load, View, new_input};
 use crate::certs::{AccessDraft, zone_newly_enabled};
 use crate::demo::now_ms;
-use crate::model::{fmt_targets, parse_rfc3339_ms, parse_targets, rel_time};
+use crate::model::{
+    clean_list, fmt_targets, parse_rfc3339_ms, parse_targets, paths_problem, rel_time,
+};
 use crate::scope::{error_survives, foreign_notice};
 use crate::theme::{DIM, Tone, c};
 use crate::ui::certs::{access_body, access_controls};
 use crate::ui::input::TextInput;
 use crate::ui::overview::{action_pill, slot_pill};
+use crate::ui::paths::{PathRow, path_editor, read_paths, rows_from};
 use crate::ui::sites::health_tone;
 use crate::ui::widgets::{
     BtnKind, Col, btn, btn_off, card, dot, empty_state, field, id, mono, notice, page_header, pill,
@@ -42,6 +45,7 @@ pub struct State {
     pub maint_enabled: bool,
     pub maint_page: Option<String>,
     pub access: AccessDraft,
+    pub paths: Vec<PathRow>,
     pub reveals: Vec<ZoneReveal>,
 }
 
@@ -58,6 +62,7 @@ impl State {
             maint_enabled: false,
             maint_page: None,
             access: AccessDraft::default(),
+            paths: Vec::new(),
             reveals: Vec::new(),
         }
     }
@@ -93,6 +98,8 @@ impl Console {
                 this.detail.maint_enabled = data.site.maintenance.enabled;
                 this.detail.maint_page = data.site.maintenance.page_id.clone();
                 this.detail.access = AccessDraft::from_access(&data.site.access);
+                this.detail.paths =
+                    rows_from(cx, &data.site.path_prefixes, &data.site.path_regexes);
             }
             this.detail.data = Load::from_result(res);
             cx.notify();
@@ -193,6 +200,58 @@ impl Console {
 
     // The whole site goes back through the normal update, so an older node rejecting the access field shows its own error.
     // Turning the zone lock on rotates in a secret right after the save, because the node only shows it when asked.
+    // Saves the routing paths through the normal site update after the node's own checks have run here.
+    fn do_paths(&mut self, cx: &mut Context<Self>) {
+        let Some((h, mut site)) = self.site_handle() else {
+            return;
+        };
+        let (prefixes, regexes) = read_paths(&self.detail.paths, cx);
+        let (prefixes, regexes) = (clean_list(prefixes), clean_list(regexes));
+        if let Some(problem) = paths_problem(&prefixes, &regexes) {
+            self.detail.error = Some(format!("The routing paths are not valid: {problem}"));
+            return;
+        }
+        site.path_prefixes = prefixes;
+        site.path_regexes = regexes;
+        self.site_action(
+            cx,
+            "Routing paths",
+            async move { h.update_site(&site.id, &site).await.map(|_| ()) },
+            |_| Ok("Routing paths saved".to_string()),
+        );
+    }
+
+    fn paths_card(&self, cx: &mut Context<Self>) -> AnyElement {
+        let editor = path_editor(
+            &self.detail.paths,
+            "detail-path",
+            None,
+            |c| &mut c.detail.paths,
+            cx,
+        );
+        let save = if self.detail.busy {
+            btn_off("Save paths").into_any_element()
+        } else {
+            btn(id("detail", "save-paths"), "Save paths", BtnKind::Primary)
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.do_paths(cx);
+                    cx.notify();
+                }))
+                .into_any_element()
+        };
+        card(
+            Some("Routing paths"),
+            Some("Which requests for this site's hosts it serves"),
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(12.))
+                .child(editor)
+                .child(div().flex().child(save)),
+        )
+        .into_any_element()
+    }
+
     fn do_access(&mut self, cx: &mut Context<Self>) {
         let Some((h, mut site)) = self.site_handle() else {
             return;
@@ -483,6 +542,7 @@ impl Console {
                     .child(self.slot_card(data, Slot::Green)),
             )
             .child(self.deploy_card(site, cx))
+            .child(self.paths_card(cx))
             .child(self.access_card(data, cx))
             .child(self.maintenance_card(data, cx))
             .child(self.history_card(site, cx))

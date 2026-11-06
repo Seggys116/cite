@@ -1,6 +1,8 @@
 // Dev aid: an in-memory stand-in for the dashboard API, enabled with ?mock=1 (add &setup=1 for onboarding, &login=1 to start signed out)
 import { ApiError } from './js/api.js';
-import { corsProblem, hasMatcher, headerOpProblem, redirectProblem } from './js/rulelib.js';
+import {
+  corsProblem, hasMatcher, headerOpProblem, listsOf, redirectProblem,
+} from './js/rulelib.js';
 
 const query = new URLSearchParams(location.search);
 const state = {
@@ -57,14 +59,14 @@ function seedSites(nodeIdx, now) {
   const health = { path: '/healthz', interval_ms: 2000, rise: 2, fall: 3, timeout_ms: 1500 };
   return [
     {
-      id: 'shop', name: 'Storefront', hosts: ['shop.example.com', 'www.example.com'], path_regex: null, kind: 'site',
+      id: 'shop', name: 'Storefront', hosts: ['shop.example.com', 'www.example.com'], path_prefixes: [], path_regexes: [], kind: 'site',
       blue: { targets: [target(1, 11, 8080), target(1, 12, 8080)], label: 'v2.14.0' },
       green: { targets: [target(1, 21, 8080), target(1, 22, 8080)], label: 'v2.13.4' },
       active: 'blue', maintenance: { enabled: false, page_id: null }, health, source: null,
       history: hist([[170, 'green', 'promote', 'Release 2.13.4'], [52, 'blue', 'promote', 'Release 2.14.0-rc1'], [51, 'green', 'rollback', 'Checkout regression'], [6, 'blue', 'promote', 'Release 2.14.0']]),
     },
     {
-      id: 'api', name: 'Public API', hosts: ['api.example.com'], path_regex: '^/v1/', kind: 'api',
+      id: 'api', name: 'Public API', hosts: ['api.example.com'], path_prefixes: ['/v2'], path_regexes: ['^/v1/'], kind: 'api',
       blue: { targets: [target(2, 11, 9000)], label: null },
       green: { targets: [target(2, 21, 9000)], label: null },
       active: 'green', maintenance: { enabled: false, page_id: null }, health: { ...health, path: '/v1/health' }, source: null,
@@ -72,7 +74,7 @@ function seedSites(nodeIdx, now) {
       history: hist([[300, 'blue', 'promote', 'Initial deploy'], [28, 'green', 'promote', 'Add pagination to orders'], [27, 'blue', 'switch', 'Manual flip while testing'], [26, 'green', 'switch', 'Back to green']]),
     },
     {
-      id: 'docs', name: 'Documentation', hosts: ['docs.example.com'], path_regex: null, kind: 'site',
+      id: 'docs', name: 'Documentation', hosts: ['docs.example.com'], path_prefixes: [], path_regexes: [], kind: 'site',
       blue: { targets: [target(3, 11, 3000)], label: null },
       green: { targets: [target(3, 21, 3000)], label: null },
       active: 'blue', maintenance: { enabled: nodeIdx === 1, page_id: 'scheduled' }, health, source: { repo: 'acme/docs', branch: 'main', runtime: 'static', node_major: 22, poll_interval: '5m' },
@@ -80,7 +82,7 @@ function seedSites(nodeIdx, now) {
       history: hist([[400, 'blue', 'promote', 'Initial deploy'], [90, 'green', 'failed', 'Health check timed out']]),
     },
     ...(nodeIdx === 0 ? [{
-      id: 'legacy', name: 'Legacy portal', hosts: ['legacy.example.com'], path_regex: null, kind: 'site',
+      id: 'legacy', name: 'Legacy portal', hosts: ['legacy.example.com'], path_prefixes: [], path_regexes: [], kind: 'site',
       blue: { targets: [target(4, 11, 8080)], label: null },
       green: { targets: [target(4, 21, 8080)], label: null },
       active: 'blue', maintenance: { enabled: false, page_id: null }, health, source: null,
@@ -91,14 +93,14 @@ function seedSites(nodeIdx, now) {
 }
 
 function seedRules() {
-  const none = { path_regex: null, path_prefix: null, methods: [], user_agent_regex: null, cidrs: [], host: null };
+  const none = {};
   return [
-    { id: 'r-wp-login', name: 'WordPress login probes', enabled: true, action: 'deny', matchers: { ...none, path_regex: '^/wp-(login|admin)' }, site: null },
-    { id: 'r-env', name: 'Dotfile and VCS leaks', enabled: true, action: 'deny', matchers: { ...none, path_regex: '/\\.(env|git)(/|$)' }, site: null },
-    { id: 'r-phpmyadmin', name: 'phpMyAdmin scans', enabled: true, action: 'drop', matchers: { ...none, path_prefix: '/phpmyadmin' }, site: null },
-    { id: 'r-scanner-ua', name: 'Known scanner agents', enabled: true, action: 'tarpit', matchers: { ...none, user_agent_regex: '(sqlmap|nikto|masscan)' }, site: null },
-    { id: 'r-trace', name: 'Odd HTTP methods', enabled: true, action: 'deny', matchers: { ...none, methods: ['TRACE', 'CONNECT'] }, site: null },
-    { id: 'r-badnet', name: 'Abusive network', enabled: false, action: 'deny', matchers: { ...none, cidrs: ['203.0.113.0/24'] }, site: 'shop' },
+    { id: 'r-wp-login', name: 'WordPress login probes', enabled: true, action: 'deny', matchers: { path_regexes: ['^/wp-(login|admin)'] }, site: null },
+    { id: 'r-env', name: 'Dotfile and VCS leaks', enabled: true, action: 'deny', matchers: { path_regexes: ['/\\.(env|git)(/|$)'] }, site: null },
+    { id: 'r-phpmyadmin', name: 'phpMyAdmin scans', enabled: true, action: 'drop', matchers: { path_prefixes: ['/phpmyadmin', '/pma'] }, site: null },
+    { id: 'r-scanner-ua', name: 'Known scanner agents', enabled: true, action: 'tarpit', matchers: { user_agent_regexes: ['(sqlmap|nikto|masscan)'] }, site: null },
+    { id: 'r-trace', name: 'Odd HTTP methods', enabled: true, action: 'deny', matchers: { methods: ['TRACE', 'CONNECT'] }, site: null },
+    { id: 'r-badnet', name: 'Abusive network', enabled: false, action: 'deny', matchers: { cidrs: ['203.0.113.0/24'] }, site: 'shop' },
     {
       id: 'r-sec-headers', name: 'Security headers', enabled: true, matchers: { ...none }, site: 'shop',
       headers: [{ target: 'response', op: 'set', name: 'X-Frame-Options', value: 'DENY' }, { target: 'response', op: 'set', name: 'Referrer-Policy', value: 'strict-origin' }, { target: 'request', op: 'remove', name: 'X-Debug' }],
@@ -107,24 +109,28 @@ function seedRules() {
       id: 'r-cors-api', name: 'CORS for the app', enabled: true, matchers: { ...none }, site: 'api', label: 'cors-app',
       cors: { origins: ['https://app.example.com'], methods: ['GET', 'POST'], allow_headers: ['Content-Type', 'Authorization'], expose_headers: ['X-Request-Id'], credentials: true, max_age_secs: 600 },
     },
-    { id: 'r-old-blog', name: 'Old blog moved', enabled: true, matchers: { ...none, path_prefix: '/blog' }, site: 'shop', redirect: { to: 'https://blog.example.com/', status: 308 } },
+    {
+      id: 'redirect-1', name: 'Old blog moved', enabled: true, matchers: { path_prefixes: ['/blog'] }, site: 'shop', label: 'redirect-1', redirect: { to: 'https://blog.example.com/', status: 308 },
+    },
+    {
+      id: 'redirect-2', name: 'Old shop pages', enabled: true, matchers: { path_regexes: ['^/shop/[0-9]+$'] }, site: 'shop', label: 'redirect-2', redirect: { to: '/products{query}', status: 301 },
+    },
   ];
 }
 
 const RULE_HITS = [['r-wp-login', 14], ['r-env', 11], ['r-phpmyadmin', 7], ['r-scanner-ua', 5], ['r-trace', 2], ['r-badnet', 1]];
 
 function seedPresets() {
-  const none = { path_regex: null, path_prefix: null, methods: [], user_agent_regex: null, cidrs: [], host: null };
-  const rule = (name, action, matchers) => ({ id: '', name, enabled: true, action, matchers: { ...none, ...matchers }, site: null });
-  const redirect = (name, to, matchers) => ({ id: '', name, enabled: true, matchers: { ...none, ...matchers }, site: null, redirect: { to, status: 301 } });
+  const rule = (name, action, matchers) => ({ id: '', name, enabled: true, action, matchers, site: null });
+  const redirect = (name, to, matchers) => ({ id: '', name, enabled: true, matchers, site: null, redirect: { to, status: 301 } });
   return [
-    { name: 'sensitive-files', title: 'Sensitive files', description: 'Blocks requests for dotfiles, backups, dumps and key material that should never be public.', rules: [rule('Dotfiles', 'deny', { path_regex: '/\\.(env|git|svn|htaccess)' }), rule('Backups and dumps', 'deny', { path_regex: '\\.(bak|sql|old|swp)$' }), rule('Key material', 'deny', { path_regex: '\\.(pem|key|p12)$' })] },
-    { name: 'cms-probes', title: 'CMS probes', description: 'Stops WordPress, Joomla and phpMyAdmin probing on sites that do not run them.', rules: [rule('WordPress', 'deny', { path_regex: '^/wp-(admin|login|content|includes)' }), rule('xmlrpc', 'deny', { path_prefix: '/xmlrpc.php' }), rule('phpMyAdmin', 'drop', { path_prefix: '/phpmyadmin' })] },
-    { name: 'scanners', title: 'Scanners', description: 'Tarpits well-known vulnerability scanners by their user agent.', rules: [rule('Scanner agents', 'tarpit', { user_agent_regex: '(sqlmap|nikto|masscan|nmap|zgrab)' })] },
+    { name: 'sensitive-files', title: 'Sensitive files', description: 'Blocks requests for dotfiles, backups, dumps and key material that should never be public.', rules: [rule('Dotfiles', 'deny', { path_regexes: ['/\\.(env|git|svn|htaccess)'] }), rule('Backups and dumps', 'deny', { path_regexes: ['\\.(bak|sql|old|swp)$'] }), rule('Key material', 'deny', { path_regexes: ['\\.(pem|key|p12)$'] })] },
+    { name: 'cms-probes', title: 'CMS probes', description: 'Stops WordPress, Joomla and phpMyAdmin probing on sites that do not run them.', rules: [rule('WordPress', 'deny', { path_regexes: ['^/wp-(admin|login|content|includes)'] }), rule('xmlrpc', 'deny', { path_prefixes: ['/xmlrpc.php'] }), rule('phpMyAdmin', 'drop', { path_prefixes: ['/phpmyadmin'] })] },
+    { name: 'scanners', title: 'Scanners', description: 'Tarpits well-known vulnerability scanners by their user agent.', rules: [rule('Scanner agents', 'tarpit', { user_agent_regexes: ['(sqlmap|nikto|masscan|nmap|zgrab)'] })] },
     { name: 'odd-methods', title: 'Odd methods', description: 'Rejects TRACE, CONNECT and other methods no real client sends to a website.', rules: [rule('Unusual methods', 'deny', { methods: ['TRACE', 'CONNECT'] })] },
     { name: 'redirect-to-www', title: 'Redirect to www', description: 'Sends the bare domain to its www address with a permanent redirect, keeping the path and query.', rules: [redirect('Redirect to www', '{scheme}://{www_host}{path}{query}', {})] },
     { name: 'redirect-to-apex', title: 'Redirect to apex', description: 'Sends the www address to the bare domain with a permanent redirect, keeping the path and query.', rules: [redirect('Redirect to apex', '{scheme}://{apex_host}{path}{query}', {})] },
-    { name: 'force-https', title: 'Force HTTPS', description: 'Sends plain HTTP requests to the HTTPS address. Skipped for Flexible SSL sites and nodes without HTTPS.', rules: [redirect('Force HTTPS', 'https://{host}{path}{query}', { scheme: 'http' })] },
+    { name: 'force-https', title: 'Force HTTPS', description: 'Sends plain HTTP requests to the HTTPS address. Skipped for sites where Cloudflare handles HTTPS and for nodes without HTTPS.', rules: [redirect('Force HTTPS', 'https://{host}{path}{query}', { scheme: 'http' })] },
   ];
 }
 
@@ -590,13 +596,14 @@ function pushHistory(site, slot, action, note) {
 function checkSiteShape(site) {
   if (!site || !/^[a-z0-9][a-z0-9-]{0,62}$/.test(site.id || '')) throw new ApiError(400, 'invalid site id');
   if (!site.name || !Array.isArray(site.hosts) || !site.hosts.length) throw new ApiError(400, 'site needs a name and at least one host');
-  if (site.path_regex) {
+  for (const source of site.path_regexes || []) {
     try {
-      new RegExp(site.path_regex);
+      new RegExp(source);
     } catch (err) {
       throw new ApiError(400, 'invalid path regex');
     }
   }
+  if ((site.path_prefixes || []).some((p) => typeof p !== 'string' || !p.startsWith('/'))) throw new ApiError(400, 'path prefixes start with /');
   if (site.access && (!['full', 'flexible'].includes(site.access.tls || 'full') || typeof (site.access.cloudflare_only ?? false) !== 'boolean')) throw new ApiError(400, 'invalid access settings');
   if (site.access && !['allow', 'block_bad', 'block_all'].includes(site.access.bots || 'allow')) throw new ApiError(400, 'bots must be allow, block_bad or block_all');
   if (site.access && site.access.zone_lock && !site.access.cloudflare_only) throw new ApiError(400, 'zone_lock needs cloudflare_only');
@@ -654,6 +661,8 @@ function nodeInfo(node) {
     name: node.name, version: node.version, uptime_secs: Math.floor((Date.now() - node.startedAt) / 1000),
     haproxy: { running: true, config_hash: node.hap.configHash, last_reload_at: iso(node.hap.lastReload), last_reload_ok: node.hap.ok, last_error: node.hap.error || null },
     sites: node.sites.length, firewall_rules: node.rules.length,
+    // The first node holds a GitHub token of its own, the second does not, so both token flows can be tried
+    github: { token_configured: node.idx === 0, source: node.idx === 0 ? 'env' : 'none' },
   };
 }
 
@@ -704,8 +713,8 @@ async function siteRoute(node, method, seg, body) {
     if (method === 'GET') return withLive(node, site);
     if (method === 'PUT') {
       checkSiteShape(body);
-      const { name, hosts, path_regex: pathRegex, kind, health, source, access } = clone(body);
-      Object.assign(site, { name, hosts, path_regex: pathRegex, kind, health, source, access: access || { cloudflare_only: false, tls: 'full' } });
+      const { name, hosts, path_prefixes: pathPrefixes, path_regexes: pathRegexes, kind, health, source, access } = clone(body);
+      Object.assign(site, { name, hosts, path_prefixes: pathPrefixes || [], path_regexes: pathRegexes || [], kind, health, source, access: access || { cloudflare_only: false, tls: 'full' } });
       if (!site.access.zone_lock) delete node.zones[id];
       else if (!node.zones[id]) node.zones[id] = { created_at: iso(Date.now()), fingerprint: fakeSha(id + Date.now()).slice(0, 12) };
       audit(node, 'site.update', `site ${id} updated`);
@@ -813,8 +822,26 @@ function checkRuleShape(rule) {
     || (rule.headers || []).map(headerOpProblem).find(Boolean)
     || (rule.cors && corsProblem(rule.cors));
   if (problem) throw new ApiError(400, `rule ${rule.id}: ${problem}`);
-  const hm = m.header;
-  if (hm && Boolean(hm.regex) === Boolean(hm.equals) && !(hm.secret && hm.equals === '')) throw new ApiError(400, `rule ${rule.id} header matcher: set exactly one of regex or equals`);
+  for (const hm of listsOf(m).headers) {
+    if (Boolean(hm.regex) === Boolean(hm.equals) && !(hm.secret && hm.equals === '')) throw new ApiError(400, `rule ${rule.id} header matcher: set exactly one of regex or equals`);
+  }
+}
+
+// Secret header values are kept apart by position and blanked in the stored rule; a blank value on save keeps the held one
+function storeRuleSecrets(node, rule) {
+  const list = (rule.matchers && rule.matchers.headers) || [];
+  const previous = node.ruleSecrets[rule.id] || [];
+  const held = list.map((hm, i) => {
+    if (!hm.secret || hm.regex) return null;
+    if (hm.equals) return hm.equals;
+    if (!previous[i]) throw new ApiError(400, `rule ${rule.id} header matcher: enter the secret value`);
+    return previous[i];
+  });
+  for (const hm of list) {
+    if (hm.secret && !hm.regex) hm.equals = '';
+  }
+  if (held.some(Boolean)) node.ruleSecrets[rule.id] = held;
+  else delete node.ruleSecrets[rule.id];
 }
 
 function ruleRoute(node, method, id, body) {
@@ -822,15 +849,47 @@ function ruleRoute(node, method, id, body) {
   if (method !== 'POST' && method !== 'PUT') return collectionRoute(node.rules, 'rule', method, id, body, node);
   const rule = clone(body);
   checkRuleShape(rule);
-  const hm = rule.matchers && rule.matchers.header;
-  if (hm && hm.secret) {
-    if (hm.equals) node.ruleSecrets[rule.id] = hm.equals;
-    else if (!node.ruleSecrets[rule.id] && !hm.regex) throw new ApiError(400, `rule ${rule.id} header matcher: enter the secret value`);
-    hm.equals = '';
-  } else {
-    delete node.ruleSecrets[rule.id];
-  }
+  storeRuleSecrets(node, rule);
   return collectionRoute(node.rules, 'rule', method, id, rule, node);
+}
+
+// Many rule changes in one step: everything is checked first and a failure leaves the rules as they were
+function bulkRoute(node, body) {
+  const replace = Array.isArray(body && body.replace) ? body.replace.map(clone) : [];
+  const remove = Array.isArray(body && body.delete) ? body.delete : [];
+  const ids = replace.map((r) => r.id);
+  if (new Set(ids).size !== ids.length) throw new ApiError(400, 'a rule id appears twice in replace');
+  replace.forEach(checkRuleShape);
+  for (const id of remove) {
+    if (!node.rules.some((r) => r.id === id)) throw new ApiError(404, `rule ${id} not found`);
+  }
+  const rulesBefore = clone(node.rules);
+  const secretsBefore = clone(node.ruleSecrets);
+  const out = { created: 0, replaced: 0, deleted: 0 };
+  try {
+    for (const rule of replace) {
+      storeRuleSecrets(node, rule);
+      const at = node.rules.findIndex((r) => r.id === rule.id);
+      if (at >= 0) {
+        node.rules[at] = rule;
+        out.replaced += 1;
+      } else {
+        node.rules.push(rule);
+        out.created += 1;
+      }
+    }
+    for (const id of remove) {
+      node.rules = node.rules.filter((r) => r.id !== id);
+      delete node.ruleSecrets[id];
+      out.deleted += 1;
+    }
+  } catch (ex) {
+    node.rules = rulesBefore;
+    node.ruleSecrets = secretsBefore;
+    throw ex;
+  }
+  audit(node, 'firewall.bulk', `${out.created} created, ${out.replaced} replaced, ${out.deleted} deleted`);
+  return out;
 }
 
 function eventsIn(node, win, siteId) {
@@ -931,6 +990,10 @@ async function nodeRoute(node, method, seg, q, body) {
   if (a === 'pages') {
     const inUse = (id) => (node.sites.find((s) => s.maintenance.page_id === id) || {}).name;
     return collectionRoute(node.pages, 'page', method, b, body, node, inUse);
+  }
+  if (a === 'firewall' && b === 'bulk') {
+    if (method !== 'POST') throw new ApiError(405, 'method not allowed');
+    return bulkRoute(node, body);
   }
   if (a === 'firewall' && b === 'rules') return ruleRoute(node, method, c, body);
   if (a === 'firewall' && b === 'presets') {

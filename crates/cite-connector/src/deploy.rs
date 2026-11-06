@@ -187,10 +187,16 @@ impl Deployer {
             .ok_or_else(|| not_found(id))
     }
 
+    // A site's own stored token wins; a site without one uses the node token, read afresh so a restart with a rotated variable reaches the next container plan.
     async fn token_for(&self, site: &Site) -> String {
         match site.source.as_ref().and_then(|s| s.secret.as_deref()) {
             Some(name) => self.store.get_secret(name).await.unwrap_or_default(),
-            None => String::new(),
+            None => self
+                .orchestrator
+                .as_ref()
+                .and_then(|o| o.default_token())
+                .unwrap_or_default()
+                .to_string(),
         }
     }
 
@@ -379,7 +385,15 @@ impl Deployer {
                 }
                 stored_secret = Some(name);
             }
-            let token_text = token.as_deref().unwrap_or("");
+            let token_text = match token.as_deref().or_else(|| orch.default_token()) {
+                Some(text) => text,
+                None => {
+                    return Err(ConnectorError::BadRequest(
+                        "No GitHub token: set CITE_GITHUB_TOKEN on the connector (or pass github_token for this site)"
+                            .into(),
+                    ));
+                }
+            };
             let started = orch.ensure_stack(&site, active, None, token_text).await;
             match started {
                 Ok(targets) => upstream_mut(&mut site, active).targets = targets,
@@ -986,7 +1000,8 @@ mod tests {
             id: id.into(),
             name: id.into(),
             hosts: vec![format!("{id}.example.com")],
-            path_regex: None,
+            path_regexes: Vec::new(),
+            path_prefixes: Vec::new(),
             kind: SiteKind::Site,
             blue: Upstream {
                 targets: vec![target("10.0.0.1:8080"), target("10.0.0.2:8080")],
@@ -1133,6 +1148,89 @@ mod tests {
         assert!(err.to_string().contains("orchestration is not enabled"));
         assert!(e.store.config().sites.is_empty());
         assert_eq!(e.store.get_secret("site-shop").await, None);
+    }
+
+    async fn node_token_env() -> (
+        Env,
+        Arc<Orchestrator>,
+        Arc<StdMutex<crate::orchestrator::tests::Fake>>,
+    ) {
+        let (orch, fake) = crate::orchestrator::tests::start_fake().await;
+        let token =
+            crate::config::NodeToken::new("ghp_nodewide", crate::config::TokenSource::Env).unwrap();
+        let orch = Arc::new(orch.with_default_token(Some(token)));
+        let e = env_with(|_| {}, Some(orch.clone())).await;
+        (e, orch, fake)
+    }
+
+    #[tokio::test]
+    async fn a_site_without_a_token_uses_the_node_token_and_never_stores_it() {
+        use crate::orchestrator::tests::container_env;
+        let (e, _orch, fake) = node_token_env().await;
+        let made = e
+            .deployer
+            .create_site("t", orchestrated_site("shop"), None)
+            .await
+            .unwrap();
+        assert_eq!(made.source.unwrap().secret, None);
+        assert!(
+            container_env(&fake, "cite-shop-blue-manager")
+                .contains("CITE_GITHUB_TOKEN=ghp_nodewide")
+        );
+        assert_eq!(e.store.get_secret("site-shop").await, None);
+
+        // the next deploy plans the idle slot afresh and resolves the same fallback
+        e.deployer
+            .deploy("t", "shop", None, None, None)
+            .await
+            .unwrap();
+        assert!(
+            container_env(&fake, "cite-shop-green-manager")
+                .contains("CITE_GITHUB_TOKEN=ghp_nodewide")
+        );
+
+        let audit = e.store.audit_tail(100).await;
+        assert!(!format!("{audit:?}").contains("ghp_nodewide"));
+        for file in ["edge.json", "secrets.json", "audit.jsonl"] {
+            let text = std::fs::read_to_string(e.cfg.data_dir.join(file)).unwrap_or_default();
+            assert!(
+                !text.contains("ghp_nodewide"),
+                "{file} holds the node token"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_site_token_overrides_the_node_token() {
+        use crate::orchestrator::tests::container_env;
+        let (e, _orch, fake) = node_token_env().await;
+        e.deployer
+            .create_site("t", orchestrated_site("shop"), Some("ghp_sitewide".into()))
+            .await
+            .unwrap();
+        let env = container_env(&fake, "cite-shop-blue-manager");
+        assert!(env.contains("CITE_GITHUB_TOKEN=ghp_sitewide") && !env.contains("ghp_nodewide"));
+        assert_eq!(
+            e.store.get_secret("site-shop").await.as_deref(),
+            Some("ghp_sitewide")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_source_site_with_no_token_anywhere_is_a_clear_400() {
+        let (orch, _fake) = crate::orchestrator::tests::start_fake().await;
+        let e = env_with(|_| {}, Some(Arc::new(orch))).await;
+        let err = e
+            .deployer
+            .create_site("t", orchestrated_site("shop"), None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ConnectorError::BadRequest(_)), "{err:?}");
+        assert!(
+            err.to_string()
+                .contains("set CITE_GITHUB_TOKEN on the connector")
+        );
+        assert!(e.store.config().sites.is_empty());
     }
 
     #[tokio::test]

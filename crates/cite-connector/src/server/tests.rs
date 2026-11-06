@@ -12,6 +12,7 @@ use crate::store::testing::test_config;
 
 mod archive_api;
 mod certificates_api;
+mod firewall_bulk;
 mod zone_api;
 
 const SECRET: &str = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
@@ -553,6 +554,28 @@ async fn node_reports_identity_and_counts() {
         node["orchestrator"],
         json!({ "enabled": false, "reachable": false })
     );
+    assert_eq!(
+        node["github"],
+        json!({ "token_configured": false, "source": "none" })
+    );
+}
+
+#[tokio::test]
+async fn node_reports_whether_a_github_token_is_configured_but_never_its_value() {
+    let h = start_with(|cfg| {
+        cfg.github_token = Some(
+            crate::config::NodeToken::new("ghp_node_wide_value", crate::config::TokenSource::Env)
+                .unwrap(),
+        );
+    })
+    .await;
+    let t = h.token().await;
+    let (_, node) = h.get(&t, "/node").await;
+    assert_eq!(
+        node["github"],
+        json!({ "token_configured": true, "source": "env" })
+    );
+    assert!(!node.to_string().contains("ghp_node_wide_value"));
 }
 
 #[tokio::test]

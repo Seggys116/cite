@@ -96,7 +96,7 @@ export function uncoveredNote(hosts) {
   const list = Array.isArray(hosts) ? hosts.filter(Boolean) : [];
   if (!list.length) return '';
   const noun = list.length === 1 ? 'site host has' : 'site hosts have';
-  return `${list.length} ${noun} no certificate on this node: ${list.join(', ')}. Visitors to ${list.length === 1 ? 'it' : 'them'} over HTTPS get a certificate warning, unless the site uses Flexible SSL behind Cloudflare.`;
+  return `${list.length} ${noun} no certificate on this node: ${list.join(', ')}. Visitors to ${list.length === 1 ? 'it' : 'them'} over HTTPS get a certificate warning, unless Cloudflare handles HTTPS for the site.`;
 }
 
 // A dotted quad as a number, or null when an octet is above 255 or has a leading zero, which the node's parser refuses

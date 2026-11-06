@@ -17,6 +17,9 @@ use crate::state::AppState;
 pub const MAX_REQUEST_BODY: usize = 1024 * 1024;
 // The connector caps the JSON at 128 KiB; escaped newlines make a 100 KiB PEM pair somewhat larger on the wire.
 pub const MAX_CERTIFICATE_BODY: usize = 144 * 1024;
+// Several hundred rules in one change; a rule is a few hundred bytes, so this is generous and still half the general cap.
+pub const MAX_BULK_BODY: usize = 512 * 1024;
+const BULK_ROUTE: &str = "firewall/bulk";
 
 const PREFIX: &str = "/api/v1/nodes/";
 const PROXY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -141,18 +144,28 @@ fn zone_secret_route_ok(method: &Method, rest: &str) -> bool {
         && (method == Method::GET || method == Method::POST)
 }
 
+// The bulk route is a single POST with no further segments; the other firewall routes keep their prefix-level access.
+fn bulk_route_ok(method: &Method, rest: &str) -> bool {
+    let mut segments = rest.split('/');
+    if segments.next() != Some("firewall") || segments.next() != Some("bulk") {
+        return true;
+    }
+    segments.next().is_none() && method == Method::POST
+}
+
 fn route_ok(method: &Method, rest: &str) -> bool {
     analytics_route_ok(method, rest)
         && certificate_route_ok(method, rest)
         && zone_secret_route_ok(method, rest)
+        && bulk_route_ok(method, rest)
 }
 
 fn body_limit_for(method: &Method, rest: &str) -> usize {
     let write = matches!(*method, Method::POST | Method::PUT);
-    if write && rest.split('/').next() == Some("certificates") {
-        MAX_CERTIFICATE_BODY
-    } else {
-        MAX_REQUEST_BODY
+    match rest.split('/').next() {
+        Some("certificates") if write => MAX_CERTIFICATE_BODY,
+        Some("firewall") if write && rest == BULK_ROUTE => MAX_BULK_BODY,
+        _ => MAX_REQUEST_BODY,
     }
 }
 
@@ -535,6 +548,32 @@ mod tests {
             timeout_for(&Method::POST, "sites/shop/zone-secret"),
             PROXY_TIMEOUT
         );
+    }
+
+    #[test]
+    fn the_bulk_route_is_one_post_with_its_own_body_limit() {
+        assert!(route_ok(&Method::POST, "firewall/bulk"));
+        for method in [Method::GET, Method::PUT, Method::DELETE, Method::PATCH] {
+            assert!(!route_ok(&method, "firewall/bulk"), "{method}");
+        }
+        assert!(!route_ok(&Method::POST, "firewall/bulk/extra"));
+        assert!(route_ok(&Method::POST, "firewall/rules"));
+        assert!(route_ok(&Method::PUT, "firewall/rules/a"));
+        assert!(route_ok(&Method::GET, "firewall/presets"));
+        assert_eq!(
+            body_limit_for(&Method::POST, "firewall/bulk"),
+            MAX_BULK_BODY
+        );
+        assert_eq!(MAX_BULK_BODY, 512 * 1024);
+        assert_eq!(
+            body_limit_for(&Method::POST, "firewall/rules"),
+            MAX_REQUEST_BODY
+        );
+        assert_eq!(
+            body_limit_for(&Method::GET, "firewall/bulk"),
+            MAX_REQUEST_BODY
+        );
+        assert_eq!(timeout_for(&Method::POST, "firewall/bulk"), PROXY_TIMEOUT);
     }
 
     #[test]

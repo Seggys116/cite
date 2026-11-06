@@ -13,6 +13,7 @@ import { newSiteView } from './js/views/siteForm.js';
 import { siteDetailView } from './js/views/siteDetail.js';
 import { trafficView } from './js/views/traffic.js';
 import { firewallView } from './js/views/firewall.js';
+import { redirectsView } from './js/views/redirects.js';
 import { maintenanceView } from './js/views/maintenance.js';
 import { settingsView } from './js/views/settings.js';
 
@@ -31,6 +32,7 @@ const VIEWS = {
   nodes: nodesView,
   traffic: trafficView,
   firewall: firewallView,
+  redirects: redirectsView,
   maintenance: maintenanceView,
   settings: settingsView,
   sites: (ctx) => {
@@ -147,6 +149,7 @@ function commands() {
   list.push(
     { label: 'Create site', hint: 'new', icon: 'plus', run: () => go('#/sites/new') },
     { label: 'Add firewall rule', hint: 'new', icon: 'shield', run: () => go('#/firewall/new') },
+    { label: 'Go to Redirects', hint: 'navigate', icon: 'swap', run: () => go('#/redirects') },
     { label: 'Add node', hint: 'new', icon: 'server', run: () => openAddNode(() => { if (parseHash().name === 'nodes') route(); }) },
     { label: 'Switch to All nodes', hint: 'node', icon: 'layers', run: () => selectNode('all') },
   );
@@ -226,7 +229,7 @@ function renderView(name, params) {
   clear(shell.content);
   shell.content.appendChild(root);
   for (const link of shell.nav.children) {
-    const on = link.dataset.nav === name;
+    const on = link.dataset.nav === (name === 'redirects' ? 'firewall' : name);
     if (on) link.setAttribute('aria-current', 'page');
     else link.removeAttribute('aria-current');
   }

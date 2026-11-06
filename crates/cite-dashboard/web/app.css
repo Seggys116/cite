@@ -560,6 +560,21 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--blue); width: 
 
 .target-list { display: flex; flex-direction: column; gap: var(--s2); margin-bottom: var(--s2); }
 .target-row { display: grid; grid-template-columns: 1fr 84px 32px; gap: var(--s2); align-items: center; }
+.wizard { display: flex; flex-direction: column; gap: var(--s4); }
+.wizard-progress { display: flex; flex-wrap: wrap; gap: var(--s3); font-size: 12px; color: var(--text-faint); }
+.wizard-step { display: inline-flex; align-items: center; gap: var(--s2); }
+.wizard-step.current { color: var(--text); font-weight: 600; }
+.wizard-step.done { color: var(--text-dim); }
+.wizard-num { display: inline-flex; align-items: center; justify-content: center; width: 20px; height: 20px; border-radius: 50%; border: 1px solid var(--chip-stroke); font-size: 11px; }
+.wizard-step.current .wizard-num { background: var(--chip-fill); }
+.wizard-title { font-size: 14px; font-weight: 600; outline: none; }
+.wizard-body { min-height: 120px; }
+.choice-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: var(--s3); }
+.choice-cards .radio-card { padding: var(--s4); }
+.cond-row { display: grid; grid-template-columns: minmax(0, 1fr) 32px; gap: var(--s2); align-items: start; }
+.cond-fields { display: grid; grid-template-columns: 200px minmax(0, 1fr); gap: var(--s2); align-items: start; }
+.redirect-row { display: grid; grid-template-columns: auto minmax(0, 1.2fr) auto minmax(0, 1.4fr) 80px 32px; gap: var(--s2); align-items: start; }
+.redirect-arrow { color: var(--text-faint); font-size: 12px; padding-top: 8px; }
 .header-row { display: grid; grid-template-columns: 110px 100px minmax(0, 1fr) minmax(0, 1fr) 32px; gap: var(--s2); align-items: center; }
 .regex-tool { display: flex; flex-direction: column; gap: var(--s3); }
 .regex-status, .regex-result { display: flex; gap: var(--s2); align-items: center; flex-wrap: wrap; min-height: 22px; }

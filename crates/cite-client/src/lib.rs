@@ -6,6 +6,7 @@ pub mod client;
 pub mod config;
 pub mod error;
 pub mod export;
+pub mod firewall;
 pub mod fleet;
 pub mod fsio;
 pub mod tokens;
@@ -21,8 +22,8 @@ pub use certificate::{
     MAX_CERT_NAME_CHARS, MAX_PEM_BYTES, validate_certificate_id, validate_certificate_name,
 };
 pub use client::{
-    AuditEntry, CreatedToken, DeployRequest, Forwarded, LoginResponse, NodeClient, NodeInfo,
-    PresetInfo, ReloadResult, RequestQuery, SiteDetail, TokenMeta,
+    AuditEntry, CreatedToken, DeployRequest, Forwarded, GithubInfo, LoginResponse, NodeClient,
+    NodeInfo, PresetInfo, ReloadResult, RequestQuery, SiteDetail, TokenMeta,
 };
 pub use config::{
     CONFIG_VERSION, ConfigFile, DEFAULT_LISTEN, DashboardConfig, MAX_NODES, NodeConfig,
@@ -34,6 +35,7 @@ pub use export::{
     ExportKind, ExportQuery, ExportReport, ExportStream, TOP_KINDS, export_file_name,
     filename_from_disposition,
 };
+pub use firewall::{BulkResult, FirewallBulk, MAX_BULK_ENTRIES, validate_rule_id};
 pub use fleet::{
     DEFAULT_FAN_OUT_LIMIT, NodeOutcome, NodeTargets, ReplicationMode, ReplicationPlan, apply_plan,
     apply_site_to_nodes, fan_out,

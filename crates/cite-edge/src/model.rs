@@ -47,8 +47,16 @@ pub struct Site {
     pub name: String,
     pub hosts: Vec<String>,
     // Fields marked default may be omitted by API clients and are filled in on load.
-    #[serde(default)]
-    pub path_regex: Option<String>,
+    /// A site takes a request when the host matches and either no path restriction is set or any prefix or any regex matches.
+    #[serde(
+        default,
+        alias = "path_regex",
+        deserialize_with = "one_or_many",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub path_regexes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub path_prefixes: Vec<String>,
     #[serde(default)]
     pub kind: SiteKind,
     pub blue: Upstream,
@@ -239,25 +247,76 @@ pub enum FirewallAction {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Matchers {
-    #[serde(default)]
-    pub path_regex: Option<String>,
-    #[serde(default)]
-    pub path_prefix: Option<String>,
+    /// Values of one field are OR'd, different fields are AND'd. The singular names of earlier releases still load into these lists.
+    #[serde(
+        default,
+        alias = "path_regex",
+        deserialize_with = "one_or_many",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub path_regexes: Vec<String>,
+    #[serde(
+        default,
+        alias = "path_prefix",
+        deserialize_with = "one_or_many",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub path_prefixes: Vec<String>,
     #[serde(default)]
     pub methods: Vec<String>,
-    #[serde(default)]
-    pub user_agent_regex: Option<String>,
+    #[serde(
+        default,
+        alias = "user_agent_regex",
+        deserialize_with = "one_or_many",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub user_agent_regexes: Vec<String>,
     #[serde(default)]
     pub cidrs: Vec<String>,
-    #[serde(default)]
-    pub host: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub header: Option<HeaderMatch>,
+    #[serde(
+        default,
+        alias = "host",
+        deserialize_with = "one_or_many",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub hosts: Vec<String>,
+    /// All listed header matchers must hold.
+    #[serde(
+        default,
+        alias = "header",
+        deserialize_with = "one_or_many",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub headers: Vec<HeaderMatch>,
     /// "http" or "https", as the visitor connected (Cloudflare's view for Flexible sites).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scheme: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub referer_regex: Option<String>,
+    #[serde(
+        default,
+        alias = "referer_regex",
+        deserialize_with = "one_or_many",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub referer_regexes: Vec<String>,
+}
+
+// Accepts a list, a single value (the shape of earlier releases) or null.
+fn one_or_many<'de, D, T>(d: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Shape<T> {
+        Many(Vec<T>),
+        One(T),
+    }
+    Ok(match Option::<Shape<T>>::deserialize(d)? {
+        None => Vec::new(),
+        Some(Shape::Many(v)) => v,
+        Some(Shape::One(v)) => vec![v],
+    })
 }
 
 // Exactly one of regex and equals is set; negate inverts the test, so "unless header X equals Y" is expressible.
@@ -595,8 +654,8 @@ mod tests {
         assert!(r.action.is_none() && r.label.is_none() && r.redirect.is_none());
         assert!(r.headers.is_empty() && r.cors.is_none() && r.site.is_none());
         assert_eq!(r.matchers, Matchers::default());
-        assert!(r.matchers.header.is_none() && r.matchers.scheme.is_none());
-        assert!(r.matchers.referer_regex.is_none());
+        assert!(r.matchers.headers.is_empty() && r.matchers.scheme.is_none());
+        assert!(r.matchers.referer_regexes.is_empty());
         let redirect: Redirect = serde_json::from_str(r#"{"to": "/x"}"#).expect("redirect");
         assert_eq!(redirect.status, 301);
         let cors: Cors = serde_json::from_str("{}").expect("cors");
@@ -651,9 +710,58 @@ mod tests {
         assert!(back.get("action").is_none() && back.get("label").is_none());
         assert_eq!(back["redirect"]["status"], 308);
         assert_eq!(back["matchers"]["scheme"], "http");
-        assert!(back["matchers"].get("referer_regex").is_none());
+        assert!(back["matchers"].get("referer_regexes").is_none());
+        assert_eq!(back["matchers"]["headers"][0]["name"], "X-A");
+        assert!(back["matchers"].get("header").is_none());
         let again: FirewallRule = serde_json::from_value(back).expect("reparse");
         assert_eq!(again, r);
+    }
+
+    #[test]
+    fn single_valued_matchers_of_earlier_releases_load_into_lists() {
+        let old = r#"{"path_regex": "^/a", "path_prefix": "/p", "methods": [], "user_agent_regex": "bot",
+            "cidrs": [], "host": "a.com", "header": {"name": "X-A", "equals": "v"}, "referer_regex": null}"#;
+        let m: Matchers = serde_json::from_str(old).expect("old shape");
+        assert_eq!(m.path_regexes, ["^/a"]);
+        assert_eq!(m.path_prefixes, ["/p"]);
+        assert_eq!(m.user_agent_regexes, ["bot"]);
+        assert_eq!(m.hosts, ["a.com"]);
+        assert_eq!(m.headers.len(), 1);
+        assert!(m.referer_regexes.is_empty());
+        let back = serde_json::to_value(&m).expect("ser");
+        for gone in [
+            "path_regex",
+            "path_prefix",
+            "user_agent_regex",
+            "host",
+            "header",
+            "referer_regexes",
+        ] {
+            assert!(back.get(gone).is_none(), "{gone}");
+        }
+        assert_eq!(back["path_regexes"], serde_json::json!(["^/a"]));
+        let again: Matchers = serde_json::from_value(back).expect("reparse");
+        assert_eq!(again, m);
+    }
+
+    #[test]
+    fn matcher_lists_load_as_given_and_unknown_keys_still_fail() {
+        let m: Matchers = serde_json::from_str(
+            r#"{"path_regexes": ["^/a", "^/b"], "hosts": ["a.com", "b.com"], "headers": [{"name": "X-A", "regex": "^v"}, {"name": "X-B", "equals": "w"}]}"#,
+        )
+        .expect("lists");
+        assert_eq!(
+            (m.path_regexes.len(), m.hosts.len(), m.headers.len()),
+            (2, 2, 2)
+        );
+        assert!(serde_json::from_str::<Matchers>(r#"{"path_regexs": ["^/a"]}"#).is_err());
+        let site = r#"{"id": "a", "name": "a", "hosts": ["a.com"], "path_regex": "^/x",
+            "blue": {"targets": []}, "green": {"targets": []}, "active": "blue"}"#;
+        let s: Site = serde_json::from_str(site).expect("old site");
+        assert_eq!(s.path_regexes, ["^/x"]);
+        assert!(s.path_prefixes.is_empty());
+        let back = serde_json::to_value(&s).expect("ser");
+        assert!(back.get("path_regex").is_none() && back.get("path_prefixes").is_none());
     }
 
     #[test]
@@ -669,7 +777,7 @@ mod tests {
         let rule = FirewallRule {
             id: "z".into(),
             matchers: Matchers {
-                header: Some(m.clone()),
+                headers: vec![m.clone()],
                 ..Matchers::default()
             },
             ..FirewallRule::default()

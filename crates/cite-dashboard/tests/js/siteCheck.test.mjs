@@ -2,7 +2,52 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   siteProblem, repoProblem, branchProblem, runtimeProblem, pollProblem, gitRefProblem, cleanToken,
+  TOKEN_HELP_HAVE, TOKEN_HELP_NONE, TOKEN_TOGGLE, tokenPlan, tokenProblem, tokenState,
 } from '../../web/js/siteCheck.js';
+
+test('a node reports whether it already holds a GitHub token', () => {
+  assert.equal(tokenState({ github: { token_configured: true, source: 'env' } }), 'yes');
+  assert.equal(tokenState({ github: { token_configured: false, source: 'none' } }), 'no');
+  assert.equal(tokenState({}), 'unknown');
+  assert.equal(tokenState(null), 'unknown');
+});
+
+test('the token field is hidden when every selected node has a token', () => {
+  const one = tokenPlan(['yes']);
+  assert.deepEqual([one.show, one.required], [false, false]);
+  assert.equal(one.help, 'This node already has a GitHub token (CITE_GITHUB_TOKEN). Leave this empty to use it.');
+  assert.equal(one.help, TOKEN_HELP_HAVE);
+  assert.equal(TOKEN_TOGGLE, 'Use a different token for this site');
+  const all = tokenPlan(['yes', 'yes']);
+  assert.equal(all.show, false);
+  assert.match(all.help, /Every selected node/);
+});
+
+test('a node without a token makes the field visible and required', () => {
+  const none = tokenPlan(['no']);
+  assert.deepEqual([none.show, none.required], [true, true]);
+  assert.equal(none.help, TOKEN_HELP_NONE);
+  assert.match(none.help, /Contents: read/);
+  assert.match(none.help, /CITE_GITHUB_TOKEN/);
+  const mixed = tokenPlan(['yes', 'no', 'yes']);
+  assert.deepEqual([mixed.show, mixed.required], [true, true]);
+});
+
+test('an unknown node never forces a token but still offers the field', () => {
+  for (const states of [[], ['unknown'], ['yes', 'unknown']]) {
+    const plan = tokenPlan(states);
+    assert.deepEqual([plan.show, plan.required], [true, false], JSON.stringify(states));
+  }
+  assert.deepEqual(tokenPlan(undefined).required, false);
+});
+
+test('a required token must not be blank', () => {
+  const required = tokenPlan(['no']);
+  assert.match(tokenProblem(required, ''), /GitHub token/);
+  assert.match(tokenProblem(required, '   '), /GitHub token/);
+  assert.equal(tokenProblem(required, 'abc'), null);
+  assert.equal(tokenProblem(tokenPlan(['yes']), ''), null);
+});
 
 const valid = {
   name: 'App', id: 'app', hostCount: 1, pathError: null, targetProblem: null, blueCount: 1, healthPath: '/', pickNodes: true, nodePicked: true,

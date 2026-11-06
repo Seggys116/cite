@@ -39,6 +39,12 @@ compose() {
 remove_stack() {
   docker rm -f "${UPSTREAMS[@]}" >/dev/null 2>&1 || true
   compose down -v --remove-orphans >/dev/null 2>&1 || true
+  upgrade_compose down -v --remove-orphans >/dev/null 2>&1 || true
+}
+
+# A second project for the upgrade check; it shares the fixed haproxy container name, so it only runs once the main stack is gone.
+upgrade_compose() {
+  docker compose -p "${PROJECT}-upg" -f "$ROOT/docker-compose.node.yml" "$@" </dev/null
 }
 
 cleanup() {
@@ -316,6 +322,17 @@ expect "CA fingerprint from init matches ca.pem" "$FINGERPRINT" "$SEEN"
 compose run --rm --no-deps -T connector init --non-interactive --json >/dev/null 2>&1 &&
   fail "a second init without --force must refuse"
 pass "second init refuses to overwrite"
+
+echo "== first boot before the connector writes anything"
+compose run --rm --no-deps -T --entrypoint cat connector /conf/haproxy/haproxy.cfg >"$WORK/boot.cfg" ||
+  fail "init left no haproxy.cfg"
+grep -q 'frontend fe_boot' "$WORK/boot.cfg" || fail "init did not write the bootstrap config: $(<"$WORK/boot.cfg")"
+pass "init wrote the bootstrap haproxy.cfg"
+compose up -d --no-deps haproxy >"$WORK/up.log" 2>&1 || fail "haproxy start failed: $(<"$WORK/up.log")"
+sleep 5
+expect "haproxy runs on the bootstrap config without a restart" "true 0" \
+  "$(docker inspect -f '{{.State.Running}} {{.RestartCount}}' "$(compose ps -q haproxy)")"
+expect "the bootstrap answers 404 on port 80" 404 "$(EDGE_HOST=anything.e2e.test edge_code /)"
 
 echo "== start and detect the dashboard source address"
 compose up -d >"$WORK/up.log" 2>&1 || fail "compose up failed: $(<"$WORK/up.log")"
@@ -787,5 +804,22 @@ done
 api GET /api/v1/settings
 api PUT /api/v1/settings "$(printf '%s' "$BODY" | jq -c '.cloudflare_ranges = []')"
 code_is "restore the built-in cloudflare ranges" 200
+
+echo "== upgrade from a volume that has only /conf/haproxy"
+remove_stack
+export CITE_HTTP_PORT=$((HTTP_PORT + 1)) CITE_HTTPS_PORT=$((HTTPS_PORT + 1)) CITE_CONNECTOR_PORT=$((API_PORT + 1))
+upgrade_compose run --rm --no-deps -T --entrypoint /bin/sh init -c \
+  'mkdir -p /conf/haproxy && chown 10001:10001 /conf /conf/haproxy && chmod 0750 /conf /conf/haproxy' >"$WORK/old.log" 2>&1 ||
+  fail "could not build the old-style volume: $(<"$WORK/old.log")"
+upgrade_compose run --rm --no-deps -T init >"$WORK/init.log" 2>&1 || fail "init on the old volume failed: $(<"$WORK/init.log")"
+upgrade_compose run --rm --no-deps -T --entrypoint /bin/sh connector -c \
+  'test -d /conf/certs && test -d /conf/state && grep -q fe_boot /conf/haproxy/haproxy.cfg' >"$WORK/old.log" 2>&1 ||
+  fail "init did not complete the old volume: $(<"$WORK/old.log")"
+pass "init created certs and state and the bootstrap config on the old volume"
+upgrade_compose up -d --no-deps haproxy >"$WORK/up.log" 2>&1 || fail "haproxy could not start on the old volume: $(<"$WORK/up.log")"
+sleep 5
+expect "haproxy runs on the upgraded volume without a restart" "true 0" \
+  "$(docker inspect -f '{{.State.Running}} {{.RestartCount}}' "$(upgrade_compose ps -q haproxy)")"
+remove_stack
 
 echo "e2e-node: all checks passed"

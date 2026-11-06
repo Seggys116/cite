@@ -1,28 +1,41 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use cite_client::{ClientError, NodeOutcome};
-use gpui::{AnyElement, Context, Entity, div, prelude::*, px};
+use gpui::{AnyElement, Context, Div, Entity, div, prelude::*, px};
 
 use crate::api::apply_to_handles;
 use crate::app::{Console, View, new_input};
 use crate::certs::AccessDraft;
 use crate::model::{
-    Placement, SiteDraft, build_site, draft_github_token, plan_placement, regex_matches,
-    regex_problem, slugify,
+    DEFAULT_POLL, DEFAULT_RUNTIME, NODE_MAJORS, Placement, RUNTIMES, SiteDraft, SourceKind,
+    build_site, draft_github_token, node_has_github_token, plan_placement, slugify,
 };
-use crate::theme::{DIM, Tone, c};
+use crate::theme::{ACCENT, DIM, Tone, c};
 use crate::ui::certs::{access_body, access_controls};
+use crate::ui::paths::{PathRow, clear_rows, path_editor, read_paths};
+use crate::wizard::{
+    STEPS, Step, TOKEN_TOGGLE, TokenView, effective_token, first_blocked, review_rows,
+    step_problem, token_view,
+};
 use crate::zone::{ZoneReveal, create_verdict};
 
 type CreateDone = (Vec<NodeOutcome>, Vec<ZoneReveal>, Vec<String>);
 use crate::ui::input::{InputEvent, TextInput};
 use crate::ui::widgets::{
-    BtnKind, btn, card, field, id, mono, notice, page_header, pill, seg_item, seg_row, text_dim,
-    toggle,
+    BtnKind, btn, btn_off, card, field, id, mono, notice, page_header, pill, seg_item, seg_row,
+    text_dim, toggle,
 };
 
 pub struct State {
     pub api: bool,
+    pub step: Step,
+    pub source: SourceKind,
+    pub runtime: String,
+    pub node_major: u8,
+    pub own_token: bool,
+    // Whether each node already holds a GitHub token of its own, learned when the form opens.
+    pub tokens: BTreeMap<String, bool>,
+    pub poll: Entity<TextInput>,
     pub access: AccessDraft,
     pub placement: Placement,
     pub picked: BTreeSet<String>,
@@ -32,7 +45,7 @@ pub struct State {
     pub name: Entity<TextInput>,
     pub id: Entity<TextInput>,
     pub hosts: Entity<TextInput>,
-    pub path: Entity<TextInput>,
+    pub paths: Vec<PathRow>,
     pub sample: Entity<TextInput>,
     pub blue: Entity<TextInput>,
     pub green: Entity<TextInput>,
@@ -47,6 +60,13 @@ impl State {
         let name = new_input(cx, "Storefront", |i| i);
         let state = Self {
             api: false,
+            step: Step::Source,
+            source: SourceKind::Github,
+            runtime: DEFAULT_RUNTIME.into(),
+            node_major: NODE_MAJORS[0],
+            own_token: false,
+            tokens: BTreeMap::new(),
+            poll: new_input(cx, DEFAULT_POLL, |i| i.mono()),
             access: AccessDraft::default(),
             placement: Placement::Selected,
             picked: BTreeSet::new(),
@@ -56,12 +76,12 @@ impl State {
             name: name.clone(),
             id: new_input(cx, "storefront", |i| i.mono()),
             hosts: new_input(cx, "shop.example.com, www.example.com", |i| i.mono()),
-            path: new_input(cx, "^/api/ (optional)", |i| i.mono()),
+            paths: Vec::new(),
             sample: new_input(cx, "/api/v1/users", |i| i.mono()),
             blue: new_input(cx, "10.0.0.11:8080, 10.0.0.12:8080", |i| i.mono()),
             green: new_input(cx, "10.0.0.21:8080 (optional)", |i| i.mono()),
             health: new_input(cx, "/", |i| i.mono()),
-            repo: new_input(cx, "https://github.com/acme/shop (optional)", |i| i.mono()),
+            repo: new_input(cx, "acme/shop", |i| i.mono()),
             branch: new_input(cx, "main", |i| i.mono()),
             gh_token: new_input(cx, "GitHub token for private repositories", |i| {
                 i.masked().mono()
@@ -91,39 +111,100 @@ impl Console {
             &c.name,
             &c.id,
             &c.hosts,
-            &c.path,
             &c.sample,
             &c.blue,
             &c.green,
             &c.repo,
-            &c.branch,
             &c.gh_token,
         ] {
             input.update(cx, |i, cx| i.set_text("", cx));
         }
         c.health.update(cx, |i, cx| i.set_text("/", cx));
+        c.branch.update(cx, |i, cx| i.set_text("main", cx));
+        c.poll.update(cx, |i, cx| i.set_text(DEFAULT_POLL, cx));
+        clear_rows(&mut self.create.paths, cx);
         self.create.last_auto_id.clear();
         self.create.access = AccessDraft::default();
+        self.create.step = Step::Source;
+        self.create.source = SourceKind::Github;
+        self.create.runtime = DEFAULT_RUNTIME.into();
+        self.create.node_major = NODE_MAJORS[0];
+        self.create.own_token = false;
+        self.create.tokens.clear();
         self.create.error = None;
         self.create.busy = false;
         self.create.picked = self.active_name().into_iter().collect();
+        self.load_node_tokens(cx);
+    }
+
+    // Which nodes already hold a GitHub token decides whether the token field is offered or required.
+    fn load_node_tokens(&mut self, cx: &mut Context<Self>) {
+        let handles = self.handles.clone();
+        let fut = async move {
+            let mut out = Vec::new();
+            for h in handles {
+                let has = h
+                    .node_info()
+                    .await
+                    .map(|i| node_has_github_token(&i))
+                    .unwrap_or(false);
+                out.push((h.name().to_string(), has));
+            }
+            Ok::<_, ClientError>(out)
+        };
+        self.fetch_scoped(cx, fut, |this, res, cx| {
+            if let Ok(found) = res {
+                this.create.tokens = found.into_iter().collect();
+                cx.notify();
+            }
+        });
+    }
+
+    // The nodes the site would be placed on with the current choice.
+    fn chosen_nodes(&self) -> Vec<String> {
+        match self.create.placement {
+            Placement::ReplicateAll => self.node_names(),
+            Placement::Selected => self.create.picked.iter().cloned().collect(),
+        }
+    }
+
+    fn token_state(&self, cx: &Context<Self>) -> TokenView {
+        let flags: Vec<bool> = self
+            .chosen_nodes()
+            .iter()
+            .map(|n| self.create.tokens.get(n).copied().unwrap_or(false))
+            .collect();
+        token_view(
+            &flags,
+            self.create.own_token,
+            self.create.gh_token.read(cx).text(),
+        )
     }
 
     fn draft(&self, cx: &Context<Self>) -> SiteDraft {
         let t = |e: &Entity<TextInput>| e.read(cx).text().to_string();
         let c = &self.create;
+        let github = c.source == SourceKind::Github;
+        let typed = t(&c.gh_token);
+        let (prefixes, regexes) = read_paths(&c.paths, cx);
         SiteDraft {
             api: c.api,
+            source: c.source,
             name: t(&c.name),
             id: t(&c.id),
             hosts: t(&c.hosts),
-            path_regex: t(&c.path),
+            path_prefixes: prefixes,
+            path_regexes: regexes,
             blue: t(&c.blue),
             green: t(&c.green),
-            health_path: t(&c.health),
+            // A source-built site always probes its root.
+            health_path: if github { "/".into() } else { t(&c.health) },
             repo: t(&c.repo),
             branch: t(&c.branch),
-            github_token: t(&c.gh_token),
+            runtime: c.runtime.clone(),
+            node_major: c.node_major,
+            poll_interval: t(&c.poll),
+            github_token: effective_token(&self.token_state(cx), &typed),
             access: c.access,
         }
     }
@@ -134,6 +215,12 @@ impl Console {
             return;
         }
         let draft = self.draft(cx);
+        let picked = self.chosen_nodes().len();
+        if let Some((step, problem)) = first_blocked(&draft, picked, &self.token_state(cx)) {
+            self.create.step = step;
+            self.create.error = Some(problem);
+            return;
+        }
         let github_token = draft_github_token(&draft);
         let site = match build_site(&draft) {
             Ok(s) => s,
@@ -253,7 +340,7 @@ impl Console {
     pub fn render_create(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let header = page_header(
             "Create site",
-            "Define routing and upstreams, then place it on your nodes",
+            "Choose where the site comes from and which domains reach it",
             Vec::new(),
         );
         if self.handles.is_empty() {
@@ -300,36 +387,13 @@ impl Console {
                         s.id.clone(),
                     ))),
             );
-        let pattern = s.path.read(cx).text().to_string();
-        let sample = s.sample.read(cx).text().to_string();
-        let status: AnyElement = if pattern.is_empty() {
-            pill("Matches every path", Tone::Muted).into_any_element()
-        } else if let Some(problem) = regex_problem(&pattern) {
-            div()
-                .flex()
-                .items_center()
-                .gap(px(8.))
-                .child(pill("Invalid", Tone::Bad))
-                .child(
-                    text_dim(problem)
-                        .text_size(px(12.))
-                        .text_color(c(Tone::Bad.color())),
-                )
-                .into_any_element()
-        } else {
-            let verdict = match regex_matches(&pattern, &sample) {
-                Some(true) => Some(pill("Sample matches", Tone::Ok)),
-                Some(false) => Some(pill("Sample does not match", Tone::Warn)),
-                None => None,
-            };
-            div()
-                .flex()
-                .items_center()
-                .gap(px(8.))
-                .child(pill("Valid regex", Tone::Ok))
-                .children(verdict)
-                .into_any_element()
-        };
+        let paths = path_editor(
+            &s.paths,
+            "create-path",
+            Some(&s.sample),
+            |c| &mut c.create.paths,
+            cx,
+        );
         let routing = div()
             .flex()
             .flex_col()
@@ -339,22 +403,7 @@ impl Console {
                 Some("Requests with these Host headers go to this site. Separate with commas."),
                 s.hosts.clone(),
             ))
-            .child(
-                div()
-                    .flex()
-                    .gap(px(12.))
-                    .child(div().flex_1().child(field(
-                        "Path regex",
-                        Some("Optional. Leave empty to route every path."),
-                        s.path.clone(),
-                    )))
-                    .child(
-                        div()
-                            .flex_1()
-                            .child(field("Test a path", None, s.sample.clone())),
-                    ),
-            )
-            .child(status);
+            .child(field("Routing paths", None, paths));
         let upstreams = div()
             .flex()
             .flex_col()
@@ -383,75 +432,258 @@ impl Console {
             access_controls(cx, "create-access", s.access, |c| &mut c.create.access),
             s.access,
         );
-        let source = div()
+        let source_step = self.source_choice(cx);
+        let github = self.github_body(cx);
+        let routing_step = div()
             .flex()
-            .gap(px(12.))
-            .child(
-                div()
-                    .flex_1()
-                    .child(field("Repository", None, s.repo.clone())),
-            )
-            .child(
-                div()
-                    .w(px(160.))
-                    .child(field("Branch", None, s.branch.clone())),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .child(field("GitHub token", None, s.gh_token.clone())),
-            );
-        let placement = self.placement_body(cx);
+            .flex_col()
+            .gap(px(16.))
+            .child(basics)
+            .child(routing);
+        let step = self.create.step;
+        let kind = self.create.source;
+        let body: AnyElement = match step {
+            Step::Source => source_step,
+            Step::Setup if kind == SourceKind::Github => github,
+            Step::Setup => upstreams.into_any_element(),
+            Step::Domains => routing_step.into_any_element(),
+            Step::Protection => access.into_any_element(),
+            Step::Where => self.where_body(cx),
+        };
+        let draft = self.draft(cx);
+        let problem = step_problem(
+            step,
+            &draft,
+            self.chosen_nodes().len(),
+            &self.token_state(cx),
+        );
         let mut col = div()
             .flex()
             .flex_col()
             .gap(px(16.))
             .child(header)
-            .child(card(Some("Basics"), None, basics))
-            .child(card(Some("Routing"), None, routing))
-            .child(card(
-                Some("Access"),
-                Some("Who may reach this site and how Cloudflare connects to it."),
-                access,
-            ))
-            .child(card(
-                Some("Upstreams"),
-                Some("Both slots can be filled now."),
-                upstreams,
-            ))
-            .child(card(
-                Some("Source"),
-                Some("Optional. Build and deploy from a repository."),
-                source,
-            ))
-            .child(card(Some("Place on"), None, placement));
+            .child(self.step_indicator())
+            .child(card(Some(step.heading(kind)), None, body));
         if let Some(err) = &self.create.error {
             col = col.child(notice(err, Tone::Bad));
         }
-        let label = if self.create.busy {
-            "Creating..."
-        } else {
-            "Create site"
-        };
-        col.child(
-            div()
-                .flex()
-                .justify_end()
-                .gap(px(8.))
-                .child(
-                    btn(id("create", "cancel"), "Cancel", BtnKind::Plain)
-                        .on_click(cx.listener(|this, _, _, cx| this.navigate(View::Sites, cx))),
-                )
-                .child(
-                    btn(id("create", "submit"), label, BtnKind::Primary).on_click(cx.listener(
-                        |this, _, _, cx| {
-                            this.submit_site(cx);
-                            cx.notify();
-                        },
-                    )),
-                ),
-        )
+        col.child(self.wizard_nav(step, problem, cx))
+            .into_any_element()
+    }
+
+    // Done steps show a check colour, the current one the accent, the rest stay muted.
+    fn step_indicator(&self) -> Div {
+        let current = self.create.step;
+        let mut row = div().flex().items_center().gap(px(8.));
+        for s in STEPS {
+            let label = format!("{}  {}", s.index() + 1, s.title(self.create.source));
+            let tone = if s == current {
+                Tone::Info
+            } else if s.index() < current.index() {
+                Tone::Ok
+            } else {
+                Tone::Muted
+            };
+            row = row.child(pill(&label, tone));
+        }
+        row
+    }
+
+    // Back and Next move one step; Next stays off until the visible step is valid.
+    fn wizard_nav(
+        &self,
+        step: Step,
+        problem: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mut row = div().flex().items_center().justify_end().gap(px(8.));
+        if let Some(p) = &problem {
+            row = row.child(div().flex_1().child(text_dim(p.clone()).text_size(px(12.))));
+        }
+        row = row.child(
+            btn(id("create", "cancel"), "Cancel", BtnKind::Plain)
+                .on_click(cx.listener(|this, _, _, cx| this.navigate(View::Sites, cx))),
+        );
+        if step != Step::Source {
+            row = row.child(btn(id("create", "back"), "Back", BtnKind::Plain).on_click(
+                cx.listener(|this, _, _, cx| {
+                    this.create.step = this.create.step.prev();
+                    this.create.error = None;
+                    cx.notify();
+                }),
+            ));
+        }
+        let ready = problem.is_none() && !self.create.busy;
+        row.child(match (step.is_last(), ready) {
+            (_, false) if self.create.busy => btn_off("Creating...").into_any_element(),
+            (true, true) => btn(id("create", "submit"), "Create site", BtnKind::Primary)
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.submit_site(cx);
+                    cx.notify();
+                }))
+                .into_any_element(),
+            (false, true) => btn(id("create", "next"), "Next", BtnKind::Primary)
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.create.step = this.create.step.next();
+                    this.create.error = None;
+                    cx.notify();
+                }))
+                .into_any_element(),
+            (last, false) => btn_off(if last { "Create site" } else { "Next" }).into_any_element(),
+        })
         .into_any_element()
+    }
+
+    // Two cards, one decision; GitHub comes first because building from a repository is the main path.
+    fn source_choice(&self, cx: &mut Context<Self>) -> AnyElement {
+        let pick = |key: &'static str,
+                    title: &str,
+                    text: &str,
+                    kind: SourceKind,
+                    cx: &mut Context<Self>| {
+            let on = self.create.source == kind;
+            let mut item = card(Some(title), Some(text), div())
+                .id(id("source", key))
+                .cursor_pointer()
+                .flex_1();
+            if on {
+                item = item.border_color(c(ACCENT));
+            }
+            item.on_click(cx.listener(move |this, _, _, cx| {
+                this.create.source = kind;
+                this.create.error = None;
+                cx.notify();
+            }))
+        };
+        div()
+            .flex()
+            .gap(px(12.))
+            .child(pick(
+                "github",
+                "Build from a GitHub repository",
+                "The node pulls the code, builds it and redeploys when the branch changes.",
+                SourceKind::Github,
+                cx,
+            ))
+            .child(pick(
+                "servers",
+                "Serve servers I already run",
+                "Route traffic to existing host:port addresses you manage yourself.",
+                SourceKind::Servers,
+                cx,
+            ))
+            .into_any_element()
+    }
+
+    // Only the repository fields and the token control; nothing about upstream slots.
+    fn github_body(&self, cx: &mut Context<Self>) -> AnyElement {
+        let s = &self.create;
+        let runtime = seg_row(
+            RUNTIMES
+                .iter()
+                .map(|r| {
+                    let name = r.to_string();
+                    seg_item(id("runtime", r), r, s.runtime == *r)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.create.runtime = name.clone();
+                            cx.notify();
+                        }))
+                        .into_any_element()
+                })
+                .collect(),
+        );
+        let mut body = div()
+            .flex()
+            .flex_col()
+            .gap(px(12.))
+            .child(
+                div()
+                    .flex()
+                    .gap(px(12.))
+                    .child(div().flex_1().child(field(
+                        "Repository",
+                        Some("GitHub owner/name, for example acme/shop."),
+                        s.repo.clone(),
+                    )))
+                    .child(
+                        div()
+                            .w(px(180.))
+                            .child(field("Branch", None, s.branch.clone())),
+                    ),
+            )
+            .child(field(
+                "Runtime",
+                Some("Picks the build and run images."),
+                div().flex().child(runtime),
+            ));
+        if s.runtime != "rust" {
+            let majors = seg_row(
+                NODE_MAJORS
+                    .iter()
+                    .map(|m| {
+                        let major = *m;
+                        seg_item(id("major", m), &format!("Node {m}"), s.node_major == major)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.create.node_major = major;
+                                cx.notify();
+                            }))
+                            .into_any_element()
+                    })
+                    .collect(),
+            );
+            body = body.child(field("Node version", None, div().flex().child(majors)));
+        }
+        body = body.child(field(
+            "Poll interval",
+            Some("How often the node checks the branch for new commits, such as 30s, 5m or 1h."),
+            s.poll.clone(),
+        ));
+        let view = self.token_state(cx);
+        if view.offer_toggle {
+            body =
+                body.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(10.))
+                        .child(toggle(id("create", "own-token"), s.own_token).on_click(
+                            cx.listener(|this, _, _, cx| {
+                                this.create.own_token = !this.create.own_token;
+                                cx.notify();
+                            }),
+                        ))
+                        .child(div().child(TOKEN_TOGGLE)),
+                );
+            if !view.show_field {
+                body = body.child(text_dim(view.help).text_size(px(12.)));
+            }
+        }
+        if view.show_field {
+            body = body.child(field("GitHub token", Some(view.help), s.gh_token.clone()));
+        }
+        body.into_any_element()
+    }
+
+    // The last step: nodes first, then a plain summary of everything chosen.
+    fn where_body(&self, cx: &mut Context<Self>) -> AnyElement {
+        let draft = self.draft(cx);
+        let mut review = div().flex().flex_col().gap(px(6.));
+        for (label, value) in review_rows(&draft, &self.chosen_nodes()) {
+            review = review.child(
+                div()
+                    .flex()
+                    .gap(px(12.))
+                    .child(div().w(px(100.)).child(text_dim(label)))
+                    .child(div().flex_1().child(value)),
+            );
+        }
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(16.))
+            .child(self.placement_body(cx))
+            .child(card(Some("Review"), None, review))
+            .into_any_element()
     }
 
     // Replicate mode ignores the per-node switches, as the fleet helper does.

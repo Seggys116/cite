@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fmt::Display;
 use std::net::IpAddr;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Request, State};
 use axum::http::header;
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
@@ -18,6 +18,7 @@ use serde_json::{Value, json};
 
 use super::{
     ApiError, ApiResult, AppState, JsonBody, MaybeJson, Params, Peer, Principal, lock_std,
+    parse_json, read_body_limited,
 };
 use crate::store::{LoginOutcome, now_unix, unix_to_rfc3339};
 use crate::{ConnectorError, logsink};
@@ -240,6 +241,10 @@ pub(super) async fn node(State(st): State<AppState>) -> ApiResult<Response> {
         "sites": cfg.sites.len(),
         "firewall_rules": cfg.firewall.len(),
         "orchestrator": { "enabled": st.orchestrator.is_some(), "reachable": reachable },
+        "github": {
+            "token_configured": st.cfg.github_token.is_some(),
+            "source": st.cfg.github_token.as_ref().map_or("none", |t| t.source().as_str()),
+        },
         "analytics": analytics,
     }))
     .into_response())
@@ -693,40 +698,63 @@ pub(super) async fn delete_page(
 // A header value marked secret is write-only: it is blanked in every response, and left empty in a request it means "keep the stored value".
 fn redacted(rule: &FirewallRule) -> FirewallRule {
     let mut out = rule.clone();
-    if let Some(header) = out.matchers.header.as_mut()
-        && header.secret
-    {
+    for header in out.matchers.headers.iter_mut().filter(|h| h.secret) {
         header.equals = header.equals.as_ref().map(|_| String::new());
         header.regex = header.regex.as_ref().map(|_| String::new());
     }
     out
 }
 
-fn keep_stored_secret(
+// A blank value on a secret header takes the stored one of the same name; repeated names pair up in order.
+pub(super) fn keep_stored_secret(
     rule: &mut FirewallRule,
     stored: Option<&FirewallRule>,
 ) -> std::result::Result<(), ConnectorError> {
-    let Some(header) = rule.matchers.header.as_mut().filter(|h| h.secret) else {
-        return Ok(());
-    };
     let blank = |v: &Option<String>| v.as_ref().is_some_and(String::is_empty);
-    if !blank(&header.equals) && !blank(&header.regex) {
-        return Ok(());
-    }
-    let old = stored
-        .and_then(|r| r.matchers.header.as_ref())
-        .filter(|h| h.secret);
-    let Some(old) = old else {
-        return Err(ConnectorError::BadRequest(
-            "a secret header value cannot be left empty: there is no stored value for this rule to keep"
-                .into(),
-        ));
-    };
-    if blank(&header.equals) {
-        header.equals = old.equals.clone();
-    }
-    if blank(&header.regex) {
-        header.regex = old.regex.clone();
+    let rule_id = rule.id.clone();
+    for at in 0..rule.matchers.headers.len() {
+        let header = &rule.matchers.headers[at];
+        if !header.secret || (!blank(&header.equals) && !blank(&header.regex)) {
+            continue;
+        }
+        let nth = rule.matchers.headers[..at]
+            .iter()
+            .filter(|h| h.secret && h.name.eq_ignore_ascii_case(&header.name))
+            .count();
+        // a blank row only stands for a stored value when that is unambiguous: with repeated names the request cannot say which one it means
+        let same_name = |r: &FirewallRule| {
+            r.matchers
+                .headers
+                .iter()
+                .filter(|h| h.secret && h.name.eq_ignore_ascii_case(&header.name))
+                .count()
+        };
+        if stored.is_some_and(|r| same_name(r) > 1) {
+            return Err(ConnectorError::BadRequest(format!(
+                "rule {rule_id}: header {} has several secret values, so a blank one cannot be matched to a stored value: enter each value again",
+                header.name
+            )));
+        }
+        let old = stored.and_then(|r| {
+            r.matchers
+                .headers
+                .iter()
+                .filter(|h| h.secret && h.name.eq_ignore_ascii_case(&header.name))
+                .nth(nth)
+        });
+        let Some(old) = old.cloned() else {
+            return Err(ConnectorError::BadRequest(format!(
+                "rule {rule_id}: a secret header value cannot be left empty: there is no stored value for header {} to keep",
+                header.name
+            )));
+        };
+        let header = &mut rule.matchers.headers[at];
+        if blank(&header.equals) {
+            header.equals = old.equals;
+        }
+        if blank(&header.regex) {
+            header.regex = old.regex;
+        }
     }
     Ok(())
 }
@@ -808,6 +836,124 @@ pub(super) async fn delete_rule(
     })
     .await?;
     Ok(ok_flag())
+}
+
+const BULK_MAX_RULES: usize = 200;
+const BULK_MAX_BODY_BYTES: usize = 512 * 1024;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BulkReq {
+    #[serde(default)]
+    replace: Vec<FirewallRule>,
+    #[serde(default)]
+    delete: Vec<String>,
+}
+
+// Rejects what no config could satisfy, before the config lock is taken.
+fn check_bulk(req: &BulkReq) -> ApiResult<()> {
+    if req.replace.is_empty() && req.delete.is_empty() {
+        return Err(ApiError::bad(
+            "replace or delete must list at least one rule",
+        ));
+    }
+    if req.replace.len() > BULK_MAX_RULES || req.delete.len() > BULK_MAX_RULES {
+        return Err(ApiError::bad(format!(
+            "replace and delete take at most {BULK_MAX_RULES} rules each"
+        )));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for rule in &req.replace {
+        check_id(&rule.id)?;
+        if !seen.insert(rule.id.as_str()) {
+            return Err(ApiError::bad(format!(
+                "rule {} appears more than once in replace",
+                rule.id
+            )));
+        }
+    }
+    let mut dropped = std::collections::HashSet::new();
+    for id in &req.delete {
+        check_id(id)?;
+        if !dropped.insert(id.as_str()) {
+            return Err(ApiError::bad(format!(
+                "rule {id} appears more than once in delete"
+            )));
+        }
+        if seen.contains(id.as_str()) {
+            return Err(ApiError::bad(format!(
+                "rule {id} is in both replace and delete"
+            )));
+        }
+    }
+    Ok(())
+}
+
+// Creates or replaces many rules and deletes others as one change: one validation of the result, one render, one apply and one audit entry.
+pub(super) async fn bulk_rules(
+    State(st): State<AppState>,
+    Extension(p): Extension<Principal>,
+    req: Request,
+) -> ApiResult<Response> {
+    let bytes = read_body_limited(req, BULK_MAX_BODY_BYTES).await?;
+    if bytes.is_empty() {
+        return Err(ApiError::bad("request body is required"));
+    }
+    let body: BulkReq = parse_json(&bytes)?;
+    check_bulk(&body)?;
+    let ids: Vec<&str> = body
+        .replace
+        .iter()
+        .map(|r| r.id.as_str())
+        .chain(body.delete.iter().map(String::as_str))
+        .collect();
+    let detail = format!(
+        "replace={} delete={} ids={}",
+        body.replace.len(),
+        body.delete.len(),
+        ids.join(",")
+    );
+    let (created, replaced, deleted, ignored) = st
+        .mutate(&p.actor(), "firewall.bulk", &detail, move |cfg| {
+            let (mut created, mut replaced) = (Vec::new(), Vec::new());
+            for mut rule in body.replace {
+                let at = cfg.firewall.iter().position(|x| x.id == rule.id);
+                keep_stored_secret(&mut rule, at.map(|i| &cfg.firewall[i]))?;
+                validate_rule(&rule).map_err(|e| {
+                    ConnectorError::BadRequest(format!("rule {}: {}", rule.id, e.0))
+                })?;
+                let shown = redacted(&rule);
+                match at {
+                    Some(i) => {
+                        cfg.firewall[i] = rule;
+                        replaced.push(shown);
+                    }
+                    None => {
+                        cfg.firewall.push(rule);
+                        created.push(shown);
+                    }
+                }
+            }
+            let (mut deleted, mut ignored) = (0usize, 0usize);
+            for id in &body.delete {
+                match cfg.firewall.iter().position(|x| &x.id == id) {
+                    Some(i) => {
+                        cfg.firewall.remove(i);
+                        deleted += 1;
+                    }
+                    None => ignored += 1,
+                }
+            }
+            Ok((created, replaced, deleted, ignored))
+        })
+        .await?;
+    json_ok(&json!({
+        "created": created.len(),
+        "replaced": replaced.len(),
+        "deleted": deleted,
+        "ignored": ignored,
+        "rules": { "created": created, "replaced": replaced },
+    }))
 }
 
 #[derive(Serialize)]

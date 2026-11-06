@@ -22,6 +22,8 @@ A connection goes through these gates in order.
 
 Other limits on the API: at most 256 simultaneous connections, 10 seconds to send headers and to complete a TLS handshake, 700 seconds per request (a deploy that builds from a repository waits for the build), 15 minutes per connection, 32 KiB of headers and 1 MiB of request body (128 KiB on the certificate routes). Responses carry `Cache-Control: no-store`.
 
+The node stack's one-shot `init` service runs as root with no network, a read-only root filesystem, `no-new-privileges` and only the capabilities `CHOWN`, `FOWNER` and `DAC_OVERRIDE`. `DAC_OVERRIDE` exists because, once `/conf` belongs to uid 10001 with mode 0750, root without it cannot enter the directory to create the subdirectories HAProxy mounts (or the bootstrap `haproxy.cfg`) on a volume made by an older release. The service touches only the mounted volumes and exits; it is not part of the running edge.
+
 ### Login
 
 Login needs the username, the password and a TOTP code, and all three are always checked so timing does not say which was wrong.

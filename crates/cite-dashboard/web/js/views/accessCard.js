@@ -4,18 +4,19 @@ import {
   button, card, confirmDialog, segmented, toast, toggle, withBusy, formatError,
 } from '../ui.js';
 import {
-  BOT_POLICIES, BOT_SPOOF_NOTE, CLOUDFLARE_ONLY_HELP, FLEXIBLE_WARNING, ZONE_LOCK_HELP, ZONE_LOCK_NEEDS_CLOUDFLARE,
-  accessOf, botWarning, flexibleWithoutCloudflare, rangesLine, tlsHelp,
+  BOT_POLICIES, BOT_SPOOF_NOTE, CLOUDFLARE_ONLY_HELP, CLOUDFLARE_ONLY_LABEL, FLEXIBLE_WARNING, TLS_FLEXIBLE_LABEL, TLS_FULL_LABEL,
+  ZONE_LOCK_HELP, ZONE_LOCK_LABEL, ZONE_LOCK_NEEDS_CLOUDFLARE, ZONE_LOCK_TOGGLE,
+  accessOf, botWarning, flexibleWithoutCloudflare, rangesLine, tlsHelp, zoneLockOpenByDefault,
 } from '../accesslib.js';
 import { rotateAndShow, zoneStatusText } from './zoneSecret.js';
 
 // Who may reach the site and how Cloudflare speaks to the node; shared by the create form and the routing tab.
 // On a saved site (site given) it also reports the zone secret and offers to rotate it.
-export function accessCard({ node, site }) {
+export function accessCard({ node, site, onChange }) {
   const value = accessOf(site);
   const only = toggle({
     checked: value.cloudflare_only,
-    label: 'Only accept traffic from Cloudflare',
+    label: CLOUDFLARE_ONLY_LABEL,
     onChange: (next) => {
       value.cloudflare_only = next;
       if (!next) {
@@ -30,7 +31,7 @@ export function accessCard({ node, site }) {
   const mode = segmented({
     label: 'SSL mode',
     value: value.tls,
-    options: [{ value: 'full', label: 'Full' }, { value: 'flexible', label: 'Flexible' }],
+    options: [{ value: 'full', label: TLS_FULL_LABEL }, { value: 'flexible', label: TLS_FLEXIBLE_LABEL }],
     onChange: (next) => {
       value.tls = next;
       sync();
@@ -46,7 +47,7 @@ export function accessCard({ node, site }) {
     sync();
   });
 
-  const lockBox = h('input', { type: 'checkbox', checked: value.zone_lock, 'aria-label': 'Only my Cloudflare zone' });
+  const lockBox = h('input', { type: 'checkbox', checked: value.zone_lock, 'aria-label': ZONE_LOCK_LABEL });
   const lockHint = h('span', { class: 'hint', role: 'status', 'aria-live': 'polite' });
   lockBox.addEventListener('change', () => {
     value.zone_lock = lockBox.checked;
@@ -60,6 +61,7 @@ export function accessCard({ node, site }) {
     seo.hidden = !seo.textContent;
     lockBox.disabled = !value.cloudflare_only;
     lockHint.textContent = value.cloudflare_only ? ZONE_LOCK_HELP : ZONE_LOCK_NEEDS_CLOUDFLARE;
+    if (onChange) onChange({ ...value });
   }
 
   // An older connector has no range route, so the line is simply left out
@@ -105,19 +107,26 @@ export function accessCard({ node, site }) {
     }
   });
 
+  // The account check is folded away unless the site already uses it, so the plain option never shows rules, secrets or headers
+  const advanced = h('div', { class: 'stack-sm', hidden: !zoneLockOpenByDefault(value) },
+    h('div', { class: 'field' },
+      h('label', { class: 'check-row' }, lockBox, h('span', {}, ZONE_LOCK_LABEL)),
+      lockHint),
+    secretRow);
+  const advancedToggle = button(ZONE_LOCK_TOGGLE, { size: 'sm', onClick: () => { advanced.hidden = !advanced.hidden; } });
+  advancedToggle.hidden = zoneLockOpenByDefault(value);
+
   sync();
   const el = card({
     title: 'Access',
     subtitle: 'Limit who can reach this site and choose how Cloudflare connects to the node.',
     body: h('div', { class: 'form' },
       h('div', { class: 'switch-row' }, only,
-        h('div', {}, h('b', {}, 'Only accept traffic from Cloudflare'), h('p', { class: 'muted' }, CLOUDFLARE_ONLY_HELP), ranges)),
-      h('div', { class: 'field' }, h('span', { class: 'field-label' }, 'SSL mode'), mode, help),
+        h('div', {}, h('b', {}, CLOUDFLARE_ONLY_LABEL), h('p', { class: 'muted' }, CLOUDFLARE_ONLY_HELP), ranges)),
+      h('div', { class: 'field' }, h('span', { class: 'field-label' }, 'HTTPS'), mode, help),
       warn,
-      h('div', { class: 'field' },
-        h('label', { class: 'check-row' }, lockBox, h('span', {}, 'Only my Cloudflare zone')),
-        lockHint),
-      secretRow,
+      h('div', {}, advancedToggle),
+      advanced,
       h('div', { class: 'field' }, h('span', { class: 'field-label' }, 'Bot policy'), bots, h('span', { class: 'hint' }, BOT_SPOOF_NOTE), seo)),
   });
   return { el, get: () => ({ ...value }) };

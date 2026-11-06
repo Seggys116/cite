@@ -528,7 +528,7 @@ fn catastrophic_deny_patterns_are_refused_before_rendering() {
             enabled: true,
             action: Some(FirewallAction::Deny),
             matchers: Matchers {
-                user_agent_regex: Some(pattern.into()),
+                user_agent_regexes: vec![pattern.into()],
                 ..Matchers::default()
             },
             ..FirewallRule::default()
@@ -598,19 +598,7 @@ fn battery_config() -> EdgeConfig {
     let mut cfg: EdgeConfig = serde_json::from_str(&json).expect("config json");
     cfg.settings.per_ip_rate_limit = None;
     for (i, (field, pattern)) in BATTERY.iter().enumerate() {
-        let mut matchers = Matchers::default();
-        match *field {
-            "ua" => matchers.user_agent_regex = Some(pattern.to_string()),
-            "path" => matchers.path_regex = Some(pattern.to_string()),
-            "ref" => matchers.referer_regex = Some(pattern.to_string()),
-            _ => {
-                matchers.header = Some(HeaderMatch {
-                    name: "X-Probe".into(),
-                    regex: Some(pattern.to_string()),
-                    ..HeaderMatch::default()
-                })
-            }
-        }
+        let matchers = matchers_for(field, &[pattern.to_string()]);
         cfg.firewall.push(FirewallRule {
             id: format!("deny-{i}"),
             name: format!("deny-{i}"),
@@ -921,33 +909,41 @@ fn gen_pattern(rng: &mut Rng) -> String {
     p
 }
 
-fn matchers_for(field: &str, pattern: &str) -> Matchers {
+// The patterns of one field, OR'd within it; the header field is a single matcher on X-Probe.
+fn matchers_for(field: &str, patterns: &[String]) -> Matchers {
     let mut m = Matchers::default();
     match field {
-        "ua" => m.user_agent_regex = Some(pattern.to_string()),
-        "path" => m.path_regex = Some(pattern.to_string()),
-        "ref" => m.referer_regex = Some(pattern.to_string()),
+        "ua" => m.user_agent_regexes = patterns.to_vec(),
+        "path" => m.path_regexes = patterns.to_vec(),
+        "ref" => m.referer_regexes = patterns.to_vec(),
         _ => {
-            m.header = Some(HeaderMatch {
-                name: "X-Probe".into(),
-                regex: Some(pattern.to_string()),
-                ..HeaderMatch::default()
-            })
+            m.headers = patterns
+                .iter()
+                .map(|p| HeaderMatch {
+                    name: "X-Probe".into(),
+                    regex: Some(p.clone()),
+                    ..HeaderMatch::default()
+                })
+                .collect()
         }
     }
     m
 }
 
-// The validator is the gate: only what it accepts under the field's cap is ever sent to HAProxy.
-fn accepted(field: &str, pattern: &str) -> bool {
-    let rule = FirewallRule {
-        id: "probe".into(),
-        name: "probe".into(),
+fn deny_rule(id: &str, matchers: Matchers) -> FirewallRule {
+    FirewallRule {
+        id: id.into(),
+        name: id.into(),
         enabled: true,
         action: Some(FirewallAction::Deny),
-        matchers: matchers_for(field, pattern),
+        matchers,
         ..FirewallRule::default()
-    };
+    }
+}
+
+// The validator is the gate: only what it accepts under the field's cap is ever sent to HAProxy.
+fn accepted(field: &str, pattern: &str) -> bool {
+    let rule = deny_rule("probe", matchers_for(field, &[pattern.to_string()]));
     cite_edge::validate::validate_rule(&rule).is_ok()
 }
 
@@ -1016,8 +1012,23 @@ fn edge_patterns() -> Vec<(&'static str, String)> {
 }
 
 fn config_for(patterns: &[(&str, String)]) -> EdgeConfig {
+    let mut cfg = base_config(patterns.len());
+    for (i, (field, pattern)) in patterns.iter().enumerate() {
+        cfg.firewall.push(FirewallRule {
+            site: Some(format!("g{i}")),
+            ..deny_rule(
+                &format!("deny-{i}"),
+                matchers_for(field, std::slice::from_ref(pattern)),
+            )
+        });
+    }
+    cfg
+}
+
+// n plain sites g0 to g{n-1} on g{i}.example.com, no firewall rules.
+fn base_config(n: usize) -> EdgeConfig {
     let target = r#"{"targets": [{"addr": "echo:80", "weight": 100}]}"#;
-    let sites: Vec<String> = (0..patterns.len())
+    let sites: Vec<String> = (0..n)
         .map(|i| {
             format!(
                 r#"{{"id": "g{i}", "name": "g{i}", "hosts": ["g{i}.example.com"], "kind": "site",
@@ -1031,17 +1042,6 @@ fn config_for(patterns: &[(&str, String)]) -> EdgeConfig {
     );
     let mut cfg: EdgeConfig = serde_json::from_str(&json).expect("config json");
     cfg.settings.per_ip_rate_limit = None;
-    for (i, (field, pattern)) in patterns.iter().enumerate() {
-        cfg.firewall.push(FirewallRule {
-            id: format!("deny-{i}"),
-            name: format!("deny-{i}"),
-            enabled: true,
-            action: Some(FirewallAction::Deny),
-            site: Some(format!("g{i}")),
-            matchers: matchers_for(field, pattern),
-            ..FirewallRule::default()
-        });
-    }
     cfg
 }
 
@@ -1316,6 +1316,228 @@ fn every_accepted_pattern_passes_haproxy_check() {
     assert!(!text.contains("will never match"), "{text}");
 }
 
+const MULTI_RULES: usize = 60;
+const MULTI_FIELDS: [&str; 3] = ["ua", "path", "ref"];
+// A request carries one long value at most, so the headers stay inside HAProxy's 16 KiB buffer.
+const SHORT_SUBJECT: usize = 1100;
+
+type Spec = Vec<(&'static str, Vec<String>)>;
+
+fn multi_matchers(spec: &Spec) -> Matchers {
+    let mut m = Matchers::default();
+    for (field, patterns) in spec {
+        let one = matchers_for(field, patterns);
+        match *field {
+            "ua" => m.user_agent_regexes = one.user_agent_regexes,
+            "path" => m.path_regexes = one.path_regexes,
+            _ => m.referer_regexes = one.referer_regexes,
+        }
+    }
+    m
+}
+
+// Rules of two or three fields with two to four patterns each, built from patterns that are valid alone and kept only when the whole rule validates.
+fn multi_specs() -> Vec<Spec> {
+    let mut pool: std::collections::HashMap<&str, Vec<String>> = std::collections::HashMap::new();
+    for (field, pattern) in generated_patterns() {
+        pool.entry(field).or_default().push(pattern);
+    }
+    let mut rng = Rng(AGREEMENT_SEED ^ 0xA5A5_5A5A);
+    let mut out = Vec::new();
+    for _ in 0..5000 {
+        if out.len() >= MULTI_RULES {
+            break;
+        }
+        let mut fields = MULTI_FIELDS.to_vec();
+        if rng.below(3) == 0 {
+            fields.remove(rng.below(3));
+        }
+        let mut spec: Spec = Vec::new();
+        for field in fields {
+            let all = pool.get(field).expect("patterns for every field");
+            let want = 2 + rng.below(3);
+            let mut picked: Vec<String> = Vec::new();
+            while picked.len() < want {
+                let p = all[rng.below(all.len())].clone();
+                if !picked.contains(&p) {
+                    picked.push(p);
+                }
+            }
+            spec.push((field, picked));
+        }
+        let rule = deny_rule("probe", multi_matchers(&spec));
+        if cite_edge::validate::validate_rule(&rule).is_ok() {
+            out.push(spec);
+        }
+    }
+    out
+}
+
+fn candidates(field: &str, patterns: &[String]) -> Vec<String> {
+    let cap = battery_cap(field);
+    let mut out: Vec<String> = Vec::new();
+    for p in patterns {
+        let re = regex::Regex::new(p).expect("an accepted pattern compiles");
+        for (_, subject) in subjects_for(field, p, &re, cap) {
+            if !out.contains(&subject) {
+                out.push(subject);
+            }
+        }
+    }
+    out
+}
+
+// Values in a field are OR'd and fields are AND'd; an oversized user agent or path stands in for its field's test, once per field, as the renderer's extra conditions do.
+fn multi_verdict(spec: &Spec, subjects: &[String]) -> bool {
+    let tests: Vec<(bool, bool)> = spec
+        .iter()
+        .zip(subjects)
+        .map(|((field, patterns), subject)| {
+            let cap = battery_cap(field);
+            let seen = &subject[..subject.len().min(cap)];
+            let hit = patterns
+                .iter()
+                .any(|p| regex::Regex::new(p).expect("compiles").is_match(seen));
+            (hit, battery_fails_closed(field) && subject.len() > cap)
+        })
+        .collect();
+    let all = tests.iter().all(|(hit, _)| *hit);
+    let widened = (0..tests.len())
+        .any(|g| tests[g].1 && tests.iter().enumerate().all(|(k, (hit, _))| k == g || *hit));
+    all || widened
+}
+
+const MULTI_SCRIPT: &str = r##"while IFS='|' read -r id host u p r; do
+  uv=$(cat "/conf/subj/$u"); pv=$(cat "/conf/subj/$p"); rv=$(cat "/conf/subj/$r")
+  res=$(curl -s -o /dev/null -w '%{http_code} %{time_total}' -H "Host: $host" -A "$uv" -e "$rv" --path-as-is "http://$HAP$pv")
+  echo "$id|$res"
+done < /conf/cases.txt
+"##;
+
+#[test]
+#[ignore = "needs docker and real haproxy 3.2"]
+fn multi_value_rules_follow_or_within_and_across_against_the_regex_crate() {
+    let specs = multi_specs();
+    assert!(specs.len() >= 40, "only {} multi-value rules", specs.len());
+    let mut cfg = base_config(specs.len());
+    for (i, spec) in specs.iter().enumerate() {
+        cfg.firewall.push(FirewallRule {
+            site: Some(format!("g{i}")),
+            ..deny_rule(&format!("deny-{i}"), multi_matchers(spec))
+        });
+    }
+    let s = stack("multi", &cfg);
+    let subj = s.dir.join("subj");
+    std::fs::write(subj.join("du"), "Mozilla/5.0").expect("default");
+    std::fs::write(subj.join("dp"), "/").expect("default");
+    std::fs::write(subj.join("dr"), "http://x.example/").expect("default");
+    let mut rng = Rng(AGREEMENT_SEED ^ 0x1234_5678);
+    let (mut cases, mut wants) = (String::new(), Vec::new());
+    for (i, spec) in specs.iter().enumerate() {
+        let cands: Vec<Vec<String>> = spec.iter().map(|(f, ps)| candidates(f, ps)).collect();
+        for mode in 0..4 {
+            // mode 0 prefers a value that matches, the others are random and may carry one long value
+            let long = if mode == 0 {
+                usize::MAX
+            } else {
+                rng.below(spec.len() + 1)
+            };
+            let mut chosen: Vec<String> = Vec::new();
+            for (k, (field, patterns)) in spec.iter().enumerate() {
+                let cap = battery_cap(field);
+                let allowed: Vec<&String> = cands[k]
+                    .iter()
+                    .filter(|c| k == long || c.len() <= SHORT_SUBJECT)
+                    .collect();
+                let hit = if mode == 0 {
+                    allowed.iter().find(|c| {
+                        c.len() <= cap
+                            && patterns.iter().any(|p| {
+                                regex::Regex::new(p).expect("compiles").is_match(c.as_str())
+                            })
+                    })
+                } else {
+                    None
+                };
+                let pick = match hit {
+                    Some(c) => (*c).clone(),
+                    None => allowed[rng.below(allowed.len())].clone(),
+                };
+                chosen.push(pick);
+            }
+            let idx = wants.len();
+            let (mut u, mut p, mut r) = ("du".to_string(), "dp".to_string(), "dr".to_string());
+            for ((field, _), subject) in spec.iter().zip(&chosen) {
+                let name = format!("{field}{idx}");
+                std::fs::write(subj.join(&name), subject).expect("subject");
+                match *field {
+                    "ua" => u = name,
+                    "path" => p = name,
+                    _ => r = name,
+                }
+            }
+            cases.push_str(&format!("{idx}|g{i}.example.com|{u}|{p}|{r}\n"));
+            let lens: Vec<usize> = chosen.iter().map(String::len).collect();
+            wants.push((
+                format!("rule {i} mode {mode} {spec:?} lengths {lens:?}"),
+                multi_verdict(spec, &chosen),
+            ));
+        }
+    }
+    write(&s.dir, "cases.txt", &cases);
+    write(&s.dir, "probe.sh", MULTI_SCRIPT);
+    let (out, state, logs) = serve_and_probe(&s);
+    let answers: std::collections::HashMap<usize, (String, f64)> = out
+        .lines()
+        .filter_map(|l| {
+            let (id, rest) = l.split_once('|')?;
+            let (code, secs) = rest.split_once(' ')?;
+            Some((id.parse().ok()?, (code.to_string(), secs.parse().ok()?)))
+        })
+        .collect();
+    let (mut bad, mut times) = (Vec::new(), Vec::new());
+    for (idx, (what, deny)) in wants.iter().enumerate() {
+        let want = if *deny { "403" } else { "200" };
+        match answers.get(&idx) {
+            None => bad.push(format!("{what}: no answer")),
+            Some((code, secs)) => {
+                times.push(*secs);
+                if code != want || *secs > REQUEST_LIMIT_SECS {
+                    bad.push(format!("{what}: want {want}, got {code} in {secs}s"));
+                }
+            }
+        }
+    }
+    times.sort_by(|a, b| a.total_cmp(b));
+    let p99 = times
+        .get(times.len().saturating_sub(1) * 99 / 100)
+        .copied()
+        .unwrap_or(0.0);
+    assert!(
+        bad.is_empty(),
+        "seed {AGREEMENT_SEED:#x}:\n{}",
+        bad.join("\n")
+    );
+    assert!(
+        p99 <= P99_LIMIT_SECS,
+        "seed {AGREEMENT_SEED:#x}: p99 {p99}s"
+    );
+    assert!(
+        wants.iter().any(|(_, d)| *d),
+        "no request was expected to be denied"
+    );
+    assert!(
+        wants.iter().any(|(_, d)| !*d),
+        "no request was expected to pass"
+    );
+    assert!(state.contains("true"), "haproxy is not running: {state}");
+    let lower = logs.to_lowercase();
+    assert!(
+        !lower.contains("watchdog") && !lower.contains("panic"),
+        "{logs}"
+    );
+}
+
 const ZONE_SECRET: &str = "live-zone-secret-0123456789-abcdefghijklmnop";
 
 fn rules_config() -> EdgeConfig {
@@ -1345,6 +1567,11 @@ fn rules_config() -> EdgeConfig {
         ),
         site("hdrsite", r#"["h.example.com"]"#, ""),
         site("negsite", r#"["n.example.com"]"#, ""),
+        site(
+            "multisite",
+            r#"["m.example.com"]"#,
+            r#""path_prefixes": ["/alpha", "/beta"], "path_regexes": ["^/gamma[0-9]+$"],"#,
+        ),
     ];
     let json = format!(
         r#"{{"version": 1, "sites": [{}], "pages": [], "firewall": []}}"#,
@@ -1391,12 +1618,12 @@ fn rules_config() -> EdgeConfig {
         ..FirewallRule::default()
     };
     let gate = |negate: bool| Matchers {
-        header: Some(HeaderMatch {
+        headers: vec![HeaderMatch {
             name: "X-Gate".into(),
             equals: Some("open".into()),
             negate,
             ..HeaderMatch::default()
-        }),
+        }],
         ..Matchers::default()
     };
     cfg.firewall
@@ -1416,12 +1643,12 @@ fn rules_config() -> EdgeConfig {
         enabled: true,
         site: Some("negsite".into()),
         matchers: Matchers {
-            header: Some(HeaderMatch {
+            headers: vec![HeaderMatch {
                 name: "X-Gate".into(),
                 regex: Some("^open$".into()),
                 negate: true,
                 ..HeaderMatch::default()
-            }),
+            }],
             ..Matchers::default()
         },
         redirect: Some(cite_edge::model::Redirect {
@@ -1430,22 +1657,53 @@ fn rules_config() -> EdgeConfig {
         }),
         ..FirewallRule::default()
     });
+    // within a field the values are alternatives, across fields all must hold
+    cfg.firewall.push(FirewallRule {
+        id: "multi-deny".into(),
+        name: "multi-deny".into(),
+        enabled: true,
+        action: Some(FirewallAction::Deny),
+        site: Some("multisite".into()),
+        matchers: Matchers {
+            user_agent_regexes: vec!["evilone".into(), "eviltwo".into()],
+            path_prefixes: vec!["/alpha/admin".into(), "/beta/admin".into()],
+            ..Matchers::default()
+        },
+        ..FirewallRule::default()
+    });
     // every matcher at once, in each role, to prove haproxy -c accepts the longest lines the renderer can produce
     let maximal = || Matchers {
-        path_regex: Some("^/never/v[0-9]+/".into()),
-        path_prefix: Some("/never".into()),
+        path_regexes: vec!["^/never/v[0-9]+/".into(), "^/nope/[a-z]+$".into()],
+        path_prefixes: vec!["/never".into(), "/nope".into()],
         methods: (0..16).map(|i| format!("M{}", "X".repeat(i + 1))).collect(),
-        user_agent_regex: Some("(?i)never-matches".into()),
+        user_agent_regexes: vec!["(?i)never-matches".into(), "(?i)nor-this".into()],
         cidrs: (0..8).map(|i| format!("198.19.0.{i}")).collect(),
-        host: Some("*.example.com".into()),
-        header: Some(HeaderMatch {
-            name: "X-Never".into(),
-            equals: Some("v".into()),
-            negate: false,
-            ..HeaderMatch::default()
-        }),
+        hosts: vec!["*.example.com".into(), "*.example.org".into()],
+        headers: vec![
+            HeaderMatch {
+                name: "X-Never".into(),
+                equals: Some("v".into()),
+                negate: false,
+                ..HeaderMatch::default()
+            },
+            HeaderMatch {
+                name: "X-Nope".into(),
+                regex: Some("^w".into()),
+                negate: true,
+                ..HeaderMatch::default()
+            },
+            HeaderMatch {
+                name: "X-Nor".into(),
+                equals: Some("z".into()),
+                negate: true,
+                ..HeaderMatch::default()
+            },
+        ],
         scheme: Some("http".into()),
-        referer_regex: Some("^https://never[.]example[.]com/".into()),
+        referer_regexes: vec![
+            "^https://never[.]example[.]com/".into(),
+            "^https://nope[.]example[.]com/".into(),
+        ],
     };
     let max_block = FirewallRule {
         id: "max-block".into(),
@@ -1543,6 +1801,17 @@ req path-enc-2048 z.example.com --path-as-is "http://$HAP/%6fpen$(mk 2043)"
 req path-enc-3000 z.example.com --path-as-is "http://$HAP/%6fpen$(mk 2995)"
 req path-zone-2048 z.example.com --path-as-is "http://$HAP/zone$(mk 2043)"
 req path-zone-3000 z.example.com --path-as-is -H 'X-Cite-Origin-Secret: @SECRET@' "http://$HAP/zone$(mk 2995)"
+req multi-alpha m.example.com "http://$HAP/alpha"
+req multi-alpha-deep m.example.com "http://$HAP/alpha/x"
+req multi-beta m.example.com "http://$HAP/beta"
+req multi-gamma m.example.com "http://$HAP/gamma7"
+req multi-gamma-bad m.example.com "http://$HAP/gamma"
+req multi-delta m.example.com "http://$HAP/delta"
+req multi-enc m.example.com --path-as-is "http://$HAP/%61lpha"
+req multi-deny-one m.example.com -A evilone "http://$HAP/alpha/admin"
+req multi-deny-two m.example.com -A eviltwo "http://$HAP/beta/admin/x"
+req multi-allow-ua m.example.com -A evilone "http://$HAP/alpha"
+req multi-allow-path m.example.com -A nice "http://$HAP/alpha/admin"
 "##;
 
 #[test]
@@ -1796,6 +2065,25 @@ fn redirects_cors_bot_policy_and_zone_lock_behave_on_real_haproxy() {
     // a percent-encoded path is judged on its decoded bytes, exactly like the same path written plainly
     assert_eq!(status("path-enc-2048"), status("path-2048"), "{out}");
     assert_eq!(status("path-enc-3000"), "404", "{out}");
+
+    // a site with two prefixes and a regex takes a request that matches any of them, and nothing else
+    for label in [
+        "multi-alpha",
+        "multi-alpha-deep",
+        "multi-beta",
+        "multi-gamma",
+        "multi-enc",
+        "multi-allow-ua",
+        "multi-allow-path",
+    ] {
+        assert_eq!(status(label), "200", "{label}: {out}");
+    }
+    for label in ["multi-gamma-bad", "multi-delta"] {
+        assert_eq!(status(label), "404", "{label}: {out}");
+    }
+    // a rule with lists denies when any user agent and any prefix match together, and only then
+    assert_eq!(status("multi-deny-one"), "403", "{out}");
+    assert_eq!(status("multi-deny-two"), "403", "{out}");
 
     // blocked requests are still logged with their user agent and scored, so analytics keep counting them
     let now = std::time::SystemTime::now()

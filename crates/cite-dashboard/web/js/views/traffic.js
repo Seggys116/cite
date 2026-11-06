@@ -100,12 +100,11 @@ function openEventSheet(node, ev) {
       toast(formatError(ex), 'error');
     }
   };
-  const emptyMatchers = { path_regex: null, path_prefix: null, methods: [], user_agent_regex: null, cidrs: [], host: null };
   const blockPath = button('Block this path', {
     iconName: 'ban',
     onClick: () => block(blockPath, {
       id: newId('rule'), name: 'Block path ' + ev.path, enabled: true, action: 'deny', site: null,
-      matchers: { ...emptyMatchers, path_regex: '^' + escapeRegex(ev.path) + '$' },
+      matchers: { path_regexes: ['^' + escapeRegex(ev.path) + '$'] },
     }, 'Path'),
   });
   const blockIp = button('Block this IP', {
@@ -113,7 +112,7 @@ function openEventSheet(node, ev) {
     disabled: !ev.client_ip,
     onClick: () => block(blockIp, {
       id: newId('rule'), name: 'Block IP ' + ev.client_ip, enabled: true, action: 'deny', site: null,
-      matchers: { ...emptyMatchers, cidrs: [ev.client_ip + (ev.client_ip.includes(':') ? '/128' : '/32')] },
+      matchers: { cidrs: [ev.client_ip + (ev.client_ip.includes(':') ? '/128' : '/32')] },
     }, 'Address'),
   });
   const mono = (v) => h('span', { class: 'mono wrap-any' }, v || '-');

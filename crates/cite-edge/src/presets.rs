@@ -30,7 +30,7 @@ fn path_rule(
         enabled: true,
         action: Some(action),
         matchers: Matchers {
-            path_regex: Some(re.to_string()),
+            path_regexes: vec![re.to_string()],
             ..Default::default()
         },
         ..FirewallRule::default()
@@ -44,7 +44,7 @@ fn ua_rule(preset: &str, n: usize, title: &str, action: FirewallAction, re: &str
         enabled: true,
         action: Some(action),
         matchers: Matchers {
-            user_agent_regex: Some(re.to_string()),
+            user_agent_regexes: vec![re.to_string()],
             ..Default::default()
         },
         ..FirewallRule::default()
@@ -71,13 +71,13 @@ pub fn zone_lock_rule(site_id: &str, secret: &str) -> FirewallRule {
         enabled: true,
         action: Some(FirewallAction::Deny),
         matchers: Matchers {
-            header: Some(HeaderMatch {
+            headers: vec![HeaderMatch {
                 name: ZONE_HEADER.to_string(),
                 equals: Some(secret.to_string()),
                 negate: true,
                 secret: true,
                 ..HeaderMatch::default()
-            }),
+            }],
             ..Default::default()
         },
         site: Some(site_id.to_string()),
@@ -629,8 +629,8 @@ mod tests {
 
     #[test]
     fn scanner_preset_regex_comes_from_the_shared_token_list() {
-        let re = preset("scanners").and_then(|p| p.rules[0].matchers.user_agent_regex.clone());
-        assert_eq!(re, Some(scanner_regex()));
+        let re = preset("scanners").map(|p| p.rules[0].matchers.user_agent_regexes.clone());
+        assert_eq!(re, Some(vec![scanner_regex()]));
         assert_eq!(
             scanner_regex(),
             "(?i)(sqlmap|nikto|nmap|masscan|zgrab|gobuster|dirbuster|wpscan|nuclei|acunetix|havij)"
@@ -666,7 +666,12 @@ mod tests {
         assert_eq!(rule.site.as_deref(), Some("shop"));
         assert_eq!(rule.label.as_deref(), Some(ZONE_LABEL));
         assert_eq!(ZONE_HEADER, "X-Cite-Origin-Secret");
-        let h = rule.matchers.header.expect("header matcher");
+        let h = rule
+            .matchers
+            .headers
+            .first()
+            .expect("header matcher")
+            .clone();
         assert_eq!(h.name, ZONE_HEADER);
         assert_eq!(h.equals.as_deref(), Some(secret.as_str()));
         assert!(h.negate && h.secret && h.regex.is_none());
@@ -678,8 +683,8 @@ mod tests {
         preset(preset_name).is_some_and(|p| {
             p.rules
                 .iter()
-                .filter_map(|r| r.matchers.path_regex.as_deref())
-                .any(|re| Regex::new(re).is_ok_and(|re| re.is_match(path)))
+                .flat_map(|r| r.matchers.path_regexes.iter())
+                .any(|re| Regex::new(re.as_str()).is_ok_and(|re| re.is_match(path)))
         })
     }
 
@@ -768,14 +773,14 @@ mod tests {
         let empty = rules
             .iter()
             .find(|r| r.name == "Empty user agent")
-            .map(|r| r.matchers.user_agent_regex.clone());
-        assert_eq!(empty, Some(Some("^$".to_string())));
+            .map(|r| r.matchers.user_agent_regexes.clone());
+        assert_eq!(empty, Some(vec!["^$".to_string()]));
     }
 
     #[test]
     fn scanner_user_agents() {
         let p = preset("scanners");
-        let re = p.and_then(|p| p.rules[0].matchers.user_agent_regex.clone());
+        let re = p.and_then(|p| p.rules[0].matchers.user_agent_regexes.first().cloned());
         let re = re.and_then(|r| Regex::new(&r).ok());
         assert!(
             re.as_ref()

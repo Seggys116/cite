@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use crate::model::{EdgeConfig, FirewallRule};
 use crate::pattern::Subject;
 use crate::presets::presets;
-use crate::validate::{validate_regex, validate_rule};
+use crate::validate::{validate_regex_list, validate_rule};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MigrationKind {
@@ -12,7 +12,7 @@ pub enum MigrationKind {
     Replaced,
     /// A rule the current validation refuses was switched off and left in the file.
     Disabled,
-    /// A site path_regex the current grammar refuses; the site is left untouched.
+    /// A site path_regexes entry the current grammar refuses; the site is left untouched.
     SiteRegexInvalid,
 }
 
@@ -32,13 +32,13 @@ enum Field {
 impl Field {
     fn name(self) -> &'static str {
         match self {
-            Field::Path => "path_regex",
+            Field::Path => "path_regexes",
         }
     }
 
-    fn slot(self, rule: &mut FirewallRule) -> &mut Option<String> {
+    fn slot(self, rule: &mut FirewallRule) -> &mut Vec<String> {
         match self {
-            Field::Path => &mut rule.matchers.path_regex,
+            Field::Path => &mut rule.matchers.path_regexes,
         }
     }
 }
@@ -87,13 +87,25 @@ pub fn migrate_loaded_config(cfg: &mut EdgeConfig) -> Vec<MigrationNote> {
     let mut notes = Vec::new();
     for rule in &mut cfg.firewall {
         for (id, field, old) in KNOWN_OLD_REGEXES {
-            if rule.id != id || field.slot(rule).as_deref() != Some(old) {
+            if rule.id != id {
                 continue;
             }
+            let Some(pos) = field.slot(rule).iter().position(|v| v == old) else {
+                continue;
+            };
             let Some(mut now) = current.get(id).cloned() else {
                 continue;
             };
-            *field.slot(rule) = field.slot(&mut now).take();
+            let Some(new) = field.slot(&mut now).first().cloned() else {
+                continue;
+            };
+            // only the entry equal to the old text changes; the owner's other entries stay in place
+            let list = field.slot(rule);
+            if list.contains(&new) {
+                list.remove(pos);
+            } else {
+                list[pos] = new;
+            }
             notes.push(MigrationNote {
                 id: rule.id.clone(),
                 what: MigrationKind::Replaced,
@@ -115,10 +127,12 @@ pub fn migrate_loaded_config(cfg: &mut EdgeConfig) -> Vec<MigrationNote> {
         }
     }
     for site in &cfg.sites {
-        if let Some(re) = &site.path_regex
-            && let Err(e) =
-                validate_regex(&format!("site {} path_regex", site.id), re, Subject::Path)
-        {
+        if let Err(e) = validate_regex_list(
+            &format!("site {}", site.id),
+            "path_regexes",
+            &site.path_regexes,
+            Subject::Path,
+        ) {
             notes.push(MigrationNote {
                 id: site.id.clone(),
                 what: MigrationKind::SiteRegexInvalid,
@@ -184,7 +198,7 @@ mod tests {
         for name in ["sensitive-files", "cms-probes"] {
             for mut r in preset(name).expect("preset").rules {
                 if let Some((_, old)) = MAIN_REGEXES.iter().find(|(id, _)| *id == r.id) {
-                    r.matchers.path_regex = Some(old.to_string());
+                    r.matchers.path_regexes = vec![old.to_string()];
                 }
                 rules.push(r);
             }
@@ -196,7 +210,7 @@ mod tests {
         rule(
             id,
             Matchers {
-                user_agent_regex: Some(ua.to_string()),
+                user_agent_regexes: vec![ua.to_string()],
                 ..Matchers::default()
             },
         )
@@ -208,8 +222,8 @@ mod tests {
         for (id, field, old) in KNOWN_OLD_REGEXES {
             assert!(MAIN_REGEXES.contains(&(id, old)), "{id}");
             let now = current_rule(id);
-            assert!(field == Field::Path && now.matchers.path_regex.is_some());
-            assert_ne!(now.matchers.path_regex.as_deref(), Some(old));
+            assert!(field == Field::Path && now.matchers.path_regexes.len() == 1);
+            assert_ne!(now.matchers.path_regexes[0], old);
         }
     }
 
@@ -218,7 +232,7 @@ mod tests {
         let mut cfg = config(vec![site("a", "a.com")]);
         cfg.firewall = main_saved_rules();
         for r in &mut cfg.firewall {
-            r.matchers.host = Some("a.com".to_string());
+            r.matchers.hosts = vec!["a.com".to_string()];
             r.matchers.cidrs = vec!["10.0.0.0/8".to_string()];
             r.site = Some("a".to_string());
             r.label = Some("mine".to_string());
@@ -231,10 +245,27 @@ mod tests {
         for (was, now) in before.firewall.iter().zip(&cfg.firewall) {
             let mut expected = was.clone();
             if MAIN_REGEXES.iter().any(|(id, _)| *id == was.id) {
-                expected.matchers.path_regex = current_rule(&was.id).matchers.path_regex;
+                expected.matchers.path_regexes = current_rule(&was.id).matchers.path_regexes;
             }
             assert!(now == &expected, "{} changed beyond its regex", was.id);
         }
+        assert!(validate_config(&cfg).is_ok());
+    }
+
+    #[test]
+    fn only_the_entry_equal_to_the_old_text_changes_in_a_list() {
+        let mut r = current_rule("preset-sensitive-files-4");
+        r.matchers.path_regexes = vec!["^/mine".to_string(), MAIN_REGEXES[1].1.to_string()];
+        let mut cfg = config(vec![site("a", "a.com")]);
+        cfg.firewall = vec![r];
+        migrate_loaded_config(&mut cfg);
+        let now = current_rule("preset-sensitive-files-4")
+            .matchers
+            .path_regexes;
+        assert_eq!(
+            cfg.firewall[0].matchers.path_regexes,
+            ["^/mine".to_string(), now[0].clone()]
+        );
         assert!(validate_config(&cfg).is_ok());
     }
 
@@ -256,11 +287,11 @@ mod tests {
     #[test]
     fn an_owner_edited_preset_is_never_touched() {
         let mut edited = current_rule("preset-scanners-1");
-        edited.matchers.user_agent_regex = Some("(?i)(sqlmap|nikto|curl)".to_string());
-        edited.matchers.host = Some("a.com".to_string());
+        edited.matchers.user_agent_regexes = vec!["(?i)(sqlmap|nikto|curl)".to_string()];
+        edited.matchers.hosts = vec!["a.com".to_string()];
         edited.matchers.cidrs = vec!["10.0.0.0/8".to_string()];
         let mut keys = current_rule("preset-sensitive-files-2");
-        keys.matchers.path_regex = Some("(?i)\\.(key|pem)$".to_string());
+        keys.matchers.path_regexes = vec!["(?i)\\.(key|pem)$".to_string()];
         let mut cfg = config(vec![site("a", "a.com")]);
         cfg.firewall = vec![edited, keys];
         let before = cfg.clone();
@@ -276,7 +307,7 @@ mod tests {
         let mut deny = rule(
             "preset-redirect-to-www-1",
             Matchers {
-                path_prefix: Some("/admin".to_string()),
+                path_prefixes: vec!["/admin".to_string()],
                 ..Matchers::default()
             },
         );
@@ -315,7 +346,7 @@ mod tests {
             assert!(!n.reason.is_empty());
             let r = &cfg.firewall[i];
             assert!(!r.enabled);
-            assert_eq!(r.matchers.user_agent_regex.as_deref(), Some(*re));
+            assert_eq!(r.matchers.user_agent_regexes, [*re]);
         }
         assert!(cfg.firewall[bad.len()].enabled);
         assert_eq!(cfg.firewall.len(), bad.len() + 1);
@@ -325,7 +356,7 @@ mod tests {
     #[test]
     fn a_site_regex_the_grammar_refuses_is_reported_and_kept() {
         let mut s = site("a", "a.com");
-        s.path_regex = Some("[[:alpha:]]+".to_string());
+        s.path_regexes = vec!["[[:alpha:]]+".to_string()];
         let mut cfg = config(vec![s, site("b", "b.com")]);
         let before = cfg.sites.clone();
         let notes = migrate_loaded_config(&mut cfg);

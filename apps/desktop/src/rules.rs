@@ -6,7 +6,7 @@ use cite_edge::model::{
 };
 use cite_edge::validate::validate_rule;
 
-use crate::model::slugify;
+use crate::model::{matcher_problem, slugify};
 use crate::theme::Tone;
 
 pub const REDIRECT_STATUSES: [u16; 4] = [301, 302, 307, 308];
@@ -72,6 +72,174 @@ pub fn action_tone(a: FirewallAction) -> Tone {
     }
 }
 
+// The kinds of condition a row can express; rows of one kind are OR'd, different kinds are AND'd.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CondKind {
+    PathPrefix,
+    PathRegex,
+    UserAgent,
+    Referer,
+    Method,
+    Host,
+    Cidr,
+    Scheme,
+    Header,
+}
+
+// The extra settings of a Header row; its value lives in the row's value field.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HeaderCond {
+    pub name: String,
+    pub regex: bool,
+    pub negate: bool,
+    pub secret: bool,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct CondRow {
+    pub kind: CondKind,
+    pub value: String,
+    pub header: HeaderCond,
+}
+
+impl CondRow {
+    pub fn value(kind: CondKind, value: &str) -> Self {
+        Self {
+            kind,
+            value: value.to_string(),
+            header: HeaderCond::default(),
+        }
+    }
+
+    pub fn header(name: &str, value: &str, regex: bool, negate: bool, secret: bool) -> Self {
+        Self {
+            kind: CondKind::Header,
+            value: value.to_string(),
+            header: HeaderCond {
+                name: name.to_string(),
+                regex,
+                negate,
+                secret,
+            },
+        }
+    }
+
+    fn is_blank(&self) -> bool {
+        if self.kind == CondKind::Header {
+            self.header.name.trim().is_empty() && self.value.trim().is_empty()
+        } else {
+            self.value.trim().is_empty()
+        }
+    }
+
+    fn normalised(&self) -> String {
+        let v = self.value.trim();
+        if self.kind == CondKind::Method {
+            v.to_uppercase()
+        } else {
+            v.to_string()
+        }
+    }
+}
+
+// A secret matcher value never reaches Debug output, so a logged row cannot leak it.
+impl fmt::Debug for CondRow {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let value = if self.kind == CondKind::Header && self.header.secret {
+            "[redacted]"
+        } else {
+            self.value.as_str()
+        };
+        f.debug_struct("CondRow")
+            .field("kind", &self.kind)
+            .field("value", &value)
+            .field("header", &self.header.name)
+            .finish_non_exhaustive()
+    }
+}
+
+// One row per value; regexes split on spaces only, because a comma is valid inside one such as a{1,3}.
+pub fn rows_from_list(kind: CondKind, text: &str) -> Vec<CondRow> {
+    let values: Vec<String> = match kind {
+        CondKind::PathRegex | CondKind::UserAgent | CondKind::Referer => {
+            text.split_whitespace().map(str::to_string).collect()
+        }
+        _ => parse_list(text),
+    };
+    values.iter().map(|v| CondRow::value(kind, v)).collect()
+}
+
+fn distinct(values: impl Iterator<Item = String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for v in values {
+        if !out.contains(&v) {
+            out.push(v);
+        }
+    }
+    out
+}
+
+// Blank rows are ignored and repeated values collapse, so only distinct lists reach the node.
+pub fn rows_to_matchers(rows: &[CondRow]) -> Matchers {
+    let of = |kind: CondKind| -> Vec<String> {
+        distinct(
+            rows.iter()
+                .filter(|r| r.kind == kind && !r.is_blank())
+                .map(CondRow::normalised),
+        )
+    };
+    Matchers {
+        path_prefixes: of(CondKind::PathPrefix),
+        path_regexes: of(CondKind::PathRegex),
+        user_agent_regexes: of(CondKind::UserAgent),
+        referer_regexes: of(CondKind::Referer),
+        methods: of(CondKind::Method),
+        hosts: of(CondKind::Host),
+        cidrs: of(CondKind::Cidr),
+        scheme: of(CondKind::Scheme).into_iter().next(),
+        headers: rows
+            .iter()
+            .filter(|r| r.kind == CondKind::Header && !r.is_blank())
+            .map(header_match)
+            .collect(),
+    }
+}
+
+fn header_match(row: &CondRow) -> HeaderMatch {
+    let value = row.value.trim().to_string();
+    HeaderMatch {
+        name: row.header.name.trim().to_string(),
+        regex: row.header.regex.then(|| value.clone()),
+        equals: (!row.header.regex).then_some(value),
+        negate: row.header.negate,
+        secret: row.header.secret,
+    }
+}
+
+// The first problem in the list, or None; two different schemes can never both hold.
+pub fn conditions_problem(rows: &[CondRow]) -> Option<String> {
+    for (i, row) in rows.iter().enumerate().filter(|(_, r)| !r.is_blank()) {
+        let single = rows_to_matchers(std::slice::from_ref(row));
+        if let Some(bad) = matcher_problem(single) {
+            return Some(format!("Condition {}: {bad}", i + 1));
+        }
+    }
+    let schemes = distinct(
+        rows.iter()
+            .filter(|r| r.kind == CondKind::Scheme && !r.is_blank())
+            .map(CondRow::normalised),
+    );
+    if schemes.len() > 1 {
+        return Some(
+            "A request is either http or https, so only one scheme condition can be used.".into(),
+        );
+    }
+    if rows.iter().all(CondRow::is_blank) {
+        return None;
+    }
+    matcher_problem(rows_to_matchers(rows))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HeaderOpDraft {
     pub target: HeaderTarget,
@@ -107,26 +275,14 @@ pub struct CorsDraft {
     pub max_age: String,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct RuleDraft {
     pub name: String,
     pub label: String,
     pub site: String,
     pub kind: RuleKind,
     pub action: FirewallAction,
-    pub path_regex: String,
-    pub path_prefix: String,
-    pub methods: String,
-    pub user_agent_regex: String,
-    pub cidrs: String,
-    pub host: String,
-    pub header_name: String,
-    pub header_value: String,
-    pub header_regex: bool,
-    pub header_negate: bool,
-    pub header_secret: bool,
-    pub scheme: Option<String>,
-    pub referer_regex: String,
+    pub conditions: Vec<CondRow>,
     pub redirect_to: String,
     pub redirect_status: u16,
     pub header_ops: Vec<HeaderOpDraft>,
@@ -142,43 +298,13 @@ impl Default for RuleDraft {
             site: String::new(),
             kind: RuleKind::Block,
             action: FirewallAction::Deny,
-            path_regex: String::new(),
-            path_prefix: String::new(),
-            methods: String::new(),
-            user_agent_regex: String::new(),
-            cidrs: String::new(),
-            host: String::new(),
-            header_name: String::new(),
-            header_value: String::new(),
-            header_regex: false,
-            header_negate: false,
-            header_secret: false,
-            scheme: None,
-            referer_regex: String::new(),
+            conditions: Vec::new(),
             redirect_to: String::new(),
             redirect_status: 301,
             header_ops: Vec::new(),
             cors_on: false,
             cors: CorsDraft::default(),
         }
-    }
-}
-
-// A secret matcher value never reaches Debug output, so a logged draft cannot leak it.
-impl fmt::Debug for RuleDraft {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let value = if self.header_secret {
-            "[redacted]"
-        } else {
-            self.header_value.as_str()
-        };
-        f.debug_struct("RuleDraft")
-            .field("name", &self.name)
-            .field("kind", &self.kind)
-            .field("header_name", &self.header_name)
-            .field("header_value", &value)
-            .field("header_secret", &self.header_secret)
-            .finish_non_exhaustive()
     }
 }
 
@@ -198,46 +324,6 @@ fn upper_list(text: &str) -> Vec<String> {
         .into_iter()
         .map(|m| m.to_uppercase())
         .collect()
-}
-
-pub fn build_header_match(d: &RuleDraft) -> Result<Option<HeaderMatch>, String> {
-    let name = d.header_name.trim();
-    let value = d.header_value.trim();
-    if name.is_empty() {
-        if value.is_empty() {
-            return Ok(None);
-        }
-        return Err("Enter the header name to compare the value with.".into());
-    }
-    if value.is_empty() {
-        return Err("Enter the header value to compare.".into());
-    }
-    if d.header_secret && d.header_regex {
-        return Err(
-            "A secret header value can only be compared for equality, not as a regex.".into(),
-        );
-    }
-    Ok(Some(HeaderMatch {
-        name: name.to_string(),
-        regex: d.header_regex.then(|| value.to_string()),
-        equals: (!d.header_regex).then(|| value.to_string()),
-        negate: d.header_negate,
-        secret: d.header_secret,
-    }))
-}
-
-pub fn build_matchers(d: &RuleDraft) -> Result<Matchers, String> {
-    Ok(Matchers {
-        path_regex: some_trimmed(&d.path_regex),
-        path_prefix: some_trimmed(&d.path_prefix),
-        methods: upper_list(&d.methods),
-        user_agent_regex: some_trimmed(&d.user_agent_regex),
-        cidrs: parse_list(&d.cidrs),
-        host: some_trimmed(&d.host),
-        header: build_header_match(d)?,
-        scheme: d.scheme.clone(),
-        referer_regex: some_trimmed(&d.referer_regex),
-    })
 }
 
 // Rows left completely blank are ignored, so an unused row never blocks the save.
@@ -369,11 +455,14 @@ pub fn build_rule(d: &RuleDraft, suffix: &str) -> Result<FirewallRule, String> {
     if name.is_empty() {
         return Err("Give the rule a name.".into());
     }
+    if let Some(problem) = conditions_problem(&d.conditions) {
+        return Err(problem);
+    }
     let mut rule = FirewallRule {
         id: format!("{}-{}", slugify(name), suffix.to_lowercase()),
         name: name.to_string(),
         enabled: true,
-        matchers: build_matchers(d)?,
+        matchers: rows_to_matchers(&d.conditions),
         site: some_trimmed(&d.site),
         label: some_trimmed(&d.label),
         ..FirewallRule::default()
@@ -457,10 +546,14 @@ pub fn effect_detail(rule: &FirewallRule) -> Option<String> {
 mod tests {
     use super::*;
 
+    fn row(kind: CondKind, value: &str) -> CondRow {
+        CondRow::value(kind, value)
+    }
+
     fn block() -> RuleDraft {
         RuleDraft {
             name: "Block WP".into(),
-            path_regex: "^/wp-".into(),
+            conditions: vec![row(CondKind::PathRegex, "^/wp-")],
             ..RuleDraft::default()
         }
     }
@@ -497,10 +590,98 @@ mod tests {
     }
 
     #[test]
+    fn same_kind_rows_are_listed_together_and_blanks_are_ignored() {
+        let rows = vec![
+            row(CondKind::PathPrefix, "/old"),
+            row(CondKind::PathPrefix, " /older "),
+            row(CondKind::PathPrefix, "/old"),
+            row(CondKind::PathPrefix, "  "),
+            row(CondKind::Method, "get"),
+            row(CondKind::Method, "Post"),
+            row(CondKind::Scheme, "https"),
+            CondRow::header("", "", false, false, false),
+        ];
+        let m = rows_to_matchers(&rows);
+        assert_eq!(m.path_prefixes, vec!["/old", "/older"]);
+        assert_eq!(m.methods, vec!["GET", "POST"]);
+        assert_eq!(m.scheme.as_deref(), Some("https"));
+        assert!(m.headers.is_empty() && m.hosts.is_empty() && m.cidrs.is_empty());
+        assert_eq!(rows_to_matchers(&[]), Matchers::default());
+    }
+
+    #[test]
+    fn a_list_in_one_input_becomes_one_row_per_value() {
+        let rows = rows_from_list(CondKind::PathRegex, "^/a ^/b\t ^/c");
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows_from_list(CondKind::PathRegex, "^/a{1,3}").len(), 1);
+        assert_eq!(
+            rows_from_list(CondKind::Cidr, "10.0.0.0/8, 192.168.0.0/16").len(),
+            2
+        );
+        let d = RuleDraft {
+            conditions: rows,
+            ..block()
+        };
+        let rule = build_rule(&d, "x").expect("valid");
+        assert_eq!(rule.matchers.path_regexes, vec!["^/a", "^/b", "^/c"]);
+        assert!(rows_from_list(CondKind::Host, " , ").is_empty());
+    }
+
+    #[test]
+    fn rows_are_checked_with_the_nodes_own_rules() {
+        let problem = |r: CondRow| conditions_problem(&[r]);
+        assert!(problem(row(CondKind::PathPrefix, "")).is_none());
+        assert!(problem(row(CondKind::PathPrefix, "/ok")).is_none());
+        assert!(problem(row(CondKind::PathPrefix, "nope")).is_some());
+        assert!(problem(row(CondKind::PathRegex, "(")).is_some());
+        assert!(problem(row(CondKind::Method, "G E T")).is_some());
+        assert!(problem(row(CondKind::Host, "*.example.com")).is_none());
+        assert!(problem(row(CondKind::Host, "not a host")).is_some());
+        assert!(problem(row(CondKind::Cidr, "203.0.113.0/24")).is_none());
+        assert!(problem(row(CondKind::Cidr, "203.0.113.0/99")).is_some());
+        assert!(problem(row(CondKind::Scheme, "ftp")).is_some());
+        assert!(problem(CondRow::header("X-A", "v", false, false, false)).is_none());
+        assert!(problem(CondRow::header("X-A", "", false, false, false)).is_some());
+        assert!(problem(CondRow::header("1bad", "v", false, false, false)).is_some());
+        assert!(problem(CondRow::header("X-A", "^a", true, false, true)).is_some());
+    }
+
+    #[test]
+    fn the_list_checks_name_the_row_and_apply_the_node_limits() {
+        let rows = vec![
+            row(CondKind::PathPrefix, "/ok"),
+            row(CondKind::Host, "bad host"),
+        ];
+        assert!(
+            conditions_problem(&rows)
+                .unwrap()
+                .starts_with("Condition 2:")
+        );
+        let two = vec![
+            row(CondKind::Scheme, "http"),
+            row(CondKind::Scheme, "https"),
+        ];
+        assert!(
+            conditions_problem(&two)
+                .unwrap()
+                .contains("only one scheme")
+        );
+        let many: Vec<CondRow> = (0..40)
+            .map(|i| row(CondKind::PathPrefix, &format!("/p{i}")))
+            .collect();
+        assert!(conditions_problem(&many).unwrap().contains("at most"));
+        assert!(conditions_problem(&[]).is_none());
+    }
+
+    #[test]
     fn block_rules_keep_their_action_and_matchers() {
         let d = RuleDraft {
             action: FirewallAction::Drop,
-            methods: "get, post".into(),
+            conditions: vec![
+                row(CondKind::PathRegex, "^/wp-"),
+                row(CondKind::Method, "get"),
+                row(CondKind::Method, "post"),
+            ],
             ..block()
         };
         let rule = build_rule(&d, "AB12").expect("valid");
@@ -564,7 +745,7 @@ mod tests {
         );
         let unknown = RuleDraft {
             redirect_to: "https://example.com/{nope}".into(),
-            path_prefix: "/old".into(),
+            conditions: vec![row(CondKind::PathPrefix, "/old")],
             ..redirect()
         };
         assert!(build_rule(&unknown, "r").unwrap_err().contains("{nope}"));
@@ -575,18 +756,18 @@ mod tests {
         assert!(build_rule(&loops, "r").unwrap_err().contains("loop"));
         let fine = RuleDraft {
             redirect_to: "/new".into(),
-            path_prefix: "/old".into(),
+            conditions: vec![row(CondKind::PathPrefix, "/old")],
             ..redirect()
         };
         assert!(build_rule(&fine, "r").is_ok());
         let upgrade = RuleDraft {
             redirect_to: "https://{host}{path}{query}".into(),
-            scheme: Some("http".into()),
+            conditions: vec![row(CondKind::Scheme, "http")],
             ..redirect()
         };
         assert!(build_rule(&upgrade, "r").is_ok());
         let no_scheme = RuleDraft {
-            scheme: None,
+            conditions: Vec::new(),
             ..upgrade
         };
         assert!(build_rule(&no_scheme, "r").unwrap_err().contains("scheme"));
@@ -761,82 +942,36 @@ mod tests {
     }
 
     #[test]
-    fn header_matchers_compare_equality_or_a_regex() {
+    fn header_conditions_compare_equality_or_a_regex() {
+        let value = crate::testkit::joined(&["gate", "-value-", "123"]);
         let eq = RuleDraft {
-            header_name: "X-Beta".into(),
-            header_value: crate::testkit::joined(&["gate", "-value-", "123"]),
-            header_negate: true,
-            header_secret: true,
+            conditions: vec![CondRow::header("X-Beta", &value, false, true, true)],
             ..block()
         };
         let rule = build_rule(&eq, "m").expect("valid");
-        let h = rule.matchers.header.expect("header");
-        assert!(
-            h.equals.as_deref() == Some(eq.header_value.as_str()),
-            "values differ"
-        );
+        let h = &rule.matchers.headers[0];
+        assert!(h.equals.as_deref() == Some(value.as_str()), "values differ");
         assert!(h.regex.is_none() && h.negate && h.secret);
         let re = RuleDraft {
-            header_name: "X-Beta".into(),
-            header_value: "^beta".into(),
-            header_regex: true,
+            conditions: vec![CondRow::header("X-Beta", "^beta", true, false, false)],
             ..block()
         };
-        let h = build_rule(&re, "m")
-            .expect("valid")
-            .matchers
-            .header
-            .expect("h");
+        let rule = build_rule(&re, "m").expect("valid");
+        let h = &rule.matchers.headers[0];
         assert_eq!(h.regex.as_deref(), Some("^beta"));
         assert!(h.equals.is_none() && !h.secret);
     }
 
     #[test]
-    fn header_matcher_mistakes_are_explained() {
-        let secret_regex = RuleDraft {
-            header_name: "X-A".into(),
-            header_value: "^a".into(),
-            header_regex: true,
-            header_secret: true,
-            ..block()
-        };
-        assert!(
-            build_rule(&secret_regex, "m")
-                .unwrap_err()
-                .contains("equality")
-        );
-        let no_value = RuleDraft {
-            header_name: "X-A".into(),
-            ..block()
-        };
-        assert!(
-            build_rule(&no_value, "m")
-                .unwrap_err()
-                .contains("header value")
-        );
-        let no_name = RuleDraft {
-            header_value: "v".into(),
-            ..block()
-        };
-        assert!(
-            build_rule(&no_name, "m")
-                .unwrap_err()
-                .contains("header name")
-        );
-        let bad_name = RuleDraft {
-            header_name: "1bad name".into(),
-            header_value: "v".into(),
-            ..block()
-        };
-        assert!(build_rule(&bad_name, "m").is_err());
-    }
-
-    #[test]
     fn a_rejected_secret_value_is_never_echoed() {
         let d = RuleDraft {
-            header_name: "X-Beta".into(),
-            header_value: "bad value with spaces".into(),
-            header_secret: true,
+            conditions: vec![CondRow::header(
+                "X-Beta",
+                "bad value with spaces",
+                false,
+                false,
+                true,
+            )],
             ..block()
         };
         let err = build_rule(&d, "m").unwrap_err();
@@ -844,33 +979,17 @@ mod tests {
     }
 
     #[test]
-    fn scheme_and_referer_matchers_are_carried() {
-        let d = RuleDraft {
-            scheme: Some("https".into()),
-            referer_regex: "spam\\.example".into(),
-            path_regex: String::new(),
-            ..block()
-        };
-        let m = build_rule(&d, "s").expect("valid").matchers;
-        assert_eq!(m.scheme.as_deref(), Some("https"));
-        assert_eq!(m.referer_regex.as_deref(), Some("spam\\.example"));
-    }
-
-    #[test]
-    fn drafts_never_debug_print_a_secret_value() {
-        let d = RuleDraft {
-            header_name: "X-Beta".into(),
-            header_value: crate::testkit::joined(&["hidden", "-matcher", "-value"]),
-            header_secret: true,
-            ..block()
-        };
-        let value = d.header_value.clone();
-        assert!(!format!("{d:?}").contains(value.as_str()));
-        let open = RuleDraft {
-            header_secret: false,
-            ..d
-        };
+    fn rows_never_debug_print_a_secret_value() {
+        let value = crate::testkit::joined(&["hidden", "-matcher", "-value"]);
+        let secret = CondRow::header("X-Beta", &value, false, false, true);
+        assert!(!format!("{secret:?}").contains(value.as_str()));
+        let open = CondRow::header("X-Beta", &value, false, false, false);
         assert!(format!("{open:?}").contains(value.as_str()));
+        let d = RuleDraft {
+            conditions: vec![secret],
+            ..block()
+        };
+        assert!(!format!("{d:?}").contains(value.as_str()));
     }
 
     #[test]
@@ -945,9 +1064,7 @@ mod tests {
         assert_eq!(op_label(HeaderOpKind::Remove), "Remove");
         assert_eq!(target_label(HeaderTarget::Request), "Request");
         assert!(REDIRECT_PLACEHOLDERS.contains("{www_host}"));
-        for example in REDIRECT_EXAMPLES {
-            assert!(!example.is_empty());
-        }
+        assert!(REDIRECT_EXAMPLES.iter().all(|e| !e.is_empty()));
         assert_eq!(action_tone(FirewallAction::Tarpit), Tone::Info);
     }
 }

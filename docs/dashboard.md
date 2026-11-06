@@ -47,10 +47,11 @@ The connector's certificate comes from a self-signed authority created by `init`
 |---|---|
 | Overview | Health and traffic across every connected node, and recent deployments from all of them. |
 | Nodes | Add and remove connectors. |
-| Sites | A table of sites with node, kind (site or API), hosts, active slot, health and state. Create site opens the form described below. |
-| Site page | Routing, access (Cloudflare only and SSL mode), health check settings, a live view of targets in each slot, deploy history, Deploy new version, Switch active slot, Roll back, a maintenance toggle with page choice, and Delete site. |
+| Sites | A table of sites with node, kind (site or API), hosts, active slot, health and state. Create site opens the wizard described below. |
+| Site page | Routing (hosts and paths), access (Cloudflare proxy only and HTTPS mode), health check settings, a live view of targets in each slot, deploy history, Deploy new version, Switch active slot, Roll back, a maintenance toggle with page choice, and Delete site. |
 | Traffic | Requests over time, status classes, methods, latency (average, p50, p95, p99), response sizes, content types, top paths, client IPs, user agents, hosts and blocking rules, and a live request list that refreshes every 3 seconds. A time window selector offers 15 minutes, 1 hour, 24 hours, 7 days and 30 days, and a site selector narrows every panel to one site. The request list filters by status, method, path, client IP and blocked only, and a request can be turned into a rule that blocks its path or its address. |
 | Firewall | An ordered list of rules. A rule blocks (deny, drop silently or tarpit), redirects, or changes headers and handles CORS, and has a scope of one site or all. Each row shows its effect, label, matchers and hits over 24 hours and can be switched on or off. Presets sit below the list. See Firewall rules below. |
+| Redirects | A table of redirect rules with one Save changes button that sends every change at once. Reached from Firewall. See Redirects below. |
 | Maintenance | Custom maintenance pages: a name, a status code and the HTML (up to 15000 bytes). A page that a site uses cannot be deleted. |
 | Settings | Data retention, connection limits, certificates, Cloudflare ranges, API tokens, the audit log (most recent 200 entries), the rendered `haproxy.cfg` with process and backend status, and dashboard appearance and session. |
 
@@ -100,20 +101,19 @@ Download is a same-origin download like an export, so large files stream to disk
 
 ## Creating a site
 
-| Field | Notes |
+Create site is a five-step wizard under the subtitle "Choose where the site comes from and which domains reach it". A progress list shows the current step, Back and Next move between steps, and Next stays disabled until the step is valid, with the reason shown beside it. Each step title receives focus when the step opens, the progress list marks the current step with `aria-current`, and Enter in a field moves to the next step. Nothing is sent until Create site on the last step.
+
+| Step | What it asks |
 |---|---|
-| Kind | Site or API. APIs usually route by path prefix, sites by host name. |
-| Hosts | Host names that route to the site. |
-| Path regex | Optional. A built-in tester shows whether the regex is valid and whether a sample path matches. Empty means every path on those hosts. |
-| Source | Existing upstreams (the default) or Build from GitHub. See below. |
-| Access | Whether to accept traffic only from Cloudflare, and the SSL mode (Full or Flexible). Both default to off and Full. See Access below. |
-| Blue and green targets | Existing upstreams only. `host:port` addresses for each slot. At least one blue target is required. |
-| Health check path | Must start with `/`. The form sends an interval of 2000 ms, a timeout of 1500 ms, 2 passes to be healthy and 3 failures to be down. |
-| Placement | Selected nodes, or Replicate to all nodes. |
+| 1. Where does the site come from? | Two cards. Build from a GitHub repository is the first choice and the core flow. Serve servers I already run is the second. |
+| 2. Details | For GitHub: Repository, Branch, Runtime and poll interval, and a token if one is needed (below). For your own servers: the upstream editor and the health check path. |
+| 3. Name and domains | Kind (site or API), name, id, the domains, and optional paths. |
+| 4. Protection | The Access card (see Access below). Nothing here is required. |
+| 5. Where should it run? | Selected nodes, or Replicate to all nodes, and a review of every choice before Create site. |
 
-With Existing upstreams the form creates a site with no `source`, so it routes to upstreams you run. The new site starts with the blue slot active. The form sends one request to the dashboard server with the chosen nodes and the site definition. With Replicate to all nodes the same site is created on every connected node, so use addresses that mean the same thing on each. The connector rejects targets that are loopback, link-local, unspecified or multicast addresses, or that name the node's own services (see [Firewall and maintenance](firewall.md#targets-and-health-checks)).
+The optional paths are a list of rows, each either Path starts with (a prefix) or Path matches regex, with a check on every row. A request that matches any row is routed to the site; no rows means every path on those domains. They are sent as `path_prefixes` and `path_regexes` on the site. A site saved with the older single `path_regex` still opens, and its regex appears as one row.
 
-Build from GitHub hides the targets, because the connector provisions the stack for the live slot. The form then asks for:
+GitHub fields:
 
 | Field | Notes |
 |---|---|
@@ -121,7 +121,20 @@ Build from GitHub hides the targets, because the connector provisions the stack 
 | Branch | Defaults to `main`. |
 | Runtime | `node`, `bun`, `static` or `rust`. Every runtime except `rust` also takes a Node version, 22 or 24. |
 | Poll interval | Defaults to `5m`. A number followed by `s`, `m` or `h`. |
-| GitHub token | Required for private repositories. Sent once as the top-level `github_token` of `POST /api/v1/deployments`, never inside `source`. The dashboard forwards it to the connector and neither stores nor returns it, and the field is emptied as soon as you submit. |
+
+The GitHub path never mentions upstreams, blue or green. The console sends empty slots, because the connector provisions the stack for the live slot, and sets `source` from the fields above.
+
+Each node reports in `GET /node` whether it already holds a GitHub token (`github.token_configured`, from `CITE_GITHUB_TOKEN`). The console reads that for every online node and decides about the token field from the nodes you pick:
+
+| Nodes picked | Token field |
+|---|---|
+| All have a token | Folded away behind a quiet "Use a different token for this site" button, with the note "This node already has a GitHub token (CITE_GITHUB_TOKEN). Leave this empty to use it." |
+| At least one has none | Shown and required, with the help "Fine-grained token with Contents: read for this repository. Better: set CITE_GITHUB_TOKEN on the node once (see docs). Stored only on the node." |
+| A node has not answered, or predates the field | Shown, not required. |
+
+With several nodes, the token is therefore required only if some selected node has none, and a token you type is sent for the whole request. The token is sent once as the top-level `github_token` of `POST /api/v1/deployments`, never inside `source`, and only for a GitHub site. The dashboard forwards it to the connector and neither stores nor returns it, and the field is emptied as soon as you submit.
+
+Serve servers I already run creates a site with no `source`, so it routes to upstreams you run. Its blue and green slots take `host:port` addresses; at least one live (blue) server is required. The health check path must start with `/`, and the wizard sends an interval of 2000 ms, a timeout of 1500 ms, 2 passes to be healthy and 3 failures to be down. The new site starts with the blue slot active. With Replicate to all nodes the same site is created on every connected node, so use addresses that mean the same thing on each. The connector rejects targets that are loopback, link-local, unspecified or multicast addresses, or that name the node's own services (see [Firewall and maintenance](firewall.md#targets-and-health-checks)).
 
 The connector accepts `github_token` only for a site with a `source`. In `each` mode `POST /deployments` also takes `per_node`, a map of node name to `{blue, green}` target lists, so each node can get its own upstreams.
 
@@ -133,11 +146,11 @@ The Access card appears in the create form and on the Routing tab of a site. It 
 
 | Setting | Meaning |
 |---|---|
-| Only accept traffic from Cloudflare | The edge refuses requests that do not come from a Cloudflare address, so nobody can bypass Cloudflare and reach the node directly. The addresses come from the node's Cloudflare ranges, shown below the toggle with their source (built-in or custom) and date. |
-| SSL mode: Full | Cloudflare connects to the node over HTTPS. The node needs a certificate that covers the host. |
-| SSL mode: Flexible | Cloudflare terminates HTTPS and talks plain HTTP to the node, so no certificate is needed on the node. Pair it with Only accept traffic from Cloudflare. |
+| Only allow traffic through the Cloudflare proxy | `cloudflare_only`. Visitors must come through Cloudflare (orange cloud on); direct requests to your server address are refused. You do not need to create any Cloudflare rule for this, and turning it on alone never asks for a rule, a secret or a header. The addresses come from the node's Cloudflare ranges, shown below the toggle with their source (built-in or custom) and date. |
+| Certificate on the node | `tls` of `full`. Visitors and Cloudflare connect over HTTPS, so the node needs a certificate that covers the host. |
+| Cloudflare handles HTTPS (no certificate on the node) | `tls` of `flexible`. Cloudflare serves the certificate to visitors and talks plain http to your server, so no certificate is needed on the node. Pair it with the option above. |
 
-Choosing Flexible without Cloudflare only shows a warning on the card: anyone who reaches the node directly is then served over plain HTTP. The warning does not block saving.
+Choosing Cloudflare handles HTTPS without the first option only shows a warning on the card: anyone who reaches the node directly is then served over plain http. The warning does not block saving.
 
 Settings, Cloudflare shows the active list for the selected node, with its source, date and count. The override box takes one CIDR range per line, IPv4 or IPv6. A bare address counts as a single host (`/32` or `/128`). The console applies the node's width rules before saving: IPv4 ranges must be `/12` or narrower, IPv6 ranges `/28` or narrower, `/0` is refused as trusting every address, and an IPv6 range that overlaps `::ffff:0:0/96`, `::/96`, `2002::/16` or `64:ff9b::/96` is refused because it would also match IPv4 clients (an IPv4-mapped address such as `::ffff:198.51.100.0/120` is read as the IPv4 range). Octets and prefix lengths with leading zeros (`010.0.0.1`, `/08`) are refused, as the node refuses them. Lines that are not addresses or ranges are refused, and up to 256 ranges are allowed. Save ranges writes `cloudflare_ranges` through `PUT /settings`; an empty box, or Use built-in list, saves an empty list so the node falls back to its built-in one. A wrong custom list locks real visitors out of sites that only accept Cloudflare traffic, so use it only when Cloudflare publishes ranges the node does not know yet.
 
@@ -148,7 +161,7 @@ The Access card also holds two settings that are stored in the same `access` obj
 | Setting | Meaning |
 |---|---|
 | Bot policy | `bots`: Allow all bots (default), Block scraper and tool bots (`block_bad`) or Block all bots including search engines (`block_all`). The last choice shows a warning that search engines, link previews and uptime monitors are blocked too. A note on the card says user-agent matching can be faked and that blocked requests still appear in analytics. |
-| Only my Cloudflare zone | `zone_lock`. The checkbox is enabled only while Only accept traffic from Cloudflare is on, and turning that off clears it. The edge then refuses requests that lack the site's secret header `X-Cite-Origin-Secret`. |
+| Also require that requests come from MY Cloudflare account (advanced) | `zone_lock`. It sits in a folded "advanced" section that opens by itself only when the site already uses it, so the plain option above never mentions rules or secrets. The checkbox is enabled only while Only allow traffic through the Cloudflare proxy is on, and turning that off clears it. The edge then refuses requests that lack the site's secret header `X-Cite-Origin-Secret`. |
 
 The node generates the zone secret and returns it only from `POST /sites/{id}/zone-secret`. After you save a site whose zone lock was off and is now on (in the create form, once per node the site was created on, even when other nodes failed: the error then lists the failed nodes and says the secret for the others is shown in the dialog), the console calls that route and shows the secret in a dialog: the header name, the secret with a copy button, the secret's fingerprint and date, and numbered Cloudflare steps (Rules, Transform Rules, Modify Request Header, Set static header). The dialog warns that the secret is not shown again. It has no close icon and ignores Escape and clicks outside; it closes only with the I have saved it button, which asks for confirmation first if Copy was never pressed. Closing it empties the text and drops the copies held by the page. The secret is not written to storage, the address or any log.
 
@@ -156,17 +169,34 @@ On the Routing tab of a site with the lock on, the card shows when the secret wa
 
 ## Firewall rules
 
-Add rule and Edit rule open a drawer with a Kind control.
+Add rule and Edit rule open a drawer with a four-step builder. Next stays disabled until the step is valid, and an existing rule opens in the same steps with its values filled in.
 
-| Kind | Fields |
+| Step | What it asks |
 |---|---|
-| Block | The action: Deny, Drop silently or Tarpit. At least one matcher is required, as before. |
-| Redirect | A target template and a status of 301, 302, 307 or 308. The placeholders `{scheme}`, `{host}`, `{www_host}`, `{apex_host}`, `{path}` and `{query}` are buttons that insert themselves at the cursor. The template and the loop checks (a redirect that keeps the host needs a path matcher, an https redirect to the same host needs the scheme matcher set to http) are checked with the same rules as the node before saving. |
-| Headers and CORS | A list of header changes (request or response, set, add or remove, name, value) and an optional CORS block: allowed origins one per line, methods, allowed and exposed headers, credentials and a max age. Inline checks mirror the node: at most 16 changes, reserved and identity headers refused, `*` cannot be combined with credentials or other origins, at most 32 entries per list, max age up to 86400. |
+| 1. What should happen? | Block, Redirect, Change headers or CORS, as cards. |
+| 2. When? | Condition rows, and a live sentence in plain English below them (see below). |
+| 3. Details | Block: Deny, Drop silently or Tarpit. Redirect: a target template and a status of 301, 302, 307 or 308, with the placeholders `{scheme}`, `{host}`, `{www_host}`, `{apex_host}`, `{path}` and `{query}` as buttons that insert themselves at the cursor. Change headers: a list of changes (request or response, set, add or remove, name, value). CORS: allowed origins one per line, methods, allowed and exposed headers, credentials and a max age. |
+| 4. Name and scope | A name, an optional label (replaces the rule id in logs and the blocked-by-rule table), one site or all sites, and a review. |
 
-Every kind also takes an optional label, which replaces the rule id in logs and the blocked-by-rule table. The new matchers are the connection scheme (any, http or https), a referer regex and a request header test: a header name, Equals or Matches regex, a value, an option to match when the test fails, and Secret value. A secret value is typed into a password box, is not shown again after saving, and the editor opens with the box empty and a note that the stored value is kept; leave it empty to keep it or type a new value to replace it. Switching a rule on or off from the list keeps a stored secret as well. A secret value is never shown in the list, where the matcher appears as `header X-Key = (secret)`.
+Each condition row has a type and a value: Path starts with, Path matches regex, User agent matches, Referer matches, Method is, Host is, IP is in range, Scheme is, or a request header test (a header name, Equals or Matches regex, a value, an option to match when the test fails, and Secret value). Rows of the same type are alternatives, so `/a` and `/b` match a request for either; rows of different types must all match. The sentence under the rows says so, for example "When the path starts with /a or /b, and the method is POST." A rule is sent with the list fields (`path_prefixes`, `path_regexes`, `user_agent_regexes`, `referer_regexes`, `hosts`, `methods`, `cidrs`, `scheme`, `headers`), and a rule saved with the older single-value matchers opens as one-item lists. A blocking rule needs at least one condition. Inline checks mirror the node: at most 32 values per kind of condition and 256 ranges, at most 16 header changes, reserved and identity headers refused, `*` cannot be combined with credentials or other origins, at most 32 entries per CORS list, max age up to 86400, and the redirect loop checks (a redirect that keeps the host needs a path condition, an https redirect to the same host needs the scheme condition set to http).
+
+A secret header value is typed into a password box, is not shown again after saving, and the builder opens with the box empty and a note that the stored value is kept; leave it empty to keep it or type a new value to replace it. Switching a rule on or off from the list keeps a stored secret as well. A secret value is never shown in the list or in the sentence, where it appears as `header X-Key = (secret)` and "a secret value".
 
 The rule list shows an Effect column: Deny, Drop silently or Tarpit for blocks, the status and target for redirects, and the number of header changes or the CORS origin for the rest. The three redirect presets (`redirect-to-www`, `redirect-to-apex`, `force-https`) appear with the other presets. They have no site, so Apply asks for confirmation first and says they act on every site on the node. See [Firewall and maintenance](firewall.md) for the rules the node enforces.
+
+## Redirects
+
+Firewall, Manage redirects (or `#/redirects`) opens a table of the node's redirect rules. Each row has an on switch, From (Path starts with a prefix, or Path matches regex), To (a template with the same placeholder chips as the builder), a status of 301, 302, 307 or 308, and delete. Rules with other conditions, or the quick rows below, show what they match in place of the From box.
+
+| Button | Adds |
+|---|---|
+| Add redirect | An empty row. |
+| Add www redirect | A row sending to `{scheme}://{www_host}{path}{query}`. |
+| Add https redirect | A row for plain http requests sending to `https://{host}{path}{query}`. |
+
+Every row is checked as you type: the path must start with `/` for a prefix, the regex must compile, the target must be a valid template, no two rows may start from the same path, and the same loop checks as the builder apply. Save changes stays disabled until every row is valid and something changed, and the summary beside it counts rows to save and delete. Save changes sends one `POST /firewall/bulk` request with `{"replace": [rules], "delete": [ids]}` containing only the rows that changed, and the node applies them as one configuration change and answers `{created, replaced, deleted}`. New rows get the next free id `redirect-<n>` and the same text as their label, and an edited row keeps its id, label, name and site. If the node refuses a rule, its message appears under the row that sent it and nothing is saved; a message that names no row is shown below the table. Discard changes reloads the list.
+
+The dashboard proxy passes only `POST` on exactly `firewall/bulk` (any other method or extra path segment is refused), needs the session's CSRF token, and refuses bodies over 512 KiB; every other firewall route keeps the usual limit.
 
 ## Certificates
 

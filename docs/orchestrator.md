@@ -108,7 +108,17 @@ Images are pulled only when they are not present locally; a pull can take up to 
 
 ## GitHub token
 
-The token is supplied when the site is created, as a `github_token` string beside the site object in the `POST /api/v1/sites` body (printable ASCII, up to 512 bytes). The connector stores it in `secrets.json` (mode 0600, up to 512 secrets, 16 KiB each) under a name it chooses from the site id, and records only that name in the site. It reaches the manager as `CITE_GITHUB_TOKEN` in the container's environment. It is not in container labels or in `edge.json`. Anyone who can inspect containers through the Docker API can read it, including the connector.
+There are two ways to give a site its GitHub token.
+
+**1. On the connector, once for the node (recommended).** Set `CITE_GITHUB_TOKEN` in `.env` (as in the single-site stack). The orchestrator overlay passes it to the connector, which reads it at start and uses it for every site built from GitHub that has no token of its own. Use a fine-grained token with Contents:read, or a classic PAT with repo scope. `CITE_GITHUB_TOKEN_FILE` is the alternative for secret mounts: mount the file into the connector and set the variable to its path; the environment variable wins when both are set. Both follow the same rules as a per-site token (printable ASCII, up to 512 bytes), and an invalid value stops the connector at start with an error that never prints it. `GET /api/v1/node` reports `github.token_configured` and `github.source` (`env`, `file` or `none`), never the value.
+
+**2. Per site.** Send a `github_token` string beside the site object in the `POST /api/v1/sites` body. It overrides the node token for that site. The connector stores it in `secrets.json` (mode 0600, up to 512 secrets, 16 KiB each) under a name it chooses from the site id, and records only that name in the site.
+
+A site created with a `source` and neither token is refused with 400 ("No GitHub token: set CITE_GITHUB_TOKEN on the connector (or pass github_token for this site)"); the manager needs the token even for a public repository.
+
+**What is stored where.** The node token is held in the connector's memory only. It is never written to `secrets.json`, `edge.json`, the audit log, status output, error messages or container labels. It reaches each manager as `CITE_GITHUB_TOKEN` in the container's environment, resolved whenever the connector creates the manager container (create, deploy, switch and rollback). Anyone who can inspect containers through the Docker API (`docker inspect`) or read the connector's environment can read it, including the connector.
+
+**Rotating the node token.** Change `CITE_GITHUB_TOKEN` in `.env` and recreate the connector (`docker compose up -d connector`). Running managers keep the old token until their site's next deploy, switch or rollback, which recreates the manager with the new one; a startup reconcile does not recreate managers. To roll a site immediately, deploy it again. Per-site tokens are unaffected.
 
 ## GitHub Enterprise Server and the API URL
 
