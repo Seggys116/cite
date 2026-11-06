@@ -205,6 +205,7 @@ fn opts() -> RenderOptions {
         runtime_addr: "unix@/conf/haproxy/admin.sock".into(),
         log_addr: "/conf/haproxy/log.sock".into(),
         tls_dir: None,
+        cloudflare_file: None,
     }
 }
 
@@ -244,13 +245,14 @@ pub fn big_config(sites: usize, rules: usize) -> EdgeConfig {
             id: format!("r{i}"),
             name: format!("r{i}"),
             enabled: true,
-            action: FirewallAction::Deny,
+            action: Some(FirewallAction::Deny),
             matchers: m,
             site: if i % 5 == 0 {
                 Some(format!("s{}", i % sites.max(1)))
             } else {
                 None
             },
+            ..FirewallRule::default()
         });
     }
     cfg

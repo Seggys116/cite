@@ -116,6 +116,76 @@ docker compose -f docker-compose.yml -f docker-compose.rust.yml up -d
 
 A Rust child is one process. Warm grace still keeps the previous binary. An open stream keeps that process until the stream ends, or until the later of `CITE_WARM_GRACE` and `CITE_DRAIN_MAX`.
 
+## Access: Cloudflare only, Flexible SSL and bot policy
+
+A site can be reachable only through the Cloudflare proxy, and can be put in a mode where Cloudflare terminates HTTPS and the origin needs no certificate. It can also refuse requests from known bots. All three live in the site's `access` object. A site without it behaves as before (open access, `tls` of `full`, `bots` of `allow`).
+
+```json
+"access": {"cloudflare_only": true, "tls": "flexible", "bots": "block_bad"}
+```
+
+| Field | Values | Effect |
+|---|---|---|
+| `cloudflare_only` | `false` (default), `true` | Connections whose TCP peer is not a Cloudflare address answer 403 before any backend is reached. |
+| `tls` | `"full"` (default), `"flexible"` | `full` keeps today's behaviour. `flexible` means Cloudflare talks plain HTTP to the origin. |
+| `bots` | `"allow"` (default), `"block_bad"`, `"block_all"` | Answers 403 to requests whose User-Agent names a bot. See [Bot policy](#bot-policy). |
+
+### Cloudflare only
+
+With `cloudflare_only` on, the edge compares the TCP peer address (`fc_src`) with the Cloudflare range list. A client cannot forge that address the way it can forge a header, so a request sent straight to your origin address is refused. The refusal is logged with the rule label `cloudflare-only`, which appears in the Traffic blocked-by-rule table.
+
+For connections from Cloudflare the edge then takes the visitor's address from `CF-Connecting-IP`, so firewall rules, the per-IP rate limit and analytics see the visitor and not a Cloudflare edge. The header is honoured only when the peer is Cloudflare, it is present exactly once and its whole value is a single IP address. Otherwise the source address stays as it was. `CF-Connecting-IP`, `True-Client-IP`, `CF-Visitor`, `CF-Connecting-IPv6` and `CF-Pseudo-IPv4` are removed from requests that do not come from Cloudflare, so a backend never receives a spoofed copy. The per-IP rate limit counts IPv4 and IPv6 visitors alike.
+
+The range list is built into the edge and was last copied from `cloudflare.com/ips-v4` and `ips-v6` on 2026-11-06. Cloudflare changes its ranges rarely but they do change, and a stale list would refuse real traffic. To override it, set `settings.cloudflare_ranges` to your own list of CIDRs. A non-empty list replaces the built-in one; an empty list (the default) uses it. A list holds at most 256 entries. Entries are stored as their masked network (`1.2.3.4/16` becomes `1.2.0.0/16`) and IPv4-mapped IPv6 entries (`::ffff:a.b.c.d`) become IPv4. Ranges wider than `/12` (IPv4) or `/28` (IPv6) are refused, as is any IPv6 range that overlaps `::ffff:0:0/96`, `::/96`, `2002::/16` or `64:ff9b::/96`, because HAProxy also tests IPv4 clients as mapped IPv6 addresses and such a range would make every IPv4 client look like Cloudflare. Cloudflare's own widest ranges are `/13` and `/29`. Changing the list reloads HAProxy.
+
+An address allowlist proves that a request came through Cloudflare, not that it came through your Cloudflare zone: anyone's zone or Worker can connect from the same addresses, so another account can proxy to your origin if it learns its address. The fix is the [zone lock](#zone-lock-prove-the-request-came-through-your-cloudflare-zone) below, which works in both Full and Flexible mode. Keep the origin address private as well. For sensitive sites also prefer Full mode with Authenticated Origin Pulls (mutual TLS at Cloudflare), which the edge does not enforce yet and which is not available in Flexible mode.
+
+This protects only the HTTP port of the edge. Anything that can reach a backend directly, or the node's other ports, is not covered, so also firewall the origin so that it accepts traffic from Cloudflare only where you can.
+
+### Flexible SSL
+
+In Flexible mode Cloudflare serves HTTPS to visitors and connects to your origin over plain HTTP on the edge's HTTP port, so the origin needs no certificate. The edge never redirects the site to HTTPS. For connections from Cloudflare it sets `X-Forwarded-Proto` from the value Cloudflare sent, but only if that value is exactly `https`; anything else, including a missing header, becomes `http`. Connections from any other peer keep the normal logic, which sets `X-Forwarded-Proto` from the connection itself.
+
+Traffic between Cloudflare and the origin is unencrypted in this mode, so anyone on that path can read or change it. Use Flexible together with `cloudflare_only`, and do not use it for sensitive data (logins, payments, personal information) unless you use Cloudflare's Full or Full (strict) mode instead and give the origin a certificate. A site with `cloudflare_only` and `tls` of `full` works through the edge's HTTPS port exactly as an ordinary site does.
+
+Because Cloudflare connects over plain HTTP, Flexible mode rules out Authenticated Origin Pulls, so on its own the address allowlist is the only proof that traffic came through Cloudflare; add the zone lock to prove it came through your zone. Flexible mode also needs the range list, to tell Cloudflare apart from other peers, even when `cloudflare_only` is off.
+
+### Zone lock: prove the request came through your Cloudflare zone
+
+All Cloudflare customers share the same edge addresses, so the address check cannot tell your zone from anyone else's. Cloudflare cannot tell the origin which zone a request is for, but you can add a secret header with one free Transform Rule, and the edge refuses requests without it.
+
+1. Turn the lock on for the site: `"access": {"cloudflare_only": true, "zone_lock": true}`. `zone_lock` requires `cloudflare_only`. The node generates a secret for the site (32 to 128 characters from letters, digits, `-` and `_`) and shows it once, when the lock is enabled or rotated.
+2. In Cloudflare, go to Rules > Transform Rules > Modify Request Header, create a rule that matches the site's hostname, and under Modify request header choose Set static: header name `X-Cite-Origin-Secret`, value the secret.
+
+The secret is not part of the site or the rules JSON, so the API never returns it. The node keeps it in a node-local file (mode 0600) and adds the lock rule when it renders the config. A site with `zone_lock` on is never rendered without its lock: if the secret is missing, or no enabled zone-lock rule is present, rendering fails instead of leaving the site open. In the crate, `cite_edge::presets::with_zone_locks(cfg, secret_for)` returns a copy of the config with the rule added for each locked site (an error if a secret is missing), and `zone_lock_rule(site_id, secret)` builds the single rule:
+
+```json
+{"id": "zone-shop", "name": "Cloudflare zone lock", "enabled": true, "action": "deny",
+ "label": "cloudflare-zone", "site": "shop",
+ "matchers": {"header": {"name": "X-Cite-Origin-Secret", "equals": "<secret>", "negate": true, "secret": true}}}
+```
+
+The rule id is `zone-<site>` when that fits in 40 characters, otherwise `zone-` plus the first 26 characters of the site id and a short hash of the whole id, so two long site ids never collide. Ids starting with `zone-` are reserved: a rule of your own that reuses one is refused with an error that says so. The edge deletes `X-Cite-Origin-Secret` from every request on the node, not only those of the locked site, because Cloudflare sends it for the whole hostname. A request without the header, or with a different value, answers 403 and is recorded with the label `cloudflare-zone`, so it shows up in the Traffic blocked-by-rule table with its user agent and bot class like any other block. Once the check has passed the edge deletes `X-Cite-Origin-Secret` from the request, so the site's backend never sees the secret.
+
+- To rotate the secret, rotate it from the console or desktop app, then paste the new value into the Cloudflare Transform Rule. The two changes cannot land at the same instant, so requests are refused with 403 in between; do them back to back.
+- The secret is written into the rendered `haproxy.cfg` (HAProxy has to compare it), so protect that file and the node's secret file like a credential. It is redacted in the rule's debug output and in validation errors, and it is never put in a log or analytics label. The config hash changes when the secret changes, so a rotation reloads HAProxy.
+- In Flexible mode the hop from Cloudflare to the origin is plain HTTP, so the secret crosses it in cleartext. Anyone who can read that path can learn it and replay it. In Full mode it travels over TLS. The lock raises the cost of a casual bypass in Flexible mode; it does not make that hop private.
+- The lock is a shared secret, not a signature: anyone who learns it can reach the site by adding the header. Keep the origin address private as well, and combine the lock with `cloudflare_only`.
+
+### Bot policy
+
+`bots` controls what the edge does with requests from known bots, judged by the `User-Agent` header:
+
+| Value | Effect |
+|---|---|
+| `allow` | The default. Nothing is blocked. |
+| `block_bad` | Answers 403 to command-line tools, HTTP libraries and security scanners (`curl`, `wget`, `python-requests`, `sqlmap`, `nikto` and the rest of the lists in [Bot policy](firewall.md#bot-policy)). A request with no user agent at all is not blocked by this setting. |
+| `block_all` | Also answers 403 to search engines, link-preview bots, SEO and AI crawlers and uptime monitors. |
+
+Blocked requests still count in analytics: they are logged with the label `bots-bad` or `bots-all`, their user agent, and the bot class and score computed from it, exactly like firewall blocks. User-agent matching is advisory because clients choose their own header, so it stops honest tools and lazy scripts only. `block_all` also removes the site from search results and link previews; do not use it on a site that needs search traffic. The token lists are shared with the Traffic bot classifier, so they cannot drift apart.
+
+Other per-site rules such as redirects (add or remove `www.`, force HTTPS), response headers and CORS are firewall rules scoped to the site; see [the firewall page](firewall.md#rules).
+
 ## Memory
 
 After a deploy the previous release keeps running for `CITE_WARM_GRACE` (24 h by default) so rollback is instant, and the executor holds two SSR processes. An open stream (response body or WebSocket) keeps the previous process until it ends, or until the later of that grace and `CITE_DRAIN_MAX`. The default `CITE_EXECUTOR_MEM` is `1g`; raise it for heavy apps, or shorten `CITE_WARM_GRACE`. Raise `CITE_DRAIN_MAX` when a stream should outlive the grace.
