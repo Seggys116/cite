@@ -5,9 +5,9 @@ use gpui::{AnyElement, Context, Entity, div, prelude::*, px};
 use crate::app::{Confirm, Console, Load, new_input};
 use crate::model::{action_label, matcher_summary};
 use crate::rules::{
-    CorsDraft, HeaderOpDraft, MAX_HEADER_OPS, REDIRECT_EXAMPLES, REDIRECT_PLACEHOLDERS,
-    REDIRECT_STATUSES, RuleDraft, RuleKind, build_rule, effect_detail, effect_pill, op_label,
-    target_label,
+    CondKind, CondRow, CorsDraft, HeaderOpDraft, MAX_HEADER_OPS, REDIRECT_EXAMPLES,
+    REDIRECT_PLACEHOLDERS, REDIRECT_STATUSES, RuleDraft, RuleKind, build_rule, effect_detail,
+    effect_pill, op_label, rows_from_list, target_label,
 };
 use crate::theme::{DIM, Tone, c};
 use crate::ui::input::TextInput;
@@ -173,25 +173,33 @@ impl Console {
         } else {
             t(&f.header_value)
         };
+        let mut conditions = Vec::new();
+        for (kind, text) in [
+            (CondKind::PathPrefix, t(&f.path_prefix)),
+            (CondKind::PathRegex, t(&f.path_regex)),
+            (CondKind::UserAgent, t(&f.ua)),
+            (CondKind::Referer, t(&f.referer)),
+            (CondKind::Method, t(&f.methods)),
+            (CondKind::Host, t(&f.host)),
+            (CondKind::Cidr, t(&f.cidrs)),
+        ] {
+            conditions.extend(rows_from_list(kind, &text));
+        }
+        conditions.extend(f.scheme.map(|s| CondRow::value(CondKind::Scheme, s)));
+        conditions.push(CondRow::header(
+            &t(&f.header_name),
+            &header_value,
+            f.header_regex,
+            f.header_negate,
+            f.header_secret,
+        ));
         RuleDraft {
             name: t(&f.name),
             label: t(&f.label),
             site: t(&f.site),
             kind: f.kind,
             action: f.action,
-            path_regex: t(&f.path_regex),
-            path_prefix: t(&f.path_prefix),
-            methods: t(&f.methods),
-            user_agent_regex: t(&f.ua),
-            cidrs: t(&f.cidrs),
-            host: t(&f.host),
-            header_name: t(&f.header_name),
-            header_value,
-            header_regex: f.header_regex,
-            header_negate: f.header_negate,
-            header_secret: f.header_secret,
-            scheme: f.scheme.map(str::to_string),
-            referer_regex: t(&f.referer),
+            conditions,
             redirect_to: t(&f.redirect_to),
             redirect_status: f.redirect_status,
             header_ops: f
@@ -531,15 +539,23 @@ impl Console {
         form = form
             .child(strong("Matchers").text_size(px(13.)))
             .child(
-                text_dim("Every filled matcher must match for the rule to fire.")
+                text_dim("Values of one matcher are alternatives; every filled matcher must match for the rule to fire.")
                     .text_size(px(12.)),
             )
             .child(
                 div()
                     .flex()
                     .gap(px(12.))
-                    .child(half("Path regex", None, &f.path_regex))
-                    .child(half("Path prefix", None, &f.path_prefix)),
+                    .child(half(
+                        "Path regex",
+                        Some("Several allowed, separated by spaces: any one may match"),
+                        &f.path_regex,
+                    ))
+                    .child(half(
+                        "Path prefix",
+                        Some("Several allowed, separated by commas: any one may match"),
+                        &f.path_prefix,
+                    )),
             )
             .child(
                 div()

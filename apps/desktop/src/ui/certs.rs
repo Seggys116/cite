@@ -7,11 +7,12 @@ use gpui::{AnyElement, Context, Div, Entity, div, prelude::*, px};
 use crate::app::{Confirm, Console, Load, new_input};
 use crate::bots::is_unsupported;
 use crate::certs::{
-    AccessDraft, BOTS_NOTE, CertBusy, CertItem, CertListing, ClearOn, FLEXIBLE_HELP, FULL_HELP,
-    MANUAL_NOTE, RangesListing, UploadForm, bots_help, bots_label, bots_warning, classify_expiry,
-    clears_for, coverage_text, date_text, days_text, delete_message, ensure_same_node,
-    flexible_warning, is_custom_source, parse_port, parse_range_list, ranges_summary, ranges_text,
-    sans_text, short_fingerprint, uncovered_note, uploaded_text, validity_text, zone_lock_help,
+    AccessDraft, BOTS_NOTE, CertBusy, CertItem, CertListing, ClearOn, FLEXIBLE_HELP,
+    FLEXIBLE_LABEL, FULL_HELP, FULL_LABEL, MANUAL_NOTE, PROXY_HELP, PROXY_LABEL, RangesListing,
+    UploadForm, ZONE_LABEL, bots_help, bots_label, bots_warning, classify_expiry, clears_for,
+    coverage_text, date_text, days_text, delete_message, ensure_same_node, flexible_warning,
+    is_custom_source, parse_port, parse_range_list, ranges_summary, ranges_text, sans_text,
+    short_fingerprint, uncovered_note, uploaded_text, validity_text, zone_lock_help,
 };
 use crate::scope::{Sequence, foreign_notice};
 use crate::theme::{BORDER, DIM, MONO, ROW_RADIUS, Tone, c};
@@ -857,24 +858,21 @@ pub fn access_body(controls: AccessControls, draft: AccessDraft) -> Div {
                 .items_center()
                 .gap(px(10.))
                 .child(controls.cloudflare_box)
-                .child(div().child("Only accept traffic from Cloudflare")),
+                .child(div().child(PROXY_LABEL)),
         )
-        .child(
-            text_dim("Requests from other addresses are refused, using the ranges in Settings.")
-                .text_size(px(12.)),
-        )
+        .child(text_dim(PROXY_HELP).text_size(px(12.)))
         .child(
             div()
                 .flex()
                 .items_center()
                 .gap(px(10.))
                 .child(controls.zone_box)
-                .child(div().child("Only my Cloudflare zone"))
+                .child(div().child(ZONE_LABEL))
                 .when(!draft.cloudflare_only, |d| d.opacity(0.5)),
         )
-        .child(text_dim(zone_lock_help(draft.cloudflare_only)).text_size(px(12.)))
+        .child(text_dim(zone_lock_help(draft.cloudflare_only, draft.zone_lock)).text_size(px(12.)))
         .child(field(
-            "SSL mode",
+            "HTTPS",
             Some(help),
             div().flex().child(controls.ssl_mode),
         ))
@@ -917,7 +915,7 @@ pub fn access_controls(
     }
     let ssl_key = format!("{prefix}-ssl");
     let mut ssl = Vec::new();
-    for (flexible, label) in [(false, "Full"), (true, "Flexible")] {
+    for (flexible, label) in [(false, FULL_LABEL), (true, FLEXIBLE_LABEL)] {
         ssl.push(
             seg_item(id(&ssl_key, label), label, draft.flexible == flexible)
                 .on_click(cx.listener(move |this, _, _, cx| {

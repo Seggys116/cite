@@ -100,19 +100,13 @@ pub fn slugify(text: &str) -> String {
 }
 
 // A throwaway rule runs the exact validation the connector applies, so the message matches.
-pub fn regex_problem(pattern: &str) -> Option<String> {
-    if pattern.is_empty() {
-        return None;
-    }
+pub fn matcher_problem(matchers: Matchers) -> Option<String> {
     let probe = FirewallRule {
         id: "probe".into(),
         name: "probe".into(),
         enabled: true,
         action: Some(FirewallAction::Deny),
-        matchers: Matchers {
-            path_regex: Some(pattern.to_string()),
-            ..Matchers::default()
-        },
+        matchers,
         ..FirewallRule::default()
     };
     validate_rule(&probe).err().map(|e| {
@@ -124,14 +118,52 @@ pub fn regex_problem(pattern: &str) -> Option<String> {
     })
 }
 
-// The sample check mirrors the pattern field so a bad regex reports no match result at all.
-pub fn regex_matches(pattern: &str, sample: &str) -> Option<bool> {
-    if pattern.is_empty() || sample.is_empty() || regex_problem(pattern).is_some() {
+// Routing paths are checked as a rule's path matchers, which share the node's list limits and regex subset.
+pub fn paths_problem(prefixes: &[String], regexes: &[String]) -> Option<String> {
+    if prefixes.is_empty() && regexes.is_empty() {
         return None;
     }
-    regex::Regex::new(pattern)
-        .ok()
-        .map(|re| re.is_match(sample))
+    matcher_problem(Matchers {
+        path_prefixes: prefixes.to_vec(),
+        path_regexes: regexes.to_vec(),
+        ..Matchers::default()
+    })
+}
+
+// A sample path is routed when it starts with any prefix or matches any regex; None while there is nothing to judge.
+pub fn paths_match(prefixes: &[String], regexes: &[String], sample: &str) -> Option<bool> {
+    let prefixes = clean_list(prefixes.iter().cloned());
+    let regexes = clean_list(regexes.iter().cloned());
+    if sample.is_empty()
+        || (prefixes.is_empty() && regexes.is_empty())
+        || paths_problem(&prefixes, &regexes).is_some()
+    {
+        return None;
+    }
+    if prefixes.iter().any(|p| sample.starts_with(p.as_str())) {
+        return Some(true);
+    }
+    Some(
+        regexes
+            .iter()
+            .filter_map(|r| regex::Regex::new(r).ok())
+            .any(|re| re.is_match(sample)),
+    )
+}
+
+pub const PATHS_HINT: &str = "Optional. Leave empty to route every path. A request is routed when its path starts with any prefix or matches any regex.";
+pub const PATHS_LIMITS: &str = "Prefixes start with /. Regexes use a small safe subset: literals, classes, groups, | and the repeats ? * + {n,m}; lookarounds, backreferences and \\p are refused. Up to 16 prefixes and 16 regexes, 256 characters each.";
+
+// Blank entries are dropped and repeats collapse, so a list always reaches the node as distinct values.
+pub fn clean_list(items: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for item in items {
+        let t = item.trim().to_string();
+        if !t.is_empty() && !out.contains(&t) {
+            out.push(t);
+        }
+    }
+    out
 }
 
 fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
@@ -222,6 +254,11 @@ pub fn read_info(info: &NodeInfo) -> InfoView {
             .and_then(|h| h.get("running"))
             .and_then(Value::as_bool),
     }
+}
+
+// Older connectors do not report the field, which reads as no node-level token.
+pub fn node_has_github_token(info: &NodeInfo) -> bool {
+    info.github.as_ref().is_some_and(|g| g.token_configured)
 }
 
 pub fn merge_top(lists: Vec<&Vec<TopItem>>, keep: usize) -> Vec<TopItem> {
@@ -462,18 +499,36 @@ pub fn fmt_targets(targets: &[Target]) -> String {
         .join(", ")
 }
 
+// Where a new site's content comes from; building from GitHub is the product's main path.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SourceKind {
+    #[default]
+    Github,
+    Servers,
+}
+
+pub const RUNTIMES: [&str; 4] = ["node", "bun", "static", "rust"];
+pub const NODE_MAJORS: [u8; 2] = [22, 24];
+pub const DEFAULT_RUNTIME: &str = "node";
+pub const DEFAULT_POLL: &str = "5m";
+
 #[derive(Clone, Default)]
 pub struct SiteDraft {
     pub api: bool,
+    pub source: SourceKind,
     pub name: String,
     pub id: String,
     pub hosts: String,
-    pub path_regex: String,
+    pub path_prefixes: Vec<String>,
+    pub path_regexes: Vec<String>,
     pub blue: String,
     pub green: String,
     pub health_path: String,
     pub repo: String,
     pub branch: String,
+    pub runtime: String,
+    pub node_major: u8,
+    pub poll_interval: String,
     pub github_token: String,
     pub access: crate::certs::AccessDraft,
 }
@@ -482,48 +537,124 @@ impl std::fmt::Debug for SiteDraft {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SiteDraft")
             .field("api", &self.api)
+            .field("source", &self.source)
             .field("name", &self.name)
             .field("id", &self.id)
             .field("hosts", &self.hosts)
-            .field("path_regex", &self.path_regex)
+            .field("path_prefixes", &self.path_prefixes)
+            .field("path_regexes", &self.path_regexes)
             .field("blue", &self.blue)
             .field("green", &self.green)
             .field("health_path", &self.health_path)
             .field("repo", &self.repo)
             .field("branch", &self.branch)
+            .field("runtime", &self.runtime)
+            .field("node_major", &self.node_major)
+            .field("poll_interval", &self.poll_interval)
             .field("github_token", &"[redacted]")
             .field("access", &self.access)
             .finish()
     }
 }
 
+// Accepts owner/name or a github.com URL and returns owner/name.
+pub fn normalize_repo(text: &str) -> String {
+    let t = text.trim().trim_end_matches('/');
+    let t = t.strip_suffix(".git").unwrap_or(t);
+    for prefix in ["https://github.com/", "http://github.com/", "github.com/"] {
+        if let Some(rest) = t.strip_prefix(prefix) {
+            return rest.to_string();
+        }
+    }
+    t.to_string()
+}
+
+pub fn repo_problem(text: &str) -> Option<String> {
+    let repo = normalize_repo(text);
+    let part_ok = |p: &str| {
+        !p.is_empty()
+            && !p.starts_with('.')
+            && p.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    };
+    let parts: Vec<&str> = repo.split('/').collect();
+    (parts.len() != 2 || !parts.iter().all(|p| part_ok(p)))
+        .then(|| "The repository must look like owner/name.".to_string())
+}
+
+pub fn branch_problem(text: &str) -> Option<String> {
+    let b = text.trim();
+    let ok = !b.is_empty()
+        && b.len() <= 256
+        && b.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '-'))
+        && !b.starts_with('/')
+        && !b.ends_with('/')
+        && !b.contains("..");
+    (!ok).then(|| "The branch contains characters git refs do not allow here.".to_string())
+}
+
+pub fn poll_problem(text: &str) -> Option<String> {
+    let t = text.trim();
+    let digits = t.strip_suffix(['s', 'm', 'h']).unwrap_or("");
+    let ok = !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit());
+    (!ok).then(|| "The poll interval must be a number with s, m or h, such as 5m.".to_string())
+}
+
+pub fn runtime_problem(text: &str) -> Option<String> {
+    (!RUNTIMES.contains(&text.trim())).then(|| "Pick node, bun, static or rust.".to_string())
+}
+
+// The GitHub fields, in the order the form shows them.
+pub fn github_problem(draft: &SiteDraft) -> Option<String> {
+    repo_problem(&draft.repo)
+        .or_else(|| branch_problem(&draft.branch))
+        .or_else(|| runtime_problem(&draft.runtime))
+        .or_else(|| poll_problem(&draft.poll_interval))
+        .or_else(|| {
+            (draft.runtime.trim() != "rust" && !NODE_MAJORS.contains(&draft.node_major))
+                .then(|| "Pick Node 22 or 24.".to_string())
+        })
+}
+
 pub fn build_site(draft: &SiteDraft) -> Result<Site, String> {
     if draft.name.trim().is_empty() {
         return Err("Give the site a name.".into());
     }
-    let blue = parse_targets(&draft.blue)?;
-    if blue.is_empty() {
-        return Err("Add at least one blue target.".into());
+    let github = draft.source == SourceKind::Github;
+    let (blue, green, source) = if github {
+        if let Some(problem) = github_problem(draft) {
+            return Err(problem);
+        }
+        let runtime = draft.runtime.trim().to_string();
+        // The node builds the live slot itself, so both slots start empty.
+        let source = Source {
+            repo: normalize_repo(&draft.repo),
+            branch: Some(draft.branch.trim().to_string()),
+            node_major: (runtime != "rust").then_some(draft.node_major),
+            runtime: Some(runtime),
+            poll_interval: Some(draft.poll_interval.trim().to_string()),
+            secret: None,
+        };
+        (Vec::new(), Vec::new(), Some(source))
+    } else {
+        let blue = parse_targets(&draft.blue)?;
+        if blue.is_empty() {
+            return Err("Add at least one blue target.".into());
+        }
+        (blue, parse_targets(&draft.green)?, None)
+    };
+    let prefixes = clean_list(draft.path_prefixes.iter().cloned());
+    let regexes = clean_list(draft.path_regexes.iter().cloned());
+    if let Some(problem) = paths_problem(&prefixes, &regexes) {
+        return Err(format!("The routing paths are not valid: {problem}"));
     }
-    let green = parse_targets(&draft.green)?;
-    let path = draft.path_regex.trim();
-    if let Some(problem) = regex_problem(path) {
-        return Err(format!("The path regex is not valid: {problem}"));
-    }
-    let repo = draft.repo.trim();
-    let source = (!repo.is_empty()).then(|| Source {
-        repo: repo.to_string(),
-        branch: Some(draft.branch.trim().to_string()).filter(|b| !b.is_empty()),
-        runtime: None,
-        node_major: None,
-        poll_interval: None,
-        secret: None,
-    });
     let site = Site {
         id: draft.id.trim().to_string(),
         name: draft.name.trim().to_string(),
         hosts: parse_hosts(&draft.hosts),
-        path_regex: (!path.is_empty()).then(|| path.to_string()),
+        path_prefixes: prefixes,
+        path_regexes: regexes,
         kind: if draft.api {
             SiteKind::Api
         } else {
@@ -557,10 +688,10 @@ pub enum Placement {
     ReplicateAll,
 }
 
-// The token travels beside the site, never inside it, and only applies when a repository is set.
+// The token travels beside the site, never inside it, and only applies to sites built from GitHub.
 pub fn draft_github_token(draft: &SiteDraft) -> Option<String> {
     let token = draft.github_token.trim();
-    (!token.is_empty() && !draft.repo.trim().is_empty()).then(|| token.to_string())
+    (!token.is_empty() && draft.source == SourceKind::Github).then(|| token.to_string())
 }
 
 // Resolves which nodes receive the site and the plan that describes how each one gets it.
@@ -591,23 +722,15 @@ pub fn plan_placement(
 // A secret header value is never part of the summary, so the list cannot show it back.
 pub fn matcher_summary(m: &Matchers) -> Vec<String> {
     let mut out = Vec::new();
-    if let Some(v) = &m.path_regex {
-        out.push(format!("path ~ {v}"));
-    }
-    if let Some(v) = &m.path_prefix {
-        out.push(format!("path {v}*"));
-    }
+    out.extend(m.path_regexes.iter().map(|v| format!("path ~ {v}")));
+    out.extend(m.path_prefixes.iter().map(|v| format!("path {v}*")));
     if !m.methods.is_empty() {
         out.push(m.methods.join(" "));
     }
-    if let Some(v) = &m.user_agent_regex {
-        out.push(format!("ua ~ {v}"));
-    }
+    out.extend(m.user_agent_regexes.iter().map(|v| format!("ua ~ {v}")));
     out.extend(m.cidrs.iter().cloned());
-    if let Some(v) = &m.host {
-        out.push(format!("host {v}"));
-    }
-    if let Some(h) = &m.header {
+    out.extend(m.hosts.iter().map(|v| format!("host {v}")));
+    for h in &m.headers {
         let (op, value) = match (&h.regex, &h.equals) {
             _ if h.secret => (if h.negate { "!=" } else { "=" }, "(hidden)".to_string()),
             (Some(re), _) => (if h.negate { "!~" } else { "~" }, re.clone()),
@@ -619,9 +742,7 @@ pub fn matcher_summary(m: &Matchers) -> Vec<String> {
     if let Some(v) = &m.scheme {
         out.push(format!("scheme {v}"));
     }
-    if let Some(v) = &m.referer_regex {
-        out.push(format!("referer ~ {v}"));
-    }
+    out.extend(m.referer_regexes.iter().map(|v| format!("referer ~ {v}")));
     out
 }
 
@@ -788,7 +909,21 @@ mod tests {
             hosts: "shop.example.com, www.example.com".into(),
             blue: "10.0.0.1:8080, 10.0.0.2:8080 50".into(),
             health_path: "/".into(),
+            source: SourceKind::Servers,
             ..SiteDraft::default()
+        }
+    }
+
+    fn github_draft() -> SiteDraft {
+        SiteDraft {
+            source: SourceKind::Github,
+            repo: "acme/shop".into(),
+            branch: "main".into(),
+            runtime: "node".into(),
+            node_major: 22,
+            poll_interval: "5m".into(),
+            blue: String::new(),
+            ..draft()
         }
     }
 
@@ -823,23 +958,6 @@ mod tests {
         assert_eq!(slugify("***"), "");
         assert!(slugify(&"a".repeat(80)).len() <= 40);
         assert_eq!(slugify("Caf\u{e9} Shop"), "caf-shop");
-    }
-
-    #[test]
-    fn regex_validity() {
-        assert_eq!(regex_problem(""), None);
-        assert_eq!(regex_problem("^/api/"), None);
-        assert!(regex_problem("(unclosed").is_some());
-        assert!(regex_problem("has space").is_some());
-    }
-
-    #[test]
-    fn regex_sample_matching() {
-        assert_eq!(regex_matches("^/api/", "/api/v1"), Some(true));
-        assert_eq!(regex_matches("^/api/", "/web"), Some(false));
-        assert_eq!(regex_matches("(", "/x"), None);
-        assert_eq!(regex_matches("", "/x"), None);
-        assert_eq!(regex_matches("^/", ""), None);
     }
 
     #[test]
@@ -930,8 +1048,37 @@ mod tests {
         no_targets.blue.clear();
         assert!(build_site(&no_targets).is_err());
         let mut bad_re = draft();
-        bad_re.path_regex = "(".into();
-        assert!(build_site(&bad_re).unwrap_err().contains("regex"));
+        bad_re.path_regexes = vec!["(".into()];
+        assert!(build_site(&bad_re).unwrap_err().contains("routing paths"));
+        let mut bad_prefix = draft();
+        bad_prefix.path_prefixes = vec!["no-slash".into()];
+        assert!(build_site(&bad_prefix).is_err());
+    }
+
+    #[test]
+    fn site_paths_are_lists_that_are_cleaned_and_limited() {
+        let mut d = draft();
+        d.path_prefixes = vec![" /a ".into(), "".into(), "/a".into(), "/b".into()];
+        d.path_regexes = vec!["^/c[0-9]+$".into(), "^/d".into()];
+        let site = build_site(&d).expect("valid");
+        assert_eq!(site.path_prefixes, vec!["/a", "/b"]);
+        assert_eq!(site.path_regexes.len(), 2);
+        d.path_prefixes = (0..40).map(|i| format!("/p{i}")).collect();
+        assert!(build_site(&d).unwrap_err().contains("at most"));
+        assert!(paths_problem(&[], &[]).is_none());
+        assert!(paths_problem(&["/ok".into()], &["^/x".into()]).is_none());
+        assert!(paths_problem(&[], &["(".into()]).is_some());
+        let (p, r) = (vec!["/static".to_string()], vec!["^/v[0-9]+/".to_string()]);
+        assert_eq!(paths_match(&p, &r, "/static/a.css"), Some(true));
+        assert_eq!(paths_match(&p, &r, "/v2/users"), Some(true));
+        assert_eq!(paths_match(&p, &r, "/other"), Some(false));
+        assert_eq!(paths_match(&p, &r, ""), None);
+        assert_eq!(paths_match(&[], &[], "/x"), None);
+        assert_eq!(paths_match(&[], &["(".to_string()], "/x"), None);
+        assert_eq!(
+            clean_list(["b".to_string(), "a".into(), "b".into(), " ".into()]),
+            ["b", "a"]
+        );
     }
 
     #[test]
@@ -954,14 +1101,18 @@ mod tests {
 
     #[test]
     fn site_drafts_carry_source() {
-        let mut d = draft();
-        d.repo = "https://github.com/acme/shop".into();
-        d.branch = "main".into();
+        let mut d = github_draft();
+        d.repo = "https://github.com/acme/shop.git".into();
         let token = crate::testkit::joined(&["gh", "-fixture", "-token"]);
         d.github_token = token.clone();
         let site = build_site(&d).expect("valid");
+        assert!(site.blue.targets.is_empty() && site.green.targets.is_empty());
         let source = site.source.expect("source");
+        assert_eq!(source.repo, "acme/shop");
         assert_eq!(source.branch.as_deref(), Some("main"));
+        assert_eq!(source.runtime.as_deref(), Some("node"));
+        assert_eq!(source.node_major, Some(22));
+        assert_eq!(source.poll_interval.as_deref(), Some("5m"));
         assert!(source.secret.is_none());
         assert!(
             draft_github_token(&d).as_deref() == Some(token.as_str()),
@@ -983,7 +1134,54 @@ mod tests {
             "values differ"
         );
         assert!(!format!("{plan:?}").contains(token.as_str()));
-        d.repo.clear();
+        d.source = SourceKind::Servers;
+        assert!(draft_github_token(&d).is_none());
+    }
+
+    #[test]
+    fn github_is_the_default_source() {
+        assert_eq!(SourceKind::default(), SourceKind::Github);
+        assert_eq!(SiteDraft::default().source, SourceKind::Github);
+    }
+
+    #[test]
+    fn github_drafts_need_no_targets_and_check_their_fields() {
+        let d = github_draft();
+        assert!(build_site(&d).is_ok());
+        for (repo, ok) in [
+            ("acme/shop", true),
+            ("https://github.com/acme/shop", true),
+            ("acme", false),
+            ("acme/.hidden", false),
+            ("a/b/c", false),
+            ("", false),
+        ] {
+            let mut x = d.clone();
+            x.repo = repo.into();
+            assert_eq!(build_site(&x).is_ok(), ok, "{repo}");
+        }
+        let mut x = d.clone();
+        x.runtime = "ruby".into();
+        assert!(build_site(&x).unwrap_err().contains("Pick node"));
+        let mut x = d.clone();
+        x.poll_interval = "soon".into();
+        assert!(build_site(&x).unwrap_err().contains("poll interval"));
+        let mut x = d.clone();
+        x.branch = "a..b".into();
+        assert!(build_site(&x).is_err());
+        let mut x = d.clone();
+        x.node_major = 18;
+        assert!(build_site(&x).is_err());
+        x.runtime = "rust".into();
+        let site = build_site(&x).expect("rust needs no node version");
+        assert_eq!(site.source.expect("source").node_major, None);
+    }
+
+    #[test]
+    fn server_drafts_carry_no_source() {
+        let mut d = draft();
+        d.repo = "acme/shop".into();
+        assert!(build_site(&d).expect("valid").source.is_none());
         assert!(draft_github_token(&d).is_none());
     }
 
@@ -1078,6 +1276,7 @@ mod tests {
         let info = NodeInfo {
             name: "n".into(),
             version: "1".into(),
+            github: None,
             extra,
         };
         assert_eq!(
@@ -1092,9 +1291,19 @@ mod tests {
         let bare = NodeInfo {
             name: String::new(),
             version: String::new(),
+            github: None,
             extra: Default::default(),
         };
         assert_eq!(read_info(&bare), InfoView::default());
+        assert!(!node_has_github_token(&bare));
+        let with = NodeInfo {
+            github: Some(cite_client::GithubInfo {
+                token_configured: true,
+                source: "env".into(),
+            }),
+            ..bare
+        };
+        assert!(node_has_github_token(&with));
     }
 
     #[test]
@@ -1214,25 +1423,25 @@ mod tests {
     #[test]
     fn matcher_summaries_and_names() {
         let m = Matchers {
-            path_prefix: Some("/admin".into()),
+            path_prefixes: vec!["/admin".into(), "/staff".into()],
             methods: vec!["POST".into()],
             cidrs: vec!["10.0.0.0/8".into()],
             ..Matchers::default()
         };
         assert_eq!(
             matcher_summary(&m),
-            vec!["path /admin*", "POST", "10.0.0.0/8"]
+            vec!["path /admin*", "path /staff*", "POST", "10.0.0.0/8"]
         );
         let extra = Matchers {
-            header: Some(cite_edge::model::HeaderMatch {
+            headers: vec![cite_edge::model::HeaderMatch {
                 name: "X-Beta".into(),
                 equals: Some(crate::testkit::joined(&["hidden", "-gate", "-value"])),
                 negate: true,
                 secret: true,
                 ..Default::default()
-            }),
+            }],
             scheme: Some("http".into()),
-            referer_regex: Some("spam".into()),
+            referer_regexes: vec!["spam".into()],
             ..Matchers::default()
         };
         let shown = matcher_summary(&extra);
@@ -1242,11 +1451,11 @@ mod tests {
         );
         assert!(!shown.join(" ").contains("hidden-gate-value"));
         let open = Matchers {
-            header: Some(cite_edge::model::HeaderMatch {
+            headers: vec![cite_edge::model::HeaderMatch {
                 name: "X-A".into(),
                 regex: Some("^a".into()),
                 ..Default::default()
-            }),
+            }],
             ..Matchers::default()
         };
         assert_eq!(matcher_summary(&open), vec!["header X-A ~ ^a"]);

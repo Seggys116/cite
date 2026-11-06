@@ -9,6 +9,7 @@ pub mod input;
 pub mod maintenance;
 pub mod nodes;
 pub mod overview;
+pub mod paths;
 pub mod settings;
 pub mod sites;
 pub mod storage;

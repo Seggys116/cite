@@ -40,6 +40,22 @@ fn status_err(code: u16, message: impl Into<String>) -> ClientError {
     }
 }
 
+// A blank secret matcher value on a saved rule means keep the stored one, as on the connector.
+fn keep_stored_secrets(rule: &mut FirewallRule, old: Option<&FirewallRule>) {
+    let Some(old) = old else { return };
+    for h in rule
+        .matchers
+        .headers
+        .iter_mut()
+        .filter(|h| h.secret && h.equals.as_deref() == Some(""))
+    {
+        let same = |p: &&HeaderMatch| p.secret && p.name.eq_ignore_ascii_case(&h.name);
+        if let Some(prev) = old.matchers.headers.iter().find(same) {
+            h.equals = prev.equals.clone();
+        }
+    }
+}
+
 // Formats epoch milliseconds as RFC 3339 without a date crate.
 pub fn iso(ms: i64) -> String {
     let secs = ms.div_euclid(1000);
@@ -698,7 +714,16 @@ fn seed_sites(node: i64, now: i64) -> Vec<Site> {
             id: id.into(),
             name: name.into(),
             hosts: hosts.iter().map(|h| (*h).to_string()).collect(),
-            path_regex: (id == "api").then(|| "^/v1/".to_string()),
+            path_regexes: if id == "api" {
+                vec!["^/v1/".to_string()]
+            } else {
+                Vec::new()
+            },
+            path_prefixes: if id == "api" {
+                vec!["/v2/".to_string()]
+            } else {
+                Vec::new()
+            },
             kind,
             blue: Upstream {
                 targets: targets(node, ports, if id == "shop" { 2 } else { 1 }, base * 10 + 1),
@@ -824,7 +849,7 @@ fn seed_rules() -> Vec<FirewallRule> {
             true,
             FirewallAction::Deny,
             Matchers {
-                path_regex: Some("^/wp-(login|admin)".into()),
+                path_regexes: vec!["^/wp-(login|admin)".into(), "^/xmlrpc\\.php$".into()],
                 ..m()
             },
             None,
@@ -835,7 +860,7 @@ fn seed_rules() -> Vec<FirewallRule> {
             true,
             FirewallAction::Deny,
             Matchers {
-                path_regex: Some("/\\.(env|git)(/|$)".into()),
+                path_regexes: vec!["/\\.(env|git)(/|$)".into()],
                 ..m()
             },
             None,
@@ -846,7 +871,7 @@ fn seed_rules() -> Vec<FirewallRule> {
             true,
             FirewallAction::Drop,
             Matchers {
-                path_prefix: Some("/phpmyadmin".into()),
+                path_prefixes: vec!["/phpmyadmin".into(), "/pma".into()],
                 ..m()
             },
             None,
@@ -857,7 +882,7 @@ fn seed_rules() -> Vec<FirewallRule> {
             true,
             FirewallAction::Tarpit,
             Matchers {
-                user_agent_regex: Some("(sqlmap|nikto|masscan)".into()),
+                user_agent_regexes: vec!["(sqlmap|nikto|masscan)".into(), "(?i)zgrab".into()],
                 ..m()
             },
             None,
@@ -890,14 +915,14 @@ fn seed_rules() -> Vec<FirewallRule> {
             true,
             FirewallAction::Deny,
             Matchers {
-                header: Some(HeaderMatch {
+                headers: vec![HeaderMatch {
                     name: "X-Beta-Key".into(),
                     equals: Some(demo_beta_key()),
                     negate: true,
                     secret: true,
                     ..HeaderMatch::default()
-                }),
-                path_prefix: Some("/beta".into()),
+                }],
+                path_prefixes: vec!["/beta".into()],
                 ..m()
             },
             Some("docs"),
@@ -909,6 +934,38 @@ fn seed_rules() -> Vec<FirewallRule> {
             }),
             label: Some("add-www".into()),
             ..effect("r-add-www", "Add www", "shop", m())
+        },
+        FirewallRule {
+            redirect: Some(Redirect {
+                to: "/blog".into(),
+                status: 301,
+            }),
+            label: Some("redirect-1".into()),
+            ..effect(
+                "redirect-1",
+                "Redirect /journal",
+                "",
+                Matchers {
+                    path_prefixes: vec!["/journal".into()],
+                    ..m()
+                },
+            )
+        },
+        FirewallRule {
+            redirect: Some(Redirect {
+                to: "/blog{path}{query}".into(),
+                status: 302,
+            }),
+            label: Some("redirect-2".into()),
+            ..effect(
+                "redirect-2",
+                "Redirect ^/posts/[0-9]+$",
+                "",
+                Matchers {
+                    path_regexes: vec!["^/posts/[0-9]+$".into()],
+                    ..m()
+                },
+            )
         },
         FirewallRule {
             cors: Some(Cors {
@@ -1186,6 +1243,11 @@ impl DemoNode {
         Ok(NodeInfo {
             name: self.name.clone(),
             version: "0.2.0".into(),
+            // Node 0 has CITE_GITHUB_TOKEN set and node 1 does not, so both token flows can be tried.
+            github: Some(cite_client::GithubInfo {
+                token_configured: self.index == 0,
+                source: if self.index == 0 { "env" } else { "none" }.into(),
+            }),
             extra,
         })
     }
@@ -1211,15 +1273,36 @@ impl DemoNode {
         })
     }
 
-    pub fn create_site(&self, site: &Site) -> Res<Site> {
+    // A source-built site needs a token from the request or the node, then gets a stack in its live slot.
+    pub fn create_site(&self, site: &Site, github_token: Option<&str>) -> Res<Site> {
         check_access(site)?;
+        let mut site = site.clone();
+        let node_token = self.index == 0;
+        if site.source.is_some() {
+            if github_token.is_none_or(str::is_empty) && !node_token {
+                return Err(status_err(
+                    400,
+                    "No GitHub token: set CITE_GITHUB_TOKEN on the connector (or pass github_token for this site)",
+                ));
+            }
+            let live = match site.active {
+                Slot::Blue => &mut site.blue,
+                Slot::Green => &mut site.green,
+            };
+            if live.targets.is_empty() {
+                live.targets.push(Target {
+                    addr: "127.0.0.1:3100".into(),
+                    weight: 100,
+                });
+            }
+        }
         let mut st = self.st();
         if st.sites.iter().any(|s| s.id == site.id) {
             return Err(status_err(409, format!("site {} already exists", site.id)));
         }
         st.sites.push(site.clone());
-        sync_zone(&mut st, site);
-        Ok(site.clone())
+        sync_zone(&mut st, &site);
+        Ok(site)
     }
 
     pub fn update_site(&self, id: &str, site: &Site) -> Res<Site> {
@@ -1385,8 +1468,15 @@ impl DemoNode {
         Ok(())
     }
 
+    // Like a real node, a listing never carries a secret matcher value.
     pub fn list_rules(&self) -> Res<Vec<FirewallRule>> {
-        Ok(self.st().rules.clone())
+        let mut rules = self.st().rules.clone();
+        for rule in &mut rules {
+            for h in rule.matchers.headers.iter_mut().filter(|h| h.secret) {
+                h.equals = Some(String::new());
+            }
+        }
+        Ok(rules)
     }
 
     pub fn create_rule(&self, rule: &FirewallRule) -> Res<FirewallRule> {
@@ -1396,15 +1486,15 @@ impl DemoNode {
     }
 
     pub fn update_rule(&self, id: &str, rule: &FirewallRule) -> Res<FirewallRule> {
-        cite_edge::validate::validate_rule(rule).map_err(|e| status_err(400, e.to_string()))?;
         let mut st = self.st();
-        match st.rules.iter_mut().find(|r| r.id == id) {
-            Some(slot) => {
-                *slot = rule.clone();
-                Ok(rule.clone())
-            }
-            None => Err(status_err(404, format!("rule {id} not found"))),
-        }
+        let Some(at) = st.rules.iter().position(|r| r.id == id) else {
+            return Err(status_err(404, format!("rule {id} not found")));
+        };
+        let mut next = rule.clone();
+        keep_stored_secrets(&mut next, Some(&st.rules[at]));
+        cite_edge::validate::validate_rule(&next).map_err(|e| status_err(400, e.to_string()))?;
+        st.rules[at] = next.clone();
+        Ok(next)
     }
 
     pub fn delete_rule(&self, id: &str) -> Res<()> {
@@ -1943,7 +2033,13 @@ mod tests {
         for site in node.list_sites().expect("sites") {
             validate_site(&site).unwrap_or_else(|e| panic!("{}: {e}", site.id));
         }
-        for rule in node.list_rules().expect("rules") {
+        for mut rule in node.list_rules().expect("rules") {
+            // listings hide secret values, so a stand-in goes where the stored one would be
+            for header in &mut rule.matchers.headers {
+                if header.secret && header.equals.as_deref() == Some("") {
+                    header.equals = Some("stand-in-value".into());
+                }
+            }
             validate_rule(&rule).unwrap_or_else(|e| panic!("{}: {e}", rule.id));
         }
     }
@@ -2382,7 +2478,12 @@ mod tests {
         assert_eq!(kind("r-add-www"), crate::rules::RuleKind::Redirect);
         assert_eq!(kind("r-api-cors"), crate::rules::RuleKind::Effects);
         let gate = rules.iter().find(|r| r.id == "r-beta-gate").expect("gate");
-        assert!(gate.matchers.header.as_ref().is_some_and(|h| h.secret));
+        assert!(gate.matchers.headers.iter().all(|h| h.secret));
+        assert!(gate.matchers.headers.len() == 1);
+        assert!(
+            gate.matchers.headers[0].equals.as_deref() == Some(""),
+            "the listing never carries the secret"
+        );
         let listed = crate::model::matcher_summary(&gate.matchers).join(" ");
         assert!(!listed.contains(demo_beta_key().as_str()), "{listed}");
     }
@@ -2429,6 +2530,42 @@ mod tests {
                 .status_code(),
             Some(400)
         );
+    }
+
+    #[test]
+    fn demo_rules_keep_a_blank_secret_matcher_on_save() {
+        let node = &demo_nodes()[0].1;
+        let mut gate = node
+            .list_rules()
+            .expect("rules")
+            .into_iter()
+            .find(|r| r.id == "r-beta-gate")
+            .expect("gate");
+        gate.name = "Renamed gate".into();
+        node.update_rule("r-beta-gate", &gate).expect("kept");
+        let secret = demo_beta_key();
+        let stored = node
+            .st()
+            .rules
+            .iter()
+            .find(|r| r.id == "r-beta-gate")
+            .cloned()
+            .expect("gate");
+        assert!(
+            stored.matchers.headers[0].equals.as_deref() == Some(secret.as_str()),
+            "stored secret changed"
+        );
+    }
+
+    #[test]
+    fn demo_sites_and_rules_use_the_list_shapes() {
+        let node = &demo_nodes()[0].1;
+        let api = node.get_site("api").expect("api").site;
+        assert_eq!((api.path_regexes.len(), api.path_prefixes.len()), (1, 1));
+        let rules = node.list_rules().expect("rules");
+        let wp = rules.iter().find(|r| r.id == "r-wp-login").expect("wp");
+        assert_eq!(wp.matchers.path_regexes.len(), 2);
+        assert!(rules.iter().filter(|r| r.redirect.is_some()).count() >= 3);
     }
 
     #[test]
