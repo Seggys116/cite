@@ -461,7 +461,7 @@ denied "unsupported API version" GET /v1.10/containers/json
 AFTER=$(docker_state)
 expect "docker state is unchanged by every denied request" "$BEFORE" "$AFTER"
 
-# The manager cannot reach GitHub, so the idle slot never gets a release: a 409 with active unchanged is the documented outcome.
+# This site's manager never gets its repository (the token is refused or GitHub is out of reach), so the connector fails the deploy early: a 409 with active unchanged is the documented outcome.
 echo "== deploy of a ref to the idle slot"
 API_TIMEOUT=240 api POST "/api/v1/sites/$SITE/deploy" '{"git_ref":"release","note":"e2e ref deploy"}'
 case $CODE in

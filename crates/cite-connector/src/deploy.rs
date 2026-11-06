@@ -14,7 +14,7 @@ use tokio::time::sleep;
 
 use crate::error::{ConnectorError, Result};
 use crate::haproxy::Haproxy;
-use crate::orchestrator::{Orchestrator, StackOpts};
+use crate::orchestrator::{Orchestrator, SlotInspect, StackOpts};
 use crate::siteops::{EnvKind, OpGuard, RESTART_LOOP, SiteOps, SlotProbe, repo_record};
 use crate::store::{Store, now_rfc3339};
 
@@ -30,6 +30,10 @@ const RELEASE_MARGIN: Duration = Duration::from_secs(5 * 60);
 const RELEASE_POLL: Duration = Duration::from_secs(2);
 const TOKEN_WAIT: Duration = Duration::from_secs(60);
 const SILENT_HEALTHY_PROBES: u32 = 3;
+const INVALID_TOKEN_PROBES: u32 = 2;
+const STUCK_PROBES: u32 = 3;
+// Three manager healthchecks (30 s apart), since the report only changes when one runs.
+const STUCK_WINDOW: Duration = Duration::from_secs(90);
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Timing {
@@ -40,6 +44,7 @@ pub(crate) struct Timing {
     pub(crate) release_wait: Duration,
     pub(crate) poll: Duration,
     pub(crate) token_wait: Duration,
+    stuck_window: Duration,
 }
 
 pub struct Deployer {
@@ -72,6 +77,129 @@ pub enum DeployReply {
 enum Release {
     Live { sha: Option<String> },
     Failed { reason: String, sha: Option<String> },
+}
+
+// What the probes of one deploy have shown so far, so a manager that can never handle the deploy id
+// fails the deploy early instead of after the whole release wait.
+struct ReleaseWatch<'a> {
+    deploy_id: &'a str,
+    stuck_window: Duration,
+    silent: u32,
+    invalid_token: u32,
+    stuck: u32,
+    stuck_since: Option<Instant>,
+    stuck_on: Option<(String, Option<String>, Option<String>)>,
+}
+
+impl<'a> ReleaseWatch<'a> {
+    fn new(deploy_id: &'a str, stuck_window: Duration) -> Self {
+        ReleaseWatch {
+            deploy_id,
+            stuck_window,
+            silent: 0,
+            invalid_token: 0,
+            stuck: 0,
+            stuck_since: None,
+            stuck_on: None,
+        }
+    }
+
+    fn observe(&mut self, seen: &SlotInspect, now: Instant) -> Option<Release> {
+        let deploy_id = self.deploy_id;
+        let healthy = seen.health == "healthy";
+        // A healthy 0.4.0 manager always prints a report, so a silent healthy one is an older image.
+        if healthy && seen.manager_report.is_none() {
+            self.silent += 1;
+            if self.silent >= SILENT_HEALTHY_PROBES {
+                return Some(Release::Failed {
+                    reason: format!(
+                        "the build manager reported no result for deploy {deploy_id}: it is healthy \
+                         but prints no status report, so its image is likely older than 0.4.0; \
+                         check CITE_STACK_VERSION on the node"
+                    ),
+                    sha: None,
+                });
+            }
+        } else {
+            self.silent = 0;
+        }
+        let report = seen.manager_report.as_ref()?;
+        let ours = report.deploy.as_ref().filter(|d| d.id == deploy_id);
+        if let Some(outcome) = ours {
+            match outcome.result.as_str() {
+                "live" => {
+                    return Some(Release::Live {
+                        sha: outcome.sha.clone().or_else(|| report.live_sha.clone()),
+                    });
+                }
+                "failed" => {
+                    let reason = outcome
+                        .reason
+                        .clone()
+                        .or_else(|| report.last_error.clone())
+                        .filter(|r| !r.is_empty())
+                        .unwrap_or_else(|| "the build failed".to_string());
+                    return Some(Release::Failed {
+                        reason,
+                        sha: outcome
+                            .sha
+                            .clone()
+                            .or_else(|| report.last_failed_sha.clone()),
+                    });
+                }
+                _ => {}
+            }
+        }
+        // The manager reports invalid only after GitHub refused its current token, so two in a row are final.
+        if report.token.as_deref() == Some("invalid") {
+            self.invalid_token += 1;
+            if self.invalid_token >= INVALID_TOKEN_PROBES {
+                return Some(Release::Failed {
+                    reason: "GitHub rejected the token for the repository, so the build manager cannot fetch it"
+                        .to_string(),
+                    sha: None,
+                });
+            }
+        } else {
+            self.invalid_token = 0;
+        }
+        // The last error survives a restart in the manager's state, so it only counts once it has stood
+        // unchanged for several probes and a whole window of healthchecks without this deploy starting.
+        let last_error = report.last_error.as_deref().filter(|e| !e.is_empty());
+        let resting = matches!(report.phase.as_str(), "idle" | "failed");
+        match last_error {
+            Some(error) if healthy && resting && ours.is_none() => {
+                let key = (
+                    report.phase.clone(),
+                    Some(error.to_string()),
+                    report.since.clone(),
+                );
+                if self.stuck_on.as_ref() != Some(&key) {
+                    self.stuck_on = Some(key);
+                    self.stuck = 0;
+                    self.stuck_since = Some(now);
+                }
+                self.stuck += 1;
+                let held = self
+                    .stuck_since
+                    .is_some_and(|t| now.duration_since(t) >= self.stuck_window);
+                if self.stuck >= STUCK_PROBES && held {
+                    return Some(Release::Failed {
+                        reason: format!(
+                            "the build manager did not start deploy {deploy_id}: {error}"
+                        ),
+                        sha: None,
+                    });
+                }
+            }
+            _ => {
+                self.stuck = 0;
+                self.stuck_since = None;
+                self.stuck_on = None;
+            }
+        }
+        None
+    }
 }
 
 // Runs to completion even when the caller is dropped, so a disconnect or the request timeout cannot stop a deploy midway.
@@ -194,6 +322,7 @@ impl Deployer {
                 release_wait: RELEASE_WAIT,
                 poll: RELEASE_POLL,
                 token_wait: TOKEN_WAIT,
+                stuck_window: STUCK_WINDOW,
             },
             site_ops: SiteOps::default(),
         }
@@ -231,6 +360,8 @@ impl Deployer {
         self.timing.release_wait = release_wait;
         self.timing.poll = poll;
         self.timing.token_wait = token_wait;
+        // A short release wait (tests, impatient operators) must still leave room for the stuck check to decide.
+        self.timing.stuck_window = STUCK_WINDOW.min(release_wait / 4);
         self
     }
 
@@ -361,59 +492,17 @@ impl Deployer {
         };
         let id = site.id.as_str();
         let deadline = Instant::now() + self.timing.release_wait;
-        let mut silent = 0u32;
+        let mut watch = ReleaseWatch::new(deploy_id, self.timing.stuck_window);
         loop {
             match probe.inspect(id, slot).await {
                 Ok(seen) => {
-                    // A healthy 0.4.0 manager always prints a report, so a silent healthy one is an older image.
-                    if seen.health == "healthy" && seen.manager_report.is_none() {
-                        silent += 1;
-                        if silent >= SILENT_HEALTHY_PROBES {
-                            return Release::Failed {
-                                reason: format!(
-                                    "the build manager reported no result for deploy {deploy_id}: it is healthy \
-                                     but prints no status report, so its image is likely older than 0.4.0; \
-                                     check CITE_STACK_VERSION on the node"
-                                ),
-                                sha: None,
-                            };
-                        }
-                    } else {
-                        silent = 0;
+                    if let Some(release) = watch.observe(&seen, Instant::now()) {
+                        return release;
                     }
-                    if let Some(report) = &seen.manager_report {
-                        if let Some(outcome) = report.deploy.as_ref().filter(|d| d.id == deploy_id)
-                        {
-                            match outcome.result.as_str() {
-                                "live" => {
-                                    return Release::Live {
-                                        sha: outcome
-                                            .sha
-                                            .clone()
-                                            .or_else(|| report.live_sha.clone()),
-                                    };
-                                }
-                                "failed" => {
-                                    let reason = outcome
-                                        .reason
-                                        .clone()
-                                        .or_else(|| report.last_error.clone())
-                                        .filter(|r| !r.is_empty())
-                                        .unwrap_or_else(|| "the build failed".to_string());
-                                    return Release::Failed {
-                                        reason,
-                                        sha: outcome
-                                            .sha
-                                            .clone()
-                                            .or_else(|| report.last_failed_sha.clone()),
-                                    };
-                                }
-                                _ => {}
-                            }
-                        }
-                        if !report.phase.is_empty() {
-                            op.step(&report.phase);
-                        }
+                    if let Some(phase) = seen.manager_report.as_ref().map(|r| r.phase.as_str())
+                        && !phase.is_empty()
+                    {
+                        op.step(phase);
                     }
                     if seen.restart_count >= RESTART_LOOP {
                         return Release::Failed {
@@ -1230,7 +1319,6 @@ mod tests {
     use cite_edge::status::{BuildEnvPatch, LogLine};
     use tempfile::TempDir;
 
-    use crate::orchestrator::SlotInspect;
     use crate::orchestrator::tests::container_env;
     use crate::siteops::{LogQuery, LogSource};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -2706,6 +2794,170 @@ mod tests {
         assert_eq!(site.active, Slot::Blue);
         assert_eq!(site.history.last().unwrap().action, DeployAction::Failed);
         assert!(!green_promoted(&e));
+    }
+
+    fn seen_with(health: &str, report: Value) -> SlotInspect {
+        SlotInspect {
+            state: "running".into(),
+            health: health.into(),
+            restart_count: 0,
+            exit_code: None,
+            oom_killed: false,
+            env: Vec::new(),
+            manager_report: Some(serde_json::from_value(report).unwrap()),
+            manager_memory: 0,
+            manager_nano_cpus: 0,
+            executor_memory: 0,
+            executor_nano_cpus: 0,
+        }
+    }
+
+    const NEW_ID: &str = "01HZX3K9M2N4P5Q6R7S8T9V0WY";
+
+    fn failed_reason(r: Option<Release>) -> String {
+        match r {
+            Some(Release::Failed { reason, sha }) => {
+                assert_eq!(sha, None);
+                reason
+            }
+            Some(Release::Live { .. }) => panic!("went live"),
+            None => panic!("still waiting"),
+        }
+    }
+
+    #[test]
+    fn two_invalid_token_reports_in_a_row_fail_but_one_does_not() {
+        let now = Instant::now();
+        let building = |token: &str| {
+            seen_with(
+                "healthy",
+                json!({"v": 1, "phase": "building", "token": token,
+                    "deploy": {"id": OLD_ID, "result": "live"}}),
+            )
+        };
+        let mut watch = ReleaseWatch::new(NEW_ID, Duration::from_secs(90));
+        assert!(watch.observe(&building("invalid"), now).is_none());
+        assert!(watch.observe(&building("ok"), now).is_none());
+        assert!(watch.observe(&building("invalid"), now).is_none());
+        let reason = failed_reason(watch.observe(&building("invalid"), now));
+        assert!(reason.contains("GitHub rejected the token"), "{reason}");
+
+        let mut unknown = ReleaseWatch::new(NEW_ID, Duration::ZERO);
+        for token in ["unknown", "unknown", "unknown", "unknown", "unknown"] {
+            assert!(unknown.observe(&building(token), now).is_none());
+        }
+    }
+
+    #[test]
+    fn an_idle_manager_with_an_error_fails_only_after_it_stood_still_for_the_window() {
+        let start = Instant::now();
+        let window = Duration::from_secs(90);
+        let idle = |since: &str| {
+            seen_with(
+                "healthy",
+                json!({"v": 1, "phase": "idle", "since": since, "token": "unknown",
+                    "last_error": "clone failed: repository not found",
+                    "deploy": {"id": OLD_ID, "result": "failed"}}),
+            )
+        };
+        let mut watch = ReleaseWatch::new(NEW_ID, window);
+        for _ in 0..5 {
+            assert!(
+                watch.observe(&idle("a"), start).is_none(),
+                "the window has not passed"
+            );
+        }
+        assert!(
+            watch.observe(&idle("b"), start + window).is_none(),
+            "progress resets"
+        );
+        assert!(watch.observe(&idle("b"), start + window).is_none());
+        let reason = failed_reason(watch.observe(&idle("b"), start + window * 2));
+        assert!(
+            reason.contains("repository not found") && reason.contains(NEW_ID),
+            "{reason}"
+        );
+
+        let mut busy = ReleaseWatch::new(NEW_ID, Duration::ZERO);
+        let building = seen_with(
+            "healthy",
+            json!({"v": 1, "phase": "building", "last_error": "old failure"}),
+        );
+        let starting = seen_with(
+            "starting",
+            json!({"v": 1, "phase": "idle", "last_error": "old failure"}),
+        );
+        for seen in [&building, &starting, &building, &starting, &building] {
+            assert!(busy.observe(seen, start + window).is_none());
+        }
+        let mut done = ReleaseWatch::new(NEW_ID, Duration::ZERO);
+        let live = seen_with(
+            "healthy",
+            json!({"v": 1, "phase": "idle", "last_error": "old failure", "token": "invalid",
+                "deploy": {"id": NEW_ID, "result": "live", "sha": SHA}}),
+        );
+        assert!(matches!(
+            done.observe(&live, start),
+            Some(Release::Live { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_rejected_token_fails_the_deploy_fast_and_stops_the_idle_slot() {
+        let (e, orch, _docker, sim) = docker_env(
+            Duration::from_millis(50),
+            None,
+            Some(Duration::from_secs(60)),
+        )
+        .await;
+        built(&e, "ghp_testtoken").await;
+        sim.set_mode(Slot::Green, Mode::Stale);
+        sim.set_token(Slot::Green, "invalid");
+        let started = Instant::now();
+        let err = e
+            .deployer
+            .deploy_and_wait("t", "shop", None, None, Some("v1".into()))
+            .await
+            .unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(
+            matches!(&err, ConnectorError::Conflict(m) if m.contains("rejected the token")),
+            "{err:?}"
+        );
+        let site = current(&e, "shop");
+        assert_eq!(site.active, Slot::Blue);
+        let last = site.history.last().unwrap();
+        assert_eq!(last.action, DeployAction::Failed);
+        assert!(
+            last.note
+                .contains("GitHub rejected the token for the repository"),
+            "{}",
+            last.note
+        );
+        assert!(last.note.contains("sha unknown"), "{}", last.note);
+        assert!(!orch.stack_running("shop", Slot::Green).await.unwrap());
+        assert!(!green_promoted(&e));
+
+        let reply = e
+            .deployer
+            .deploy("t", "shop", None, None, None, false)
+            .await
+            .unwrap();
+        let DeployReply::Started(accepted) = reply else {
+            panic!("expected an accepted deploy, got {reply:?}");
+        };
+        for _ in 0..200 {
+            if current(&e, "shop")
+                .history
+                .iter()
+                .any(|d| d.id == accepted.deployment_id && d.action == DeployAction::Failed)
+            {
+                assert_eq!(current(&e, "shop").active, Slot::Blue);
+                return;
+            }
+            sleep(Duration::from_millis(30)).await;
+        }
+        panic!("the unwaited deploy left no failed entry");
     }
 
     #[tokio::test]
