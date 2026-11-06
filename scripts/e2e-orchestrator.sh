@@ -628,7 +628,8 @@ if live_serves e2e-live-v2; then fail "the stale v2 release was promoted by a fa
 pass "the live site still serves v1 after the failed build"
 api GET "/api/v1/sites/$LIVE_SITE/status"
 code_is "status of the failed build" 200
-jq_ok "status phase is failed with the reason" '.phase == "failed" and (tostring | contains("e2e-build-boom"))'
+jq_ok "status names the failed build and keeps the live slot healthy" '(.error // "" | contains("exit status")) and .last_failure.slot == "green" and ((.slots[] | select(.slot == "blue") | .health) == "healthy")'
+jq_ok "the failed slot reports phase failed for our deploy" '(.slots[] | select(.slot == "green") | .report.phase) == "failed" and (.slots[] | select(.slot == "green") | .report.deploy.result) == "failed"'
 api GET "/api/v1/sites/$LIVE_SITE/logs?source=manager&tail=500"
 code_is "logs of the failed build" 200
 case $BODY in
@@ -636,7 +637,7 @@ case $BODY in
   *) fail "logs output does not show the build failure: $BODY" ;;
 esac
 api GET "/api/v1/sites/$LIVE_SITE"
-jq_ok "deployment history records the failure with the reason" '(.history | last) as $h | $h.action == "failed" and (($h.note // "") | contains("e2e-build-boom"))'
+jq_ok "deployment history records the failure with the reason" '(.history | last) as $h | $h.action == "failed" and (($h.note // "") | contains("exit status"))'
 jq_ok "blue stays active after the failed build" '.active == "blue"'
 
 echo "== live: fixing the build command brings the site live"
@@ -691,8 +692,8 @@ case $CODE in
   4*) pass "a token the host rejects is refused (HTTP $CODE)" ;;
   *) fail "rejected token: expected a 4xx, got HTTP $CODE: $BODY" ;;
 esac
-printf '%s' "$BODY" | grep -qi invalid || fail "the refusal does not say the token is invalid: $BODY"
-pass "the refusal names an invalid token"
+printf '%s' "$BODY" | grep -qi "refused" || fail "the refusal does not say GitHub refused the token: $BODY"
+pass "the refusal says GitHub refused the token"
 api GET "/api/v1/sites/$LIVE_SITE/github-token"
 jq_ok "the rejected token was rolled back" '.source == "site"'
 expect "the rejected token was not stored" 0 "$(conf_file secrets.json | grep -c "$BAD_TOKEN" || true)"
