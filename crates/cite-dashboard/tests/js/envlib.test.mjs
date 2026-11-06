@@ -58,14 +58,14 @@ test('a patch carries values to set and names to remove', () => {
 });
 
 test('the limits on count and size are checked before sending', () => {
-  const many = Array.from({ length: 65 }, (_, i) => [`V${i}`, '1']);
-  assert.match(buildPatch(pending(many), []).problem, /at most 64/);
-  const existing = Array.from({ length: 64 }, (_, i) => `E${i}`);
-  assert.match(buildPatch(pending([['NEW', '1']]), existing).problem, /holds at most 64/);
+  const many = Array.from({ length: 129 }, (_, i) => [`V${i}`, '1']);
+  assert.match(buildPatch(pending(many), []).problem, /at most 128/);
+  const existing = Array.from({ length: 128 }, (_, i) => `E${i}`);
+  assert.match(buildPatch(pending([['NEW', '1']]), existing).problem, /holds at most 128/);
   assert.equal(buildPatch(pending([['NEW', '1']], ['E0']), existing).problem, undefined);
   assert.equal(buildPatch(pending([['E0', '2']]), existing).problem, undefined);
-  const big = Array.from({ length: 4 }, (_, i) => [`B${i}`, 'x'.repeat(4000)]);
-  assert.match(buildPatch(pending(big), []).problem, /12 KiB/);
+  const big = Array.from({ length: 7 }, (_, i) => [`B${i}`, 'x'.repeat(4000)]);
+  assert.match(buildPatch(pending(big), []).problem, /24 KiB/);
 });
 
 test('a new row needs a free name and a value', () => {

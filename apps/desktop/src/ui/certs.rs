@@ -559,7 +559,7 @@ impl Console {
                     .flex()
                     .items_end()
                     .gap(px(10.))
-                    .child(div().w(px(160.)).child(field(
+                    .child(div().flex_1().min_w_0().max_w(px(200.)).child(field(
                         "HTTPS port",
                         Some("Usually 443"),
                         self.certs.port.clone(),
@@ -753,7 +753,12 @@ impl Console {
             .border_1()
             .border_color(c(BORDER))
             .child(strong(title))
-            .child(div().w(px(320.)).child(field("Name", None, s.name.clone())))
+            .child(
+                div()
+                    .w_full()
+                    .max_w(px(420.))
+                    .child(field("Name", None, s.name.clone())),
+            )
             .child(div().flex().child(mode))
             .child(inputs)
             .child(div().flex().gap(px(8.)).child(submit_btn).child(

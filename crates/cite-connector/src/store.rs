@@ -30,7 +30,8 @@ const AUDIT_TAIL_MAX: usize = 1000;
 const AUDIT_ACTOR_MAX: usize = 128;
 const AUDIT_DETAIL_MAX: usize = 1024;
 const SECRET_NAME_MAX: usize = 128;
-const SECRET_VALUE_MAX: usize = 16 * 1024;
+// Above the 24 KiB an environment map may take, so a full build or runtime env always fits.
+const SECRET_VALUE_MAX: usize = 32 * 1024;
 const MAX_SECRETS: usize = 512;
 const TOKEN_CHECK_CONCURRENCY: usize = 2;
 

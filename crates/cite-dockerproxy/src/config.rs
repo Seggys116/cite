@@ -23,6 +23,8 @@ pub struct Config {
     pub edge_network: String,
     pub max_conns: usize,
     pub github_api_url: Option<String>,
+    /// Whether an executor may also join its own stack's egress network (CITE_STACK_EXECUTOR_EGRESS, default true).
+    pub executor_egress: bool,
 }
 
 // Names end up in regexes and Docker paths, so only plain name characters are accepted.
@@ -226,7 +228,18 @@ impl Config {
             validate_github_api_url(url)
                 .map_err(|e| format!("CITE_STACK_FORGE_API_URL {url:?} {e}"))?;
         }
+        let executor_egress = match optional("CITE_STACK_EXECUTOR_EGRESS").as_deref() {
+            None => true,
+            Some(v) if v.eq_ignore_ascii_case("true") || v == "1" => true,
+            Some(v) if v.eq_ignore_ascii_case("false") || v == "0" => false,
+            Some(v) => {
+                return Err(format!(
+                    "CITE_STACK_EXECUTOR_EGRESS {v:?} must be true or false"
+                ));
+            }
+        };
         Ok(Config {
+            executor_egress,
             forge,
             forge_api_url,
             max_memory,
@@ -265,6 +278,16 @@ mod tests {
         assert_eq!(c.edge_network, "cite_edge");
         assert_eq!(c.max_conns, 64);
         assert_eq!(c.github_api_url, None);
+        assert!(c.executor_egress);
+    }
+
+    #[test]
+    fn executor_egress_is_a_strict_boolean() {
+        for (raw, want) in [("false", false), ("0", false), ("TRUE", true), ("1", true)] {
+            let c = cfg(&[("CITE_STACK_EXECUTOR_EGRESS", raw)]).unwrap();
+            assert_eq!(c.executor_egress, want, "{raw}");
+        }
+        assert!(cfg(&[("CITE_STACK_EXECUTOR_EGRESS", "off")]).is_err());
     }
 
     #[test]

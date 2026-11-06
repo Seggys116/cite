@@ -20,13 +20,19 @@ Cite's Compose defaults aim for a small attack surface. Verify a live stack with
 | User | root → drops to **10002** for builds | **65532** |
 | Published ports | **none** | host `CITE_PORT` → 8080 |
 | Docker socket | **never** | **never** |
-| Egress | yes (GitHub + registries) | **denied by default** |
+| Egress | yes (GitHub + registries) | **denied by default** (single-site Compose); per site, on by default (orchestrator) |
 
-Enable executor egress only when an SSR site must call external APIs:
+In the single-site Compose stack, enable executor egress only when an SSR site must call external APIs:
 
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.egress.yml up -d
 ```
+
+## Executor egress
+
+With the orchestrator, each site has an `outbound` flag that is **on by default**: the executor of a server runtime joins its stack's own egress bridge besides its internal network, so server-side code can call external APIs. Static sites never get it. Be clear about what that opens: site code can then reach anything the egress bridge can route to, which is the internet, the Docker host's gateway address (and any host service listening on it, including ports bound to `0.0.0.0`), and every LAN or VPC range the host can reach, including the cloud metadata address unless it is blocked as below. It still cannot reach other sites' executors, HAProxy's sockets, the connector or the Docker proxy, because none of those are on that bridge, and nothing can connect in to the executor from the egress side because it publishes no ports.
+
+For isolation, turn `outbound` off on sites that do not need it, or set `CITE_STACK_EXECUTOR_EGRESS=false` in `.env` so the Docker proxy refuses executor egress for every site on the node (the connector then refuses outbound sites with a clear error and `GET /api/v1/node` reports `executor_egress: false`). Where outbound access is on, add `DOCKER-USER` rules that drop traffic from the `cite-*-egress` bridges to the host and private ranges you do not want reached, and block the metadata address as described below.
 
 ## Host firewall
 

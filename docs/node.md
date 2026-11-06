@@ -6,9 +6,9 @@ This page covers installing, configuring and operating one Cite node: HAProxy pl
 
 | Service | Image | Role |
 |---|---|---|
-| `init` | `ghcr.io/seggys116/cite-connector:${CITE_VERSION:-0.4.0}` | One-shot. Creates `/conf/haproxy`, `/conf/certs` and `/conf/state` in the `cite_conf` volume owned by uid 10001, and sets the owner and mode of the `cite_run` volume at `/run/cite`, then exits. No network. |
+| `init` | `ghcr.io/seggys116/cite-connector:${CITE_VERSION:-0.4.1}` | One-shot. Creates `/conf/haproxy`, `/conf/certs` and `/conf/state` in the `cite_conf` volume owned by uid 10001, and sets the owner and mode of the `cite_run` volume at `/run/cite`, then exits. No network. |
 | `haproxy` | `docker.io/library/haproxy:3.2-bookworm` | Public listener on ports 80 and 443. Reads its config from the `haproxy` and `certs` subpaths of `cite_conf`, mounted read-only. It cannot see the connector's credentials, tokens, secrets or TLS keys. |
-| `connector` | `ghcr.io/seggys116/cite-connector:${CITE_VERSION:-0.4.0}` | Authenticated API on 7443, renders the HAProxy config, receives HAProxy's logs, runs the optional orchestrator. |
+| `connector` | `ghcr.io/seggys116/cite-connector:${CITE_VERSION:-0.4.1}` | Authenticated API on 7443, renders the HAProxy config, receives HAProxy's logs, runs the optional orchestrator. |
 
 The two containers do not share a process namespace. They share one small volume, `cite_run`, mounted at `/run/cite` in both, which holds three unix sockets: HAProxy's admin socket (`admin.sock`), the master CLI (`master.sock`, from `-S /run/cite/master.sock,level,admin` on the HAProxy command) and the log datagram socket the connector binds (`log.sock`). The directory is owned by uid 10001 with mode 0750, the admin and log sockets are mode 0600, and no admin listener exists on any network. The connector reloads HAProxy by connecting to the master socket, sending `reload` and reading the reply: `Success=1` or `Success=0` followed by the loader output. It then checks that `show info` on the admin socket reports a new pid. A config counts as applied only after that check passes, so a refused or unconfirmed reload is retried on the next apply and fails the change that caused it. If the master CLI is unreachable (HAProxy is not up yet at first boot), applying a config still succeeds with `reloaded` false and the reason in the status `last_error`. Both containers run as uid 10001 with a read-only root filesystem, `no-new-privileges` and all capabilities dropped.
 
@@ -88,6 +88,9 @@ Compose reads `docker-compose.override.yml` automatically only when you run `doc
 | `CITE_STACK_VERSION` | the connector's version | Image tag used for orchestrated stacks. |
 | `CITE_REGISTRY` | `ghcr.io/seggys116` | Registry prefix for orchestrated stack images. |
 | `CITE_DEPLOY_BUILD_TIMEOUT` | `600` | Seconds a deploy or switch waits for a repo-built slot to become healthy. 60 to 3600. Upstream-only sites keep the 60 second health wait. |
+| `CITE_DOPPLER_TOKEN` | unset | Node-wide Doppler token for sites bound to a Doppler config without a token of their own. Same rules and handling as `CITE_GITHUB_TOKEN`: 1 to 512 printable ASCII characters, held in memory only, never written to disk or shown. See [Doppler](#doppler). |
+| `CITE_DOPPLER_TOKEN_FILE` | unset | Path of a file holding the Doppler token, for secret mounts. `CITE_DOPPLER_TOKEN` wins when both are set. |
+| `CITE_DOPPLER_POLL_SECS` | `300` | Seconds between Doppler syncs of each bound site. 60 to 86400. |
 | `CITE_STACK_GITHUB_API_URL` | unset (managers use `https://api.github.com`) | GitHub API base URL passed to every orchestrated manager as `CITE_GITHUB_API_URL`, for GitHub Enterprise Server. An `http` or `https` URL of at most 200 characters, with no user name, query or fragment. The Docker proxy must have the same value in `CITE_PROXY_GITHUB_API_URL`, or it refuses to create the managers. The overlay sets both from `CITE_GITHUB_API_URL` in `.env`. See [Orchestrator](orchestrator.md#github-enterprise-server-and-the-api-url). |
 | `RUST_LOG` | `info` | Log level. |
 
@@ -97,7 +100,7 @@ Boolean values accept `1`, `true`, `yes`, `on`, `0`, `false`, `no`, `off`. The c
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `CITE_VERSION` | `0.4.0` | Connector image tag. |
+| `CITE_VERSION` | `0.4.1` | Connector image tag. |
 | `CITE_HTTP_PORT` | `80` | Host port for HTTP. |
 | `CITE_HTTPS_PORT` | `443` | Host port for HTTPS. |
 | `CITE_PUBLIC_BIND` | `0.0.0.0` | Host IP for the two public ports. |
@@ -188,6 +191,32 @@ A site with `access.zone_lock` only answers requests that carry the site's secre
 
 Each node generates its own secrets. A hostname that is load-balanced across several nodes through one Cloudflare Transform Rule can therefore carry only one value, so only one of those nodes accepts it. Either point each node's hostname at its own Transform Rule value, or do not use the zone lock on a hostname served by more than one node.
 
+## Doppler
+
+A site built from a repository can take its build and runtime variables from a [Doppler](https://www.doppler.com) project and config. The node pulls the secrets, keeps them current and redeploys the site when they change. It needs the orchestrator, and the node lists the capability `doppler` only when the orchestrator is on.
+
+**Token.** Set `CITE_DOPPLER_TOKEN` (or `CITE_DOPPLER_TOKEN_FILE`) on the connector once; the orchestrator overlay passes both, and `CITE_DOPPLER_POLL_SECS`, from `.env`. A site can carry its own token instead, sent with its binding and stored in `secrets.json` as `site-<id>.doppler-token`; it wins over the node token. A site with neither cannot be bound ("No Doppler token: set CITE_DOPPLER_TOKEN on the connector or pass a token for this site"). Listing projects and configs uses the node token, so use a personal or CLI token there; a service token scoped to one config works for a site but cannot list projects. `GET /api/v1/node` reports `doppler: {configured, source}` (`env`, `file` or `none`), never the value.
+
+**Binding with a service token only (simplest).** In Doppler, open the project, pick the config the site should read (for example `prd`), then Access > Service Tokens > Generate, give it read access and copy the token (it starts with `dp.st.`). In the site's Doppler settings, paste that token, leave the project and config empty, choose build, runtime or both, and save. A service token is scoped to exactly one project and config, so the node needs nothing else: it downloads that config without naming it, and the binding status shows no project or config. No node token is needed for this. The token is stored and handled like any other site token below; pasting a new one re-syncs, and removing the binding deletes it. A token-only binding is refused when the site has no `dp.st.` token (a personal or CLI token reads every project, so it cannot stand in for the names), and setting only one of project and config is refused.
+
+**What is synced.** Binding a site names a project, a config (or neither, with a service token) and whether the values feed the build variables, the runtime variables or both. The node downloads the config as JSON from `https://api.doppler.com` only (https, no redirects, 15 second timeout, 4 MiB response cap, the token sent as `Authorization: Bearer`). It drops Doppler's own `DOPPLER_*` variables and every name the target refuses, under the same rules as a variable set by hand: a build variable may not be a name the build manager reserves, a runtime variable may not be `PORT`, `NODE_ENV`, `HOST`, `HOSTNAME` or `NITRO_HOST`, and values over 4096 bytes or with control characters are left out. The binding status counts and names what was skipped and why, never a value. The filtered values are stored as `site-<id>.doppler-build` and `site-<id>.doppler-runtime` in `secrets.json`; they never reach `edge.json`, labels, the audit log or the connector log.
+
+**Merge rule.** At every deploy the Doppler values form the base and the variables you set by hand (`PATCH /sites/{id}/build-env` and `runtime-env`) override them, name by name. Manual variables are never changed by a sync.
+
+**Automatic redeploy.** A background task syncs every bound site every `CITE_DOPPLER_POLL_SECS` seconds (with a little random delay, two sites at a time, each site on its own so one failure does not stop the rest). It hashes the filtered build and runtime maps separately (SHA-256 over the sorted JSON), and only when a hash changed does it store the new values, audit `site.doppler.sync` with the site and the counts, and start a deploy of the site with the note `doppler sync` without waiting for it. If a deploy or another operation is already running on the site, the redeploy waits and starts when that one has finished, so two never overlap. Binding a site always redeploys it once the first sync succeeds. A failed sync keeps the last good values, shows the error in the status and is retried after one minute, then two, four and so on up to the poll interval or an hour; a 429 from Doppler is not retried before its `Retry-After`. Sync state is kept in memory: after a restart each bound site is synced once, and only a change redeploys it.
+
+**Removing a binding** deletes the binding, the site's Doppler token and the synced values; manual variables stay. It does not redeploy: the running site keeps the old values until its next deploy, and the status says so.
+
+**Limits.** A build or runtime environment holds at most 128 variables and 24 KiB of JSON, counting the Doppler values and the manual ones together. A sync that would go over is refused and keeps the previous values; a manual change that would go over is refused as well.
+
+## Persistent volumes and outbound access
+
+Both need the orchestrator; the node lists the capabilities `volumes` and `outbound` only when it is on.
+
+**Volumes.** A site that runs a server (node, bun, Rust SSR, or a start command) can keep files across deploys in up to 8 named volumes, each with a mount path such as `/data`. Both slots mount the same volume, so data survives deploys, rollbacks and slot switches. Edit the list with the site; it takes effect on the next deploy. Removing a volume from the list keeps its data until you delete it with `DELETE /api/v1/sites/{id}/volumes/{name}` (after a redeploy), and deleting a site keeps its volumes unless the delete asks for `purge_volumes=true`. Back volumes up like any Docker volume (`docker run --rm -v cite-vol-<id>_<name>:/v ...`). Rules and the ownership step are in [Orchestrator](orchestrator.md#persistent-volumes).
+
+**Outbound access.** Every site has `outbound`, on by default, which lets server-side code call external APIs. Turn it off per site for code that never needs the internet, or set `CITE_STACK_EXECUTOR_EGRESS=false` in `.env` to forbid it for every site on the node (`GET /api/v1/node` then reports `executor_egress: false`). See [Hardening](hardening.md#executor-egress) for what outbound access exposes. The single-site compose stack keeps executors without egress; add `docker-compose.egress.yml` there to give its executor a route out.
+
 ## Upgrading from an older release
 
 The firewall grammar is stricter than before: regexes are checked for patterns HAProxy can never match or that match too much (for example a leading `.*`, as in `.*bot.*`). At start the connector reads `edge.json` and repairs what it can:
@@ -215,7 +244,7 @@ Everything lives in the `cite_conf` volume, mounted at `/conf`.
 | `edge.json.pre-migration` | 0600 | Only after an upgrade that rewrote `edge.json`: the original, written once and never removed. It holds the pre-migration header-secret values; delete it after checking the migration. |
 | `credentials.json` | 0600 | Username, Argon2id password hash, TOTP secret. |
 | `tokens.json` | 0600 | API token ids, Argon2id hashes, names and last-used times. At most 64 tokens. |
-| `secrets.json` | 0600 | GitHub tokens for orchestrated sites. |
+| `secrets.json` | 0600 | GitHub tokens for orchestrated sites, their build and runtime variables, per-site Doppler tokens and the synced Doppler values. |
 | `zone-secrets.json` | 0600 | One Cloudflare zone-lock secret per locked site. Not part of `edge.json` or any backup the API produces; the secrets reach `haproxy/haproxy.cfg`, which HAProxy reads. |
 | `audit.jsonl`, `audit.jsonl.1` | 0600 | Audit log of changes and logins. |
 | `analytics/analytics.db` | 0600 | SQLite analytics database, with its `-wal` and `-shm` files. An old `analytics.json` is imported once and then deleted. |

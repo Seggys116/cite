@@ -23,7 +23,10 @@ pub use config::{
     node_flag_denied, parse_build_env_json, parse_env_file,
 };
 pub use confined::{FileKey, FileName, NAME_MAX, TrustedDir};
-pub use detect::{Detection, detect_site, detect_site_configured, detect_site_with};
+pub use detect::{
+    Detection, StartBin, detect_site, detect_site_configured, detect_site_in, detect_site_with,
+    next_standalone_server_dir, node_range_allows, package_bin_path,
+};
 pub use duration::{PollInterval, parse_byte_size, parse_duration, parse_poll_interval};
 pub use error::{Error, Result};
 pub use extract::{ExtractLimits, ExtractReport, extract_archive};

@@ -6,8 +6,8 @@ const MAX_REL_PATH: usize = 255;
 const MAX_COMMAND: usize = 1024;
 const MAX_FRAMEWORK: usize = 32;
 const DEPLOY_ID_LEN: usize = 26;
-const MAX_BUILD_ENV_JSON: usize = 12 * 1024;
-const MAX_BUILD_ENV_KEYS: usize = 64;
+const MAX_BUILD_ENV_JSON: usize = 24 * 1024;
+const MAX_BUILD_ENV_KEYS: usize = 128;
 const MAX_BUILD_ENV_KEY: usize = 64;
 const MAX_BUILD_ENV_VALUE: usize = 4096;
 
@@ -518,20 +518,18 @@ mod tests {
             let items: Vec<String> = (0..n).map(|i| format!("\"K{i}\":\"v\"")).collect();
             format!("{{{}}}", items.join(","))
         };
-        assert!(build_env_json(&keys(64)));
-        assert!(!build_env_json(&keys(65)));
+        assert!(build_env_json(&keys(128)));
+        assert!(!build_env_json(&keys(129)));
     }
 
     #[test]
-    fn build_env_json_size_limit_is_twelve_kib() {
+    fn build_env_json_size_limit_is_twenty_four_kib() {
         let of_size = |total: usize| {
-            let rest = total - 8192 - 22;
-            format!(
-                "{{\"A\":\"{}\",\"B\":\"{}\",\"C\":\"{}\"}}",
-                "x".repeat(4096),
-                "y".repeat(4096),
-                "z".repeat(rest)
-            )
+            let fixed: String = (0..5)
+                .map(|i| format!("\"K{i}\":\"{}\",", "x".repeat(4096)))
+                .collect();
+            let rest = total - fixed.len() - 8;
+            format!("{{{fixed}\"C\":\"{}\"}}", "z".repeat(rest))
         };
         let exact = of_size(MAX_BUILD_ENV_JSON);
         assert_eq!(exact.len(), MAX_BUILD_ENV_JSON);

@@ -72,9 +72,15 @@ pub struct ConnectorConfig {
     pub certs_mode: u32,
     // The node-wide GitHub token; sites without their own token use it. It is held in memory only.
     pub github_token: Option<NodeToken>,
+    // The node-wide Doppler token, held the same way; sites bound to Doppler without their own token use it.
+    pub doppler_token: Option<NodeToken>,
+    pub doppler_poll_secs: u64,
 }
 
 const MAX_NODE_TOKEN_BYTES: usize = 512;
+const DEFAULT_DOPPLER_POLL_SECS: u64 = 300;
+const MIN_DOPPLER_POLL_SECS: u64 = 60;
+const MAX_DOPPLER_POLL_SECS: u64 = 86_400;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokenSource {
@@ -104,7 +110,7 @@ impl NodeToken {
             || !value.bytes().all(|b| b.is_ascii_graphic())
         {
             return Err(config_err(
-                "the GitHub token must be printable ASCII without spaces, at most 512 bytes".into(),
+                "the token must be printable ASCII without spaces, at most 512 bytes".into(),
             ));
         }
         Ok(Self {
@@ -129,26 +135,36 @@ impl std::fmt::Debug for NodeToken {
 }
 
 // The environment variable wins over the file; an unset or blank variable means "not given".
-fn node_token(env: &HashMap<String, String>) -> Result<Option<NodeToken>> {
-    if let Some(raw) = get(env, "CITE_GITHUB_TOKEN") {
+fn node_token(env: &HashMap<String, String>, var: &str) -> Result<Option<NodeToken>> {
+    if let Some(raw) = get(env, var) {
         return NodeToken::new(raw, TokenSource::Env)
             .map(Some)
-            .map_err(|e| config_err(format!("CITE_GITHUB_TOKEN: {e}")));
+            .map_err(|e| config_err(format!("{var}: {e}")));
     }
-    let Some(path) = get(env, "CITE_GITHUB_TOKEN_FILE") else {
+    let file_var = format!("{var}_FILE");
+    let Some(path) = get(env, &file_var) else {
         return Ok(None);
     };
     let mut bytes = Vec::new();
     // one byte past the limit plus room for a trailing newline, so an oversized file is refused rather than slurped
     std::fs::File::open(path)
         .and_then(|f| std::io::Read::read_to_end(&mut std::io::Read::take(f, 1024), &mut bytes))
-        .map_err(|e| config_err(format!("cannot read CITE_GITHUB_TOKEN_FILE {path}: {e}")))?;
+        .map_err(|e| config_err(format!("cannot read {file_var} {path}: {e}")))?;
     let text = String::from_utf8(bytes)
-        .map_err(|_| config_err("CITE_GITHUB_TOKEN_FILE is not valid text".into()))?;
+        .map_err(|_| config_err(format!("{file_var} is not valid text")))?;
     let text = zeroize::Zeroizing::new(text);
     NodeToken::new(text.trim(), TokenSource::File)
         .map(Some)
-        .map_err(|e| config_err(format!("CITE_GITHUB_TOKEN_FILE: {e}")))
+        .map_err(|e| config_err(format!("{file_var}: {e}")))
+}
+
+fn parse_doppler_poll(raw: &str) -> Result<u64> {
+    match raw.parse::<u64>() {
+        Ok(n) if (MIN_DOPPLER_POLL_SECS..=MAX_DOPPLER_POLL_SECS).contains(&n) => Ok(n),
+        _ => Err(config_err(format!(
+            "CITE_DOPPLER_POLL_SECS must be {MIN_DOPPLER_POLL_SECS} to {MAX_DOPPLER_POLL_SECS} seconds"
+        ))),
+    }
 }
 
 // Startup misconfiguration is reported through Internal; it never reaches an HTTP response.
@@ -460,6 +476,10 @@ impl ConnectorConfig {
             Some(raw) => parse_certs_mode(raw)?,
             None => 0o600,
         };
+        let doppler_poll_secs = match get(env, "CITE_DOPPLER_POLL_SECS") {
+            Some(raw) => parse_doppler_poll(raw)?,
+            None => DEFAULT_DOPPLER_POLL_SECS,
+        };
         Ok(Self {
             listen,
             allow,
@@ -501,7 +521,9 @@ impl ConnectorConfig {
             tls_dir: data_dir.join("tls"),
             certs_dir: data_dir.join("certs"),
             certs_mode,
-            github_token: node_token(env)?,
+            github_token: node_token(env, "CITE_GITHUB_TOKEN")?,
+            doppler_token: node_token(env, "CITE_DOPPLER_TOKEN")?,
+            doppler_poll_secs,
             data_dir,
         })
     }
@@ -587,6 +609,76 @@ mod tests {
         let path = dir.path().join("big");
         std::fs::write(&path, "a".repeat(4096)).unwrap();
         assert!(token_cfg(&[("CITE_GITHUB_TOKEN_FILE", &path.display().to_string())]).is_err());
+    }
+
+    fn doppler_cfg(extra: &[(&str, &str)]) -> Result<ConnectorConfig> {
+        let mut e = base();
+        e.extend(env(extra));
+        ConnectorConfig::from_env_map(&e)
+    }
+
+    #[test]
+    fn the_node_doppler_token_follows_the_github_token_rules() {
+        let none = doppler_cfg(&[]).unwrap();
+        assert!(none.doppler_token.is_none());
+        assert_eq!(none.doppler_poll_secs, 300);
+        let from_env = doppler_cfg(&[("CITE_DOPPLER_TOKEN", "dp.st.prd.env")])
+            .unwrap()
+            .doppler_token
+            .unwrap();
+        assert_eq!(
+            (from_env.expose(), from_env.source()),
+            ("dp.st.prd.env", TokenSource::Env)
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("doppler");
+        std::fs::write(&path, "dp.st.prd.file\n").unwrap();
+        let path = path.display().to_string();
+        let from_file = doppler_cfg(&[("CITE_DOPPLER_TOKEN_FILE", &path)])
+            .unwrap()
+            .doppler_token
+            .unwrap();
+        assert_eq!(
+            (from_file.expose(), from_file.source()),
+            ("dp.st.prd.file", TokenSource::File)
+        );
+        let both = doppler_cfg(&[
+            ("CITE_DOPPLER_TOKEN", "dp.st.prd.env"),
+            ("CITE_DOPPLER_TOKEN_FILE", &path),
+        ])
+        .unwrap();
+        assert_eq!(
+            both.doppler_token.as_ref().unwrap().expose(),
+            "dp.st.prd.env"
+        );
+        assert!(both.github_token.is_none(), "the tokens are independent");
+        let err = doppler_cfg(&[("CITE_DOPPLER_TOKEN", "dp secret")])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("CITE_DOPPLER_TOKEN") && !err.contains("dp secret"),
+            "{err}"
+        );
+        let shown = format!("{:?}", both.doppler_token);
+        assert!(!shown.contains("dp.st.prd.env"), "{shown}");
+    }
+
+    #[test]
+    fn the_doppler_poll_interval_is_bounded() {
+        for (raw, ok) in [
+            ("60", Some(60)),
+            ("300", Some(300)),
+            ("86400", Some(86_400)),
+            ("59", None),
+            ("0", None),
+            ("86401", None),
+            ("5m", None),
+        ] {
+            let got = doppler_cfg(&[("CITE_DOPPLER_POLL_SECS", raw)])
+                .ok()
+                .map(|c| c.doppler_poll_secs);
+            assert_eq!(got, ok, "{raw}");
+        }
     }
 
     #[test]

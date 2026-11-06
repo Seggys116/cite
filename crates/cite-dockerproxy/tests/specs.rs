@@ -39,6 +39,8 @@ fn site(id: &str, runtime: &str, node_major: Option<u8>) -> Site {
         }),
         history: Vec::new(),
         access: Default::default(),
+        volumes: Vec::new(),
+        outbound: true,
     }
 }
 
@@ -300,6 +302,9 @@ fn executor_may_join_only_its_own_or_the_edge_network() {
     body["NetworkingConfig"]["EndpointsConfig"] =
         json!({ "cite_edge": {}, "cite-shop-blue-egress": {} });
     denied(accepts(&s.executor_name, &body));
+    let mut other = s.executor.clone();
+    other["NetworkingConfig"]["EndpointsConfig"]["cite-other-blue-egress"] = json!({});
+    denied(accepts(&s.executor_name, &other));
 }
 
 #[test]
@@ -466,15 +471,23 @@ fn accept_all(key: &str, values: &[&str]) {
     }
 }
 
-// Text of exactly `total` bytes whose escaped quotes make it grow the most inside a create body.
+// Text of exactly `total` bytes whose escaped quotes make it grow the most inside a create body; every value stays within 4096 characters.
 fn build_env_json_of(total: usize) -> String {
-    let quotes = "\"".repeat(4096);
-    let fixed = serde_json::to_string(&json!({ "A": quotes, "B": "" }))
-        .unwrap()
-        .len();
-    let rest = total - fixed;
-    let b = format!("{}{}", "\"".repeat(rest / 2), "x".repeat(rest % 2));
-    let text = serde_json::to_string(&json!({ "A": quotes, "B": b })).unwrap();
+    let len = |m: &serde_json::Map<String, Value>| serde_json::to_string(m).unwrap().len();
+    let mut map = serde_json::Map::new();
+    for i in 0.. {
+        let mut next = map.clone();
+        next.insert(format!("K{i}"), json!("\"".repeat(2048)));
+        if len(&next) + ",\"Z\":\"\"".len() > total {
+            break;
+        }
+        map = next;
+    }
+    map.insert("Z".into(), json!(""));
+    let rest = total - len(&map);
+    let tail = format!("{}{}", "\"".repeat(rest / 2), "x".repeat(rest % 2));
+    map.insert("Z".into(), json!(tail));
+    let text = serde_json::to_string(&map).unwrap();
     assert_eq!(text.len(), total);
     text
 }
@@ -729,8 +742,8 @@ fn build_environment_json_is_bounded_and_cannot_set_dangerous_variables() {
         let items: Vec<String> = (0..n).map(|i| format!("\"K{i}\":\"v\"")).collect();
         format!("{{{}}}", items.join(","))
     };
-    assert!(with_entry("CITE_BUILD_ENV_JSON", &keys(64)).is_ok());
-    assert!(with_entry("CITE_BUILD_ENV_JSON", &keys(65)).is_err());
+    assert!(with_entry("CITE_BUILD_ENV_JSON", &keys(128)).is_ok());
+    assert!(with_entry("CITE_BUILD_ENV_JSON", &keys(129)).is_err());
 }
 
 // The quoted literals of one `const NAME: &[&str] = &[...];` in the manager's config source.
@@ -894,17 +907,17 @@ fn create_with_env(env: &[String]) -> (usize, Result<(), String>) {
 #[test]
 fn the_largest_legal_create_body_fits_the_body_cap() {
     assert_eq!(max_github_url().len(), 200);
-    let env = maximal_manager_env(&build_env_json_of(12 * 1024));
+    let env = maximal_manager_env(&build_env_json_of(24 * 1024));
     assert_eq!(env.len(), 29);
     let (size, result) = create_with_env(&env);
     result.unwrap();
     assert!(size < MAX_BODY, "{size} bytes");
-    assert!(size > 30_000, "{size} bytes is not the worst case");
+    assert!(size > 55_000, "{size} bytes is not the worst case");
 }
 
 #[test]
 fn one_byte_more_than_the_largest_legal_build_environment_is_refused() {
-    let (_, result) = create_with_env(&maximal_manager_env(&build_env_json_of(12 * 1024 + 1)));
+    let (_, result) = create_with_env(&maximal_manager_env(&build_env_json_of(24 * 1024 + 1)));
     assert!(result.is_err());
 }
 
@@ -1175,11 +1188,11 @@ fn executor_with_runtime_json(text: &str) -> (usize, Result<(), String>) {
 
 #[test]
 fn the_largest_legal_executor_body_fits_the_body_cap() {
-    let (size, result) = executor_with_runtime_json(&build_env_json_of(12 * 1024));
+    let (size, result) = executor_with_runtime_json(&build_env_json_of(24 * 1024));
     result.unwrap();
     assert!(size < MAX_BODY, "{size} bytes");
-    assert!(size > 20_000, "{size} bytes is not the worst case");
-    let (_, result) = executor_with_runtime_json(&build_env_json_of(12 * 1024 + 1));
+    assert!(size > 45_000, "{size} bytes is not the worst case");
+    let (_, result) = executor_with_runtime_json(&build_env_json_of(24 * 1024 + 1));
     assert!(result.is_err());
 }
 

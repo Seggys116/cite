@@ -25,6 +25,10 @@ use crate::certificate::{
     validate_certificate_id,
 };
 use crate::config::{NodeConfig, parse_node_url};
+use crate::doppler::{
+    DopplerBindRequest, DopplerBinding, DopplerConfig, DopplerInfo, DopplerProject,
+    validate_doppler_slug,
+};
 use crate::error::ClientError;
 use crate::export::{
     AnalyticsStats, EXPORT_TIMEOUT, ExportQuery, ExportReport, ExportStream, validate_top_kind,
@@ -88,8 +92,28 @@ pub struct NodeInfo {
     /// Absent on connectors that predate the node-level token.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub github: Option<GithubInfo>,
+    /// Absent on connectors that predate Doppler sync.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doppler: Option<DopplerInfo>,
+    /// Whether site executors may make outbound requests; absent on connectors that predate the setting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor_egress: Option<bool>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
+}
+
+/// A persistent site volume as the node reports it; sizes and dates are absent when Docker does not report them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VolumeInfo {
+    pub name: String,
+    /// Empty for a volume left over from an earlier volume list.
+    pub mount_path: String,
+    pub size_bytes: Option<u64>,
+    pub mounted: bool,
+    pub created_at: Option<String>,
+    /// False when the site no longer lists the volume but its data is still kept.
+    pub declared: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -556,6 +580,46 @@ impl NodeClient {
     pub async fn delete_site(&self, id: &str) -> Res<()> {
         self.unit(Method::DELETE, &format!("/sites/{}", enc(id)))
             .await
+    }
+
+    /// Deletes the site and, unlike `delete_site`, the data in its persistent volumes too.
+    pub async fn delete_site_purging_volumes(&self, id: &str) -> Res<()> {
+        let id = validate_site_id(id)?;
+        self.exec(
+            Method::DELETE,
+            &format!("/sites/{}", enc(id)),
+            &[("purge_volumes", "true".to_string())],
+            None,
+            DEFAULT_OPTS,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    pub async fn site_volumes(&self, id: &str) -> Res<Vec<VolumeInfo>> {
+        let id = validate_site_id(id)?;
+        self.json(
+            Method::GET,
+            &format!("/sites/{}/volumes", enc(id)),
+            &[],
+            None,
+        )
+        .await
+    }
+
+    /// Removes a volume's data; the node refuses while a running slot could still use it.
+    pub async fn site_volume_delete(&self, id: &str, name: &str) -> Res<()> {
+        let id = validate_site_id(id)?;
+        if !cite_edge::validate::is_valid_volume_name(name) {
+            return Err(ClientError::Config(
+                "a volume name is 1 to 31 lowercase letters, digits and '-'".to_string(),
+            ));
+        }
+        self.unit(
+            Method::DELETE,
+            &format!("/sites/{}/volumes/{}", enc(id), enc(name)),
+        )
+        .await
     }
 
     pub async fn deploy(&self, id: &str, request: &DeployRequest) -> Res<Deployment> {
@@ -1052,6 +1116,82 @@ impl NodeClient {
                 &format!("/sites/{}/{which}", enc(id)),
                 &[],
                 body_of(patch)?,
+                ACTION_OPTS,
+            )
+            .await?;
+        decode(&bytes)
+    }
+
+    /// Projects the node's own Doppler token can see.
+    pub async fn doppler_projects(&self) -> Res<Vec<DopplerProject>> {
+        self.json(Method::GET, "/doppler/projects", &[], None).await
+    }
+
+    pub async fn doppler_configs(&self, project: &str) -> Res<Vec<DopplerConfig>> {
+        let project = validate_doppler_slug(project)?;
+        self.json(
+            Method::GET,
+            &format!("/doppler/projects/{}/configs", enc(project)),
+            &[],
+            None,
+        )
+        .await
+    }
+
+    pub async fn site_doppler(&self, id: &str) -> Res<DopplerBinding> {
+        let id = validate_site_id(id)?;
+        self.json(
+            Method::GET,
+            &format!("/sites/{}/doppler", enc(id)),
+            &[],
+            None,
+        )
+        .await
+    }
+
+    /// Binds the site and syncs once; a failed first sync leaves the previous binding in place.
+    pub async fn site_doppler_set(
+        &self,
+        id: &str,
+        req: &DopplerBindRequest,
+    ) -> Res<DopplerBinding> {
+        let id = validate_site_id(id)?;
+        req.validate()?;
+        let bytes = self
+            .exec(
+                Method::PUT,
+                &format!("/sites/{}/doppler", enc(id)),
+                &[],
+                body_of(req)?,
+                ACTION_OPTS,
+            )
+            .await?;
+        decode(&bytes)
+    }
+
+    /// Removes the binding and the synced values; the running site keeps them until its next deploy.
+    pub async fn site_doppler_clear(&self, id: &str) -> Res<DopplerBinding> {
+        let id = validate_site_id(id)?;
+        let bytes = self
+            .exec(
+                Method::DELETE,
+                &format!("/sites/{}/doppler", enc(id)),
+                &[],
+                None,
+                ACTION_OPTS,
+            )
+            .await?;
+        decode(&bytes)
+    }
+
+    pub async fn site_doppler_sync(&self, id: &str) -> Res<DopplerBinding> {
+        let id = validate_site_id(id)?;
+        let bytes = self
+            .exec(
+                Method::POST,
+                &format!("/sites/{}/doppler/sync", enc(id)),
+                &[],
+                Some(json!({})),
                 ACTION_OPTS,
             )
             .await?;

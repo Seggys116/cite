@@ -968,6 +968,8 @@ mod tests {
             source: None,
             history: vec![],
             access: Default::default(),
+            volumes: Vec::new(),
+            outbound: true,
         }
     }
 

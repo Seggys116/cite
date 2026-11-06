@@ -86,24 +86,28 @@ pub fn split_command(input: &str) -> Result<Vec<String>> {
     Ok(args)
 }
 
-/// Reject package-manager argv. The executor image has no npm/pnpm/yarn.
+/// Programs the executor image does not have: package managers, build tools and shells.
+const REFUSED_ARGV0: [&str; 13] = [
+    "npm", "npx", "pnpm", "pnpx", "yarn", "corepack", "bunx", "cargo", "rustc", "sh", "bash",
+    "dash", "env",
+];
+
+/// Reject package-manager, shell and launcher argv. The executor image has none of them.
 pub fn validate_start_argv(argv: &[String]) -> Result<()> {
     if argv.is_empty() {
         return Err(Error::Config("start argv is empty".into()));
     }
     let argv0 = argv[0].as_str();
-    if matches!(
-        argv0,
-        "npm" | "npx" | "pnpm" | "yarn" | "corepack" | "cargo" | "rustc"
-    ) || argv0.ends_with("/npm")
-        || argv0.ends_with("/npx")
-        || argv0.ends_with("/pnpm")
-        || argv0.ends_with("/yarn")
-        || argv0.ends_with("/cargo")
-        || argv0.ends_with("/rustc")
-    {
+    let program = argv0.rsplit('/').next().unwrap_or(argv0);
+    if REFUSED_ARGV0.contains(&program) {
         return Err(Error::Config(format!(
             "`{argv0}` cannot run in the executor; use node, bun, or a release binary"
+        )));
+    }
+    if program == "bun" && matches!(argv.get(1).map(String::as_str), Some("run" | "x")) {
+        return Err(Error::Config(format!(
+            "`bun {}` cannot run in the executor; start the file directly, for example `bun server.ts`",
+            argv[1]
         )));
     }
     Ok(())
@@ -163,6 +167,25 @@ mod tests {
             assert!(err.to_string().contains("cannot run"), "{argv0}: {err}");
         }
         assert!(validate_start_argv(&["bin/hello".into()]).is_ok());
+    }
+
+    #[test]
+    fn rejects_shells_and_bun_launchers_but_not_bun_files() {
+        let argv = |parts: &[&str]| parts.iter().map(|p| p.to_string()).collect::<Vec<_>>();
+        for refused in [
+            &["sh", "-c", "node x"][..],
+            &["/bin/bash", "start.sh"],
+            &["env", "node", "x.js"],
+            &["bunx", "serve"],
+            &["bun", "run", "server.ts"],
+            &["bun", "x", "serve"],
+            &["pnpx", "serve"],
+        ] {
+            let err = validate_start_argv(&argv(refused)).unwrap_err();
+            assert!(err.to_string().contains("cannot run"), "{refused:?}: {err}");
+        }
+        assert!(validate_start_argv(&argv(&["bun", "server.ts"])).is_ok());
+        assert!(validate_start_argv(&argv(&["node", "server.js"])).is_ok());
     }
 
     #[test]

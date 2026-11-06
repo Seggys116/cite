@@ -10,10 +10,11 @@ use crate::model::{
 };
 use crate::theme::{BLUE, DIM, GREEN, RED, Tone, YELLOW, c};
 use crate::ui::bots::{bot_badge, request_detail};
-use crate::ui::chart::{Line, hbar, line_chart};
+use crate::ui::chart::{Line, STAT_MIN, clip_tip, hbar, line_chart, wide, x_axis};
+use crate::ui::scroll::scroll_area;
 use crate::ui::widgets::{
-    BtnKind, Col, btn, card, clip, dot, empty_state, id, mono, page_header, pill, seg_item,
-    seg_row, skeleton, stat, table, text_dim, tone_for_status,
+    BtnKind, Col, btn, card, dot, empty_state, grid, grid_min, id, mono, page_header, pill,
+    seg_item, seg_row, skeleton, stat, table, text_dim, tone_for_status,
 };
 
 const RECENT_LIMIT: usize = 30;
@@ -227,9 +228,10 @@ pub fn top_table(items: &[TopItem], with_bytes: bool) -> AnyElement {
     let rows: Vec<Vec<AnyElement>> = items
         .iter()
         .take(6)
-        .map(|t| {
+        .enumerate()
+        .map(|(i, t)| {
             let mut cells = vec![
-                clip(t.key.clone())
+                clip_tip(id("top-key", format!("{i}-{}", t.key)), t.key.clone())
                     .font_family(crate::theme::MONO)
                     .text_size(px(12.))
                     .into_any_element(),
@@ -266,23 +268,20 @@ fn traffic_body(
 ) -> AnyElement {
     let sm = &data.summary;
     let errors = sm.errors_4xx + sm.errors_5xx;
-    let stats = div()
-        .flex()
-        .flex_wrap()
-        .gap(px(12.))
-        .child(stat(
+    let tiles = vec![
+        stat(
             "Requests",
             fmt_num(sm.requests),
             format!("{} in this window", fmt_int(sm.requests)),
             Tone::Muted,
-        ))
-        .child(stat(
+        ),
+        stat(
             "Bandwidth out",
             fmt_bytes(sm.bytes_out),
             format!("{} received", fmt_bytes(sm.bytes_in)),
             Tone::Muted,
-        ))
-        .child(stat(
+        ),
+        stat(
             "Errors",
             fmt_num(errors),
             if sm.requests > 0 {
@@ -298,16 +297,25 @@ fn traffic_body(
             } else {
                 Tone::Muted
             },
-        ))
-        .child(stat(
+        ),
+        stat(
             "Blocked",
             fmt_num(sm.blocked),
             "stopped by the firewall".into(),
             Tone::Muted,
-        ));
+        ),
+    ];
+    let stats = grid_min(
+        STAT_MIN,
+        tiles
+            .into_iter()
+            .map(|t| t.min_w_0().h_full().into_any_element())
+            .collect(),
+    );
     let pts = &data.series.points;
     let legend = div()
         .flex()
+        .flex_wrap()
         .gap(px(14.))
         .text_size(px(12.))
         .child(legend_item("Requests", BLUE))
@@ -334,18 +342,21 @@ fn traffic_body(
         190.,
         true,
     );
-    let axis = div()
-        .flex()
-        .justify_between()
-        .text_size(px(11.))
-        .text_color(c(DIM))
-        .child(match pts.first() {
-            Some(p) if window == "15m" || window == "1h" || window == "24h" => {
+    let short = window == "15m" || window == "1h" || window == "24h";
+    let mut stamps: Vec<String> = pts
+        .iter()
+        .map(|p| {
+            if short {
                 format!("{} UTC", fmt_clock(p.ts * 1000))
+            } else {
+                crate::bots::fmt_stamp(p.ts * 1000)
             }
-            _ => format!("{window} ago"),
         })
-        .child("now");
+        .collect();
+    if let Some(last) = stamps.last_mut() {
+        *last = "now".to_string();
+    }
+    let axis = x_axis("tr-axis", stamps);
     let series_card = card(
         Some("Requests over time"),
         Some(&format!("{} second buckets", data.series.step_secs)),
@@ -394,37 +405,37 @@ fn traffic_body(
         );
         size_bars = size_bars.child(hbar(&label, b.count, sizes_max, BLUE, fmt_int(b.count)));
     }
-    let half = |card: gpui::Div| card.flex_1().min_w(px(300.));
-    let row_a = div()
-        .flex()
-        .flex_wrap()
-        .gap(px(16.))
-        .child(half(card(Some("Status classes"), None, status)))
-        .child(half(card(
-            Some("Latency"),
-            Some("Total time per request"),
-            latency,
-        )))
-        .child(half(card(Some("Response sizes"), None, size_bars)));
-    let row_b = div()
-        .flex()
-        .flex_wrap()
-        .gap(px(16.))
-        .child(half(card(
-            Some("Top paths"),
-            None,
-            top_table(&sm.top_paths, true),
-        )))
-        .child(half(card(
-            Some("Top client IPs"),
-            None,
-            top_table(&sm.top_ips, false),
-        )))
-        .child(half(card(
-            Some("Top user agents"),
-            None,
-            top_table(&sm.top_user_agents, false),
-        )));
+    let half = |card: gpui::Div| card.flex_1().min_w_0().into_any_element();
+    let row_a = grid(
+        vec![
+            half(card(Some("Status classes"), None, status)),
+            half(card(
+                Some("Latency"),
+                Some("Total time per request"),
+                latency,
+            )),
+            half(card(Some("Response sizes"), None, size_bars)),
+        ],
+    );
+    let row_b = grid(
+        vec![
+            half(card(
+                Some("Top paths"),
+                None,
+                top_table(&sm.top_paths, true),
+            )),
+            half(card(
+                Some("Top client IPs"),
+                None,
+                top_table(&sm.top_ips, false),
+            )),
+            half(card(
+                Some("Top user agents"),
+                None,
+                top_table(&sm.top_user_agents, false),
+            )),
+        ],
+    );
     let mut page = div()
         .flex()
         .flex_col()
@@ -468,15 +479,17 @@ fn recent_card(events: &[LogEvent], cx: &mut Context<Console>) -> AnyElement {
                     .into_any_element(),
                 pill(&e.status.to_string(), tone_for_status(e.status)).into_any_element(),
                 mono(e.method.clone()).into_any_element(),
-                clip(e.path.clone())
+                clip_tip(id("tr-path", i), e.path.clone())
                     .font_family(crate::theme::MONO)
                     .text_size(px(12.))
                     .into_any_element(),
-                clip(e.host.clone())
+                clip_tip(id("tr-host", i), e.host.clone())
                     .text_size(px(12.))
                     .text_color(c(DIM))
                     .into_any_element(),
-                mono(e.client_ip.clone())
+                clip_tip(id("tr-ip", i), e.client_ip.clone())
+                    .font_family(crate::theme::MONO)
+                    .text_size(px(12.))
                     .text_color(c(DIM))
                     .into_any_element(),
                 mono(format!("{} ms", e.total_ms)).into_any_element(),
@@ -522,14 +535,20 @@ fn recent_card(events: &[LogEvent], cx: &mut Context<Console>) -> AnyElement {
     card(
         Some("Recent requests"),
         None,
-        div().flex().flex_col().gap(px(8.)).child(live).child(table(
-            &cols,
-            rows,
-            Some(empty_state(
-                "No requests yet",
-                "Requests appear here as they arrive.",
+        div().flex().flex_col().gap(px(8.)).child(live).child(
+            scroll_area("tr-recent").max_h(px(520.)).child(wide(
+                id("tr", "recent-table"),
+                cols.iter().filter_map(|col| col.width).sum::<f32>() + 220.,
+                table(
+                    &cols,
+                    rows,
+                    Some(empty_state(
+                        "No requests yet",
+                        "Requests appear here as they arrive.",
+                    )),
+                ),
             )),
-        )),
+        ),
     )
     .into_any_element()
 }

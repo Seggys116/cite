@@ -331,6 +331,117 @@ pub fn validate_site_strict(site: &Site) -> Result<(), ValidationError> {
     if let Some(src) = &site.source {
         validate_source(src).map_err(|e| ValidationError(format!("site {} {}", site.id, e.0)))?;
     }
+    validate_volumes(site)
+}
+
+pub const MAX_VOLUMES: usize = 8;
+const MAX_VOLUME_NAME: usize = 31;
+const MAX_MOUNT_PATH: usize = 255;
+
+/// Paths the executor images use or the kernel provides; a volume may not sit on, under or above any of them.
+pub const RESERVED_MOUNT_PATHS: [&str; 19] = [
+    "/var/lib/cite",
+    "/cite-executor",
+    "/nodejs",
+    "/tmp",
+    "/proc",
+    "/sys",
+    "/dev",
+    "/etc",
+    "/run",
+    "/var/run",
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/lib",
+    "/lib32",
+    "/lib64",
+    "/libx32",
+    "/root",
+    "/boot",
+];
+
+pub fn is_valid_volume_name(name: &str) -> bool {
+    let b = name.as_bytes();
+    (1..=MAX_VOLUME_NAME).contains(&b.len())
+        && b.first()
+            .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && b.iter()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-')
+}
+
+fn path_within(inner: &str, outer: &str) -> bool {
+    inner == outer
+        || inner
+            .strip_prefix(outer)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// Why a mount path is refused, or None when it is an acceptable volume target.
+pub fn mount_path_problem(p: &str) -> Option<&'static str> {
+    let shaped = (2..=MAX_MOUNT_PATH).contains(&p.len())
+        && p.starts_with('/')
+        && p.bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'/' | b'-'));
+    if !shaped {
+        return Some("must be an absolute path of 2 to 255 letters, digits, '.', '_', '-' and '/'");
+    }
+    if p.ends_with('/') || p[1..].split('/').any(|seg| seg.is_empty() || seg == "." || seg == "..")
+    {
+        return Some("must be normalised: no trailing slash, empty, '.' or '..' segments");
+    }
+    if RESERVED_MOUNT_PATHS
+        .iter()
+        .any(|r| path_within(p, r) || path_within(r, p))
+    {
+        return Some("overlaps a path the executor or the system uses");
+    }
+    None
+}
+
+/// True when the site's runtime runs a server process, the only kind that can write to a volume.
+pub fn runs_server(src: &crate::model::Source) -> bool {
+    let runtime = src.runtime.as_deref().unwrap_or("node");
+    runtime != "static" && src.rendering != Some(crate::model::RenderMode::Static)
+}
+
+pub fn validate_volumes(site: &Site) -> Result<(), ValidationError> {
+    if site.volumes.is_empty() {
+        return Ok(());
+    }
+    let what = format!("site {} volumes", site.id);
+    if !site.source.as_ref().is_some_and(runs_server) {
+        return invalid(format!(
+            "{what}: only sites built from a repository with a server runtime (node, bun, rust SSR or a start command) can have volumes; a static site has no process to write to them"
+        ));
+    }
+    if site.volumes.len() > MAX_VOLUMES {
+        return invalid(format!("{what}: at most {MAX_VOLUMES} volumes per site"));
+    }
+    for (i, v) in site.volumes.iter().enumerate() {
+        if !is_valid_volume_name(&v.name) {
+            return invalid(format!(
+                "{what}: name {:?} must match ^[a-z0-9][a-z0-9-]{{0,30}}$",
+                v.name
+            ));
+        }
+        if let Some(why) = mount_path_problem(&v.mount_path) {
+            return invalid(format!("{what} {}: mount_path {why}", v.name));
+        }
+        for other in &site.volumes[..i] {
+            if other.name == v.name {
+                return invalid(format!("{what}: name {:?} is used twice", v.name));
+            }
+            if path_within(&v.mount_path, &other.mount_path)
+                || path_within(&other.mount_path, &v.mount_path)
+            {
+                return invalid(format!(
+                    "{what}: {} and {} have overlapping mount paths",
+                    other.name, v.name
+                ));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -428,6 +539,43 @@ pub fn validate_source(src: &crate::model::Source) -> Result<(), ValidationError
         return source_error(
             "forge",
             "the forge is set for the whole node by the operator (CITE_STACK_FORGE); a per-site forge is not supported",
+        );
+    }
+    if let Some(binding) = &src.doppler {
+        validate_doppler_binding(binding)?;
+    }
+    Ok(())
+}
+
+const MAX_DOPPLER_SLUG: usize = 100;
+
+/// A Doppler project or config name: 1 to 100 of letters, digits, '.', '_' and '-'.
+pub fn is_valid_doppler_slug(s: &str) -> bool {
+    (1..=MAX_DOPPLER_SLUG).contains(&s.len())
+        && s.bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'-'))
+}
+
+// Both names empty means a service token supplies them; whether such a token is stored is checked where tokens are known.
+pub fn validate_doppler_binding(b: &crate::model::DopplerBinding) -> Result<(), ValidationError> {
+    if b.project.is_empty() != b.config.is_empty() {
+        return source_error(
+            "doppler",
+            "project and config must both be set, or both be empty to take them from a service token",
+        );
+    }
+    for (field, value) in [("project", &b.project), ("config", &b.config)] {
+        if !b.token_only() && !is_valid_doppler_slug(value) {
+            return source_error(
+                &format!("doppler {field}"),
+                "must be 1 to 100 characters of letters, digits, '.', '_' and '-'",
+            );
+        }
+    }
+    if !b.build && !b.runtime {
+        return source_error(
+            "doppler",
+            "must feed the build variables, the runtime variables or both",
         );
     }
     Ok(())
@@ -1282,6 +1430,8 @@ pub(crate) mod fixtures {
             source: None,
             history: vec![],
             access: SiteAccess::default(),
+            volumes: Vec::new(),
+            outbound: true,
         }
     }
 

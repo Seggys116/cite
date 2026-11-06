@@ -73,6 +73,36 @@ pub struct Site {
     // Left out of the JSON while it is the default so nodes that predate the field still accept the site.
     #[serde(default, skip_serializing_if = "SiteAccess::is_default")]
     pub access: SiteAccess,
+    /// Named Docker volumes mounted read-write into both executor slots; they outlive deploys and rollbacks.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub volumes: Vec<Volume>,
+    /// Lets a server runtime make outbound requests; sites saved before the field existed get it switched on.
+    #[serde(default = "default_true")]
+    pub outbound: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Volume {
+    pub name: String,
+    pub mount_path: String,
+}
+
+impl Volume {
+    /// The Docker volume behind this entry; the underscore cannot occur in a site id, so the split is unambiguous.
+    pub fn docker_name(&self, site_id: &str) -> String {
+        volume_docker_name(site_id, &self.name)
+    }
+}
+
+pub const VOLUME_PREFIX: &str = "cite-vol-";
+
+pub fn volume_docker_name(site_id: &str, name: &str) -> String {
+    format!("{VOLUME_PREFIX}{site_id}_{name}")
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -233,6 +263,27 @@ pub struct Source {
     pub build_memory_mb: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_cpus: Option<Cpus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doppler: Option<DopplerBinding>,
+}
+
+/// A Doppler project and config whose secrets feed the build and/or runtime variables of a site.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DopplerBinding {
+    /// Empty together with `config` when the site's service token alone names the project and config.
+    pub project: String,
+    pub config: String,
+    #[serde(default)]
+    pub build: bool,
+    #[serde(default)]
+    pub runtime: bool,
+}
+
+impl DopplerBinding {
+    pub fn token_only(&self) -> bool {
+        self.project.is_empty() && self.config.is_empty()
+    }
 }
 
 // A plain f32 would stop Source, Site and EdgeConfig from deriving Eq; comparing bits keeps them hashable-equal and the JSON is still a number.

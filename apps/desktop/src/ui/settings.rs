@@ -1,6 +1,6 @@
 use cite_client::TokenMeta;
 use cite_edge::model::EdgeSettings;
-use gpui::{AnyElement, ClipboardItem, Context, Entity, div, prelude::*, px};
+use gpui::{AnyElement, ClipboardItem, Context, Div, Entity, FontWeight, div, prelude::*, px};
 
 use crate::app::{Confirm, Console, Load, new_input};
 use crate::archive::retention_warning;
@@ -9,12 +9,13 @@ use crate::config::KEYCHAIN_SERVICE;
 use crate::demo::now_ms;
 use crate::model::{SettingsDraft, parse_rfc3339_ms, rel_time};
 use crate::scope::{TokenShelf, foreign_notice};
-use crate::theme::{DIM, Tone, c};
+use crate::theme::{CARD_RADIUS, DIM, DIVIDER, MONO, SURFACE, TEXT, Tone, c, chip_stroke};
+use crate::ui::chart::{FIELD_MIN, clip_tip, wide};
 use crate::ui::input::TextInput;
 use crate::ui::nodes::hostname;
 use crate::ui::widgets::{
-    BtnKind, Col, btn, card, empty_state, field, id, mono, notice, page_header, seg_item, seg_row,
-    skeleton, strong, table, text_dim, toggle,
+    BtnKind, Col, btn, card, empty_state, field, grid_min, id, mono, notice, page_header, seg_item,
+    seg_row, skeleton, strong, tab_bar, tab_item, table, text_dim, toggle,
 };
 
 pub struct Data {
@@ -22,7 +23,46 @@ pub struct Data {
     pub tokens: Vec<TokenMeta>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Tab {
+    #[default]
+    General,
+    Nodes,
+    Certificates,
+    Alerts,
+    Retention,
+    Tokens,
+}
+
+impl Tab {
+    pub const ALL: [Tab; 6] = [
+        Tab::General,
+        Tab::Nodes,
+        Tab::Certificates,
+        Tab::Alerts,
+        Tab::Retention,
+        Tab::Tokens,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Tab::General => "General",
+            Tab::Nodes => "Nodes",
+            Tab::Certificates => "Certificates",
+            Tab::Alerts => "Alerts",
+            Tab::Retention => "Retention and ranges",
+            Tab::Tokens => "Tokens",
+        }
+    }
+
+    // Tabs that show one node's configuration and so need a connected node and its loaded settings.
+    pub fn needs_node(self) -> bool {
+        !matches!(self, Tab::General | Tab::Nodes)
+    }
+}
+
 pub struct State {
+    pub tab: Tab,
     pub data: Load<Data>,
     // The node the loaded data came from; saves are refused for any other node.
     pub data_node: String,
@@ -45,6 +85,7 @@ pub struct State {
 impl State {
     pub fn new(cx: &mut Context<Console>) -> Self {
         Self {
+            tab: Tab::default(),
             data: Load::Idle,
             data_node: String::new(),
             error: None,
@@ -197,93 +238,150 @@ impl Console {
             Some(n) => format!("Configuration of {n}"),
             None => "Console preferences".into(),
         };
-        let mut col = div().flex().flex_col().gap(px(16.)).child(page_header(
-            "Settings",
-            &subtitle,
-            Vec::new(),
-        ));
-        col = col.child(self.desktop_card());
+        let tab = self.settings.tab;
+        let mut strip = Vec::new();
+        for t in Tab::ALL {
+            strip.push(
+                tab_item(id("set-tab", t.label()), t.label(), t == tab)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.settings.tab = t;
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+            );
+        }
+        let col = div()
+            .flex()
+            .flex_col()
+            .gap(px(SPACE))
+            .child(page_header("Settings", &subtitle, Vec::new()))
+            .child(tab_bar(strip));
+        let body = self.settings_tab_body(tab, cx);
+        col.child(body).into_any_element()
+    }
+
+    fn settings_tab_body(&mut self, tab: Tab, cx: &mut Context<Self>) -> AnyElement {
+        let mut col = div().flex().flex_col().gap(px(SPACE));
+        if !tab.needs_node() {
+            let body = if tab == Tab::General {
+                self.general_tab()
+            } else {
+                self.nodes_panel(cx)
+            };
+            return col.child(body).into_any_element();
+        }
         if self.handles.is_empty() {
             return col.child(self.no_nodes_block(cx)).into_any_element();
         }
         col = col.children(self.scope_note());
-        let ready = matches!(self.settings.data, Load::Ready(_));
-        let tools = ready.then(|| self.certtools_card(cx));
-        let alerts = ready.then(|| self.alerts_card(cx));
         match &self.settings.data {
-            Load::Idle | Load::Loading => col = col.child(skeleton(220.)).child(skeleton(160.)),
+            Load::Idle | Load::Loading => {
+                return col
+                    .child(skeleton(220.))
+                    .child(skeleton(160.))
+                    .into_any_element();
+            }
             Load::Failed(msg) => {
                 let msg = msg.clone();
-                col = col.child(self.error_block(cx, &msg));
+                return col.child(self.error_block(cx, &msg)).into_any_element();
             }
-            Load::Ready(data) => {
-                col = col
-                    .child(self.retention_card(cx))
-                    .child(self.certs_card(cx))
-                    .children(tools)
-                    .child(self.ranges_card(cx))
-                    .children(alerts)
-                    .child(self.tokens_card(data, cx));
-            }
+            Load::Ready(_) => {}
         }
+        col = match tab {
+            Tab::Certificates => {
+                let tools = self.certtools_card(cx);
+                col.child(self.certs_card(cx)).child(tools)
+            }
+            Tab::Alerts => col.child(self.alerts_card(cx)),
+            Tab::Retention => col
+                .child(self.retention_card(cx))
+                .child(self.ranges_card(cx)),
+            Tab::Tokens => {
+                let tokens = match &self.settings.data {
+                    Load::Ready(data) => self.tokens_card(data, cx),
+                    _ => skeleton(160.).into_any_element(),
+                };
+                col.child(tokens)
+            }
+            Tab::General | Tab::Nodes => col,
+        };
         col.into_any_element()
     }
 
     // Shows where credentials live so the storage model is never a surprise.
-    fn desktop_card(&self) -> AnyElement {
+    fn general_tab(&self) -> AnyElement {
         let path = if self.demo {
             "In-memory demo data".to_string()
         } else {
             self.config_path.display().to_string()
         };
-        let row = |label: &str, value: String| {
-            div()
-                .flex()
-                .gap(px(12.))
-                .child(div().w(px(140.)).child(text_dim(label.to_string())))
-                .child(mono(value))
+        let value = |key: &str, text: String| {
+            clip_tip(id("set-general", key), text)
+                .font_family(MONO)
+                .text_size(px(12.))
+                .text_color(c(DIM))
+                .into_any_element()
         };
-        let body = div()
+        let desktop = group(vec![
+            form_row(
+                "Config file",
+                Some("Nodes and saved filters; never holds a token."),
+                value("config", path),
+            ),
+            form_row(
+                "Keychain service",
+                Some("Node tokens live in the operating system keychain."),
+                value("keychain", KEYCHAIN_SERVICE.to_string()),
+            ),
+        ]);
+        let about = group(vec![
+            form_row(
+                "Computer",
+                Some("Names the tokens this console mints."),
+                value("host", hostname()),
+            ),
+            form_row(
+                "Version",
+                None,
+                value("version", env!("CARGO_PKG_VERSION").to_string()),
+            ),
+            form_row(
+                "Appearance",
+                Some("The console follows a single dark theme."),
+                value("theme", "Dark".to_string()),
+            ),
+        ]);
+        div()
             .flex()
             .flex_col()
-            .gap(px(6.))
-            .child(row("Config file", path))
-            .child(row("Keychain service", KEYCHAIN_SERVICE.to_string()))
-            .child(row("Computer", hostname()))
-            .child(row("Version", env!("CARGO_PKG_VERSION").to_string()));
-        card(
-            Some("This computer"),
-            Some("Node tokens live in the operating system keychain and never in the config file."),
-            body,
-        )
-        .into_any_element()
+            .gap(px(SPACE))
+            .child(section("Desktop configuration", desktop))
+            .child(section("This computer", about))
+            .into_any_element()
     }
 
     fn retention_card(&self, cx: &mut Context<Self>) -> AnyElement {
         let s = &self.settings;
         let cell = |label: &str, hint: &str, e: &Entity<TextInput>| {
-            div()
-                .flex_1()
-                .min_w(px(160.))
-                .child(field(label, Some(hint), e.clone()))
+            field(label, Some(hint), e.clone()).into_any_element()
         };
         let switch = |key: &str,
                       on: bool,
                       label: &str,
+                      detail: &str,
                       f: fn(&mut Console) -> &mut bool,
                       cx: &mut Context<Self>| {
-            div()
-                .flex()
-                .items_center()
-                .gap(px(10.))
-                .child(
-                    toggle(id("ret", key), on).on_click(cx.listener(move |this, _, _, cx| {
+            form_row(
+                label,
+                Some(detail),
+                toggle(id("ret", key), on)
+                    .on_click(cx.listener(move |this, _, _, cx| {
                         let flag = f(this);
                         *flag = !*flag;
                         cx.notify();
-                    })),
-                )
-                .child(div().child(label.to_string()))
+                    }))
+                    .into_any_element(),
+            )
         };
         let (ua, ip) = (s.store_ua, s.store_ip);
         let mut keep = Vec::new();
@@ -302,77 +400,89 @@ impl Console {
                     .into_any_element(),
             );
         }
-        let mut history = div().flex().flex_col().gap(px(10.)).child(field(
+        let mut history_rows = vec![form_row(
             "Keep data",
             Some("Hourly history is kept forever unless you choose a limit."),
-            div().flex().child(seg_row(keep)),
-        ));
+            seg_row(keep).into_any_element(),
+        )];
         if !s.keep_forever {
-            history = history.child(div().w(px(220.)).child(field(
+            history_rows.push(form_row(
                 "Days to keep",
                 Some("1 to 3650"),
-                s.hours.clone(),
-            )));
+                div()
+                    .w(px(140.))
+                    .flex_shrink()
+                    .min_w(px(80.))
+                    .child(s.hours.clone())
+                    .into_any_element(),
+            ));
         }
-        history = history.child(switch(
+        history_rows.push(switch(
             "archive",
             s.archive_before_delete,
-            "Archive old data before deleting it",
+            "Archive before deleting",
+            "Saves a copy of old data before it is removed.",
             |c| &mut c.settings.archive_before_delete,
             cx,
         ));
+        let mut history = div()
+            .flex()
+            .flex_col()
+            .gap(px(GAP))
+            .child(group(history_rows));
         let days_text = s.hours.read(cx).text().to_string();
         if let Some(warning) =
             retention_warning(s.keep_forever, s.archive_before_delete, &days_text)
         {
             history = history.child(notice(&warning, Tone::Bad));
         }
-        let mut body = div()
-            .flex()
-            .flex_col()
-            .gap(px(12.))
-            .child(history)
-            .child(
-                div()
-                    .flex()
-                    .gap(px(12.))
-                    .child(cell("Recent events", "Kept in memory", &s.recent))
-                    .child(cell(
-                        "Minute buckets (hours)",
-                        "Fine-grained history",
-                        &s.minutes,
-                    )),
-            )
-            .child(
-                div()
-                    .flex()
-                    .gap(px(12.))
-                    .child(cell(
-                        "Audit log (days)",
-                        "How long changes are kept",
-                        &s.audit,
-                    ))
-                    .child(cell(
-                        "Persist interval (s)",
-                        "How often stats hit disk",
-                        &s.persist,
-                    ))
-                    .child(cell("Per-IP rate limit", "Requests per minute", &s.rate)),
-            )
-            .child(switch(
+        let limits = grid_min(
+            FIELD_MIN,
+            vec![
+                cell("Recent events", "Kept in memory", &s.recent),
+                cell(
+                    "Minute buckets (hours)",
+                    "Fine-grained history",
+                    &s.minutes,
+                ),
+                cell(
+                    "Audit log (days)",
+                    "How long changes are kept",
+                    &s.audit,
+                ),
+                cell(
+                    "Persist interval (s)",
+                    "How often stats hit disk",
+                    &s.persist,
+                ),
+                cell("Per-IP rate limit", "Requests per minute", &s.rate),
+            ],
+        );
+        let privacy = group(vec![
+            switch(
                 "ua",
                 ua,
                 "Store user agents",
+                "Needed for bot detection detail and the agent lists.",
                 |c| &mut c.settings.store_ua,
                 cx,
-            ))
-            .child(switch(
+            ),
+            switch(
                 "ip",
                 ip,
                 "Store client IPs",
+                "Needed for the client lists and IP filters.",
                 |c| &mut c.settings.store_ip,
                 cx,
-            ));
+            ),
+        ]);
+        let mut body = div()
+            .flex()
+            .flex_col()
+            .gap(px(SPACE))
+            .child(section("History", history))
+            .child(section("Limits", limits))
+            .child(section("Privacy", privacy));
         if let Some(err) = &self.settings.error {
             body = body.child(notice(err, Tone::Bad));
         }
@@ -397,14 +507,18 @@ impl Console {
                     ),
                 ),
         );
-        card(
-            Some("Data retention and limits"),
-            Some(
-                "History is kept forever by default. Choose a limit only if old data may be removed, and keep archiving on to save a copy first.",
-            ),
-            body,
-        )
-        .into_any_element()
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(GAP))
+            .child(
+                text_dim(
+                    "History is kept forever by default. Choose a limit only if old data may be removed, and keep archiving on to save a copy first.",
+                )
+                .text_size(px(12.)),
+            )
+            .child(body)
+            .into_any_element()
     }
 
     // A created token is displayed once with a copy button, as the node never shows it again.
@@ -474,12 +588,18 @@ impl Console {
                         div()
                             .flex()
                             .flex_col()
+                            .flex_1()
+                            .min_w_0()
                             .child(strong("Copy your new token"))
                             .child(
                                 text_dim("It is shown once and cannot be retrieved later.")
                                     .text_size(px(12.)),
                             )
-                            .child(mono(token)),
+                            .child(
+                                clip_tip(id("tok", "value"), token)
+                                    .font_family(MONO)
+                                    .text_size(px(12.)),
+                            ),
                     )
                     .child(
                         div()
@@ -512,7 +632,7 @@ impl Console {
                     .flex()
                     .items_end()
                     .gap(px(10.))
-                    .child(div().w(px(300.)).child(field(
+                    .child(div().flex_1().min_w_0().max_w(px(420.)).child(field(
                         "New token name",
                         None,
                         self.settings.token_name.clone(),
@@ -526,14 +646,132 @@ impl Console {
                         ),
                     ),
             )
-            .child(table(
-                &cols,
-                rows,
-                Some(empty_state(
-                    "No API tokens",
-                    "Create a long-lived token for scripts and CI pipelines.",
-                )),
+            .child(wide(
+                id("tok", "table"),
+                560.,
+                table(
+                    &cols,
+                    rows,
+                    Some(empty_state(
+                        "No API tokens",
+                        "Create a long-lived token for scripts and CI pipelines.",
+                    )),
+                ),
             ));
-        card(Some("API tokens"), None, body).into_any_element()
+        if let Some(err) = &self.settings.error {
+            body = body.child(notice(err, Tone::Bad));
+        }
+        card(
+            Some("API tokens"),
+            Some("Long-lived tokens for scripts and CI pipelines on this node."),
+            body,
+        )
+        .into_any_element()
+    }
+}
+
+// The spacing rhythm shared by settings and the setup flows: SPACE between sections, GAP inside them.
+pub(crate) const SPACE: f32 = 20.0;
+pub(crate) const GAP: f32 = 12.0;
+
+pub(crate) fn section(title: &str, body: impl IntoElement) -> Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(8.))
+        .min_w_0()
+        .child(
+            div()
+                .pl(px(4.))
+                .text_size(px(11.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(c(DIM))
+                .child(title.to_string()),
+        )
+        .child(body)
+}
+
+// Rows of one settings group share a rounded panel and are split by hairlines.
+pub(crate) fn group(rows: Vec<AnyElement>) -> Div {
+    let mut root = div()
+        .flex()
+        .flex_col()
+        .w_full()
+        .min_w_0()
+        .overflow_hidden()
+        .rounded(px(CARD_RADIUS + 2.))
+        .border_1()
+        .border_color(chip_stroke())
+        .bg(c(SURFACE));
+    for (i, row) in rows.into_iter().enumerate() {
+        if i > 0 {
+            root = root.child(div().h(px(1.)).w_full().bg(c(DIVIDER)));
+        }
+        root = root.child(row);
+    }
+    root
+}
+
+// A title and optional detail on the left, the control on the right; the text column shrinks first.
+pub(crate) fn form_row(title: &str, detail: Option<&str>, control: AnyElement) -> AnyElement {
+    let mut text = div()
+        .flex()
+        .flex_col()
+        .gap(px(2.))
+        .flex_1()
+        .min_w(px(120.))
+        .child(
+            div()
+                .text_size(px(13.))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(c(TEXT))
+                .child(title.to_string()),
+        );
+    if let Some(d) = detail {
+        text = text.child(text_dim(d.to_string()).text_size(px(11.)));
+    }
+    div()
+        .flex()
+        .flex_wrap()
+        .items_center()
+        .justify_between()
+        .gap(px(16.))
+        .min_h(px(52.))
+        .px(px(16.))
+        .py(px(12.))
+        .child(text)
+        .child(
+            div()
+                .flex()
+                .justify_end()
+                .flex_shrink()
+                .min_w_0()
+                .max_w_full()
+                .child(control),
+        )
+        .into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tabs_are_listed_once_with_distinct_labels() {
+        let labels: Vec<&str> = Tab::ALL.iter().map(|t| t.label()).collect();
+        let mut unique = labels.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), labels.len());
+        assert_eq!(Tab::default(), Tab::General);
+    }
+
+    #[test]
+    fn only_node_scoped_tabs_need_a_node() {
+        assert!(!Tab::General.needs_node());
+        assert!(!Tab::Nodes.needs_node());
+        for t in [Tab::Certificates, Tab::Alerts, Tab::Retention, Tab::Tokens] {
+            assert!(t.needs_node());
+        }
     }
 }

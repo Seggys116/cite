@@ -1,14 +1,16 @@
-use cite_edge::model::{Site, SiteKind};
+use cite_edge::model::{DeployAction, Site, SiteKind};
 use gpui::{AnyElement, Context, Entity, div, prelude::*, px};
 
 use crate::api::{NodeHandle, join_all};
 use crate::app::{Console, Load, View, new_input};
-use crate::theme::{DIM, Tone, c};
+use crate::demo::now_ms;
+use crate::model::{parse_rfc3339_ms, rel_time};
+use crate::theme::{BORDER, DIM, DIVIDER, MONO, Tone, c, tint};
+use crate::ui::chart::{clip_tip, clip_tip_full, wide};
 use crate::ui::input::TextInput;
-use crate::ui::overview::slot_pill;
+use crate::ui::overview::{action_pill, slot_pill};
 use crate::ui::widgets::{
-    BtnKind, Col, btn, card, dot, empty_state, id, mono, notice, page_header, pill, skeleton,
-    strong, table, text_dim,
+    BtnKind, Col, btn, card, dot, empty_state, id, notice, page_header, pill, skeleton, text_dim,
 };
 
 pub struct Row {
@@ -193,7 +195,31 @@ impl Console {
                         Tone::Warn,
                     ));
                 }
-                col = col.child(div().w(px(360.)).child(self.sites.filter.clone()));
+                let needle = self.sites.filter.read(cx).text().to_string();
+                let shown = data
+                    .rows
+                    .iter()
+                    .filter(|r| matches_filter(r, &needle))
+                    .count();
+                let count = if shown == data.rows.len() {
+                    format!("{} sites", data.rows.len())
+                } else {
+                    format!("{shown} of {} sites", data.rows.len())
+                };
+                col = col.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(12.))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .max_w(px(420.))
+                                .child(self.sites.filter.clone()),
+                        )
+                        .child(text_dim(count).text_size(px(12.))),
+                );
                 col = col.child(self.sites_table(data, cx));
             }
         }
@@ -203,26 +229,15 @@ impl Console {
     fn sites_table(&self, data: &Data, cx: &mut Context<Self>) -> AnyElement {
         let needle = self.sites.filter.read(cx).text().to_string();
         let show_node = self.selected.is_none();
+        let now = now_ms();
         let rows: Vec<Vec<AnyElement>> = data
             .rows
             .iter()
             .filter(|r| matches_filter(r, &needle))
             .map(|r| {
-                let (node, site_id) = (r.node.clone(), r.site.id.clone());
-                let hosts = r
-                    .site
-                    .hosts
-                    .iter()
-                    .take(2)
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let extra = r.site.hosts.len().saturating_sub(2);
-                let hosts = if extra > 0 {
-                    format!("{hosts} +{extra}")
-                } else {
-                    hosts
-                };
+                let key = format!("{}-{}", r.node, r.site.id);
+                let hosts = hosts_label(&r.site.hosts);
+                let all_hosts = r.site.hosts.join(", ");
                 let dots = if r.health.is_empty() {
                     text_dim(if data.health_pending {
                         "checking"
@@ -233,6 +248,7 @@ impl Console {
                 } else {
                     div()
                         .flex()
+                        .flex_wrap()
                         .gap(px(4.))
                         .children(r.health.iter().map(|(_, s)| dot(health_tone(s))))
                         .into_any_element()
@@ -250,64 +266,176 @@ impl Console {
                     },
                     Tone::Muted,
                 );
-                let open = btn(
-                    id("open-site", format!("{}-{}", r.node, r.site.id)),
-                    "Open",
-                    BtnKind::Plain,
-                )
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.navigate(
-                        View::SiteDetail {
-                            node: node.clone(),
-                            id: site_id.clone(),
-                        },
-                        cx,
-                    );
-                }));
+                let deploy = match last_deploy(&r.site) {
+                    Some((action, at)) => div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .min_w_0()
+                        .child(action_pill(action))
+                        .child(
+                            text_dim(rel_time(now, at))
+                                .text_size(px(11.))
+                                .whitespace_nowrap(),
+                        )
+                        .into_any_element(),
+                    None => text_dim("never").text_size(px(12.)).into_any_element(),
+                };
                 let mut cells = vec![
                     div()
                         .flex()
                         .flex_col()
-                        .child(strong(r.site.name.clone()))
-                        .child(mono(r.site.id.clone()).text_color(c(DIM)))
+                        .min_w_0()
+                        .child(
+                            clip_tip(id("site-name", &key), r.site.name.clone())
+                                .font_weight(gpui::FontWeight::SEMIBOLD),
+                        )
+                        .child(
+                            clip_tip(id("site-id", &key), r.site.id.clone())
+                                .font_family(MONO)
+                                .text_size(px(11.))
+                                .text_color(c(DIM)),
+                        )
                         .into_any_element(),
                 ];
                 if show_node {
-                    cells.push(mono(r.node.clone()).into_any_element());
+                    cells.push(
+                        clip_tip(id("site-node", &key), r.node.clone())
+                            .font_family(MONO)
+                            .text_size(px(12.))
+                            .into_any_element(),
+                    );
                 }
                 cells.extend([
-                    kind.into_any_element(),
-                    div().text_size(px(12.)).child(hosts).into_any_element(),
-                    slot_pill(r.site.active),
                     dots,
+                    kind.into_any_element(),
+                    clip_tip_full(id("site-hosts", &key), hosts, all_hosts)
+                        .text_size(px(12.))
+                        .into_any_element(),
+                    slot_pill(r.site.active),
+                    deploy,
                     state.into_any_element(),
-                    open.into_any_element(),
                 ]);
                 cells
             })
+            .collect();
+        let targets: Vec<(String, String)> = data
+            .rows
+            .iter()
+            .filter(|r| matches_filter(r, &needle))
+            .map(|r| (r.node.clone(), r.site.id.clone()))
             .collect();
         let mut cols = vec![Col::flex("Site")];
         if show_node {
             cols.push(Col::fixed("Node", 110.));
         }
         cols.extend([
-            Col::fixed("Kind", 70.),
+            Col::fixed("Health", 80.),
+            Col::fixed("Kind", 64.),
             Col::flex("Hosts"),
-            Col::fixed("Active", 80.),
-            Col::fixed("Health", 90.),
+            Col::fixed("Active", 76.),
+            Col::fixed("Last deploy", 150.),
             Col::fixed("State", 110.),
-            Col::fixed("", 80.),
         ]);
         let empty = if data.rows.is_empty() {
             empty_state(
                 "No sites yet",
-                "Create a site to route a host to a blue/green pair of upstreams.",
+                "Create a site to build a GitHub repository or route a host to servers you run.",
             )
         } else {
             empty_state("No sites match", "Try a different name or host.")
         };
-        card(None, None, table(&cols, rows, Some(empty))).into_any_element()
+        let min_width = cols.iter().filter_map(|col| col.width).sum::<f32>() + 360.;
+        let table = click_table(&cols, rows, targets, empty, cx);
+        card(None, None, wide(id("sites", "table"), min_width, table)).into_any_element()
     }
+}
+
+// Shows up to two hosts and counts the rest, so the cell stays one line.
+pub fn hosts_label(hosts: &[String]) -> String {
+    if hosts.is_empty() {
+        return "-".to_string();
+    }
+    let shown = hosts.iter().take(2).cloned().collect::<Vec<_>>().join(", ");
+    match hosts.len().saturating_sub(2) {
+        0 => shown,
+        extra => format!("{shown} +{extra}"),
+    }
+}
+
+// The newest entry of the site's deploy history by timestamp, whatever order the node returned.
+pub fn last_deploy(site: &Site) -> Option<(DeployAction, i64)> {
+    site.history
+        .iter()
+        .map(|d| (d.action, parse_rfc3339_ms(&d.at).unwrap_or(0)))
+        .max_by_key(|(_, at)| *at)
+}
+
+// Same columns as the shared table, but every row is one click target that opens the site.
+fn click_table(
+    cols: &[Col],
+    rows: Vec<Vec<AnyElement>>,
+    targets: Vec<(String, String)>,
+    empty: gpui::Div,
+    cx: &mut Context<Console>,
+) -> AnyElement {
+    let cell = |col: &Col, child: AnyElement| {
+        let base = div()
+            .flex()
+            .items_center()
+            .min_w_0()
+            .overflow_hidden()
+            .px(px(6.));
+        let sized = match col.width {
+            Some(w) => base.w(px(w)).flex_none(),
+            None => base.flex_1(),
+        };
+        sized.child(child)
+    };
+    let mut head = div()
+        .flex()
+        .px(px(10.))
+        .py(px(8.))
+        .border_b_1()
+        .border_color(c(BORDER))
+        .text_size(px(10.))
+        .font_weight(gpui::FontWeight::SEMIBOLD)
+        .text_color(c(DIM));
+    for col in cols {
+        head = head.child(cell(col, col.label.to_uppercase().into_any_element()));
+    }
+    let mut root = div().flex().flex_col().w_full().child(head);
+    if rows.is_empty() {
+        return root.child(empty).into_any_element();
+    }
+    for (row, (node, site_id)) in rows.into_iter().zip(targets) {
+        let mut line = div()
+            .id(id("site-row", format!("{node}-{site_id}")))
+            .flex()
+            .items_center()
+            .min_h(px(44.))
+            .px(px(10.))
+            .py(px(6.))
+            .text_size(px(13.))
+            .border_b_1()
+            .border_color(c(DIVIDER))
+            .cursor_pointer()
+            .hover(|s| s.bg(tint(0xffffff, 0.035)))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.navigate(
+                    View::SiteDetail {
+                        node: node.clone(),
+                        id: site_id.clone(),
+                    },
+                    cx,
+                );
+            }));
+        for (col, child) in cols.iter().zip(row) {
+            line = line.child(cell(col, child));
+        }
+        root = root.child(line);
+    }
+    root.into_any_element()
 }
 
 #[cfg(test)]
@@ -332,6 +460,8 @@ mod tests {
             source: None,
             history: Vec::new(),
             access: Default::default(),
+            volumes: Vec::new(),
+            outbound: true,
         }
     }
 
@@ -357,5 +487,39 @@ mod tests {
         assert!(health_from_stats(&json!({}), &site("shop", Slot::Blue)).is_empty());
         let bare = json!({"backends": [{"name": "be_shop_blue"}]});
         assert!(health_from_stats(&bare, &site("shop", Slot::Blue)).is_empty());
+    }
+
+    #[test]
+    fn hosts_label_shows_two_and_counts_the_rest() {
+        let hosts = |list: &[&str]| list.iter().map(|h| h.to_string()).collect::<Vec<_>>();
+        assert_eq!(hosts_label(&[]), "-");
+        assert_eq!(hosts_label(&hosts(&["a.com"])), "a.com");
+        assert_eq!(hosts_label(&hosts(&["a.com", "b.com"])), "a.com, b.com");
+        assert_eq!(
+            hosts_label(&hosts(&["a.com", "b.com", "c.com", "d.com"])),
+            "a.com, b.com +2"
+        );
+    }
+
+    #[test]
+    fn last_deploy_is_the_newest_entry_regardless_of_order() {
+        use cite_edge::model::{DeployAction, Deployment};
+        let mut s = site("shop", Slot::Blue);
+        assert!(last_deploy(&s).is_none());
+        let entry = |at: &str, action| Deployment {
+            id: at.into(),
+            at: at.into(),
+            slot: Slot::Blue,
+            action,
+            note: String::new(),
+        };
+        s.history = vec![
+            entry("2026-11-02T10:00:00Z", DeployAction::Promote),
+            entry("2026-11-05T09:00:00Z", DeployAction::Failed),
+            entry("2026-11-01T08:00:00Z", DeployAction::Rollback),
+        ];
+        let (action, at) = last_deploy(&s).unwrap();
+        assert_eq!(action, DeployAction::Failed);
+        assert_eq!(Some(at), parse_rfc3339_ms("2026-11-05T09:00:00Z"));
     }
 }

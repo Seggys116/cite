@@ -19,6 +19,7 @@ use tokio::time::sleep;
 use zeroize::Zeroizing;
 
 use crate::deploy::{Deployer, detach, secret_name, site_mut, upstream};
+use crate::doppler;
 use crate::error::{ConnectorError, Result};
 use crate::orchestrator::{LogRole, LogsBatch, Orchestrator, SlotInspect, StackOpts};
 use crate::store::now_rfc3339;
@@ -26,8 +27,6 @@ use crate::store::now_rfc3339;
 const STATUS_TTL: Duration = Duration::from_secs(2);
 const LOGS_PER_SITE: usize = 1;
 const LOGS_TOTAL: usize = 4;
-const ENV_MAX_KEYS: usize = 64;
-const ENV_MAX_BYTES: usize = 12 * 1024;
 pub(crate) const RESTART_LOOP: u32 = 3;
 const ERROR_TAIL: u32 = 200;
 const ERROR_LINES: usize = 3;
@@ -72,7 +71,7 @@ impl EnvKind {
         }
     }
 
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             EnvKind::Build => "build env",
             EnvKind::Runtime => "runtime env",
@@ -437,16 +436,7 @@ fn apply_patch(
     for (key, value) in &patch.set {
         current.insert(key.clone(), value.clone());
     }
-    if current.len() > ENV_MAX_KEYS {
-        return Err(ConnectorError::BadRequest(format!(
-            "{label}: at most {ENV_MAX_KEYS} variables"
-        )));
-    }
-    if serde_json::to_string(&current)?.len() > ENV_MAX_BYTES {
-        return Err(ConnectorError::BadRequest(format!(
-            "{label}: the variables are larger than 12 KiB together"
-        )));
-    }
+    doppler::env_limits(&current, label).map_err(ConnectorError::BadRequest)?;
     Ok(current)
 }
 
@@ -622,6 +612,7 @@ impl Deployer {
                 Ok(map) => out.extend(map.into_values()),
                 Err(err) => tracing::warn!("{} of {} unreadable: {err}", kind.label(), site.id),
             }
+            out.extend(self.doppler_snapshot(&site.id, kind).await.into_values());
         }
         out.retain(|s| !s.is_empty());
         out.sort();
@@ -726,12 +717,55 @@ impl Deployer {
         }
     }
 
+    // An unreadable snapshot counts as none: the next sync rewrites it, and the manual variables still apply.
+    pub(crate) async fn doppler_snapshot(&self, id: &str, kind: EnvKind) -> BTreeMap<String, String> {
+        match self
+            .store
+            .get_secret(&doppler::snapshot_secret(id, kind))
+            .await
+        {
+            Some(text) => serde_json::from_str(&text).unwrap_or_default(),
+            None => BTreeMap::new(),
+        }
+    }
+
+    // Only a kind the binding still feeds contributes, so turning a kind off drops its values at the next deploy.
+    async fn synced_for(&self, id: &str, kind: EnvKind) -> Result<BTreeMap<String, String>> {
+        let fed = self
+            .get_site(id)?
+            .source
+            .and_then(|s| s.doppler)
+            .is_some_and(|b| match kind {
+                EnvKind::Build => b.build,
+                EnvKind::Runtime => b.runtime,
+            });
+        if fed {
+            Ok(self.doppler_snapshot(id, kind).await)
+        } else {
+            Ok(BTreeMap::new())
+        }
+    }
+
+    fn merged(
+        synced: BTreeMap<String, String>,
+        manual: BTreeMap<String, String>,
+        kind: EnvKind,
+    ) -> Result<BTreeMap<String, String>> {
+        let map = doppler::merge_env(synced, manual);
+        doppler::env_limits(&map, kind.label()).map_err(|m| {
+            ConnectorError::BadRequest(format!("{m} once the Doppler variables are added"))
+        })?;
+        Ok(map)
+    }
+
+    // The synced Doppler values form the base; manual variables override them.
     pub(crate) async fn env_opt(
         &self,
         id: &str,
         kind: EnvKind,
     ) -> Result<Option<BTreeMap<String, String>>> {
-        let map = self.env_map(id, kind).await?;
+        let manual = self.env_map(id, kind).await?;
+        let map = Self::merged(self.synced_for(id, kind).await?, manual, kind)?;
         Ok((!map.is_empty()).then_some(map))
     }
 
@@ -788,6 +822,7 @@ impl Deployer {
             )));
         }
         let next = apply_patch(self.env_map(id, kind).await?, &patch, kind.label())?;
+        Self::merged(self.synced_for(id, kind).await?, next.clone(), kind)?;
         let name = kind.secret(id);
         if next.is_empty() {
             self.store.delete_secret(&name).await;
@@ -1151,7 +1186,7 @@ mod tests {
         let next = apply_patch(current, &patch, "build env").unwrap();
         assert_eq!(next.keys().collect::<Vec<_>>(), vec!["KEEP", "NEW"]);
 
-        let many: BTreeMap<String, String> = (0..ENV_MAX_KEYS)
+        let many: BTreeMap<String, String> = (0..cite_edge::status::MAX_ENV_KEYS)
             .map(|i| (format!("K{i}"), "v".into()))
             .collect();
         let one_more = BuildEnvPatch {
@@ -1163,11 +1198,11 @@ mod tests {
             Err(ConnectorError::BadRequest(_))
         ));
 
-        let big: BTreeMap<String, String> = (0..4)
+        let big: BTreeMap<String, String> = (0..7)
             .map(|i| (format!("BIG{i}"), "x".repeat(4000)))
             .collect();
         let err = apply_patch(big, &BuildEnvPatch::default(), "runtime env").unwrap_err();
-        assert!(err.to_string().contains("12 KiB"), "{err}");
+        assert!(err.to_string().contains("24 KiB"), "{err}");
         assert!(!err.to_string().contains("xxxx"));
     }
 
@@ -1176,6 +1211,24 @@ mod tests {
         assert_eq!(EnvKind::Build.secret("shop"), "site-shop.build-env");
         assert_eq!(EnvKind::Runtime.secret("shop"), "site-shop.runtime-env");
         assert_ne!(EnvKind::Build.secret("shop"), secret_name("shop-build-env"));
+        let doppler_names = [
+            doppler::token_secret("shop"),
+            doppler::snapshot_secret("shop", EnvKind::Build),
+            doppler::snapshot_secret("shop", EnvKind::Runtime),
+        ];
+        assert_eq!(
+            doppler_names,
+            [
+                "site-shop.doppler-token",
+                "site-shop.doppler-build",
+                "site-shop.doppler-runtime"
+            ]
+        );
+        for name in &doppler_names {
+            assert_ne!(*name, EnvKind::Build.secret("shop"));
+            assert_ne!(*name, EnvKind::Runtime.secret("shop"));
+            assert_ne!(*name, secret_name("shop"));
+        }
     }
 
     #[test]

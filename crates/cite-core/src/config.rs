@@ -188,8 +188,8 @@ pub struct ManagerConfig {
     pub dev_same_user: bool,
 }
 
-const BUILD_ENV_JSON_MAX_KEYS: usize = 64;
-const BUILD_ENV_JSON_MAX_BYTES: usize = 12 * 1024;
+const BUILD_ENV_JSON_MAX_KEYS: usize = 128;
+const BUILD_ENV_JSON_MAX_BYTES: usize = 24 * 1024;
 const BUILD_ENV_VALUE_MAX_BYTES: usize = 4096;
 
 /// Names the build job, its caches or the host environment set themselves, plus loader and proxy keys; compared upper-cased.
@@ -1697,17 +1697,17 @@ mod tests {
 
     #[test]
     fn build_env_json_limits() {
-        let many: String = (0..64)
+        let many: String = (0..128)
             .map(|i| format!("\"K{i}\":\"v\""))
             .collect::<Vec<_>>()
             .join(",");
         assert!(load_json(&format!("{{{many}}}")).is_ok());
-        let too_many = format!("{{{many},\"K64\":\"v\"}}");
+        let too_many = format!("{{{many},\"K128\":\"v\"}}");
         assert!(
             load_json(&too_many)
                 .unwrap_err()
                 .to_string()
-                .contains("64 keys")
+                .contains("128 keys")
         );
 
         let ok_value = "a".repeat(4096);
@@ -1715,7 +1715,7 @@ mod tests {
         let bad_value = "a".repeat(4097);
         assert!(load_json(&format!("{{\"BIG\":\"{bad_value}\"}}")).is_err());
 
-        let padding = " ".repeat(12 * 1024);
+        let padding = " ".repeat(24 * 1024);
         let err = load_json(&format!("{{}}{padding}"))
             .unwrap_err()
             .to_string();

@@ -271,6 +271,9 @@ pub struct DeployRecord {
     pub outcome: String,
     #[serde(default)]
     pub reason: String,
+    /// Which step failed (fetch, install, build, pack, start); absent for a live deploy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -287,6 +290,9 @@ pub struct ManagerState {
     pub last_failed_sha: Option<String>,
     #[serde(default)]
     pub last_failed_reason: Option<String>,
+    /// The step `last_failed_reason` comes from: fetch, install, build, pack or start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_failed_phase: Option<String>,
     #[serde(default)]
     pub last_failed_attempts: u32,
     #[serde(default)]
@@ -327,6 +333,8 @@ pub struct DeployOutcome {
     pub sha: Option<String>,
     #[serde(default)]
     pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
     pub started_at: String,
     pub finished_at: String,
 }
@@ -351,6 +359,7 @@ impl Default for ManagerState {
             last_deployed_sha: None,
             last_failed_sha: None,
             last_failed_reason: None,
+            last_failed_phase: None,
             last_failed_attempts: 0,
             next_poll_at: None,
             history: Vec::new(),
@@ -799,6 +808,7 @@ mod tests {
                 result: DeployResult::Failed,
                 sha: Some("a".repeat(40)),
                 reason: "install failed".into(),
+                phase: Some("install".into()),
                 started_at: "2026-01-01T00:00:00Z".into(),
                 finished_at: "2026-01-01T00:01:00Z".into(),
             }),
@@ -900,6 +910,7 @@ mod tests {
                 at: "2026-01-01T00:00:00Z".into(),
                 outcome: "live".into(),
                 reason: String::new(),
+                phase: None,
             });
         }
         write_state(&path, &state).unwrap();

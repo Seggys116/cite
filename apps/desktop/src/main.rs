@@ -23,13 +23,39 @@ mod siteops;
 mod testkit;
 mod theme;
 mod ui;
+mod window_state;
 mod wizard;
 mod zone;
 
 use gpui::{
     App, AppContext, Application, Bounds, KeyBinding, TitlebarOptions, WindowBounds, WindowOptions,
-    actions, px, size,
+    actions, point, px, size,
 };
+
+use crate::theme::layout::{
+    WINDOW_DEFAULT_H, WINDOW_DEFAULT_W, WINDOW_INSET, WINDOW_MIN_H, WINDOW_MIN_W,
+};
+use crate::window_state::WindowState;
+
+// Saved bounds are used only while some part of them is still on a connected display.
+fn initial_bounds(state: &WindowState, cx: &App) -> WindowBounds {
+    let fallback = Bounds::centered(None, size(px(WINDOW_DEFAULT_W), px(WINDOW_DEFAULT_H)), cx);
+    let Some(frame) = state.restorable_frame() else {
+        return WindowBounds::Windowed(fallback);
+    };
+    let saved = Bounds::new(
+        point(px(frame.x), px(frame.y)),
+        size(px(frame.width), px(frame.height)),
+    );
+    if !cx.displays().iter().any(|d| d.bounds().intersects(&saved)) {
+        return WindowBounds::Windowed(fallback);
+    }
+    if state.maximized {
+        WindowBounds::Maximized(saved)
+    } else {
+        WindowBounds::Windowed(saved)
+    }
+}
 
 // Quit is bound at the application level so it works from every view.
 actions!(cite, [Quit]);
@@ -47,18 +73,28 @@ fn main() {
         ui::init(cx);
         cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
         cx.on_action(|_: &Quit, cx| cx.quit());
-        let bounds = Bounds::centered(None, size(px(1320.), px(840.)), cx);
+        // Demo and preview runs always open at the default size so screenshots stay comparable.
+        let state = if opts.demo {
+            WindowState::default()
+        } else {
+            WindowState::load(&window_state::window_state_path())
+        };
         let window = cx.open_window(
             WindowOptions {
                 focus,
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                window_bounds: Some(initial_bounds(&state, cx)),
+                window_min_size: Some(size(px(WINDOW_MIN_W), px(WINDOW_MIN_H))),
                 titlebar: Some(TitlebarOptions {
                     title: Some("Cite".into()),
-                    ..Default::default()
+                    appears_transparent: true,
+                    traffic_light_position: Some(point(
+                        px(WINDOW_INSET + 10.),
+                        px(WINDOW_INSET + 10.),
+                    )),
                 }),
                 ..Default::default()
             },
-            |_, cx| cx.new(|cx| app::Console::new(opts, cx)),
+            |window, cx| cx.new(|cx| app::Console::new(opts, state, window, cx)),
         );
         if let Err(err) = window {
             eprintln!("cannot open the window: {err}");

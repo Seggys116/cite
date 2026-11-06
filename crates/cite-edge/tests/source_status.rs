@@ -1,8 +1,9 @@
-use cite_edge::model::{Cpus, PackageManager, RenderMode, Slot, Source};
+use cite_edge::model::{Cpus, DopplerBinding, PackageManager, RenderMode, Slot, Source};
 use cite_edge::status::{
-    BuildEnvPatch, CAPABILITIES, LogsResponse, ManagerReport, SiteStatus, SlotStatus, TokenStatus,
+    BuildEnvPatch, CAPABILITIES, LogsResponse, MAX_ENV_BYTES, MAX_ENV_KEYS, ManagerReport,
+    SiteStatus, SlotStatus, TokenStatus,
 };
-use cite_edge::validate::validate_source;
+use cite_edge::validate::{is_valid_doppler_slug, validate_doppler_binding, validate_source};
 use proptest::prelude::*;
 
 fn src(repo: &str) -> Source {
@@ -578,17 +579,20 @@ fn build_env_patch_table() {
 #[test]
 fn build_env_patch_limits_and_redaction() {
     let mut many = BuildEnvPatch::default();
-    for i in 0..65 {
+    for i in 0..129 {
         many.set.insert(format!("K{i}"), "v".into());
     }
     assert!(many.validate().is_err());
-    many.set.remove("K64");
-    many.validate().expect("64 keys");
+    many.set.remove("K128");
+    many.validate().expect("128 keys");
     let mut big = BuildEnvPatch::default();
-    for i in 0..4 {
+    for i in 0..7 {
         big.set.insert(format!("K{i}"), "x".repeat(4096));
     }
-    assert!(big.validate().expect_err("too big").0.contains("12 KiB"));
+    assert!(big.validate().expect_err("too big").0.contains("24 KiB"));
+    big.set.remove("K6");
+    big.set.remove("K5");
+    big.validate().expect("20 KiB of values fit");
     let p = patch(&[("TOKEN_X", "hunter2-value")], &[]);
     let shown = format!("{p:?}");
     assert!(shown.contains("TOKEN_X") && !shown.contains("hunter2"));
@@ -683,12 +687,123 @@ fn build_env_refuses_what_the_manager_refuses() {
 }
 
 #[test]
-fn capabilities_are_the_thirteen_known_names() {
-    assert_eq!(CAPABILITIES.len(), 13);
+fn every_copy_of_the_environment_limits_says_128_keys_and_24_kib() {
+    assert_eq!(MAX_ENV_KEYS, 128);
+    assert_eq!(MAX_ENV_BYTES, 24 * 1024);
+    for (source, needles) in [
+        (
+            PROXY_ENV,
+            [
+                "MAX_BUILD_ENV_KEYS: usize = 128;",
+                "MAX_BUILD_ENV_JSON: usize = 24 * 1024;",
+            ],
+        ),
+        (
+            EXECUTOR_ENV,
+            [
+                "MAX_KEYS: usize = 128;",
+                "MAX_JSON_BYTES: usize = 24 * 1024;",
+            ],
+        ),
+        (
+            CORE_CONFIG,
+            [
+                "BUILD_ENV_JSON_MAX_KEYS: usize = 128;",
+                "BUILD_ENV_JSON_MAX_BYTES: usize = 24 * 1024;",
+            ],
+        ),
+    ] {
+        for needle in needles {
+            assert!(source.contains(needle), "{needle} is missing");
+        }
+    }
+}
+
+#[test]
+fn capabilities_are_the_sixteen_known_names() {
+    assert_eq!(CAPABILITIES.len(), 16);
     assert!(CAPABILITIES.contains(&"site-status") && CAPABILITIES.contains(&"forges"));
-    assert!(CAPABILITIES.contains(&"analytics-filters"));
+    assert!(CAPABILITIES.contains(&"analytics-filters") && CAPABILITIES.contains(&"doppler"));
+    assert!(CAPABILITIES.contains(&"volumes") && CAPABILITIES.contains(&"outbound"));
     let mut sorted = CAPABILITIES.to_vec();
     sorted.sort_unstable();
     sorted.dedup();
-    assert_eq!(sorted.len(), 13);
+    assert_eq!(sorted.len(), 16);
+}
+
+fn binding(project: &str, config: &str, build: bool, runtime: bool) -> DopplerBinding {
+    DopplerBinding {
+        project: project.into(),
+        config: config.into(),
+        build,
+        runtime,
+    }
+}
+
+#[test]
+fn doppler_bindings_are_validated_as_part_of_the_source() {
+    let long = "a".repeat(100);
+    for (project, config, build, runtime) in [
+        ("shop", "prd", true, false),
+        ("shop-web", "dev_personal", false, true),
+        ("A.b_c-9", "stg.1", true, true),
+        (long.as_str(), long.as_str(), true, true),
+    ] {
+        let b = binding(project, config, build, runtime);
+        validate_doppler_binding(&b).expect("valid binding");
+        validate_source(&with(|s| s.doppler = Some(b))).expect("valid source");
+    }
+    let too_long = "a".repeat(101);
+    for (project, config, field) in [
+        ("", "prd", "both be set"),
+        (too_long.as_str(), "prd", "doppler project"),
+        ("shop web", "prd", "doppler project"),
+        ("shop/x", "prd", "doppler project"),
+        ("sh\u{f6}p", "prd", "doppler project"),
+        ("shop", "", "both be set"),
+        ("shop", "p?r", "doppler config"),
+        ("shop", too_long.as_str(), "doppler config"),
+    ] {
+        refused(
+            &with(|s| s.doppler = Some(binding(project, config, true, true))),
+            field,
+        );
+    }
+    refused(
+        &with(|s| s.doppler = Some(binding("shop", "prd", false, false))),
+        "doppler",
+    );
+    assert!(is_valid_doppler_slug("prd") && !is_valid_doppler_slug("a b"));
+}
+
+#[test]
+fn a_token_only_binding_leaves_both_names_empty() {
+    let b = binding("", "", true, false);
+    assert!(b.token_only());
+    validate_doppler_binding(&b).expect("token-only binding");
+    validate_source(&with(|s| s.doppler = Some(b))).expect("valid source");
+    refused(
+        &with(|s| s.doppler = Some(binding("", "", false, false))),
+        "doppler",
+    );
+    assert!(!binding("shop", "prd", true, false).token_only());
+}
+
+#[test]
+fn a_doppler_binding_round_trips_and_is_left_out_while_unset() {
+    let plain = src("acme/shop");
+    assert!(
+        !serde_json::to_string(&plain)
+            .expect("ser")
+            .contains("doppler")
+    );
+    let bound = with(|s| s.doppler = Some(binding("shop", "prd", true, false)));
+    let text = serde_json::to_string(&bound).expect("ser");
+    assert!(text.contains(r#""doppler":{"project":"shop","config":"prd","build":true,"runtime":false}"#));
+    let back: Source = serde_json::from_str(&text).expect("de");
+    assert_eq!(back, bound);
+    let defaults: DopplerBinding =
+        serde_json::from_str(r#"{"project":"p","config":"c"}"#).expect("defaults");
+    assert!(!defaults.build && !defaults.runtime);
+    assert!(serde_json::from_str::<DopplerBinding>(r#"{"project":"p","config":"c","x":1}"#).is_err());
 }

@@ -503,6 +503,8 @@ fn site(id: &str) -> Site {
         source: None,
         history: Vec::new(),
         access: Default::default(),
+        volumes: Vec::new(),
+        outbound: true,
     }
 }
 
