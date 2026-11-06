@@ -12,8 +12,6 @@ use cite_core::ExecutorConfig;
 use tracing::{info, warn};
 
 const SHARDS: usize = 16;
-/// Candidates examined when a full shard needs room, so insertion cost does not grow with the table.
-const EVICTION_SAMPLE: usize = 16;
 /// Upper bound on tracked clients across all shards.
 pub const MAX_TRACKED: usize = 100_000;
 /// Window in which rate-limit violations count towards a ban.
@@ -21,6 +19,11 @@ const BAN_WINDOW: Duration = Duration::from_secs(10);
 /// Ban log lines allowed per sweep interval; the rest are summarised.
 const LOG_BUDGET: u32 = 10;
 pub const SWEEP_INTERVAL: Duration = Duration::from_secs(10);
+
+#[cfg(not(test))]
+type ShardHasher = RandomState;
+#[cfg(test)]
+type ShardHasher = tests::SeededHasher;
 
 /// Client identity: an IPv4 address, or the /64 prefix of an IPv6 address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -95,6 +98,7 @@ pub enum Admission {
 }
 
 struct Entry {
+    id: u64,
     tokens: f64,
     refilled: Instant,
     conns: u32,
@@ -105,8 +109,9 @@ struct Entry {
 }
 
 impl Entry {
-    fn new(burst: u32, now: Instant) -> Self {
+    fn new(id: u64, burst: u32, now: Instant) -> Self {
         Self {
+            id,
             tokens: f64::from(burst),
             refilled: now,
             conns: 0,
@@ -127,11 +132,12 @@ impl Entry {
 struct Shard {
     map: HashMap<ClientKey, Entry>,
     order: VecDeque<ClientKey>,
+    next_id: u64,
 }
 
 pub struct Limiter {
     cfg: LimitConfig,
-    hasher: RandomState,
+    hasher: ShardHasher,
     shards: Vec<Mutex<Shard>>,
     limited: AtomicU64,
     bans: AtomicU64,
@@ -147,12 +153,13 @@ pub struct Limiter {
 pub struct ConnSlot {
     limiter: Arc<Limiter>,
     key: ClientKey,
+    id: u64,
 }
 
 impl Drop for ConnSlot {
     fn drop(&mut self) {
         let mut shard = self.limiter.shard(self.key);
-        if let Some(entry) = shard.map.get_mut(&self.key) {
+        if let Some(entry) = shard.map.get_mut(&self.key).filter(|e| e.id == self.id) {
             entry.conns = entry.conns.saturating_sub(1);
         }
     }
@@ -160,9 +167,13 @@ impl Drop for ConnSlot {
 
 impl Limiter {
     pub fn new(cfg: LimitConfig) -> Arc<Self> {
+        Self::with_hasher(cfg, ShardHasher::default())
+    }
+
+    fn with_hasher(cfg: LimitConfig, hasher: ShardHasher) -> Arc<Self> {
         Arc::new(Self {
             cfg,
-            hasher: RandomState::new(),
+            hasher,
             shards: (0..SHARDS).map(|_| Mutex::new(Shard::default())).collect(),
             limited: AtomicU64::new(0),
             bans: AtomicU64::new(0),
@@ -210,41 +221,44 @@ impl Limiter {
         BAN_WINDOW.max(refill + Duration::from_secs(1))
     }
 
-    /// Returns the entry for `key`; a full shard evicts its oldest unpinned client, or `None` when every candidate is pinned.
-    fn entry<'a>(
-        &self,
-        shard: &'a mut Shard,
-        key: ClientKey,
-        now: Instant,
-    ) -> Option<&'a mut Entry> {
+    /// Returns the entry for `key`, evicting from a full shard so every client is always tracked.
+    fn entry<'a>(&self, shard: &'a mut Shard, key: ClientKey, now: Instant) -> &'a mut Entry {
         if !shard.map.contains_key(&key) {
-            if shard.map.len() >= self.shard_capacity() && !Self::evict_one(shard, now) {
-                return None;
+            if shard.map.len() >= self.shard_capacity() {
+                Self::evict_one(shard, now);
             }
-            shard.map.insert(key, Entry::new(self.cfg.burst, now));
+            shard.next_id += 1;
+            let entry = Entry::new(shard.next_id, self.cfg.burst, now);
+            shard.map.insert(key, entry);
             shard.order.push_back(key);
         }
-        shard.map.get_mut(&key)
+        shard.map.get_mut(&key).expect("entry was just inserted")
     }
 
-    /// Pinned or banned clients are rotated to the back, so they never block eviction of the rest.
-    fn evict_one(shard: &mut Shard, now: Instant) -> bool {
-        for _ in 0..EVICTION_SAMPLE {
+    /// Evicts the oldest idle client; pinned or banned ones rotate to the back, and only a shard with nothing else gives up its oldest pinned client.
+    fn evict_one(shard: &mut Shard, now: Instant) {
+        for _ in 0..shard.order.len() {
             let Some(candidate) = shard.order.pop_front() else {
-                return false;
+                return;
             };
             let keep = shard
                 .map
                 .get(&candidate)
                 .is_some_and(|e| e.conns > 0 || e.banned(now));
-            if keep {
-                shard.order.push_back(candidate);
-            } else {
+            if !keep {
                 shard.map.remove(&candidate);
-                return true;
+                return;
             }
+            shard.order.push_back(candidate);
         }
-        false
+        let victim = shard
+            .order
+            .iter()
+            .position(|key| shard.map.get(key).is_none_or(|e| !e.banned(now)))
+            .unwrap_or(0);
+        if let Some(key) = shard.order.remove(victim) {
+            shard.map.remove(&key);
+        }
     }
 
     /// Records a request from an untrusted peer that carried X-Forwarded-For; the sweep logs one hint per interval.
@@ -268,9 +282,7 @@ impl Limiter {
         if !track {
             return Admission::Allowed(None);
         }
-        let Some(entry) = self.entry(&mut shard, key, now) else {
-            return Admission::Allowed(None);
-        };
+        let entry = self.entry(&mut shard, key, now);
         if entry.conns as usize >= self.cfg.max_conn_per_ip {
             drop(shard);
             self.count_dropped();
@@ -278,10 +290,12 @@ impl Limiter {
         }
         entry.conns += 1;
         entry.last_seen = now;
+        let id = entry.id;
         drop(shard);
         Admission::Allowed(Some(ConnSlot {
             limiter: self.clone(),
             key,
+            id,
         }))
     }
 
@@ -293,10 +307,8 @@ impl Limiter {
         let mut event = Event::None;
         let verdict = {
             let mut shard = self.shard(key);
-            match self.entry(&mut shard, key, now) {
-                Some(entry) => self.step(entry, now, &mut event),
-                None => Verdict::Allow,
-            }
+            let entry = self.entry(&mut shard, key, now);
+            self.step(entry, now, &mut event)
         };
         match event {
             Event::None => {}
@@ -383,7 +395,7 @@ impl Limiter {
             shard.map.retain(|_, e| {
                 e.conns > 0 || e.banned(now) || now.saturating_duration_since(e.last_seen) <= idle
             });
-            let Shard { map, order } = &mut *shard;
+            let Shard { map, order, .. } = &mut *shard;
             order.retain(|key| map.contains_key(key));
         }
         for key in ended {
@@ -430,7 +442,30 @@ fn ceil_secs(duration: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::hash::{DefaultHasher, Hasher};
     use std::net::{Ipv4Addr, Ipv6Addr};
+
+    /// Shard hasher with an explicit seed, so shard placement can be pinned per test.
+    pub(super) struct SeededHasher(u64);
+
+    impl Default for SeededHasher {
+        fn default() -> Self {
+            Self(RandomState::new().hash_one(0u8))
+        }
+    }
+
+    impl BuildHasher for SeededHasher {
+        type Hasher = DefaultHasher;
+
+        fn build_hasher(&self) -> DefaultHasher {
+            let mut hasher = DefaultHasher::new();
+            hasher.write_u64(self.0);
+            hasher
+        }
+    }
+
+    /// Length of the pinned run that made the old sampled eviction give up and allow uncounted.
+    const PINNED_RUN: usize = 16;
 
     fn cfg() -> LimitConfig {
         LimitConfig {
@@ -651,7 +686,7 @@ mod tests {
         let mut small = cfg();
         small.capacity = SHARDS * 64;
         small.max_conn_per_ip = 5;
-        let limiter = Limiter::new(small);
+        let limiter = Limiter::with_hasher(small, SeededHasher(107));
         let t0 = Instant::now();
         let mut pinned = Vec::new();
         for n in 0..400u32 {
@@ -677,11 +712,51 @@ mod tests {
         drop(pinned);
     }
 
+    fn shard_of(limiter: &Limiter, ip: IpAddr) -> usize {
+        (limiter.hasher.hash_one(ClientKey::from_ip(ip)) as usize) % SHARDS
+    }
+
     #[test]
-    fn saturated_table_fails_open_for_pinned_entries() {
+    fn full_shard_with_a_pinned_front_still_counts_new_clients() {
+        let mut small = cfg();
+        small.capacity = SHARDS * 64;
+        small.max_conn_per_ip = 5;
+        let limiter = Limiter::with_hasher(small, SeededHasher(0));
+        let t0 = Instant::now();
+        let fresh = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 200));
+        let target = shard_of(&limiter, fresh);
+        let mut hosts = (0..u32::MAX)
+            .map(|n| IpAddr::V4(Ipv4Addr::from(0x0e00_0000 + n)))
+            .filter(|ip| *ip != fresh && shard_of(&limiter, *ip) == target);
+        let pinned: Vec<ConnSlot> = hosts
+            .by_ref()
+            .take(PINNED_RUN)
+            .map(|ip| match limiter.admit_connection(ip, t0) {
+                Admission::Allowed(Some(slot)) => slot,
+                _ => panic!("pinned host was not admitted"),
+            })
+            .collect();
+        for ip in hosts.take(64 - PINNED_RUN) {
+            assert_eq!(limiter.check_request(ip, t0), Verdict::Allow);
+        }
+        assert_eq!(lock(&limiter.shards[target]).map.len(), 64);
+        let at = t0 + Duration::from_secs(5);
+        for _ in 0..5 {
+            assert_eq!(limiter.check_request(fresh, at), Verdict::Allow);
+        }
+        assert!(matches!(
+            limiter.check_request(fresh, at),
+            Verdict::Limited { .. }
+        ));
+        assert!(limiter.tracked() <= SHARDS * 64);
+        drop(pinned);
+    }
+
+    #[test]
+    fn saturated_table_gives_up_pinned_entries_but_still_counts_new_clients() {
         let mut small = cfg();
         small.capacity = SHARDS;
-        let limiter = Limiter::new(small);
+        let limiter = Limiter::with_hasher(small, SeededHasher(0));
         let now = Instant::now();
         let mut slots = Vec::new();
         for host in 0..200u32 {
@@ -692,7 +767,25 @@ mod tests {
         }
         assert!(limiter.tracked() <= SHARDS);
         let stranger = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9));
-        assert_eq!(limiter.check_request(stranger, now), Verdict::Allow);
+        for _ in 0..5 {
+            assert_eq!(limiter.check_request(stranger, now), Verdict::Allow);
+        }
+        assert!(matches!(
+            limiter.check_request(stranger, now),
+            Verdict::Limited { .. }
+        ));
+        assert!(limiter.tracked() <= SHARDS);
+        let evicted = IpAddr::V4(Ipv4Addr::from(0x0a00_0000));
+        let fresh_slot = limiter.admit_connection(evicted, now);
+        assert!(matches!(fresh_slot, Admission::Allowed(Some(_))));
+        drop(slots);
+        let second = limiter.admit_connection(evicted, now);
+        assert!(matches!(second, Admission::Allowed(Some(_))));
+        assert!(matches!(
+            limiter.admit_connection(evicted, now),
+            Admission::TooMany
+        ));
+        drop((fresh_slot, second));
     }
 
     #[test]

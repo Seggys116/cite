@@ -113,7 +113,7 @@ A preset is a fixed set of rules you add with one call: `POST /api/v1/firewall/p
 | | `preset-scanners-2` | tarpit | An empty user agent |
 | `odd-methods` | `preset-odd-methods-1` | deny | `TRACE`, `TRACK`, `CONNECT`, `DEBUG` |
 
-The path presets use the `(?i)` flag so they match in any case. That needs a HAProxy built with PCRE. The HAProxy container and the connector image's `haproxy -c` check both use `haproxy:3.0-bookworm` by default. If the binary rejects the flag, applying the preset fails at the `haproxy -c` step and the stored configuration is restored.
+The path presets use the `(?i)` flag so they match in any case. That needs a HAProxy built with PCRE. The HAProxy container and the connector image's `haproxy -c` check both use `haproxy:3.2-bookworm` by default. If the binary rejects the flag, applying the preset fails at the `haproxy -c` step and the stored configuration is restored.
 
 Presets are ordinary rules once added. Edit, disable or delete them like any other.
 

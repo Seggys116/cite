@@ -39,7 +39,7 @@ services:
         max-file: "3"
 
   haproxy:
-    image: docker.io/library/haproxy:3.0-bookworm
+    image: docker.io/library/haproxy:3.2-bookworm
     restart: unless-stopped
     container_name: cite-node-haproxy
     depends_on:
