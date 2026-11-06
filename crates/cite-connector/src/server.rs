@@ -13,8 +13,6 @@ use axum::routing::{get, post};
 use cite_edge::allow::IpAllowlist;
 use cite_edge::model::EdgeConfig;
 use cite_edge::ratelimit::{LoginLimiter, client_key};
-use cite_edge::render::{RenderOptions, render};
-use cite_edge::validate::validate_config;
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -25,6 +23,8 @@ use tokio::sync::Semaphore;
 use tokio_rustls::TlsAcceptor;
 use tower::Service;
 
+use crate::certs::{self, CertStore};
+use crate::change;
 use crate::config::ConnectorConfig;
 use crate::deploy::{Deployer, detach};
 use crate::haproxy::Haproxy;
@@ -34,6 +34,7 @@ use crate::store::{Store, TokenOutcome, now_unix, unix_to_rfc3339};
 use crate::{ConnectorError, Result, tls};
 
 mod archives;
+mod certificates;
 mod export;
 mod handlers;
 mod health;
@@ -41,6 +42,7 @@ mod health;
 mod perf;
 #[cfg(test)]
 mod tests;
+mod zone_secret;
 
 pub use health::healthcheck;
 
@@ -67,10 +69,13 @@ pub struct Inner {
     analytics: Arc<cite_store::Store>,
     ingest: Arc<IngestStats>,
     exports: Arc<Semaphore>,
+    certs: Arc<CertStore>,
     limiter: StdMutex<LoginLimiter>,
     token_limiter: StdMutex<LoginLimiter>,
-    render_opts: RenderOptions,
     started: Instant,
+    // Test hook: counts rotations that reached the point of waiting for the config lock.
+    #[cfg(test)]
+    rotations_waiting: std::sync::atomic::AtomicUsize,
 }
 
 impl Inner {
@@ -83,14 +88,7 @@ impl Inner {
         analytics: Arc<cite_store::Store>,
         ingest: Arc<IngestStats>,
     ) -> AppState {
-        let render_opts = RenderOptions {
-            maps_dir: cfg.maps_dir.display().to_string(),
-            pages_dir: cfg.pages_dir.display().to_string(),
-            runtime_addr: crate::haproxy::stats_listen(&cfg.runtime_addr)
-                .unwrap_or_else(|_| cfg.runtime_addr.clone()),
-            log_addr: cfg.log_addr_for_haproxy.clone(),
-            tls_dir: None,
-        };
+        let certs = Arc::new(CertStore::new(cfg.certs_dir.clone(), cfg.certs_mode));
         Arc::new(Inner {
             cfg,
             store,
@@ -100,10 +98,12 @@ impl Inner {
             analytics,
             ingest,
             exports: Arc::new(Semaphore::new(MAX_EXPORTS)),
+            certs,
             limiter: StdMutex::new(LoginLimiter::new()),
             token_limiter: StdMutex::new(LoginLimiter::new()),
-            render_opts,
             started: Instant::now(),
+            #[cfg(test)]
+            rotations_waiting: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -129,54 +129,7 @@ impl Inner {
         f: impl FnOnce(&mut EdgeConfig) -> Result<T>,
     ) -> Result<T> {
         let _gate = self.deployer.config_lock().lock().await;
-        let previous = self.store.config();
-        let opts = &self.render_opts;
-        let out = self
-            .store
-            .update_detailed(actor, action, detail, |cfg| {
-                let value = f(cfg)?;
-                validate_config(cfg)?;
-                render(cfg, opts)?;
-                Ok(value)
-            })
-            .await?;
-        let loaded = self
-            .haproxy
-            .apply(&self.store.config())
-            .await
-            .and_then(|applied| applied.require_loaded());
-        if let Err(err) = loaded {
-            let restored = Arc::clone(&previous);
-            let undo = self
-                .store
-                .update_detailed(actor, "config.rollback", action, move |cfg| {
-                    *cfg = (*restored).clone();
-                    Ok(())
-                })
-                .await;
-            match undo {
-                Ok(()) => {
-                    let again = self
-                        .haproxy
-                        .apply(&previous)
-                        .await
-                        .and_then(|applied| applied.require_loaded());
-                    if let Err(e) = again {
-                        tracing::warn!(error = %e, "haproxy could not re-apply the restored configuration");
-                    }
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, "could not restore the previous configuration")
-                }
-            }
-            return Err(match err {
-                ConnectorError::BadRequest(msg) => ConnectorError::BadRequest(msg),
-                other => ConnectorError::Unavailable(format!(
-                    "haproxy could not apply the change: {other}"
-                )),
-            });
-        }
-        Ok(out)
+        change::mutate_and_apply(&self.store, &self.haproxy, actor, action, detail, f).await
     }
 }
 
@@ -251,10 +204,14 @@ pub struct JsonBody<T>(pub T);
 
 pub struct MaybeJson<T>(pub T);
 
-async fn read_body(req: Request) -> ApiResult<bytes::Bytes> {
-    axum::body::to_bytes(req.into_body(), MAX_BODY_BYTES)
+async fn read_body_limited(req: Request, limit: usize) -> ApiResult<bytes::Bytes> {
+    axum::body::to_bytes(req.into_body(), limit)
         .await
         .map_err(|_| ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "request body too large"))
+}
+
+async fn read_body(req: Request) -> ApiResult<bytes::Bytes> {
+    read_body_limited(req, MAX_BODY_BYTES).await
 }
 
 fn parse_json<T: DeserializeOwned>(bytes: &[u8]) -> ApiResult<T> {
@@ -478,6 +435,10 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/sites/{id}",
             get(h::get_site).put(h::put_site).delete(h::delete_site),
         )
+        .route(
+            "/api/v1/sites/{id}/zone-secret",
+            get(zone_secret::status).post(zone_secret::rotate),
+        )
         .route("/api/v1/sites/{id}/deploy", post(h::deploy_site))
         .route("/api/v1/sites/{id}/switch", post(h::switch_site))
         .route("/api/v1/sites/{id}/rollback", post(h::rollback_site))
@@ -515,6 +476,17 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/analytics/backup", post(archives::backup))
         .route("/api/v1/analytics/cut", post(archives::cut))
         .route("/api/v1/analytics/restore", post(archives::restore))
+        .route(
+            "/api/v1/certificates",
+            get(certificates::list).post(certificates::create),
+        )
+        .route(
+            "/api/v1/certificates/{id}",
+            get(certificates::get_one)
+                .put(certificates::replace)
+                .delete(certificates::delete),
+        )
+        .route("/api/v1/cloudflare/ranges", get(h::cloudflare_ranges))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
     Router::new()
         .merge(public)
@@ -629,6 +601,9 @@ pub async fn run(cfg: ConnectorConfig) -> Result<()> {
     tls::install_provider();
     let store = Store::open(&cfg).await?;
     let haproxy = Arc::new(Haproxy::new(&cfg));
+    if let Err(e) = certs::prepare(&cfg.certs_dir) {
+        tracing::warn!(error = %e, "certificate directory could not be prepared");
+    }
     // HAProxy needs a config on disk to boot, so this happens even when the API cannot start.
     match haproxy.apply(&store.config()).await {
         Ok(out) => {

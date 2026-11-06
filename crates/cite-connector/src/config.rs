@@ -67,6 +67,9 @@ pub struct ConnectorConfig {
     pub github_api_url: Option<String>,
     pub session_ttl_secs: u64,
     pub tls_dir: PathBuf,
+    // The directory HAProxy loads `ssl crt` certificates from; one combined PEM per certificate.
+    pub certs_dir: PathBuf,
+    pub certs_mode: u32,
 }
 
 // Startup misconfiguration is reported through Internal; it never reaches an HTTP response.
@@ -248,6 +251,15 @@ fn parse_sans(raw: &str) -> Result<Vec<String>> {
     Ok(out)
 }
 
+// 0600 suits HAProxy running as the connector's user; 0640 lets a HAProxy in the connector's group read the keys.
+fn parse_certs_mode(raw: &str) -> Result<u32> {
+    match raw {
+        "600" | "0600" => Ok(0o600),
+        "640" | "0640" => Ok(0o640),
+        _ => Err(config_err("CITE_CERTS_MODE must be 0600 or 0640".into())),
+    }
+}
+
 fn parse_ttl(raw: &str) -> Result<u64> {
     let secs: u64 = raw
         .parse()
@@ -365,6 +377,10 @@ impl ConnectorConfig {
 
         // Everything HAProxy reads lives under one directory so it can be a single shared volume.
         let haproxy_dir = data_dir.join("haproxy");
+        let certs_mode = match get(env, "CITE_CERTS_MODE") {
+            Some(raw) => parse_certs_mode(raw)?,
+            None => 0o600,
+        };
         Ok(Self {
             listen,
             allow,
@@ -404,6 +420,8 @@ impl ConnectorConfig {
             github_api_url,
             session_ttl_secs,
             tls_dir: data_dir.join("tls"),
+            certs_dir: data_dir.join("certs"),
+            certs_mode,
             data_dir,
         })
     }
@@ -452,6 +470,24 @@ mod tests {
     }
 
     #[test]
+    fn the_certificate_file_mode_is_one_of_two_values() {
+        for (raw, mode) in [
+            ("0600", Some(0o600)),
+            ("640", Some(0o640)),
+            ("0644", None),
+            ("0777", None),
+            ("x", None),
+        ] {
+            let mut env = base();
+            env.insert("CITE_CERTS_MODE".into(), raw.into());
+            let parsed = ConnectorConfig::from_env_map(&env)
+                .ok()
+                .map(|c| c.certs_mode);
+            assert_eq!(parsed, mode, "{raw}");
+        }
+    }
+
+    #[test]
     fn defaults_apply_when_only_allowlist_is_set() {
         let cfg = ConnectorConfig::from_env_map(&base()).expect("config");
         assert_eq!(cfg.listen, "0.0.0.0:7443".parse().expect("addr"));
@@ -474,6 +510,8 @@ mod tests {
         assert_eq!(cfg.pages_dir, PathBuf::from("/conf/haproxy/pages"));
         assert_eq!(cfg.haproxy_cfg, PathBuf::from("/conf/haproxy/haproxy.cfg"));
         assert_eq!(cfg.tls_dir, PathBuf::from("/conf/tls"));
+        assert_eq!(cfg.certs_dir, PathBuf::from("/conf/certs"));
+        assert_eq!(cfg.certs_mode, 0o600);
         assert_eq!(cfg.runtime_addr, "haproxy:9999");
         assert_eq!(cfg.master_addr, "haproxy:9998");
         assert_eq!(cfg.log_addr_for_haproxy, "connector:5140");

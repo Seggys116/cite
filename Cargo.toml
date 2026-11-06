@@ -63,6 +63,9 @@ proptest = "1"
 tempfile = "3"
 libc = "0.2"
 rusqlite = { version = "0.37", features = ["bundled"] }
+x509-parser = "0.17"
+pem = "3"
+zeroize = "1"
 
 [profile.release]
 lto = "thin"

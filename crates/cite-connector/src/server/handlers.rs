@@ -7,6 +7,7 @@ use axum::http::header;
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 use cite_edge::analytics::{RequestFilter, window_from_str};
+use cite_edge::cloudflare::{CLOUDFLARE_RANGES_UPDATED, effective_ranges};
 use cite_edge::model::{EdgeSettings, FirewallRule, MaintenancePage, Site, Slot, Target};
 use cite_edge::presets::{preset, presets};
 use cite_edge::ratelimit::client_key;
@@ -248,13 +249,20 @@ pub(super) async fn reload(
     State(st): State<AppState>,
     Extension(p): Extension<Principal>,
 ) -> ApiResult<Response> {
-    let _gate = st.deployer.config_lock().lock().await;
-    // Forced, so certificates renewed on disk and an earlier failed reload are picked up.
-    let out = st.haproxy.reload(&st.store.config()).await?;
-    out.require_running()?;
-    st.store
-        .audit(&p.actor(), "haproxy.reload", &out.config_hash)
-        .await;
+    // Detached like every other change, so a dropped connection cannot stop a reload halfway.
+    let this = std::sync::Arc::clone(&st);
+    let actor = p.actor();
+    let out = crate::deploy::detach(async move {
+        let _gate = this.deployer.config_lock().lock().await;
+        // Forced, so certificates renewed on disk and an earlier failed reload are picked up.
+        let out = this.haproxy.reload(&this.store.config()).await?;
+        out.require_running()?;
+        this.store
+            .audit(&actor, "haproxy.reload", &out.config_hash)
+            .await;
+        Ok(out)
+    })
+    .await?;
     Ok(Json(json!({
         "ok": true,
         "config_hash": out.config_hash,
@@ -266,7 +274,7 @@ pub(super) async fn reload(
 pub(super) async fn haproxy_config(State(st): State<AppState>) -> ApiResult<Response> {
     let text = st
         .haproxy
-        .current_config_text()
+        .redacted_config_text(&st.store.config())
         .ok_or_else(|| missing("rendered configuration"))?;
     Ok(([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], text).into_response())
 }
@@ -284,6 +292,21 @@ pub(super) async fn haproxy_stats(State(st): State<AppState>) -> ApiResult<Respo
 pub(super) async fn get_settings(State(st): State<AppState>) -> ApiResult<Response> {
     let cfg = st.store.config();
     json_ok(&cfg.settings)
+}
+
+// The list HAProxy trusts as Cloudflare: the built-in copy unless the settings carry their own.
+pub(super) async fn cloudflare_ranges(State(st): State<AppState>) -> ApiResult<Response> {
+    let cfg = st.store.config();
+    let source = if cfg.settings.cloudflare_ranges.is_empty() {
+        "builtin"
+    } else {
+        "custom"
+    };
+    json_ok(&json!({
+        "source": source,
+        "updated": CLOUDFLARE_RANGES_UPDATED,
+        "ranges": effective_ranges(&cfg.settings),
+    }))
 }
 
 pub(super) async fn put_settings(
@@ -667,9 +690,51 @@ pub(super) async fn delete_page(
     Ok(ok_flag())
 }
 
+// A header value marked secret is write-only: it is blanked in every response, and left empty in a request it means "keep the stored value".
+fn redacted(rule: &FirewallRule) -> FirewallRule {
+    let mut out = rule.clone();
+    if let Some(header) = out.matchers.header.as_mut()
+        && header.secret
+    {
+        header.equals = header.equals.as_ref().map(|_| String::new());
+        header.regex = header.regex.as_ref().map(|_| String::new());
+    }
+    out
+}
+
+fn keep_stored_secret(
+    rule: &mut FirewallRule,
+    stored: Option<&FirewallRule>,
+) -> std::result::Result<(), ConnectorError> {
+    let Some(header) = rule.matchers.header.as_mut().filter(|h| h.secret) else {
+        return Ok(());
+    };
+    let blank = |v: &Option<String>| v.as_ref().is_some_and(String::is_empty);
+    if !blank(&header.equals) && !blank(&header.regex) {
+        return Ok(());
+    }
+    let old = stored
+        .and_then(|r| r.matchers.header.as_ref())
+        .filter(|h| h.secret);
+    let Some(old) = old else {
+        return Err(ConnectorError::BadRequest(
+            "a secret header value cannot be left empty: there is no stored value for this rule to keep"
+                .into(),
+        ));
+    };
+    if blank(&header.equals) {
+        header.equals = old.equals.clone();
+    }
+    if blank(&header.regex) {
+        header.regex = old.regex.clone();
+    }
+    Ok(())
+}
+
 pub(super) async fn list_rules(State(st): State<AppState>) -> ApiResult<Response> {
     let cfg = st.store.config();
-    json_ok(&cfg.firewall)
+    let rules: Vec<FirewallRule> = cfg.firewall.iter().map(redacted).collect();
+    json_ok(&rules)
 }
 
 pub(super) async fn create_rule(
@@ -677,10 +742,14 @@ pub(super) async fn create_rule(
     Extension(p): Extension<Principal>,
     JsonBody(rule): JsonBody<FirewallRule>,
 ) -> ApiResult<Response> {
-    validate_rule(&rule)?;
-    let created = rule.clone();
+    let created = redacted(&rule);
     let id = rule.id.clone();
     st.mutate(&p.actor(), "firewall.create", &id, move |cfg| {
+        // the stored value is read under the config lock, so a concurrent edit cannot be overwritten with a stale one
+        let mut rule = rule;
+        let rule_id = rule.id.clone();
+        keep_stored_secret(&mut rule, cfg.firewall.iter().find(|x| x.id == rule_id))?;
+        validate_rule(&rule)?;
         if cfg.firewall.iter().any(|x| x.id == rule.id) {
             return Err(ConnectorError::Conflict(format!(
                 "rule {} already exists",
@@ -704,14 +773,16 @@ pub(super) async fn put_rule(
     if rule.id != id {
         return Err(ApiError::bad("rule id in the body must match the path"));
     }
-    validate_rule(&rule)?;
-    let saved = rule.clone();
+    let saved = redacted(&rule);
     st.mutate(&p.actor(), "firewall.update", &id, move |cfg| {
+        let mut rule = rule;
         let slot = cfg
             .firewall
             .iter_mut()
             .find(|x| x.id == rule.id)
             .ok_or_else(|| ConnectorError::NotFound(format!("rule {} not found", rule.id)))?;
+        keep_stored_secret(&mut rule, Some(&*slot))?;
+        validate_rule(&rule)?;
         *slot = rule;
         Ok(())
     })
@@ -770,9 +841,24 @@ pub(super) async fn apply_preset(
         .mutate(&p.actor(), "firewall.preset", chosen.name, move |cfg| {
             let mut added = Vec::new();
             for rule in chosen.rules {
-                if !cfg.firewall.iter().any(|x| x.id == rule.id) {
-                    cfg.firewall.push(rule.clone());
-                    added.push(rule);
+                match cfg.firewall.iter().position(|x| x.id == rule.id) {
+                    // a rule with the preset's id is refreshed to the current definition, keeping the owner's on/off choice and site scope
+                    Some(at) => {
+                        let existing = &mut cfg.firewall[at];
+                        let refreshed = FirewallRule {
+                            enabled: existing.enabled,
+                            site: existing.site.clone(),
+                            ..rule
+                        };
+                        if *existing != refreshed {
+                            *existing = refreshed.clone();
+                            added.push(refreshed);
+                        }
+                    }
+                    None => {
+                        cfg.firewall.push(rule.clone());
+                        added.push(rule);
+                    }
                 }
             }
             Ok(added)

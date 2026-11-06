@@ -194,27 +194,7 @@ impl Deployer {
         }
     }
 
-    async fn restore(&self, actor: &str, action: &str, previous: Arc<EdgeConfig>) {
-        let snapshot = previous.clone();
-        let label = format!("{action}.restore");
-        let restored = self
-            .store
-            .update(actor, &label, move |cfg| {
-                *cfg = (*snapshot).clone();
-                Ok(())
-            })
-            .await;
-        match restored {
-            Ok(()) => {
-                if let Err(err) = self.haproxy.apply(&previous).await {
-                    tracing::warn!("haproxy could not re-apply the restored config: {err}");
-                }
-            }
-            Err(err) => tracing::error!("config could not be restored after {action}: {err}"),
-        }
-    }
-
-    // A failed apply restores the previous config so the store never holds a state HAProxy rejected.
+    // A failed apply restores the previous config so the store never holds a state HAProxy rejected; the shared helper keeps this identical to the API's own changes.
     async fn mutate_apply<T>(
         &self,
         actor: &str,
@@ -222,18 +202,7 @@ impl Deployer {
         change: impl FnOnce(&mut EdgeConfig) -> Result<T>,
     ) -> Result<T> {
         let _gate = self.config_lock.lock().await;
-        let previous = self.store.config();
-        let out = self.store.update(actor, action, change).await?;
-        let loaded = self
-            .haproxy
-            .apply(&self.store.config())
-            .await
-            .and_then(|applied| applied.require_loaded());
-        if let Err(err) = loaded {
-            self.restore(actor, action, previous).await;
-            return Err(err);
-        }
-        Ok(out)
+        crate::change::mutate_and_apply(&self.store, &self.haproxy, actor, action, "", change).await
     }
 
     async fn record(&self, actor: &str, id: &str, entry: Deployment) {
@@ -843,8 +812,19 @@ impl Deployer {
             }
         };
         if let Err(err) = pushed {
-            self.restore(actor, "site.maintenance", previous).await;
-            return Err(err);
+            let rollback = crate::change::roll_back(
+                &self.store,
+                &self.haproxy,
+                actor,
+                "site.maintenance",
+                previous,
+            )
+            .await;
+            return Err(if rollback.failed() {
+                crate::change::failure(err, false, rollback)
+            } else {
+                err
+            });
         }
         self.get_site(id)
     }
@@ -1018,6 +998,7 @@ mod tests {
             health: HealthCheck::default(),
             source: None,
             history: vec![],
+            access: Default::default(),
         }
     }
 

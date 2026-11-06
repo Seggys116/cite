@@ -10,6 +10,7 @@ use cite_edge::auth::{
     ApiToken, ApiTokens, AuthError, Credentials, SessionInfo, SessionStore, TokenLookup,
     authenticate, dummy_verify,
 };
+use cite_edge::migrate::{MigrationKind, MigrationNote, migrate_loaded_config};
 use cite_edge::model::{CONFIG_VERSION, EdgeConfig};
 use cite_edge::validate::validate_config;
 use serde::{Deserialize, Serialize};
@@ -110,6 +111,9 @@ pub struct Store {
     sessions: StdMutex<SessionStore>,
     audit: Mutex<AuditState>,
     disk: StdMutex<AuthDisk>,
+    // Test hook: -1 is off; otherwise that many config writes succeed and the one after fails.
+    #[cfg(test)]
+    fail_config_write_in: std::sync::atomic::AtomicI64,
 }
 
 pub enum TokenOutcome {
@@ -241,6 +245,50 @@ async fn guarded_write(
     .map_err(|e| internal("write task", e))?
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OpenMode {
+    Migrating,
+    ReadOnly,
+}
+
+const MIGRATION_BACKUP: &str = "edge.json.pre-migration";
+
+// Writes the migrated config over edge.json after keeping the original once, and describes the change for the audit log (ids and counts only, never rule text).
+fn persist_migration(
+    paths: &Paths,
+    original: &[u8],
+    migrated: &EdgeConfig,
+    notes: &[MigrationNote],
+) -> Result<String> {
+    let backup = fixed_name(MIGRATION_BACKUP)?;
+    // any entry of that name (a file of any size, a directory, a link) counts as an existing backup and is neither read nor replaced
+    if paths.dir.key(&backup).is_none() {
+        write_atomic_in(&paths.dir, &backup, original, 0o600)
+            .map_err(|e| internal("cannot write the pre-migration backup", e))?;
+    } else {
+        tracing::warn!("{MIGRATION_BACKUP} already exists and was left as it is");
+    }
+    let bytes = serde_json::to_vec_pretty(migrated)?;
+    write_atomic_in(&paths.dir, &paths.edge, &bytes, 0o600)
+        .map_err(|e| internal("cannot write the migrated edge.json", e))?;
+    let (mut replaced, mut disabled) = (Vec::new(), Vec::new());
+    for note in notes {
+        tracing::warn!(id = %note.id, reason = %note.reason, "edge.json was migrated at start");
+        match &note.what {
+            MigrationKind::Replaced => replaced.push(note.id.as_str()),
+            MigrationKind::Disabled => disabled.push(note.id.as_str()),
+            _ => {}
+        }
+    }
+    Ok(format!(
+        "replaced={} disabled={} replaced_ids={} disabled_ids={}",
+        replaced.len(),
+        disabled.len(),
+        replaced.join(","),
+        disabled.join(",")
+    ))
+}
+
 fn make_dir(path: &Path, mode: u32) -> Result<()> {
     ensure_dir(path, mode).map_err(|e| internal(&format!("cannot prepare {}", path.display()), e))
 }
@@ -327,15 +375,30 @@ fn read_tail(dir: &TrustedDir, files: &AuditFiles, limit: usize) -> Vec<AuditEnt
 }
 
 impl Store {
+    // The server's open: repairs edge.json from an older release and records it.
     pub async fn open(cfg: &ConnectorConfig) -> Result<Arc<Store>> {
+        Self::open_with(cfg, OpenMode::Migrating).await
+    }
+
+    // For the command line, which can run while the server is up: reads edge.json in memory and writes nothing to it.
+    pub async fn open_read_only(cfg: &ConnectorConfig) -> Result<Arc<Store>> {
+        Self::open_with(cfg, OpenMode::ReadOnly).await
+    }
+
+    async fn open_with(cfg: &ConnectorConfig, mode: OpenMode) -> Result<Arc<Store>> {
         let cfg = cfg.clone();
-        let store = tokio::task::spawn_blocking(move || Self::open_blocking(&cfg))
-            .await
-            .map_err(|e| internal("open task", e))??;
+        let (store, migrated) =
+            tokio::task::spawn_blocking(move || Self::open_blocking(&cfg, mode))
+                .await
+                .map_err(|e| internal("open task", e))??;
+        if let Some(summary) = migrated {
+            store.audit("system", "config.migrated", &summary).await;
+        }
         Ok(Arc::new(store))
     }
 
-    fn open_blocking(cfg: &ConnectorConfig) -> Result<Store> {
+    // The second value says what start-up changed in edge.json, for the audit log once the store exists.
+    fn open_blocking(cfg: &ConnectorConfig, mode: OpenMode) -> Result<(Store, Option<String>)> {
         // The data directory is traversable but not listable so HAProxy can reach its subdirectory.
         make_dir(&cfg.data_dir, 0o711)?;
         for dir in [&cfg.haproxy_dir, &cfg.maps_dir, &cfg.pages_dir] {
@@ -358,26 +421,55 @@ impl Store {
             },
         };
 
-        let config = match load_json::<EdgeConfig>(&paths.dir, &paths.edge, MAX_EDGE_BYTES)? {
-            Some(c) => {
+        let (config, migrated) = match read_optional(&paths.dir, &paths.edge, MAX_EDGE_BYTES)? {
+            Some(original) => {
+                let mut c: EdgeConfig = serde_json::from_slice(&original)
+                    .map_err(|e| internal("edge.json is invalid", e))?;
                 if c.version != CONFIG_VERSION {
                     return Err(ConnectorError::Internal(format!(
                         "edge.json has version {}, expected {CONFIG_VERSION}",
                         c.version
                     )));
                 }
-                validate_config(&c).map_err(|e| internal("edge.json failed validation", e))?;
-                c
+                let notes = migrate_loaded_config(&mut c);
+                let bad_site = notes
+                    .iter()
+                    .find(|n| matches!(n.what, MigrationKind::SiteRegexInvalid));
+                if mode == OpenMode::ReadOnly {
+                    // the command line never rewrites edge.json, so a config the server would still have to migrate or refuse must not block it
+                    if bad_site.is_none() {
+                        validate_config(&c)
+                            .map_err(|e| internal("edge.json failed validation", e))?;
+                    }
+                    (c, None)
+                } else {
+                    if let Some(bad) = bad_site {
+                        return Err(ConnectorError::Internal(format!(
+                            "edge.json: site {} has a path_regex the current rules refuse, and it cannot be fixed automatically; edit the path_regex of that site in edge.json, or remove it, then start again (see docs/node.md, Upgrading from an older release)",
+                            bad.id
+                        )));
+                    }
+                    // nothing is written unless the migrated config is valid
+                    validate_config(&c).map_err(|e| internal("edge.json failed validation", e))?;
+                    let summary = if notes.is_empty() {
+                        None
+                    } else {
+                        Some(persist_migration(&paths, &original, &c, &notes)?)
+                    };
+                    (c, summary)
+                }
             }
             None => {
                 let c = EdgeConfig {
                     version: CONFIG_VERSION,
                     ..EdgeConfig::default()
                 };
-                let bytes = serde_json::to_vec_pretty(&c)?;
-                write_atomic_in(&paths.dir, &paths.edge, &bytes, 0o600)
-                    .map_err(|e| internal("cannot write edge.json", e))?;
-                c
+                if mode == OpenMode::Migrating {
+                    let bytes = serde_json::to_vec_pretty(&c)?;
+                    write_atomic_in(&paths.dir, &paths.edge, &bytes, 0o600)
+                        .map_err(|e| internal("cannot write edge.json", e))?;
+                }
+                (c, None)
             }
         };
         let creds = load_json::<Stamped<Credentials>>(
@@ -398,7 +490,7 @@ impl Store {
         };
         let audit_size = paths.dir.len(&paths.audit.current).unwrap_or(0);
 
-        Ok(Store {
+        let store = Store {
             session_ttl_secs: cfg.session_ttl_secs,
             sessions: StdMutex::new(SessionStore::new(cfg.session_ttl_secs, SESSION_IDLE_SECS)),
             paths,
@@ -415,7 +507,16 @@ impl Store {
                 last_prune: 0,
             }),
             disk: StdMutex::new(disk),
-        })
+            #[cfg(test)]
+            fail_config_write_in: std::sync::atomic::AtomicI64::new(-1),
+        };
+        Ok((store, migrated))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_config_write_after(&self, successes: i64) {
+        self.fail_config_write_in
+            .store(successes, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub fn config(&self) -> Arc<EdgeConfig> {
@@ -445,6 +546,18 @@ impl Store {
         let out = f(&mut next)?;
         validate_config(&next)?;
         let bytes = serde_json::to_vec_pretty(&next)?;
+        #[cfg(test)]
+        {
+            use std::sync::atomic::Ordering;
+            let left = self.fail_config_write_in.load(Ordering::SeqCst);
+            if left == 0 {
+                self.fail_config_write_in.store(-1, Ordering::SeqCst);
+                return Err(internal("write failed", "injected failure"));
+            }
+            if left > 0 {
+                self.fail_config_write_in.store(left - 1, Ordering::SeqCst);
+            }
+        }
         write_file(
             self.paths.dir.clone(),
             self.paths.edge.clone(),
@@ -1000,6 +1113,211 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(&test_config(dir.path())).await.expect("open");
         (dir, store)
+    }
+
+    fn old_config(rules: Vec<cite_edge::model::FirewallRule>) -> EdgeConfig {
+        EdgeConfig {
+            version: CONFIG_VERSION,
+            firewall: rules,
+            ..EdgeConfig::default()
+        }
+    }
+
+    fn ua_rule(id: &str, regex: &str) -> cite_edge::model::FirewallRule {
+        cite_edge::model::FirewallRule {
+            id: id.into(),
+            name: id.into(),
+            enabled: true,
+            action: Some(cite_edge::model::FirewallAction::Deny),
+            matchers: cite_edge::model::Matchers {
+                user_agent_regex: Some(regex.into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn seeded(config: &EdgeConfig) -> (tempfile::TempDir, ConnectorConfig) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = test_config(dir.path());
+        make_dir(&cfg.data_dir, 0o711).expect("data dir");
+        fs::write(
+            cfg.data_dir.join("edge.json"),
+            serde_json::to_vec_pretty(config).expect("json"),
+        )
+        .expect("seed edge.json");
+        (dir, cfg)
+    }
+
+    #[tokio::test]
+    async fn a_config_with_a_regex_the_new_rules_refuse_opens_migrated_once() {
+        let old = old_config(vec![
+            ua_rule("old-bot", ".*bot.*"),
+            ua_rule("fine", "curl/"),
+        ]);
+        let (_dir, cfg) = seeded(&old);
+        let original = fs::read(cfg.data_dir.join("edge.json")).expect("original");
+
+        let store = Store::open(&cfg).await.expect("opens");
+        let rules = store.config().firewall.clone();
+        let bot = rules.iter().find(|r| r.id == "old-bot");
+        assert!(
+            bot.is_none_or(
+                |r| !r.enabled || r.matchers.user_agent_regex.as_deref() != Some(".*bot.*")
+            ),
+            "the refused rule must not stay enabled as it was"
+        );
+        validate_config(&store.config()).expect("the migrated config validates");
+
+        let backup = cfg.data_dir.join("edge.json.pre-migration");
+        assert_eq!(fs::read(&backup).expect("backup"), original);
+        let mode = fs::metadata(&backup).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let on_disk: serde_json::Value =
+            serde_json::from_slice(&fs::read(cfg.data_dir.join("edge.json")).unwrap()).unwrap();
+        assert_eq!(on_disk, serde_json::to_value(&*store.config()).unwrap());
+
+        let entries = store.audit_tail(50).await;
+        let migrated: Vec<_> = entries
+            .iter()
+            .filter(|e| e.action == "config.migrated")
+            .collect();
+        assert_eq!(migrated.len(), 1);
+        assert!(migrated[0].detail.contains("old-bot"));
+        assert!(
+            !migrated[0].detail.contains(".*bot"),
+            "no rule text in the audit entry"
+        );
+        drop(store);
+
+        let again = Store::open(&cfg).await.expect("reopens");
+        assert_eq!(again.config().firewall, rules);
+        assert_eq!(
+            fs::read(&backup).unwrap(),
+            original,
+            "the backup is only written once"
+        );
+        let entries = again.audit_tail(50).await;
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|e| e.action == "config.migrated")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn the_command_line_open_leaves_edge_json_byte_identical() {
+        let mut config = old_config(vec![ua_rule("old-bot", ".*bot.*")]);
+        let mut site: cite_edge::model::Site = serde_json::from_value(serde_json::json!({
+            "id": "shop", "name": "Shop", "hosts": ["shop.example.com"],
+            "blue": {"targets": [{"addr": "10.0.0.1:8080"}]}, "green": {"targets": []},
+            "active": "blue"
+        }))
+        .unwrap();
+        site.path_regex = Some("(unclosed".into());
+        config.sites.push(site);
+        let (_dir, cfg) = seeded(&config);
+        let edge = cfg.data_dir.join("edge.json");
+        let before = fs::read(&edge).expect("original");
+
+        let store = Store::open_read_only(&cfg)
+            .await
+            .expect("a refused site regex must not block the command line");
+        drop(store);
+        assert_eq!(fs::read(&edge).unwrap(), before);
+        assert!(!cfg.data_dir.join("edge.json.pre-migration").exists());
+
+        let (_dir2, cfg2) = seeded(&old_config(vec![ua_rule("old-bot", ".*bot.*")]));
+        let before = fs::read(cfg2.data_dir.join("edge.json")).unwrap();
+        let store = Store::open_read_only(&cfg2).await.expect("opens");
+        assert!(
+            store
+                .audit_tail(50)
+                .await
+                .iter()
+                .all(|e| e.action != "config.migrated")
+        );
+        assert_eq!(fs::read(cfg2.data_dir.join("edge.json")).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn nothing_is_written_when_the_migrated_config_fails_validation() {
+        let (_dir, cfg) = seeded(&old_config(vec![
+            ua_rule("old-bot", ".*bot.*"),
+            ua_rule("twice", "curl/"),
+            ua_rule("twice", "wget/"),
+        ]));
+        let edge = cfg.data_dir.join("edge.json");
+        let before = fs::read(&edge).unwrap();
+        assert!(Store::open(&cfg).await.is_err());
+        assert_eq!(fs::read(&edge).unwrap(), before);
+        assert!(!cfg.data_dir.join("edge.json.pre-migration").exists());
+        assert!(!cfg.data_dir.join("audit.jsonl").exists());
+    }
+
+    #[tokio::test]
+    async fn an_existing_backup_of_any_kind_is_kept_and_does_not_stop_the_start() {
+        use std::os::unix::fs::symlink;
+        for kind in ["directory", "symlink", "oversized"] {
+            let (_dir, cfg) = seeded(&old_config(vec![ua_rule("old-bot", ".*bot.*")]));
+            let backup = cfg.data_dir.join("edge.json.pre-migration");
+            match kind {
+                "directory" => fs::create_dir(&backup).unwrap(),
+                "symlink" => symlink(cfg.data_dir.join("elsewhere"), &backup).unwrap(),
+                _ => {
+                    let file = fs::File::create(&backup).unwrap();
+                    file.set_len(MAX_EDGE_BYTES + 1).unwrap();
+                }
+            }
+            let store = Store::open(&cfg)
+                .await
+                .unwrap_or_else(|e| panic!("{kind}: {e}"));
+            validate_config(&store.config()).expect("migrated config validates");
+            let meta = fs::symlink_metadata(&backup).unwrap();
+            match kind {
+                "directory" => assert!(meta.is_dir()),
+                "symlink" => assert!(meta.file_type().is_symlink()),
+                _ => assert_eq!(meta.len(), MAX_EDGE_BYTES + 1),
+            }
+            assert!(!cfg.data_dir.join("elsewhere").exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_config_that_needs_no_migration_leaves_no_backup() {
+        let (_dir, cfg) = seeded(&old_config(vec![ua_rule("fine", "curl/")]));
+        let store = Store::open(&cfg).await.expect("opens");
+        assert!(!cfg.data_dir.join("edge.json.pre-migration").exists());
+        assert!(
+            store
+                .audit_tail(50)
+                .await
+                .iter()
+                .all(|e| e.action != "config.migrated")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_invalid_site_regex_stops_start_with_a_clear_error() {
+        let mut config = old_config(vec![]);
+        let mut site: cite_edge::model::Site = serde_json::from_value(serde_json::json!({
+            "id": "shop", "name": "Shop", "hosts": ["shop.example.com"],
+            "blue": {"targets": [{"addr": "10.0.0.1:8080"}]}, "green": {"targets": []},
+            "active": "blue"
+        }))
+        .unwrap();
+        site.path_regex = Some("(unclosed".into());
+        config.sites.push(site);
+        let (_dir, cfg) = seeded(&config);
+        let err = Store::open(&cfg).await.err().expect("must refuse");
+        let text = err.to_string();
+        assert!(
+            text.contains("shop") && text.contains("path_regex") && text.contains("docs/node.md"),
+            "{text}"
+        );
+        assert!(!cfg.data_dir.join("edge.json.pre-migration").exists());
     }
 
     fn page(id: &str) -> MaintenancePage {

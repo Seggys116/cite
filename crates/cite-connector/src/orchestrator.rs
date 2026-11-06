@@ -1782,6 +1782,7 @@ pub(crate) mod tests {
                 secret: None,
             }),
             history: Vec::new(),
+            access: Default::default(),
         }
     }
 

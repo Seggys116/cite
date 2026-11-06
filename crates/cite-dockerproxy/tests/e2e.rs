@@ -27,6 +27,7 @@ fn site(id: &str, runtime: &str) -> Site {
             secret: None,
         }),
         history: Vec::new(),
+        access: Default::default(),
     }
 }
 

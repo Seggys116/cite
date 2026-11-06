@@ -36,6 +36,7 @@ fn site(id: &str, runtime: &str, node_major: Option<u8>) -> Site {
             secret: None,
         }),
         history: Vec::new(),
+        access: Default::default(),
     }
 }
 

@@ -1,27 +1,34 @@
+use std::borrow::Cow;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::{Mutex as StdMutex, MutexGuard};
+use std::sync::{Arc, Mutex as StdMutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use cite_core::atomic::{ensure_dir, write_atomic};
-use cite_edge::model::{EdgeConfig, Slot};
+use cite_edge::model::{BotPolicy, EdgeConfig, FirewallRule, SiteAccess, Slot};
+use cite_edge::presets::{ZONE_HEADER, with_zone_locks};
 use cite_edge::render::{RenderOptions, Rendered, config_hash, render};
 use cite_edge::runtime::{
     BackendStat, all_servers_up, cmd_set_active, cmd_set_maintenance, cmd_show_stat, parse_stat_csv,
 };
+use regex::Regex;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpStream, UnixStream};
 use tokio::process::Command;
 use tokio::sync::Mutex;
 use tokio::time::{sleep, timeout};
 
+use crate::certs::{self, LiveSet};
 use crate::config::ConnectorConfig;
 use crate::error::{ConnectorError, Result};
 use crate::store::now_rfc3339;
+use crate::zones::{Plan, ZoneStore};
 
+const CLOUDFLARE_LIST: &str = "cloudflare.lst";
 const CHECK_TIMEOUT: Duration = Duration::from_secs(20);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const READ_TIMEOUT: Duration = Duration::from_secs(3);
@@ -63,6 +70,15 @@ impl ApplyOutcome {
         }
     }
 
+    // `strict` is for changes that add or alter a protection: they are only acknowledged once a running HAProxy loaded them.
+    pub fn require(&self, strict: bool) -> Result<()> {
+        if strict {
+            self.require_running()
+        } else {
+            self.require_loaded()
+        }
+    }
+
     // Used where the caller needs the config live, so an unreachable HAProxy counts as a failure too.
     pub fn require_running(&self) -> Result<()> {
         match &self.reload_error {
@@ -99,7 +115,7 @@ struct State {
 }
 
 pub struct Haproxy {
-    data_dir: PathBuf,
+    certs_dir: PathBuf,
     haproxy_dir: PathBuf,
     maps_dir: PathBuf,
     pages_dir: PathBuf,
@@ -109,8 +125,85 @@ pub struct Haproxy {
     log_addr: String,
     haproxy_bin: String,
     validate: bool,
+    zones: Arc<ZoneStore>,
     apply_lock: Mutex<()>,
     state: StdMutex<State>,
+}
+
+const REDACTED: &str = "<redacted>";
+
+// True when `after` introduces or changes a protection (Cloudflare-only, zone lock, bot policy, Cloudflare ranges, a blocking or secret-header rule) that `before` did not have.
+pub fn needs_live_haproxy(before: &EdgeConfig, after: &EdgeConfig) -> bool {
+    if before.settings.cloudflare_ranges != after.settings.cloudflare_ranges {
+        return true;
+    }
+    let guarded = |a: &SiteAccess| a.cloudflare_only || a.zone_lock || a.bots != BotPolicy::Allow;
+    let site_changed = after.sites.iter().any(|site| {
+        guarded(&site.access)
+            && before
+                .sites
+                .iter()
+                .find(|b| b.id == site.id)
+                .is_none_or(|b| b.access != site.access)
+    });
+    let sensitive = |r: &FirewallRule| {
+        r.enabled && (r.action.is_some() || r.matchers.header.as_ref().is_some_and(|h| h.secret))
+    };
+    site_changed
+        || after
+            .firewall
+            .iter()
+            .any(|r| sensitive(r) && !before.firewall.contains(r))
+}
+
+// Header secrets reach the rendered text and can be quoted back by HAProxy's own messages, so every text that leaves this module is scrubbed.
+fn scrub(text: &str, secrets: &[String]) -> String {
+    // longest first, so a secret that contains another is removed whole instead of leaving its tail behind
+    let mut ordered: Vec<&String> = secrets.iter().filter(|s| !s.is_empty()).collect();
+    ordered.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    ordered.dedup();
+    let by_value = ordered
+        .into_iter()
+        .fold(text.to_string(), |acc, s| acc.replace(s.as_str(), REDACTED));
+    zone_header_pattern()
+        .replace_all(&by_value, format!("${{1}}{REDACTED}").as_str())
+        .into_owned()
+}
+
+// The zone rule's value is also removed by shape, so a secret the store no longer knows (an unreadable store, a failed apply) cannot show through old text.
+fn zone_header_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        let header = regex::escape(ZONE_HEADER);
+        Regex::new(&format!(
+            r"(?i)(req\.fhdr\({header}\) -m (?:str|reg) -- )\S+"
+        ))
+        .expect("the zone header pattern is valid")
+    })
+}
+
+fn scrub_error(err: ConnectorError, secrets: &[String]) -> ConnectorError {
+    match err {
+        ConnectorError::BadRequest(m) => ConnectorError::BadRequest(scrub(&m, secrets)),
+        ConnectorError::Unavailable(m) => ConnectorError::Unavailable(scrub(&m, secrets)),
+        ConnectorError::Internal(m) => ConnectorError::Internal(scrub(&m, secrets)),
+        other => other,
+    }
+}
+
+// Every secret a rendered config can hold: the node's zone secrets and the values of user rules marked secret.
+fn secret_values(edge: &EdgeConfig, zones: &ZoneStore) -> Vec<String> {
+    let mut out = zones.all_secrets();
+    for header in edge
+        .firewall
+        .iter()
+        .filter_map(|r| r.matchers.header.as_ref())
+    {
+        if header.secret {
+            out.extend(header.equals.iter().chain(header.regex.iter()).cloned());
+        }
+    }
+    out
 }
 
 fn internal(err: impl std::fmt::Display) -> ConnectorError {
@@ -154,6 +247,25 @@ pub(crate) fn stats_listen(runtime_addr: &str) -> Result<String> {
         .parse::<std::net::Ipv4Addr>()
         .map_or("0.0.0.0".to_string(), |ip| ip.to_string());
     Ok(format!("ipv4@{bind}:{port}"))
+}
+
+// The render hash covers the text and maps; the Cloudflare list and the certificate files are inputs HAProxy reads too, so a change in either must change the hash and force a reload.
+fn apply_hash(rendered: &Rendered, live: &LiveSet) -> String {
+    let mut hasher = Sha256::new();
+    let base = config_hash(rendered);
+    for part in [
+        base.as_bytes(),
+        rendered.cloudflare_list.as_bytes(),
+        live.digest.as_bytes(),
+    ] {
+        hasher.update((part.len() as u64).to_be_bytes());
+        hasher.update(part);
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 fn truncate(text: &str, max: usize) -> String {
@@ -204,6 +316,11 @@ fn write_files(
     for (name, body) in maps {
         write_if_changed(&maps_dir.join(name), body.as_bytes(), PUBLIC_MODE)?;
     }
+    write_if_changed(
+        &maps_dir.join(CLOUDFLARE_LIST),
+        rendered.cloudflare_list.as_bytes(),
+        PUBLIC_MODE,
+    )?;
     write_atomic(cfg_path, rendered.config.as_bytes(), PUBLIC_MODE).map_err(internal)
 }
 
@@ -333,7 +450,19 @@ async fn run_check(bin: &str, cfg_path: &Path) -> Result<()> {
         Ok(Ok(output)) => output,
     };
     if output.status.success() {
-        return Ok(());
+        // haproxy exits 0 on this warning, but a rule that can never match is not the protection it looks like
+        let combined = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout)
+        );
+        return match combined.lines().find(|l| l.contains("will never match")) {
+            Some(line) => Err(ConnectorError::BadRequest(format!(
+                "haproxy rejected the configuration: {}",
+                truncate(line.trim(), MAX_ERROR_TEXT)
+            ))),
+            None => Ok(()),
+        };
     }
     let mut text = String::from_utf8_lossy(&output.stderr).into_owned();
     if text.trim().is_empty() {
@@ -352,7 +481,7 @@ impl Haproxy {
             ..State::default()
         };
         Haproxy {
-            data_dir: cfg.data_dir.clone(),
+            certs_dir: cfg.certs_dir.clone(),
             haproxy_dir: cfg.haproxy_dir.clone(),
             maps_dir: cfg.maps_dir.clone(),
             pages_dir: cfg.pages_dir.clone(),
@@ -362,9 +491,58 @@ impl Haproxy {
             log_addr: cfg.log_addr_for_haproxy.clone(),
             haproxy_bin: cfg.haproxy_bin.clone(),
             validate: cfg.validate_with_haproxy,
+            zones: Arc::new(ZoneStore::open(cfg.data_dir.clone()).unwrap_or_else(|e| {
+                tracing::error!(error = %e, "zone secrets unavailable; zone-locked sites will not render");
+                ZoneStore::unreadable(cfg.data_dir.clone())
+            })),
             apply_lock: Mutex::new(()),
             state: StdMutex::new(state),
         }
+    }
+
+    pub fn zones(&self) -> &Arc<ZoneStore> {
+        &self.zones
+    }
+
+    // The config every render goes through: a zone-locked site gets its rule here, and a site without a secret fails closed.
+    fn with_locks<'a>(&self, edge: &'a EdgeConfig, plan: &Plan) -> Result<Cow<'a, EdgeConfig>> {
+        if !edge.sites.iter().any(|s| s.access.zone_lock) {
+            return Ok(Cow::Borrowed(edge));
+        }
+        Ok(Cow::Owned(with_zone_locks(edge, |id| plan.secret_for(id))?))
+    }
+
+    async fn commit_plan(&self, plan: Plan) -> Result<()> {
+        let zones = Arc::clone(&self.zones);
+        tokio::task::spawn_blocking(move || zones.commit(plan))
+            .await
+            .map_err(internal)?
+    }
+
+    // Dry render for validating a change before it is stored; a locked site that has no secret yet is rendered with a stand-in.
+    pub fn check_render(&self, cfg: &EdgeConfig) -> Result<()> {
+        let opts = self.dry_options()?;
+        let stand_in = "A".repeat(43);
+        let locked = with_zone_locks(cfg, |id| {
+            Some(
+                self.zones
+                    .secret_for(id)
+                    .unwrap_or_else(|| stand_in.clone()),
+            )
+        })?;
+        render(&locked, &opts)?;
+        Ok(())
+    }
+
+    // The options a dry render uses: the real directories, and no TLS bind, since only the shape of the config is being checked.
+    pub(crate) fn dry_options(&self) -> Result<RenderOptions> {
+        self.render_options(&self.maps_dir, &self.pages_dir, &LiveSet::default())
+    }
+
+    // The live config text with every secret removed, for the API.
+    pub fn redacted_config_text(&self, edge: &EdgeConfig) -> Option<String> {
+        let text = self.current_config_text()?;
+        Some(scrub(&text, &secret_values(edge, &self.zones)))
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
@@ -379,10 +557,15 @@ impl Haproxy {
         self.state().config_text.clone()
     }
 
-    fn render_options(&self, maps_dir: &Path, pages_dir: &Path) -> Result<RenderOptions> {
-        let certs = self.data_dir.join("certs");
-        let tls_dir = if certs.is_dir() {
-            certs.to_str().map(str::to_string)
+    // HAProxy refuses `ssl crt` on a directory without certificates, so the TLS bind is only rendered once one exists.
+    fn render_options(
+        &self,
+        maps_dir: &Path,
+        pages_dir: &Path,
+        live: &LiveSet,
+    ) -> Result<RenderOptions> {
+        let tls_dir = if live.count > 0 {
+            Some(path_str(&self.certs_dir)?)
         } else {
             None
         };
@@ -392,6 +575,7 @@ impl Haproxy {
             runtime_addr: stats_listen(&self.runtime_addr)?,
             log_addr: self.log_addr.clone(),
             tls_dir,
+            cloudflare_file: Some(path_str(&maps_dir.join(CLOUDFLARE_LIST))?),
         })
     }
 
@@ -401,6 +585,7 @@ impl Haproxy {
         same && self.haproxy_cfg.is_file()
             && self.maps_dir.join("active.map").is_file()
             && self.maps_dir.join("maint.map").is_file()
+            && self.maps_dir.join(CLOUDFLARE_LIST).is_file()
             && rendered
                 .pages
                 .iter()
@@ -419,12 +604,46 @@ impl Haproxy {
 
     async fn apply_with(&self, edge: &EdgeConfig, force: bool) -> Result<ApplyOutcome> {
         let _guard = self.apply_lock.lock().await;
-        let options = self.render_options(&self.maps_dir, &self.pages_dir)?;
+        match self.apply_locked(edge, force).await {
+            Ok(outcome) => Ok(outcome),
+            Err(err) => {
+                let err = scrub_error(err, &secret_values(edge, &self.zones));
+                // a failure before the reload says nothing about HAProxy, which may well be up and enforcing the old config
+                let up = self.runtime_pid().await.is_some();
+                let mut st = self.state();
+                st.status.last_error = Some(err.to_string());
+                if up {
+                    st.status.running = true;
+                }
+                Err(err)
+            }
+        }
+    }
+
+    async fn apply_locked(&self, edge: &EdgeConfig, force: bool) -> Result<ApplyOutcome> {
+        let locked: Vec<String> = edge
+            .sites
+            .iter()
+            .filter(|s| s.access.zone_lock)
+            .map(|s| s.id.clone())
+            .collect();
+        // nothing is stored or dropped until this config has loaded, so a failed apply and its rollback see the same secrets
+        let plan = self.zones.plan(&locked)?;
+        let mut secrets = secret_values(edge, &self.zones);
+        secrets.extend(plan.secrets());
+        let effective = self.with_locks(edge, &plan)?;
+        let edge: &EdgeConfig = &effective;
+        let certs_dir = self.certs_dir.clone();
+        let live = tokio::task::spawn_blocking(move || certs::live_set(&certs_dir))
+            .await
+            .map_err(internal)?;
+        let options = self.render_options(&self.maps_dir, &self.pages_dir, &live)?;
         let rendered = render(edge, &options)?;
-        let hash = config_hash(&rendered);
+        let hash = apply_hash(&rendered, &live);
         let files_current = self.files_current(&hash, &rendered);
         let loaded = self.state().applied.as_deref() == Some(hash.as_str());
         if files_current && loaded && !force {
+            self.commit_plan(plan).await?;
             return Ok(ApplyOutcome {
                 config_hash: hash,
                 reloaded: false,
@@ -434,18 +653,27 @@ impl Haproxy {
             });
         }
         if !files_current {
-            if let Err(err) = self.validate_and_install(edge, &rendered).await {
-                self.state().status.last_error = Some(err.to_string());
-                return Err(err);
+            if let Err(err) = self.validate_and_install(edge, &rendered, &live).await {
+                return Err(scrub_error(err, &secrets));
             }
             let mut st = self.state();
+            // HAProxy may read these files at any moment, so what it loaded is unknown until a reload is confirmed
+            st.applied = None;
             st.config_text = Some(rendered.config.clone());
             st.written = Some(hash.clone());
             st.status.config_hash = hash.clone();
         }
-        let result = self.reload_master().await;
+        let mut result = self.reload_master().await;
+        if let Some(msg) = result.error.as_mut() {
+            *msg = scrub(msg, &secrets);
+            self.state().status.last_error = Some(msg.clone());
+        }
         if result.reloaded {
             self.state().applied = Some(hash.clone());
+        }
+        // an unreachable HAProxy counts as applied, as for every other change; a refused or unconfirmed reload does not
+        if result.error.is_none() || !result.running {
+            self.commit_plan(plan).await?;
         }
         Ok(ApplyOutcome {
             config_hash: hash,
@@ -456,9 +684,14 @@ impl Haproxy {
         })
     }
 
-    async fn validate_and_install(&self, edge: &EdgeConfig, rendered: &Rendered) -> Result<()> {
+    async fn validate_and_install(
+        &self,
+        edge: &EdgeConfig,
+        rendered: &Rendered,
+        live: &LiveSet,
+    ) -> Result<()> {
         if self.validate {
-            self.validate_staged(edge).await?;
+            self.validate_staged(edge, live).await?;
         }
         let (maps, pages, cfg) = (
             self.maps_dir.clone(),
@@ -471,13 +704,13 @@ impl Haproxy {
             .map_err(internal)?
     }
 
-    // The staged copy points at its own maps and pages so the check never depends on live files.
-    async fn validate_staged(&self, edge: &EdgeConfig) -> Result<()> {
+    // The staged copy points at its own maps and pages so the check never depends on live files; the certificate directory is the live one, so a bad certificate fails here.
+    async fn validate_staged(&self, edge: &EdgeConfig, live: &LiveSet) -> Result<()> {
         let stage = self.haproxy_dir.join(STAGE_DIR);
         let stage_maps = stage.join("maps");
         let stage_pages = stage.join("pages");
         let cfg_path = stage.join("haproxy.cfg");
-        let options = self.render_options(&stage_maps, &stage_pages)?;
+        let options = self.render_options(&stage_maps, &stage_pages, live)?;
         let staged = render(edge, &options)?;
         let write = {
             let (maps, pages, cfg) = (stage_maps, stage_pages, cfg_path.clone());
@@ -663,6 +896,7 @@ mod tests {
             health: HealthCheck::default(),
             source: None,
             history: vec![],
+            access: Default::default(),
         }
     }
 
@@ -679,7 +913,7 @@ mod tests {
     fn haproxy_in(dir: &TempDir, runtime_addr: &str) -> Haproxy {
         let root = dir.path();
         Haproxy {
-            data_dir: root.join("data"),
+            certs_dir: root.join("data/certs"),
             haproxy_dir: root.join("haproxy"),
             maps_dir: root.join("haproxy/maps"),
             pages_dir: root.join("haproxy/pages"),
@@ -689,6 +923,7 @@ mod tests {
             log_addr: "127.0.0.1:5140".into(),
             haproxy_bin: "true".into(),
             validate: false,
+            zones: Arc::new(ZoneStore::open(root.join("data")).unwrap()),
             apply_lock: Mutex::new(()),
             state: StdMutex::new(State::default()),
         }
@@ -1272,5 +1507,402 @@ mod tests {
             .unwrap();
         assert!(up);
         assert!(*calls.lock().unwrap() >= 3);
+    }
+
+    fn locked_edge() -> EdgeConfig {
+        let mut shop = site("shop");
+        shop.access.cloudflare_only = true;
+        shop.access.zone_lock = true;
+        edge(vec![shop, site("blog")])
+    }
+
+    #[tokio::test]
+    async fn a_zone_locked_site_gets_a_generated_secret_in_the_rendered_config_only() {
+        let (hp, seen, dir) = reloading_haproxy("Success=1\n--\nok\n").await;
+        fs::create_dir_all(dir.path().join("data")).unwrap();
+        let cfg = locked_edge();
+        assert!(hp.apply(&cfg).await.unwrap().reloaded);
+        let secret = hp.zones().secret_for("shop").expect("generated");
+        assert_eq!(secret.len(), 43);
+        assert!(hp.zones().secret_for("blog").is_none());
+        let text = hp.current_config_text().unwrap();
+        assert!(text.contains(&secret), "the rule must be in the config");
+        assert!(!hp.redacted_config_text(&cfg).unwrap().contains(&secret));
+        let stored = fs::read_to_string(dir.path().join("data/zone-secrets.json")).unwrap();
+        assert!(stored.contains(&secret));
+        assert!(!hp.apply(&cfg).await.unwrap().reloaded);
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn rotating_the_secret_changes_the_hash_and_reloads() {
+        let (hp, seen, dir) = reloading_haproxy("Success=1\n--\nok\n").await;
+        fs::create_dir_all(dir.path().join("data")).unwrap();
+        let cfg = locked_edge();
+        let first = hp.apply(&cfg).await.unwrap();
+        let old = hp.zones().secret_for("shop").unwrap();
+        hp.zones().rotate("shop").unwrap();
+        let second = hp.apply(&cfg).await.unwrap();
+        assert!(second.reloaded);
+        assert_ne!(first.config_hash, second.config_hash);
+        assert!(
+            hp.zones().secret_for("shop").unwrap() != old,
+            "the secret must change"
+        );
+        assert!(!hp.current_config_text().unwrap().contains(&old));
+        assert_eq!(seen.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn turning_the_lock_off_or_deleting_the_site_drops_the_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("data")).unwrap();
+        let hp = haproxy_in(&dir, "127.0.0.1:9");
+        hp.apply(&locked_edge()).await.unwrap();
+        assert!(hp.zones().has_any());
+        hp.apply(&edge(vec![site("shop")])).await.unwrap();
+        assert!(!hp.zones().has_any());
+        let stored = fs::read_to_string(dir.path().join("data/zone-secrets.json")).unwrap();
+        assert_eq!(stored.trim(), "{}");
+        assert!(
+            !hp.current_config_text()
+                .unwrap()
+                .contains("X-Cite-Origin-Secret")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_locked_site_without_a_readable_secret_store_is_never_rendered() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut hp = haproxy_in(&dir, "127.0.0.1:9");
+        hp.zones = Arc::new(ZoneStore::unreadable(dir.path().join("data")));
+        let err = hp.apply(&locked_edge()).await.unwrap_err();
+        assert!(matches!(err, ConnectorError::BadRequest(_)), "{err:?}");
+        assert!(!hp.haproxy_cfg.exists());
+        assert!(hp.check_render(&locked_edge()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn an_apply_that_fails_early_still_records_the_error_and_that_haproxy_is_up() {
+        let (mut hp, _seen, dir) = reloading_haproxy("Success=1\n--\nok\n").await;
+        hp.zones = Arc::new(ZoneStore::unreadable(dir.path().join("data")));
+        assert!(hp.status().last_error.is_none() && !hp.status().running);
+        let err = hp.apply(&locked_edge()).await.unwrap_err();
+        let status = hp.status();
+        assert_eq!(status.last_error.as_deref(), Some(err.to_string().as_str()));
+        assert!(
+            status.running,
+            "the runtime socket answers, so HAProxy is up"
+        );
+    }
+
+    #[tokio::test]
+    async fn files_written_without_a_confirmed_reload_force_the_next_apply_to_reload() {
+        let (mut hp, seen, _dir) = reloading_haproxy("Success=1\n--\nok\n").await;
+        let good = hp.master_addr.clone();
+        let (one, two) = (
+            edge(vec![site("shop")]),
+            edge(vec![site("shop"), site("blog")]),
+        );
+        assert!(hp.apply(&one).await.unwrap().reloaded);
+        hp.master_addr = "127.0.0.1:1".into();
+        assert!(!hp.apply(&two).await.unwrap().running);
+        assert!(!hp.apply(&one).await.unwrap().running);
+        hp.master_addr = good;
+        assert!(
+            hp.apply(&one).await.unwrap().reloaded,
+            "an unconfirmed write must not be skipped"
+        );
+        assert_eq!(seen.lock().unwrap().len(), 2);
+    }
+
+    const REFUSED: &str = "Success=0\n--\n[ALERT] refused\n";
+
+    #[tokio::test]
+    async fn a_refused_reload_that_drops_a_lock_keeps_the_secret_for_the_rollback() {
+        let (hp, _seen, dir) = reloading_haproxy(REFUSED).await;
+        fs::create_dir_all(dir.path().join("data")).unwrap();
+        let s1 = hp.zones().rotate("shop").unwrap().secret.to_string();
+        let file = dir.path().join("data/zone-secrets.json");
+
+        let off = hp
+            .apply(&edge(vec![site("shop"), site("blog")]))
+            .await
+            .unwrap();
+        assert!(off.running && off.reload_error.is_some());
+        assert!(
+            hp.zones().secret_for("shop").as_deref() == Some(s1.as_str()),
+            "the stored secret changed"
+        );
+        assert!(fs::read_to_string(&file).unwrap().contains(&s1));
+
+        let back = hp.apply(&locked_edge()).await.unwrap();
+        assert!(back.reload_error.is_some());
+        assert!(
+            hp.zones().secret_for("shop").as_deref() == Some(s1.as_str()),
+            "the stored secret changed"
+        );
+        assert!(hp.current_config_text().unwrap().contains(&s1));
+        assert!(fs::read_to_string(&file).unwrap().contains(&s1));
+    }
+
+    #[tokio::test]
+    async fn a_refused_reload_that_deletes_a_locked_site_keeps_its_secret() {
+        let (hp, _seen, dir) = reloading_haproxy(REFUSED).await;
+        fs::create_dir_all(dir.path().join("data")).unwrap();
+        let s1 = hp.zones().rotate("shop").unwrap().secret.to_string();
+        let gone = hp.apply(&edge(vec![site("blog")])).await.unwrap();
+        assert!(gone.reload_error.is_some());
+        assert!(
+            hp.zones().secret_for("shop").as_deref() == Some(s1.as_str()),
+            "the stored secret changed"
+        );
+        hp.apply(&locked_edge()).await.unwrap();
+        assert!(hp.current_config_text().unwrap().contains(&s1));
+    }
+
+    #[tokio::test]
+    async fn a_confirmed_reload_commits_new_secrets_and_prunes_old_ones() {
+        let (hp, _seen, dir) = reloading_haproxy("Success=1\n--\nok\n").await;
+        fs::create_dir_all(dir.path().join("data")).unwrap();
+        hp.zones().rotate("old").unwrap();
+        assert!(hp.apply(&locked_edge()).await.unwrap().reloaded);
+        assert!(hp.zones().secret_for("shop").is_some());
+        assert!(hp.zones().secret_for("old").is_none());
+    }
+
+    #[tokio::test]
+    async fn the_config_text_is_redacted_by_shape_even_with_an_empty_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let hp = haproxy_in(&dir, "127.0.0.1:9");
+        hp.state().config_text = Some(
+            "    http-request deny if !{ req.fhdr(X-Cite-Origin-Secret) -m str -- AbCd0123-_xyz }\n    acl a req.fhdr(user-agent) -m reg -- bot\n"
+                .into(),
+        );
+        let shown = hp.redacted_config_text(&edge(vec![])).unwrap();
+        assert!(!shown.contains("AbCd0123"), "{shown}");
+        assert!(shown.contains("-- <redacted> }"), "{shown}");
+        assert!(shown.contains("-m reg -- bot"), "{shown}");
+        let err = scrub_error(
+            ConnectorError::BadRequest(
+                "bad line req.fhdr(x-cite-origin-secret) -m str -- Zz9".into(),
+            ),
+            &[],
+        );
+        assert!(!err.to_string().contains("Zz9"));
+    }
+
+    #[tokio::test]
+    async fn a_never_matching_rule_warning_fails_the_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let tools = tempfile::tempdir().unwrap();
+        let script = tools.path().join("fake-haproxy");
+        fs::write(
+            &script,
+            "#!/bin/sh\nif [ -e \"$(dirname \"$0\")/warn\" ]; then echo \"[WARNING] (1) : config : anonymous acl will never match because it uses keyword 'req.fhdr'\" >&2; fi\nexit 0\n",
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut hp = haproxy_in(&dir, "127.0.0.1:9");
+        hp.validate = true;
+        hp.haproxy_bin = script.display().to_string();
+        hp.apply(&edge(vec![site("shop")])).await.unwrap();
+        let live = fs::read_to_string(&hp.haproxy_cfg).unwrap();
+        fs::write(tools.path().join("warn"), "").unwrap();
+        let err = hp
+            .apply(&edge(vec![site("shop"), site("blog")]))
+            .await
+            .unwrap_err();
+        let ConnectorError::BadRequest(msg) = &err else {
+            panic!("expected BadRequest, got {err:?}");
+        };
+        assert!(msg.contains("will never match"), "{msg}");
+        assert_eq!(fs::read_to_string(&hp.haproxy_cfg).unwrap(), live);
+    }
+
+    #[test]
+    fn a_secret_inside_another_secret_leaves_no_tail_behind() {
+        let secrets = vec![
+            "token123".to_string(),
+            "token123456789".to_string(),
+            "token123".to_string(),
+        ];
+        assert_eq!(
+            scrub("v=token123456789 w=token123", &secrets),
+            "v=<redacted> w=<redacted>"
+        );
+    }
+
+    #[test]
+    fn only_protection_changes_need_a_running_haproxy() {
+        let base = edge(vec![site("shop")]);
+        assert!(!needs_live_haproxy(&base, &base));
+        let mut page = base.clone();
+        page.sites[0].name = "renamed".into();
+        assert!(!needs_live_haproxy(&base, &page));
+
+        let changes: [fn(&mut EdgeConfig); 5] = [
+            |c: &mut EdgeConfig| c.sites[0].access.cloudflare_only = true,
+            |c: &mut EdgeConfig| c.sites[0].access.zone_lock = true,
+            |c: &mut EdgeConfig| c.sites[0].access.bots = BotPolicy::BlockBad,
+            |c: &mut EdgeConfig| c.settings.cloudflare_ranges = vec!["192.0.2.0/24".into()],
+            |c: &mut EdgeConfig| {
+                c.firewall.push(FirewallRule {
+                    id: "deny".into(),
+                    name: "deny".into(),
+                    enabled: true,
+                    action: Some(cite_edge::model::FirewallAction::Deny),
+                    ..FirewallRule::default()
+                })
+            },
+        ];
+        for change in changes {
+            let mut changed = base.clone();
+            change(&mut changed);
+            assert!(needs_live_haproxy(&base, &changed));
+            assert!(!needs_live_haproxy(&changed, &changed));
+        }
+        let mut locked = base.clone();
+        locked.sites[0].access.cloudflare_only = true;
+        assert!(
+            !needs_live_haproxy(&locked, &base),
+            "removing a protection is tolerant"
+        );
+    }
+
+    #[test]
+    fn a_strict_apply_fails_when_haproxy_is_absent_and_a_tolerant_one_does_not() {
+        let out = ApplyOutcome {
+            config_hash: String::new(),
+            reloaded: false,
+            running: false,
+            reload_error: Some("master CLI unreachable".into()),
+            reload_refused: false,
+        };
+        assert!(out.require(false).is_ok());
+        assert!(matches!(
+            out.require(true),
+            Err(ConnectorError::Unavailable(_))
+        ));
+    }
+
+    #[test]
+    fn scrubbing_removes_every_secret_from_text() {
+        let secrets = vec!["s3cret-one".to_string(), String::new(), "two".to_string()];
+        let text = scrub("a s3cret-one b two c s3cret-one", &secrets);
+        assert_eq!(text, "a <redacted> b <redacted> c <redacted>");
+    }
+
+    fn put_cert(hp: &Haproxy, id_char: char, body: &str) {
+        fs::create_dir_all(&hp.certs_dir).unwrap();
+        let text = format!(
+            "-----BEGIN CERTIFICATE-----\n{body}\n-----END CERTIFICATE-----\n-----BEGIN PRIVATE KEY-----\n{body}\n-----END PRIVATE KEY-----\n"
+        );
+        let name = format!("{}.pem", id_char.to_string().repeat(26));
+        fs::write(hp.certs_dir.join(name), text).unwrap();
+    }
+
+    fn with_https(sites: Vec<Site>) -> EdgeConfig {
+        let mut cfg = edge(sites);
+        cfg.settings.https_port = Some(8443);
+        cfg
+    }
+
+    #[tokio::test]
+    async fn the_tls_bind_follows_the_certificates_in_the_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let hp = haproxy_in(&dir, "127.0.0.1:9");
+        let cfg = with_https(vec![site("shop")]);
+        let bind = format!("bind :8443 ssl crt {}", hp.certs_dir.display());
+
+        let none = hp.apply(&cfg).await.unwrap();
+        assert!(!hp.current_config_text().unwrap().contains("ssl crt"));
+
+        fs::create_dir_all(&hp.certs_dir).unwrap();
+        let empty = hp.apply(&cfg).await.unwrap();
+        assert_eq!(empty.config_hash, none.config_hash);
+        assert!(!hp.current_config_text().unwrap().contains("ssl crt"));
+
+        put_cert(&hp, 'A', "one");
+        let one = hp.apply(&cfg).await.unwrap();
+        assert!(hp.current_config_text().unwrap().contains(&bind));
+        assert_ne!(one.config_hash, none.config_hash);
+
+        put_cert(&hp, 'A', "renewed");
+        let renewed = hp.apply(&cfg).await.unwrap();
+        assert_ne!(renewed.config_hash, one.config_hash);
+        assert!(hp.current_config_text().unwrap().contains(&bind));
+
+        fs::remove_file(hp.certs_dir.join(format!("{}.pem", "A".repeat(26)))).unwrap();
+        let gone = hp.apply(&cfg).await.unwrap();
+        assert_eq!(gone.config_hash, none.config_hash);
+        assert!(!hp.current_config_text().unwrap().contains("ssl crt"));
+    }
+
+    #[tokio::test]
+    async fn a_new_certificate_reloads_haproxy_although_the_site_config_is_unchanged() {
+        let (hp, seen, _dir) = reloading_haproxy("Success=1\n--\nok\n").await;
+        let cfg = with_https(vec![site("shop")]);
+        assert!(hp.apply(&cfg).await.unwrap().reloaded);
+        assert!(!hp.apply(&cfg).await.unwrap().reloaded);
+        put_cert(&hp, 'B', "fresh");
+        assert!(hp.apply(&cfg).await.unwrap().reloaded);
+        assert_eq!(seen.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn the_cloudflare_list_is_written_with_the_maps_and_a_change_reloads() {
+        let (hp, seen, _dir) = reloading_haproxy("Success=1\n--\nok\n").await;
+        let mut shop = site("shop");
+        shop.access.cloudflare_only = true;
+        let mut cfg = edge(vec![shop]);
+        assert!(hp.apply(&cfg).await.unwrap().reloaded);
+        let list = hp.maps_dir.join(CLOUDFLARE_LIST);
+        let text = fs::read_to_string(&list).unwrap();
+        assert!(text.lines().any(|l| l == "173.245.48.0/20"), "{text}");
+        let mode = fs::metadata(&list).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, PUBLIC_MODE);
+        let config = hp.current_config_text().unwrap();
+        assert!(config.contains(&list.display().to_string()), "{config}");
+
+        cfg.settings.cloudflare_ranges = vec!["192.0.2.0/24".into()];
+        assert!(hp.apply(&cfg).await.unwrap().reloaded);
+        assert_eq!(fs::read_to_string(&list).unwrap().trim(), "192.0.2.0/24");
+        assert_eq!(seen.lock().unwrap().len(), 2);
+
+        fs::remove_file(&list).unwrap();
+        hp.apply(&cfg).await.unwrap();
+        assert!(list.is_file());
+    }
+
+    #[tokio::test]
+    async fn validation_checks_the_staged_config_against_the_live_certificate_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let tools = tempfile::tempdir().unwrap();
+        let script = tools.path().join("fake-haproxy");
+        fs::write(
+            &script,
+            "#!/bin/sh\ncp \"$3\" \"$(dirname \"$0\")/capture.cfg\"\n[ -e \"$(dirname \"$0\")/fail\" ] && exit 1\nexit 0\n",
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut hp = haproxy_in(&dir, "127.0.0.1:9");
+        hp.validate = true;
+        hp.haproxy_bin = script.display().to_string();
+        let cfg = with_https(vec![site("shop")]);
+        put_cert(&hp, 'C', "good");
+        hp.apply(&cfg).await.unwrap();
+        let captured = fs::read_to_string(tools.path().join("capture.cfg")).unwrap();
+        assert!(
+            captured.contains(&format!("ssl crt {}", hp.certs_dir.display())),
+            "{captured}"
+        );
+        let live = fs::read_to_string(&hp.haproxy_cfg).unwrap();
+
+        fs::write(tools.path().join("fail"), "").unwrap();
+        put_cert(&hp, 'D', "bad");
+        let err = hp.apply(&cfg).await.unwrap_err();
+        assert!(matches!(err, ConnectorError::BadRequest(_)), "{err:?}");
+        assert_eq!(fs::read_to_string(&hp.haproxy_cfg).unwrap(), live);
     }
 }

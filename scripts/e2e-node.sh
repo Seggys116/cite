@@ -5,14 +5,17 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PROJECT=cite-e2e
 HTTP_PORT=18080
+HTTPS_PORT=18443
 API_PORT=17443
 SITE_HOST=app.e2e.test
-UPSTREAMS=(e2e-blue e2e-green e2e-blue2)
+CERT_HOST=secure.e2e.test
+CF_HOST=cf.e2e.test
+UPSTREAMS=(e2e-blue e2e-green e2e-blue2 e2e-echo)
 
 export CITE_VERSION="${CITE_VERSION:-e2e}"
 export CITE_PUBLIC_BIND=127.0.0.1
 export CITE_HTTP_PORT=$HTTP_PORT
-export CITE_HTTPS_PORT=18443
+export CITE_HTTPS_PORT=$HTTPS_PORT
 export CITE_CONNECTOR_BIND=127.0.0.1
 export CITE_CONNECTOR_PORT=$API_PORT
 export CITE_CONNECTOR_ALLOW=allow-all
@@ -78,7 +81,8 @@ api() {
 }
 
 code_is() {
-  expect "$1 (HTTP $2)" "$2" "$CODE"
+  [ "$2" = "$CODE" ] || fail "$1 (HTTP $2): expected '$2', got '$CODE' with body: $(printf '%s' "$BODY" | head -c 400)"
+  pass "$1 (HTTP $2)"
 }
 
 jq_ok() {
@@ -177,6 +181,106 @@ traffic_failures() {
     grep -v ' 200$' "$1" | sort | uniq -c >&2
   fi
   echo "$n"
+}
+
+# The node serves a certificate only for the SNI name, so curl is pointed at the loopback port with --resolve and trusts the uploaded certificate as its own CA.
+https_edge() {
+  local cacert=$1
+  shift
+  curl -sS --max-time 5 --cacert "$cacert" --resolve "$CERT_HOST:$HTTPS_PORT:127.0.0.1" "$@" "https://$CERT_HOST:$HTTPS_PORT/"
+}
+
+fingerprint_of() {
+  sed 's/^.*=//' | tr -d ':' | tr 'A-F' 'a-f'
+}
+
+served_fingerprint() {
+  openssl s_client -connect "127.0.0.1:$HTTPS_PORT" -servername "$CERT_HOST" </dev/null 2>/dev/null |
+    openssl x509 -noout -fingerprint -sha256 2>/dev/null | fingerprint_of
+}
+
+# Waits until HAProxy presents the certificate with this fingerprint on the HTTPS port.
+wait_served() {
+  local want=$1 got=""
+  for _ in $(seq 1 20); do
+    got=$(served_fingerprint || true)
+    [ "$got" = "$want" ] && break
+    sleep 1
+  done
+  expect "$2" "$want" "$got"
+}
+
+self_signed() {
+  openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 30 \
+    -keyout "$1.key" -out "$1.pem" -subj "/CN=$CERT_HOST" -addext "subjectAltName=DNS:$CERT_HOST" >/dev/null 2>&1 ||
+    fail "openssl could not create a certificate"
+}
+
+# 24 characters from the first base64 line of a PEM key: a leak of the body shows up even when the BEGIN line is missing.
+key_slice() {
+  sed -n '2p' "$1" | cut -c 20-43
+}
+
+# Fails on an error document too, so an absent key cannot be a side effect of the request having failed.
+no_key_material() {
+  case $BODY in
+    '{"error"'*) fail "$1 is an error document: $BODY" ;;
+    "") fail "$1 is empty" ;;
+  esac
+  local slice
+  for slice in "${KEY_SLICES[@]}"; do
+    [ "${#slice}" -ge 20 ] || fail "could not take a slice of a key to look for"
+    case $BODY in
+      *"$slice"*) fail "$1 contains key material" ;;
+    esac
+  done
+  case $BODY in
+    *"PRIVATE KEY"*) fail "$1 contains a key block" ;;
+  esac
+  pass "$1 carries no key"
+}
+
+upload_body() {
+  jq -nc --arg name "$1" --rawfile c "$2.pem" --rawfile k "$2.key" '{name:$name,certificate:$c,private_key:$k}'
+}
+
+cf_code() {
+  EDGE_HOST=$CF_HOST edge "$1" -o /dev/null -w '%{http_code}' "${@:2}"
+}
+
+# Sets LOGGED to the client address the node recorded for a request path, waiting for the log pipeline to deliver it.
+logged_client() {
+  LOGGED=""
+  for _ in $(seq 1 20); do
+    api GET "/api/v1/analytics/requests?limit=200"
+    LOGGED=$(printf '%s' "$BODY" | jq -r --arg p "$1" '[.[] | select(.path == $p)] | first | .client_ip // empty')
+    [ -z "$LOGGED" ] || return 0
+    sleep 1
+  done
+  fail "no analytics event for $1"
+}
+
+# Answers every request with the zone header it received, so a test can see whether the edge forwarded it.
+start_echo() {
+  printf '%s\n' 'server { listen 80; location / { return 200 "zone=[$http_x_cite_origin_secret]"; } }' >"$WORK/echo.conf"
+  docker run -d --name e2e-echo --network cite_edge --network-alias e2e-echo \
+    -v "$WORK/echo.conf:/etc/nginx/conf.d/default.conf:ro" docker.io/library/nginx:alpine >/dev/null
+}
+
+# A site body with a second slot, which every site needs; the extra argument is the access object.
+plain_site() {
+  local access=${4:-}
+  [ -n "$access" ] || access='{}'
+  jq -nc --arg id "$1" --arg host "$2" --arg target "$3" --argjson access "$access" '{
+    id: $id, name: $id, hosts: [$host], active: "blue",
+    blue: {targets: [{addr: $target}]},
+    green: {targets: [{addr: "e2e-green:80"}]},
+    access: $access
+  }'
+}
+
+zone_code() {
+  EDGE_HOST=zone.e2e.test edge / -o /dev/null -w '%{http_code}' -H 'CF-Connecting-IP: 203.0.113.9' "$@"
 }
 
 start_upstream() {
@@ -505,5 +609,183 @@ code_is "connector reaches the restarted HAProxy" 200
 edge_is "service after reload" green-v2
 api GET /api/v1/node
 jq_ok "HAProxy healthy" '.haproxy.running == true and .haproxy.last_reload_ok == true'
+
+echo "== certificates"
+api POST /api/v1/sites "$(jq -nc --arg host "$CERT_HOST" '{
+  id: "secure", name: "Secure", hosts: [$host], active: "blue",
+  blue: {targets: [{addr: "e2e-blue:80"}]},
+  green: {targets: [{addr: "e2e-green:80"}]}
+}')"
+code_is "create the site the certificate is for" 200
+self_signed "$WORK/cert1"
+self_signed "$WORK/cert2"
+KEY_SLICES=("$(key_slice "$WORK/cert1.key")" "$(key_slice "$WORK/cert2.key")")
+FP1=$(openssl x509 -in "$WORK/cert1.pem" -noout -fingerprint -sha256 | fingerprint_of)
+FP2=$(openssl x509 -in "$WORK/cert2.pem" -noout -fingerprint -sha256 | fingerprint_of)
+api GET /api/v1/settings
+jq_ok "https is off by default" '.https_port == null'
+api POST /api/v1/certificates "$(upload_body "e2e cert" "$WORK/cert1")"
+code_is "upload a certificate" 201
+jq_ok "certificate is described and covers the site" ".name == \"e2e cert\" and .sans == [\"$CERT_HOST\"] and .covers == [\"$CERT_HOST\"] and .days_left >= 29 and .key_type == \"ecdsa-p256\" and .fingerprint_sha256 == \"$FP1\""
+jq_ok "upload warns that https is not enabled" '.warning | type == "string"'
+no_key_material "the upload response"
+CERT_ID=$(printf '%s' "$BODY" | jq -er .id)
+api GET /api/v1/certificates
+jq_ok "list shows the certificate, the unset port and the uncovered site" ".items | length == 1 and .[0].id == \"$CERT_ID\""
+jq_ok "list reports https state and uncovered hosts" ".https_port == null and .dir_ready == true and (.uncovered_hosts | index(\"$SITE_HOST\")) != null"
+no_key_material "the list response"
+api GET /api/v1/settings
+api PUT /api/v1/settings "$(printf '%s' "$BODY" | jq -c '.https_port = 443')"
+code_is "enable https on port 443" 200
+wait_served "$FP1" "HAProxy serves the uploaded certificate by SNI"
+expect "https reaches the site through HAProxy" blue-v1 "$(https_edge "$WORK/cert1.pem")"
+expect "http keeps serving the same host" 200 "$(EDGE_HOST=$CERT_HOST edge_code /)"
+
+api PUT "/api/v1/certificates/$CERT_ID" "$(upload_body "e2e cert" "$WORK/cert2")"
+code_is "replace the certificate in place" 200
+jq_ok "replacement keeps the id and changes the fingerprint" ".id == \"$CERT_ID\" and .fingerprint_sha256 == \"$FP2\" and (has(\"warning\") | not)"
+wait_served "$FP2" "HAProxy serves the replacement certificate"
+expect "https works with the replacement" blue-v1 "$(https_edge "$WORK/cert2.pem")"
+api POST /api/v1/certificates "$(upload_body "again" "$WORK/cert2")"
+code_is "the same certificate twice is a conflict" 409
+api POST /api/v1/certificates "$(jq -nc --rawfile c "$WORK/cert1.pem" --rawfile k "$WORK/cert2.key" '{name:"mismatch",certificate:$c,private_key:$k}')"
+code_is "a key that does not match is refused" 400
+api GET "/api/v1/certificates/$CERT_ID"
+code_is "fetch one certificate" 200
+api GET /api/v1/audit?limit=100
+code_is "read the audit log" 200
+no_key_material "the audit log"
+jq_ok "uploads and replacements are audited without key material" 'any(.[]; .action == "certificates.create") and any(.[]; .action == "certificates.replace") and all(.[]; (.detail | contains("PRIVATE KEY") | not))'
+
+api DELETE "/api/v1/certificates/$CERT_ID"
+code_is "delete the last certificate" 204
+rc=0
+https_edge "$WORK/cert2.pem" -o /dev/null || rc=$?
+[ "$rc" != 0 ] || fail "https still answers after the last certificate was deleted"
+pass "https stops answering once no certificate is left (curl exit $rc)"
+expect "http keeps serving after the delete" 200 "$(EDGE_HOST=$CERT_HOST edge_code /)"
+api GET /api/v1/certificates
+jq_ok "list is empty and https_port is untouched" '.items == [] and .https_port == 443'
+api GET "/api/v1/certificates/$CERT_ID"
+code_is "deleted certificate is gone" 404
+api DELETE /api/v1/sites/secure
+code_is "remove the certificate site" 200
+
+echo "== cloudflare access"
+api POST /api/v1/sites "$(jq -nc --arg host "$CF_HOST" '{
+  id: "cf", name: "Cloudflare only", hosts: [$host], active: "blue",
+  blue: {targets: [{addr: "e2e-green:80"}]},
+  green: {targets: [{addr: "e2e-blue:80"}]},
+  access: {cloudflare_only: true, tls: "flexible"}
+}')"
+code_is "create a cloudflare-only site" 200
+jq_ok "site keeps its access settings" '.access.cloudflare_only == true and .access.tls == "flexible"'
+api GET /api/v1/cloudflare/ranges
+code_is "read the cloudflare ranges" 200
+jq_ok "built-in ranges are reported with their date" '.source == "builtin" and (.ranges | length) > 0 and (.updated | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}$"))'
+# The upstream only has an index page, so a 404 on any other path proves the request reached it.
+expect "an ordinary site passes the probe to its origin" 404 "$(edge_code /client-addr-probe)"
+logged_client /client-addr-probe
+EDGE_CLIENT=$LOGGED
+pass "HAProxy sees the test client as $EDGE_CLIENT"
+expect "a client outside the cloudflare ranges is refused" 403 "$(cf_code /cf-blocked -H 'CF-Connecting-IP: 203.0.113.9')"
+
+api GET /api/v1/settings
+api PUT /api/v1/settings "$(printf '%s' "$BODY" | jq -c --arg ip "$EDGE_CLIENT" '.cloudflare_ranges = [$ip]')"
+code_is "trust the test client as a cloudflare address" 200
+api GET /api/v1/cloudflare/ranges
+jq_ok "custom ranges are reported" ".source == \"custom\" and .ranges == [\"$EDGE_CLIENT/32\"]"
+expect "a listed peer reaches the origin" green-v2 "$(EDGE_HOST=$CF_HOST edge / -H 'CF-Connecting-IP: 203.0.113.9')"
+expect "a listed peer is not refused" 404 "$(cf_code /cf-real-ip -H 'CF-Connecting-IP: 203.0.113.9')"
+logged_client /cf-real-ip
+expect "the backend logs the CF-Connecting-IP value as the client" 203.0.113.9 "$LOGGED"
+
+api GET /api/v1/settings
+api PUT /api/v1/settings "$(printf '%s' "$BODY" | jq -c '.cloudflare_ranges = []')"
+code_is "return to the built-in ranges" 200
+expect "an unlisted peer is refused again" 403 "$(cf_code /cf-forged -H 'CF-Connecting-IP: 198.51.100.77')"
+logged_client /cf-forged
+expect "a forged header from an unlisted peer does not change the logged address" "$EDGE_CLIENT" "$LOGGED"
+expect "the forged header is ignored on an ordinary site" 404 "$(edge /plain-forged -H 'CF-Connecting-IP: 198.51.100.78' -o /dev/null -w '%{http_code}')"
+logged_client /plain-forged
+expect "the logged address of an ordinary site is the peer" "$EDGE_CLIENT" "$LOGGED"
+api DELETE /api/v1/sites/cf
+code_is "remove the cloudflare-only site" 200
+
+echo "== zone lock, redirects, cors and bot policy"
+start_echo
+api POST /api/v1/sites "$(plain_site zone zone.e2e.test e2e-echo:80 '{"cloudflare_only":true,"zone_lock":true}')"
+code_is "create a zone-locked site" 200
+api GET /api/v1/sites/zone/zone-secret
+code_is "read the zone secret status" 200
+jq_ok "a secret was generated and is not returned" '.configured == true and .header == "X-Cite-Origin-Secret" and (.fingerprint | length) == 8 and (has("secret") | not)'
+api POST /api/v1/sites/zone/zone-secret
+code_is "rotate the zone secret" 200
+jq_ok "the new secret is shown once with its fingerprint" '(.secret | length) == 43 and (.fingerprint | length) == 8'
+ZONE_SECRET=$(printf '%s' "$BODY" | jq -er .secret)
+api GET /api/v1/sites/zone/zone-secret
+code_is "read the zone secret status again" 200
+jq_ok "the status never returns the secret" "has(\"configured\") and (has(\"secret\") | not) and (tostring | contains(\"$ZONE_SECRET\") | not)"
+api GET /api/v1/haproxy/config
+code_is "read the rendered config" 200
+case $BODY in
+  *"frontend fe_main"*) ;;
+  *) fail "the config endpoint did not return a config: $BODY" ;;
+esac
+case $BODY in
+  *"$ZONE_SECRET"*) fail "the rendered config shown by the API contains the zone secret" ;;
+esac
+pass "the config shown by the API has no secret"
+api GET /api/v1/settings
+api PUT /api/v1/settings "$(printf '%s' "$BODY" | jq -c --arg ip "$EDGE_CLIENT" '.cloudflare_ranges = [$ip]')"
+code_is "trust the test client as a cloudflare address again" 200
+expect "no zone header is refused" 403 "$(zone_code)"
+expect "a wrong zone secret is refused" 403 "$(zone_code -H 'X-Cite-Origin-Secret: wrong-secret-value-0123456789abcdef')"
+expect "the right zone secret is served" 200 "$(zone_code -H "X-Cite-Origin-Secret: $ZONE_SECRET")"
+expect "the origin does not receive the zone header" "zone=[]" "$(EDGE_HOST=zone.e2e.test edge / -H 'CF-Connecting-IP: 203.0.113.9' -H "X-Cite-Origin-Secret: $ZONE_SECRET")"
+api POST /api/v1/sites/zone/zone-secret
+code_is "rotate the zone secret again" 200
+NEW_ZONE_SECRET=$(printf '%s' "$BODY" | jq -er .secret)
+expect "the old zone secret stops working" 403 "$(zone_code -H "X-Cite-Origin-Secret: $ZONE_SECRET")"
+expect "the new zone secret works" 200 "$(zone_code -H "X-Cite-Origin-Secret: $NEW_ZONE_SECRET")"
+api GET "/api/v1/audit?limit=100"
+jq_ok "rotation is audited without the secret" "any(.[]; .action == \"zone_secret.rotate\") and (tostring | contains(\"$NEW_ZONE_SECRET\") | not)"
+api GET /api/v1/firewall/rules
+jq_ok "the zone rule is not stored with the firewall rules" 'all(.[]; .id != "zone-zone")'
+
+api POST /api/v1/sites "$(plain_site redir redir.e2e.test e2e-green:80)"
+code_is "create a site for redirects" 200
+api POST /api/v1/firewall/rules '{"id":"e2e-www","name":"add www","enabled":true,"site":"redir","redirect":{"to":"{scheme}://{www_host}{path}{query}"}}'
+code_is "create a redirect-to-www rule" 200
+expect "the bare host is redirected with a 301 to www" "301 http://www.redir.e2e.test/page?x=1" \
+  "$(EDGE_HOST=redir.e2e.test edge '/page?x=1' -o /dev/null -w '%{http_code} %{redirect_url}')"
+
+api POST /api/v1/sites "$(plain_site cors cors.e2e.test e2e-green:80)"
+code_is "create a site for cors" 200
+api POST /api/v1/firewall/rules '{"id":"e2e-cors","name":"cors","enabled":true,"site":"cors","cors":{"origins":["https://app.example.com"],"methods":["GET"],"allow_headers":["Content-Type"],"max_age_secs":600}}'
+code_is "create a cors rule" 200
+expect "a preflight from a listed origin is answered 204 by the edge" 204 \
+  "$(EDGE_HOST=cors.e2e.test edge /api -X OPTIONS -H 'Origin: https://app.example.com' -H 'Access-Control-Request-Method: GET' -D "$WORK/preflight.h" -o /dev/null -w '%{http_code}')"
+grep -qi '^access-control-allow-origin: https://app.example.com' "$WORK/preflight.h" || fail "the preflight has no allow-origin header: $(<"$WORK/preflight.h")"
+pass "the preflight names the allowed origin"
+
+api POST /api/v1/sites "$(plain_site bots bots.e2e.test e2e-green:80 '{"bots":"block_bad"}')"
+code_is "create a site with the block_bad bot policy" 200
+expect "a tool user agent is refused" 403 "$(EDGE_HOST=bots.e2e.test edge / -A 'curl/8.5.0' -o /dev/null -w '%{http_code}')"
+expect "a browser user agent is served" green-v2 "$(EDGE_HOST=bots.e2e.test edge / -A 'Mozilla/5.0 (X11; Linux x86_64; rv:120.0) Gecko/20100101 Firefox/120.0')"
+api GET /api/v1/firewall/presets
+jq_ok "the redirect and force-https presets are listed" 'map(.name) as $n | all(["redirect-to-www","redirect-to-apex","force-https"][]; . as $w | $n | index($w) != null)'
+
+api DELETE /api/v1/firewall/rules/e2e-www
+code_is "remove the redirect rule" 200
+api DELETE /api/v1/firewall/rules/e2e-cors
+code_is "remove the cors rule" 200
+for site in zone redir cors bots; do
+  api DELETE "/api/v1/sites/$site"
+  code_is "remove site $site" 200
+done
+api GET /api/v1/settings
+api PUT /api/v1/settings "$(printf '%s' "$BODY" | jq -c '.cloudflare_ranges = []')"
+code_is "restore the built-in cloudflare ranges" 200
 
 echo "e2e-node: all checks passed"
