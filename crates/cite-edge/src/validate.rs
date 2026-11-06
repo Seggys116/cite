@@ -12,7 +12,7 @@ use crate::model::{
     Cors, EdgeConfig, EdgeSettings, FirewallRule, HeaderMatch, HeaderOp, HeaderOpKind,
     HeaderTarget, HealthCheck, MaintenancePage, Matchers, Redirect, Site,
 };
-use crate::pattern::{Subject, check_regex};
+use crate::pattern::{Subject, check_budget, check_regex, work as pattern_work};
 use crate::presets::ZONE_HEADER;
 
 // HAProxy loads a page file into one buffer (tune.bufsize 16384 by default), so larger pages fail the config check.
@@ -21,6 +21,8 @@ const MAX_TARGETS: usize = 32;
 const MAX_PATTERN_LEN: usize = 256;
 const MAX_TEXT_LEN: usize = 128;
 const MAX_HEADER_OPS: usize = 16;
+const MAX_LIST: usize = 16;
+const MAX_REGEXES_PER_RULE: usize = 32;
 const MAX_CORS_ENTRIES: usize = 32;
 const MAX_HEADER_VALUE: usize = 512;
 const MAX_MATCH_VALUE: usize = 256;
@@ -299,9 +301,8 @@ pub fn validate_site(site: &Site) -> Result<(), ValidationError> {
     for host in &site.hosts {
         validate_host(&format!("{what} host"), host)?;
     }
-    if let Some(re) = &site.path_regex {
-        validate_regex(&format!("{what} path_regex"), re, Subject::Path)?;
-    }
+    validate_regex_list(&what, "path_regexes", &site.path_regexes, Subject::Path)?;
+    validate_prefix_list(&what, &site.path_prefixes)?;
     for (slot, up) in [("blue", &site.blue), ("green", &site.green)] {
         if up.targets.len() > MAX_TARGETS {
             return invalid(format!(
@@ -357,15 +358,55 @@ pub fn validate_rule(rule: &FirewallRule) -> Result<(), ValidationError> {
 }
 
 fn has_matcher(m: &Matchers) -> bool {
-    m.path_regex.is_some()
-        || m.path_prefix.is_some()
+    !m.path_regexes.is_empty()
+        || !m.path_prefixes.is_empty()
         || !m.methods.is_empty()
-        || m.user_agent_regex.is_some()
+        || !m.user_agent_regexes.is_empty()
         || !m.cidrs.is_empty()
-        || m.host.is_some()
-        || m.header.is_some()
+        || !m.hosts.is_empty()
+        || !m.headers.is_empty()
         || m.scheme.is_some()
-        || m.referer_regex.is_some()
+        || !m.referer_regexes.is_empty()
+}
+
+// A list holds at most MAX_LIST distinct values.
+fn check_list<T: PartialEq>(what: &str, field: &str, items: &[T]) -> Result<(), ValidationError> {
+    if items.len() > MAX_LIST {
+        return invalid(format!("{what}: at most {MAX_LIST} {field}"));
+    }
+    for (i, a) in items.iter().enumerate() {
+        if items[..i].contains(a) {
+            return invalid(format!("{what}: {field} lists entry {} twice", i + 1));
+        }
+    }
+    Ok(())
+}
+
+// Each pattern is checked on its own, then the sum of their work must stay inside the same bounds as one pattern, because HAProxy runs them one after another.
+pub(crate) fn validate_regex_list(
+    what: &str,
+    field: &str,
+    items: &[String],
+    subject: Subject,
+) -> Result<(), ValidationError> {
+    check_list(what, field, items)?;
+    let mut work = Vec::new();
+    for re in items {
+        validate_regex(&format!("{what} {field}"), re, subject)?;
+        if let Ok(w) = pattern_work(re, subject.cap()) {
+            work.push(w);
+        }
+    }
+    check_budget(&work)
+        .map_err(|e| ValidationError(format!("{what}: {field} together are too costly: {e}")))
+}
+
+fn validate_prefix_list(what: &str, items: &[String]) -> Result<(), ValidationError> {
+    check_list(what, "path_prefixes", items)?;
+    for p in items {
+        validate_pattern(&format!("{what} path_prefixes"), p, false)?;
+    }
+    Ok(())
 }
 
 // A rule blocks or it has effects; mixing them would leave it unclear whether the request still reaches the site.
@@ -390,16 +431,26 @@ fn validate_kind(what: &str, rule: &FirewallRule) -> Result<(), ValidationError>
 }
 
 fn validate_matchers(what: &str, m: &Matchers) -> Result<(), ValidationError> {
-    if let Some(re) = &m.path_regex {
-        validate_regex(&format!("{what} path_regex"), re, Subject::Path)?;
+    let header_regexes = m.headers.iter().filter(|h| h.regex.is_some()).count();
+    let regexes = m.path_regexes.len()
+        + m.user_agent_regexes.len()
+        + m.referer_regexes.len()
+        + header_regexes;
+    if regexes > MAX_REGEXES_PER_RULE {
+        return invalid(format!(
+            "{what}: at most {MAX_REGEXES_PER_RULE} regexes in total"
+        ));
     }
-    if let Some(p) = &m.path_prefix {
-        validate_pattern(&format!("{what} path_prefix"), p, false)?;
-    }
-    if let Some(re) = &m.user_agent_regex {
-        validate_regex(&format!("{what} user_agent_regex"), re, Subject::UserAgent)?;
-    }
-    if let Some(h) = &m.host {
+    validate_regex_list(what, "path_regexes", &m.path_regexes, Subject::Path)?;
+    validate_prefix_list(what, &m.path_prefixes)?;
+    validate_regex_list(
+        what,
+        "user_agent_regexes",
+        &m.user_agent_regexes,
+        Subject::UserAgent,
+    )?;
+    check_list(what, "hosts", &m.hosts)?;
+    for h in &m.hosts {
         validate_host(&format!("{what} host"), h)?;
     }
     if m.methods.len() > 16 {
@@ -429,13 +480,41 @@ fn validate_matchers(what: &str, m: &Matchers) -> Result<(), ValidationError> {
     {
         return invalid(format!("{what}: scheme must be \"http\" or \"https\""));
     }
-    if let Some(re) = &m.referer_regex {
-        validate_regex(&format!("{what} referer_regex"), re, Subject::Referer)?;
+    validate_regex_list(
+        what,
+        "referer_regexes",
+        &m.referer_regexes,
+        Subject::Referer,
+    )?;
+    // the empty-value test is rendered as its own condition, so it cannot be one alternative among several
+    for (field, list) in [
+        ("user_agent_regexes", &m.user_agent_regexes),
+        ("referer_regexes", &m.referer_regexes),
+    ] {
+        if list.len() > 1 && list.iter().any(|s| s == "^$") {
+            return invalid(format!(
+                "{what}: \"^$\" (an empty value) must be the only entry of {field}; use a separate rule"
+            ));
+        }
     }
-    if let Some(h) = &m.header {
+    // header matchers may hold secrets, so a repeated one is reported by position only
+    check_list(what, "headers", &m.headers)?;
+    let mut work = Vec::new();
+    for h in &m.headers {
         validate_header_match(what, h)?;
+        if let Some(w) = h
+            .regex
+            .as_deref()
+            .and_then(|re| pattern_work(re, Subject::Header.cap()).ok())
+        {
+            work.push(w);
+        }
     }
-    Ok(())
+    check_budget(&work).map_err(|e| {
+        ValidationError(format!(
+            "{what}: header regexes together are too costly: {e}"
+        ))
+    })
 }
 
 // Header names are written into fetch arguments, so they are limited to letters, digits, - and _.
@@ -514,7 +593,7 @@ fn validate_redirect(what: &str, r: &Redirect, m: &Matchers) -> Result<(), Valid
         ));
     }
     let t = parse_template(&r.to).map_err(|e| ValidationError(format!("{what} to: {e}")))?;
-    let path_matcher = m.path_prefix.is_some() || m.path_regex.is_some();
+    let path_matcher = !m.path_prefixes.is_empty() || !m.path_regexes.is_empty();
     let keeps_host = matches!(
         t.target,
         Target::Relative
@@ -544,8 +623,8 @@ fn validate_redirect(what: &str, r: &Redirect, m: &Matchers) -> Result<(), Valid
                 "{what}: a redirect that keeps the host needs a path_prefix or path_regex matcher, or it loops"
             ));
         }
-        if let (Some(p), [Piece::Lit(lit)]) = (&m.path_prefix, t.pieces.as_slice())
-            && lit.starts_with(p.as_str())
+        if let [Piece::Lit(lit)] = t.pieces.as_slice()
+            && m.path_prefixes.iter().any(|p| lit.starts_with(p.as_str()))
         {
             return invalid(format!(
                 "{what}: the target {lit:?} starts with the matched path_prefix and would loop"
@@ -861,19 +940,20 @@ fn hosts_overlap(a: &str, b: &str) -> bool {
 fn with_regexes_stubbed(rule: &FirewallRule) -> FirewallRule {
     let mut out = rule.clone();
     let m = &mut out.matchers;
-    for re in [
-        &mut m.path_regex,
-        &mut m.user_agent_regex,
-        &mut m.referer_regex,
+    // stubs differ from each other so the duplicate check still passes
+    for list in [
+        &mut m.path_regexes,
+        &mut m.user_agent_regexes,
+        &mut m.referer_regexes,
     ] {
-        if re.is_some() {
-            *re = Some("x".to_string());
+        for (i, re) in list.iter_mut().enumerate() {
+            *re = "x".repeat(i + 1);
         }
     }
-    if let Some(h) = &mut m.header
-        && h.regex.is_some()
-    {
-        h.regex = Some("x".to_string());
+    for (i, h) in m.headers.iter_mut().enumerate() {
+        if h.regex.is_some() {
+            h.regex = Some("x".repeat(i + 1));
+        }
     }
     out
 }
@@ -941,7 +1021,8 @@ pub(crate) mod fixtures {
             id: id.into(),
             name: id.into(),
             hosts: vec![host.into()],
-            path_regex: None,
+            path_regexes: vec![],
+            path_prefixes: vec![],
             kind: SiteKind::Site,
             blue: Upstream {
                 targets: vec![Target {
@@ -1304,27 +1385,27 @@ mod tests {
     fn the_blowup_checks_apply_to_every_regex_field() {
         let bad = "(a|aa){2,60}[0-9]";
         let mut s = site("s", "a.com");
-        s.path_regex = Some(bad.into());
+        s.path_regexes = vec![bad.into()];
         assert!(validate_site(&s).is_err());
         for m in [
             Matchers {
-                path_regex: Some(bad.into()),
+                path_regexes: vec![bad.into()],
                 ..Default::default()
             },
             Matchers {
-                user_agent_regex: Some(bad.into()),
+                user_agent_regexes: vec![bad.into()],
                 ..Default::default()
             },
             Matchers {
-                referer_regex: Some(bad.into()),
+                referer_regexes: vec![bad.into()],
                 ..Default::default()
             },
             Matchers {
-                header: Some(HeaderMatch {
+                headers: vec![HeaderMatch {
                     name: "X-A".into(),
                     regex: Some(bad.into()),
                     ..HeaderMatch::default()
-                }),
+                }],
                 ..Default::default()
             },
         ] {
@@ -1356,7 +1437,7 @@ mod tests {
         };
         assert!(validate_rule(&rule("r", m)).is_err());
         let m = Matchers {
-            user_agent_regex: Some("bad agent".into()),
+            user_agent_regexes: vec!["bad agent".into()],
             ..Default::default()
         };
         assert!(validate_rule(&rule("r", m)).is_err());
@@ -1414,14 +1495,14 @@ mod tests {
 
     fn header_matcher(h: HeaderMatch) -> Matchers {
         Matchers {
-            header: Some(h),
+            headers: vec![h],
             ..Default::default()
         }
     }
 
     fn path_prefix(p: &str) -> Matchers {
         Matchers {
-            path_prefix: Some(p.into()),
+            path_prefixes: vec![p.into()],
             ..Default::default()
         }
     }
@@ -1433,14 +1514,13 @@ mod tests {
         let r: FirewallRule = serde_json::from_str(json).expect("old rule");
         assert_eq!(r.action, Some(crate::model::FirewallAction::Tarpit));
         assert!(r.label.is_none() && r.redirect.is_none() && r.headers.is_empty());
-        assert!(r.cors.is_none() && r.matchers.header.is_none());
+        assert!(r.cors.is_none() && r.matchers.headers.is_empty());
         assert!(validate_rule(&r).is_ok());
         let back = serde_json::to_value(&r).expect("serialise");
         assert_eq!(
             back,
             serde_json::json!({"id": "r", "name": "r", "enabled": true, "action": "tarpit",
-                "matchers": {"path_regex": null, "path_prefix": "/x", "methods": [],
-                    "user_agent_regex": null, "cidrs": [], "host": null}, "site": null})
+                "matchers": {"path_prefixes": ["/x"], "methods": [], "cidrs": []}, "site": null})
         );
     }
 
@@ -1526,7 +1606,7 @@ mod tests {
     #[test]
     fn redirects_that_could_loop_are_refused() {
         let host_only = Matchers {
-            host: Some("old.example.com".into()),
+            hosts: vec!["old.example.com".into()],
             ..Default::default()
         };
         let http = Matchers {
@@ -1760,12 +1840,12 @@ mod tests {
     fn new_matchers_are_validated() {
         let ok = Matchers {
             scheme: Some("https".into()),
-            referer_regex: Some("^https://example[.]com/".into()),
-            header: Some(HeaderMatch {
+            referer_regexes: vec!["^https://example[.]com/".into()],
+            headers: vec![HeaderMatch {
                 name: "X-Env".into(),
                 regex: Some("^prod".into()),
                 ..HeaderMatch::default()
-            }),
+            }],
             ..Default::default()
         };
         assert!(validate_rule(&rule("r", ok)).is_ok());
@@ -1778,7 +1858,7 @@ mod tests {
         }
         for re in ["(unclosed", "a b", "(a+)+", ""] {
             let m = Matchers {
-                referer_regex: Some(re.into()),
+                referer_regexes: vec![re.into()],
                 ..Default::default()
             };
             assert!(validate_rule(&rule("r", m)).is_err(), "{re:?}");
@@ -1818,11 +1898,161 @@ mod tests {
         assert!(validate_rule(&rule("r", header_matcher(secret_regex))).is_err());
     }
 
+    fn ua_rule_with(list: Vec<String>) -> FirewallRule {
+        rule(
+            "r",
+            Matchers {
+                user_agent_regexes: list,
+                ..Default::default()
+            },
+        )
+    }
+
+    #[test]
+    fn matcher_lists_are_limited_and_duplicates_are_refused() {
+        let many = |n: usize| (0..n).map(|i| format!("bot{i}")).collect::<Vec<_>>();
+        assert!(validate_rule(&ua_rule_with(many(16))).is_ok());
+        assert!(validate_rule(&ua_rule_with(many(17))).is_err());
+        let twice = vec!["bot".to_string(), "other".to_string(), "bot".to_string()];
+        let err = validate_rule(&ua_rule_with(twice)).unwrap_err().to_string();
+        assert!(err.contains("twice"), "{err}");
+        let prefixes = |n: usize| Matchers {
+            path_prefixes: (0..n).map(|i| format!("/p{i}")).collect(),
+            ..Default::default()
+        };
+        assert!(validate_rule(&rule("r", prefixes(16))).is_ok());
+        assert!(validate_rule(&rule("r", prefixes(17))).is_err());
+        let hosts = |n: usize| Matchers {
+            hosts: (0..n).map(|i| format!("h{i}.example.com")).collect(),
+            ..Default::default()
+        };
+        assert!(validate_rule(&rule("r", hosts(16))).is_ok());
+        assert!(validate_rule(&rule("r", hosts(17))).is_err());
+        let mut dup_host = hosts(2);
+        dup_host.hosts[1] = dup_host.hosts[0].clone();
+        assert!(validate_rule(&rule("r", dup_host)).is_err());
+        let bad_prefix = Matchers {
+            path_prefixes: vec!["/ok".into(), "nope".into()],
+            ..Default::default()
+        };
+        assert!(validate_rule(&rule("r", bad_prefix)).is_err());
+        let long_prefix = Matchers {
+            path_prefixes: vec![format!("/{}", "a".repeat(256))],
+            ..Default::default()
+        };
+        assert!(validate_rule(&rule("r", long_prefix)).is_err());
+    }
+
+    #[test]
+    fn a_rule_holds_at_most_32_regexes_in_total() {
+        let list = |tag: &str, n: usize| (0..n).map(|i| format!("{tag}{i}")).collect::<Vec<_>>();
+        let ok = Matchers {
+            path_regexes: list("^/p", 16),
+            user_agent_regexes: list("ua", 16),
+            ..Default::default()
+        };
+        assert!(validate_rule(&rule("r", ok)).is_ok());
+        let over = Matchers {
+            path_regexes: list("^/p", 16),
+            user_agent_regexes: list("ua", 16),
+            referer_regexes: list("^http://r", 1),
+            ..Default::default()
+        };
+        let err = validate_rule(&rule("r", over)).unwrap_err().to_string();
+        assert!(err.contains("at most 32 regexes"), "{err}");
+        let headers = |n: usize| Matchers {
+            headers: (0..n)
+                .map(|i| HeaderMatch {
+                    name: format!("X-H{i}"),
+                    equals: Some("v".into()),
+                    ..HeaderMatch::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        assert!(validate_rule(&rule("r", headers(16))).is_ok());
+        assert!(validate_rule(&rule("r", headers(17))).is_err());
+        let mut same = headers(2);
+        same.headers[1] = same.headers[0].clone();
+        assert!(validate_rule(&rule("r", same)).is_err());
+    }
+
+    #[test]
+    fn patterns_of_one_field_share_a_work_budget() {
+        let heavy = |c: char| format!("[a-z]{{1,40}}{c}[a-z]*");
+        assert!(validate_rule(&ua_rule_with(vec![heavy('x')])).is_ok());
+        assert!(validate_rule(&ua_rule_with(vec![heavy('y')])).is_ok());
+        let err = validate_rule(&ua_rule_with(vec![heavy('x'), heavy('y')]))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("too costly") && err.contains("steps in total"),
+            "{err}"
+        );
+        // anchored patterns are cheap in total steps but add up per start position
+        let anchored: Vec<String> = ('b'..='n')
+            .map(|c| format!("^[a-z]{{1,40}}{c}[a-z]*"))
+            .collect();
+        assert!(validate_rule(&ua_rule_with(anchored[..4].to_vec())).is_ok());
+        let err = validate_rule(&ua_rule_with(anchored))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("per start position"), "{err}");
+        // a different field has its own budget
+        let spread = Matchers {
+            path_regexes: vec![heavy('x').replace("[a-z]*", "[a-z]{1,40}")],
+            user_agent_regexes: vec![heavy('x')],
+            ..Default::default()
+        };
+        assert!(validate_rule(&rule("r", spread)).is_ok());
+    }
+
+    #[test]
+    fn the_empty_value_test_cannot_be_one_of_several_alternatives() {
+        assert!(validate_rule(&ua_rule_with(vec!["^$".into()])).is_ok());
+        let err = validate_rule(&ua_rule_with(vec!["^$".into(), "bot".into()]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("only entry"), "{err}");
+    }
+
+    #[test]
+    fn any_non_empty_list_counts_as_a_matcher() {
+        let only_hosts = Matchers {
+            hosts: vec!["a.example.com".into()],
+            ..Default::default()
+        };
+        assert!(validate_rule(&rule("r", only_hosts)).is_ok());
+        let only_headers = header_matcher(HeaderMatch {
+            name: "X-A".into(),
+            equals: Some("v".into()),
+            ..HeaderMatch::default()
+        });
+        assert!(validate_rule(&rule("r", only_headers)).is_ok());
+    }
+
+    #[test]
+    fn site_path_lists_follow_the_same_limits() {
+        let mut s = site("s", "a.com");
+        s.path_prefixes = vec!["/a".into(), "/b".into()];
+        s.path_regexes = vec!["^/c[0-9]+$".into(), "^/d".into()];
+        assert!(validate_site(&s).is_ok());
+        s.path_prefixes = (0..17).map(|i| format!("/p{i}")).collect();
+        assert!(validate_site(&s).is_err());
+        s.path_prefixes = vec!["/a".into(), "/a".into()];
+        assert!(validate_site(&s).is_err());
+        s.path_prefixes = vec!["a".into()];
+        assert!(validate_site(&s).is_err());
+        s.path_prefixes = vec![];
+        s.path_regexes = vec!["^/c".into(), "^/c".into()];
+        assert!(validate_site(&s).is_err());
+    }
+
     #[test]
     fn zone_lock_secrets_are_length_and_charset_checked_and_never_echoed() {
         let lock = |secret: &str, secret_flag: bool| {
             let mut r = crate::presets::zone_lock_rule("shop", secret);
-            if let Some(h) = r.matchers.header.as_mut() {
+            if let Some(h) = r.matchers.headers.first_mut() {
                 h.secret = secret_flag;
             }
             r
@@ -1850,11 +2080,11 @@ mod tests {
             .to_string();
         assert!(err.contains("marked secret"), "{err}");
         let regex = Matchers {
-            header: Some(HeaderMatch {
+            headers: vec![HeaderMatch {
                 name: ZONE_HEADER.to_ascii_lowercase(),
                 regex: Some("^a".into()),
                 ..HeaderMatch::default()
-            }),
+            }],
             ..Default::default()
         };
         assert!(validate_rule(&rule("r", regex)).is_err());
@@ -1953,7 +2183,7 @@ mod tests {
         cfg.firewall.push(rule(
             "zone-shop",
             Matchers {
-                path_prefix: Some("/x".into()),
+                path_prefixes: vec!["/x".into()],
                 ..Default::default()
             },
         ));
@@ -2011,7 +2241,7 @@ mod tests {
         let mut r = rule(
             "r1",
             Matchers {
-                path_prefix: Some("/x".into()),
+                path_prefixes: vec!["/x".into()],
                 ..Default::default()
             },
         );

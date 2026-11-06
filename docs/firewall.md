@@ -48,7 +48,7 @@ Escapes of reserved characters stay encoded, and some origins decode them or tre
 - The path is normalised again (merged slashes, dot segments, `..` resolved), so `/x/..;/admin` becomes `/admin`.
 - The result is fully URL-decoded.
 
-`path_prefix`, `path_regex` and the preset path rules fire if either the normalised path as sent or the canonical path matches. `/;x/admin`, `/x/..;/admin`, `/.;/admin`, `/%3Bx/admin`, `/\admin`, `/%5cadmin`, `/../admin` and `/x%2f..%2f.env` are all caught by a `/admin` or `/.env` rule. The canonical path is only used for matching. The upstream still receives the normalised path, and the query string is unchanged. Requests containing `%2F`, `%5C` or a raw backslash are not rejected, because some applications use them legitimately; rules just see the backslash as `/`. `/x/%5Cadmin` is therefore not an `/admin` request (it is `/x/admin`).
+`path_prefixes`, `path_regexes` and the preset path rules fire if either the normalised path as sent or the canonical path matches. `/;x/admin`, `/x/..;/admin`, `/.;/admin`, `/%3Bx/admin`, `/\admin`, `/%5cadmin`, `/../admin` and `/x%2f..%2f.env` are all caught by a `/admin` or `/.env` rule. The canonical path is only used for matching. The upstream still receives the normalised path, and the query string is unchanged. Requests containing `%2F`, `%5C` or a raw backslash are not rejected, because some applications use them legitimately; rules just see the backslash as `/`. `/x/%5Cadmin` is therefore not an `/admin` request (it is `/x/admin`).
 
 Firewall rules therefore run before maintenance and routing. A blocked request never reaches a backend, and it is counted in analytics with the rule id that fired.
 
@@ -58,7 +58,7 @@ A rule has an id, a name, an enabled flag, matchers, an optional site, an option
 
 ```json
 {"id": "no-admin", "name": "No admin", "enabled": true, "action": "deny",
- "matchers": {"path_prefix": "/admin"}, "site": "shop"}
+ "matchers": {"path_prefixes": ["/admin", "/wp-admin"]}, "site": "shop"}
 ```
 
 | Outcome | Fields | Meaning |
@@ -71,15 +71,19 @@ A rule has an id, a name, an enabled flag, matchers, an optional site, an option
 
 | Matcher | Matches |
 |---|---|
-| `path_regex` | The request path, as a regular expression. |
-| `path_prefix` | The request path starting with this string. Must begin with `/` and contain no backslash. |
+| `path_regexes` | The request path matches any of these regular expressions. |
+| `path_prefixes` | The request path starts with any of these strings. Each must begin with `/`, be at most 256 characters and contain no backslash. |
 | `methods` | Any of up to 16 uppercase method names, for example `TRACE`. |
-| `user_agent_regex` | The `User-Agent` header, as a regular expression. |
+| `user_agent_regexes` | The `User-Agent` header matches any of these regular expressions. |
 | `cidrs` | The client's TCP source address against up to 256 CIDRs or single IPs, IPv4 or IPv6. Lists of more than 4 CIDRs, and more than 4 `methods`, are rendered as named ACLs split over several lines, because HAProxy aborts on a line of more than 64 words. Whatever a rule combines, no rendered line exceeds 60 words; a long condition is evaluated once into a variable, and rendering fails rather than emit a longer line. |
-| `host` | The `Host` header without port, lower-cased. An exact name, or `*.example.com` for any subdomain. |
+| `hosts` | The `Host` header without port, lower-cased, equals any of these. Each is an exact name, or `*.example.com` for any subdomain. |
 | `scheme` | `"http"` or `"https"`: how the visitor connected. For Flexible SSL sites reached through Cloudflare it is Cloudflare's view. |
-| `referer_regex` | The `Referer` header, as a regular expression. `^$` also matches a request without the header. |
-| `header` | One request header, see below. |
+| `referer_regexes` | The `Referer` header matches any of these regular expressions. A list that is just `["^$"]` also matches a request without the header. |
+| `headers` | Request header matchers, see below. All of them must hold. |
+
+Within one list the values are alternatives (OR); across the different matcher fields all must match (AND); the exception is `headers`, whose entries are all required. So a rule with `"user_agent_regexes": ["evilone", "eviltwo"]` and `"path_prefixes": ["/a", "/b"]` fires for a user agent matching either regex on a path starting with either prefix. For a rule, `path_prefixes` and `path_regexes` are both path matchers and are AND'd with each other, like any two fields; a site treats them as alternatives (see [Sites](sites.md)). The singular names of earlier releases (`path_regex`, `path_prefix`, `user_agent_regex`, `host`, `referer_regex`, `header`) are still accepted when a rule is saved or loaded and become a one-entry list; the node writes only the list names.
+
+Limits: each list holds at most 16 distinct entries (a repeated entry is refused), a rule holds at most 32 regexes in total (including header regexes), and each regex must pass the [regex subset](#regex-subset). The patterns of one field run one after another, so their work is added up: the summed bounds of the subset (20,000,000 steps over a capped subject, and 250,000 steps from one start position) apply to the whole list of a field, not to each pattern. `"^$"` must be the only entry of its list. Rendering uses one `acl` line per value under one name, so there is a single oversize guard per field, and a blocking rule gets one extra condition for each of the path and user agent fields.
 
 When a rule sets several matchers, all of them must match. A blocking rule with no matcher is refused, because it would block everything. An effect rule may have none (a CORS or security-header rule for a whole site), except a redirect, which needs a matcher or a `{www_host}` / `{apex_host}` target so that it cannot loop.
 
@@ -92,7 +96,7 @@ When a rule sets several matchers, all of them must match. A blocking rule with 
 ### Header matcher
 
 ```json
-{"header": {"name": "X-Env", "equals": "staging", "negate": true}}
+{"headers": [{"name": "X-Env", "equals": "staging", "negate": true}]}
 ```
 
 `name` is a header name (letters, digits, `-` and `_`, up to 64, starting with a letter) and is case-insensitive. Set exactly one of `regex` (same rules as every other regex) and `equals` (exact, case-sensitive; 1 to 256 characters from letters, digits and `- _ . ~ : / @ = + , ; * & ?`). `negate` inverts the test, so `"negate": true` with `equals` reads as "unless the header equals this value". A request without the header does not match the plain test, so it does match the negated one.
@@ -168,7 +172,7 @@ The connector also asks `haproxy -c` to check the final file, so a regex that HA
 
 ### Regex subset
 
-Every regex field (`path_regex`, `user_agent_regex`, `referer_regex`, a header matcher's `regex`, and a site's `path_regex`) accepts only this subset, on which PCRE2 and Rust's regex crate agree:
+Every regex field (`path_regexes`, `user_agent_regexes`, `referer_regexes`, a header matcher's `regex`, and a site's `path_regexes`) accepts only this subset, on which PCRE2 and Rust's regex crate agree:
 
 - Literal characters and escaped punctuation (`\. \/ \- \_ \+ \* \? \( \) \| \[ \] \{ \} \^ \$ \, \: \; \= \! \@ \% \& \~`); the dot; the anchors `^` and `$`; `\b` and `\B`; the shorthands `\d \D \w \W \s \S`.
 - Character classes made of single characters, ranges (`a-z`), the shorthands above and escaped punctuation, optionally negated with a leading `^`. A `-` must start or end the class. No nested classes and no POSIX classes (`[[:alpha:]]`, `[[.x.]]`, `[[=x=]]`): any `[` inside a class is refused, as is `^` anywhere but first.
@@ -183,15 +187,15 @@ Matching sees only the first bytes of its subject, so the work is bounded whatev
 
 | Subject | Bytes matched |
 |---|---|
-| `User-Agent` (`user_agent_regex`) | first 512 |
-| `Referer` (`referer_regex`) | first 1024 |
-| a header (`header.regex`) | first 1024 |
-| the path (`path_regex`, rule or site), as sent and canonical | first 2048 |
+| `User-Agent` (`user_agent_regexes`) | first 512 |
+| `Referer` (`referer_regexes`) | first 1024 |
+| a header (`headers[].regex`) | first 1024 |
+| the path (`path_regexes`, rule or site), as sent and canonical | first 2048 |
 
 What happens to a longer value depends on the field:
 
-- **User agent and path, blocking rules (`deny`, `drop`, `tarpit`):** a longer subject counts as a match, so padding a value past the cap can never evade the rule. An over-long user agent is denied by any `user_agent_regex` deny rule, and a path over 2048 bytes by any `path_regex` rule, even if the regex would not have matched. The one exception is the empty-agent test `^$`, which padding cannot defeat.
-- **User agent and path, effect rules (redirects, header changes, CORS):** a longer subject matches nothing and no effect applies. A site's `path_regex` treats a path over 2048 bytes as not matching, so it falls through to the 404 exactly like any other unmatched request.
+- **User agent and path, blocking rules (`deny`, `drop`, `tarpit`):** a longer subject counts as a match, so padding a value past the cap can never evade the rule. An over-long user agent is denied by any `user_agent_regexes` deny rule, and a path over 2048 bytes by any `path_regexes` rule, even if the regex would not have matched. The one exception is the empty-agent test `^$`, which padding cannot defeat.
+- **User agent and path, effect rules (redirects, header changes, CORS):** a longer subject matches nothing and no effect applies. A site's `path_regexes` treat a path over 2048 bytes as not matching (its `path_prefixes` do not look at the length), so it falls through to the 404 exactly like any other unmatched request.
 - **Referer and header regexes (any rule):** the regex is evaluated on the first 1024 bytes only, and a longer value is neither a match nor a non-match by itself. Referers and cookies longer than that are routine (click ids, SSO return URLs), so failing closed would deny real visitors. A negated header regex is evaluated on the same prefix, and a request without the header matches the negated test as before.
 
 Because of that last point, referer and header regexes are advisory signals: padding a value past 1024 bytes can hide text from a deny rule. Anything that must not be evaded should use an `equals` header matcher (compared in full), a path or user-agent rule, or the zone lock. The bot-policy token regexes are literal alternations, run on the whole header and are exempt from the cap.
@@ -271,10 +275,10 @@ Presets are ordinary rules once added. Edit, disable or delete them like any oth
 
 Rules saved by an earlier release are checked against the [regex subset](#regex-subset) when the node starts, and nothing is silently deleted:
 
-- Only known old regexes are rewritten: a rule with the id `preset-sensitive-files-2`, `-4`, `-5` or `-6`, or `preset-cms-probes-2` or `-4`, whose `path_regex` is exactly the text the previous release stored, gets the current preset's `path_regex`. Every other matcher, the action, the enabled flag, the site, the label and the name stay as they are.
+- Only known old regexes are rewritten: a rule with the id `preset-sensitive-files-2`, `-4`, `-5` or `-6`, or `preset-cms-probes-2` or `-4`, that has an entry in `path_regexes` exactly equal to the text the previous release stored (its single `path_regex`) gets that entry replaced by the current preset's pattern. Every other entry and matcher, the action, the enabled flag, the site, the label and the name stay as they are.
 - Owner edits are kept. A preset rule you changed (a different pattern, an added host, CIDR or user agent token, a narrower scope) or reused for another purpose is never touched, as long as it still passes the current limits.
 - Any other enabled rule that the current limits refuse, such as `.*bot.*`, `[[:space:]]`, a repeat count above 1000 or a nested quantifier, is switched off and stays in the file. Rewrite its pattern and enable it again. A disabled rule's patterns are not checked when the configuration loads, because it is never rendered, but saving a disabled rule through the API validates it fully.
-- A site whose `path_regex` is refused is not changed, and the node refuses to start with an error naming the site. Fix the pattern in the stored configuration first.
+- A site whose `path_regexes` has a refused entry is not changed, and the node refuses to start with an error naming the site. Fix the pattern in the stored configuration first.
 
 Each rewritten or disabled rule is reported by id, running the migration again changes nothing, and a configuration that already validates and holds no known old pattern is left exactly as it is.
 

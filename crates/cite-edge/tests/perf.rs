@@ -224,7 +224,7 @@ pub fn big_config(sites: usize, rules: usize) -> EdgeConfig {
     for i in 0..rules {
         let m = match i % 4 {
             0 => Matchers {
-                path_regex: Some(format!("^/admin{i}/.*")),
+                path_regexes: vec![format!("^/admin{i}/.*")],
                 ..Default::default()
             },
             1 => Matchers {
@@ -232,12 +232,12 @@ pub fn big_config(sites: usize, rules: usize) -> EdgeConfig {
                 ..Default::default()
             },
             2 => Matchers {
-                user_agent_regex: Some(format!("(?i)bot{i}")),
+                user_agent_regexes: vec![format!("(?i)bot{i}")],
                 methods: vec!["POST".into()],
                 ..Default::default()
             },
             _ => Matchers {
-                path_prefix: Some(format!("/private{i}")),
+                path_prefixes: vec![format!("/private{i}")],
                 ..Default::default()
             },
         };

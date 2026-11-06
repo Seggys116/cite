@@ -139,6 +139,27 @@ pub(crate) fn check_regex(re: &str, cap: usize) -> Res<()> {
     Ok(())
 }
 
+// (matching steps over a cap-byte subject, steps from one start position) of a pattern that parses.
+pub(crate) fn work(re: &str, cap: usize) -> Res<(u64, u64)> {
+    let c = measure(re, cap)?;
+    Ok((c.starts.saturating_mul(c.r), c.r.saturating_mul(c.a)))
+}
+
+// Patterns of one field run one after another on the same subject, so their work adds up against the limits of a single pattern.
+pub(crate) fn check_budget(items: &[(u64, u64)]) -> Res<()> {
+    let steps = items.iter().fold(0u64, |a, w| a.saturating_add(w.0));
+    let per_start = items.iter().fold(0u64, |a, w| a.saturating_add(w.1));
+    if steps > MAX_STEPS {
+        return Err(format!("about {steps} steps in total (limit {MAX_STEPS})"));
+    }
+    if per_start > MAX_PER_START {
+        return Err(format!(
+            "about {per_start} steps per start position in total (limit {MAX_PER_START})"
+        ));
+    }
+    Ok(())
+}
+
 fn merge(branches: Vec<Node>) -> Node {
     if branches.len() == 1 {
         return branches[0];

@@ -383,14 +383,23 @@ fn host_inline(host: &str) -> String {
 }
 
 // A site matched by its own ACLs; plain sites in a long run are matched through the host map instead.
-fn site_cond(site: &Site) -> String {
-    match site.path_regex {
-        Some(_) => format!("host_{0} path_{0} pathok_{0}", site.id),
-        None => format!("host_{}", site.id),
+// A site with prefixes and regexes gets one condition for each, and each becomes its own set-var line, which makes them alternatives.
+fn site_conds(site: &Site) -> Vec<String> {
+    let id = &site.id;
+    let mut conds = Vec::new();
+    if !site.path_prefixes.is_empty() {
+        conds.push(format!("host_{id} pathp_{id}"));
     }
+    if !site.path_regexes.is_empty() {
+        conds.push(format!("host_{id} path_{id} pathok_{id}"));
+    }
+    if conds.is_empty() {
+        conds.push(format!("host_{id}"));
+    }
+    conds
 }
 
-// Regexes only ever see the first cap bytes. With guard set (user agent and path), blocking rules also get a "big" ACL that is true for a longer subject, so padding cannot hide a match, and effect rules get an "ok" ACL, so a longer subject matches nothing. Referer and header regexes have no guard: they judge the prefix, because long values of both are routine.
+// Regexes only ever see the first cap bytes. User agent and path fields also get one guard ACL (see guard_acl_line): blocking rules get a "big" ACL that is true for a longer subject, so padding cannot hide a match, and effect rules get an "ok" ACL, so a longer subject matches nothing. Referer and header regexes have no guard: they judge the prefix, because long values of both are routine.
 fn regex_acl_lines(
     lines: &mut Vec<String>,
     stem: &str,
@@ -398,19 +407,34 @@ fn regex_acl_lines(
     fetch: &str,
     cap: usize,
     re: &str,
-    guard: bool,
 ) {
     let id = &rule.id;
     lines.push(format!(
         "acl {stem}_{id} {fetch},bytes(0,{cap}) -m reg -- {re}"
     ));
-    if !guard {
-        return;
-    }
+}
+
+// One oversize or length guard per field, however many regexes the field holds.
+fn guard_acl_line(stem: &str, rule: &FirewallRule, fetch: &str, cap: usize) -> String {
+    let id = &rule.id;
     if rule.action.is_some() {
-        lines.push(format!("acl {stem}big_{id} {fetch},length gt {cap}"));
+        format!("acl {stem}big_{id} {fetch},length gt {cap}")
     } else {
-        lines.push(format!("acl {stem}ok_{id} {fetch},length le {cap}"));
+        format!("acl {stem}ok_{id} {fetch},length le {cap}")
+    }
+}
+
+// The empty-agent test ^$ is the only entry of its list, so it never mixes with ACL-based regexes.
+fn is_empty_test(list: &[String]) -> bool {
+    list.len() == 1 && list[0] == "^$"
+}
+
+// The first header matcher keeps the plain stem, so a rule with one header renders as it always did.
+fn header_stem(k: usize) -> String {
+    if k == 0 {
+        "rh".to_string()
+    } else {
+        format!("rh{k}")
     }
 }
 
@@ -418,12 +442,17 @@ fn regex_acl_lines(
 fn rule_acl_lines(rule: &FirewallRule) -> Vec<String> {
     let m = &rule.matchers;
     let mut lines = Vec::new();
-    if let Some(re) = &m.path_regex {
-        regex_acl_lines(&mut lines, "rp", rule, "path", PATH_CAP, re, true);
-        let id = &rule.id;
-        lines.push(format!(
-            "acl rp_{id} var(txn.cpath),bytes(0,{PATH_CAP}) -m reg -- {re}"
-        ));
+    let id = &rule.id;
+    if !m.path_regexes.is_empty() {
+        for re in &m.path_regexes {
+            regex_acl_lines(&mut lines, "rp", rule, "path", PATH_CAP, re);
+        }
+        lines.push(guard_acl_line("rp", rule, "path", PATH_CAP));
+        for re in &m.path_regexes {
+            lines.push(format!(
+                "acl rp_{id} var(txn.cpath),bytes(0,{PATH_CAP}) -m reg -- {re}"
+            ));
+        }
         // effect rules judge the length of the path as sent only, while a blocking rule treats either form being long as a match
         if rule.action.is_some() {
             lines.push(format!(
@@ -431,37 +460,31 @@ fn rule_acl_lines(rule: &FirewallRule) -> Vec<String> {
             ));
         }
     }
-    if let Some(re) = m.user_agent_regex.as_ref().filter(|re| *re != "^$") {
-        regex_acl_lines(
-            &mut lines,
-            "ru",
-            rule,
-            "req.fhdr(user-agent)",
-            UA_CAP,
-            re,
-            true,
-        );
+    if !m.user_agent_regexes.is_empty() && !is_empty_test(&m.user_agent_regexes) {
+        for re in &m.user_agent_regexes {
+            regex_acl_lines(&mut lines, "ru", rule, "req.fhdr(user-agent)", UA_CAP, re);
+        }
+        lines.push(guard_acl_line("ru", rule, "req.fhdr(user-agent)", UA_CAP));
     }
-    if let Some(re) = m.referer_regex.as_ref().filter(|re| *re != "^$") {
-        regex_acl_lines(
-            &mut lines,
-            "rr",
-            rule,
-            "req.fhdr(referer)",
-            REFERER_CAP,
-            re,
-            false,
-        );
+    if !m.referer_regexes.is_empty() && !is_empty_test(&m.referer_regexes) {
+        for re in &m.referer_regexes {
+            regex_acl_lines(&mut lines, "rr", rule, "req.fhdr(referer)", REFERER_CAP, re);
+        }
     }
-    if let Some(h) = &m.header
-        && let Some(re) = &h.regex
-    {
-        let fetch = format!("req.fhdr({})", h.name.to_ascii_lowercase());
-        regex_acl_lines(&mut lines, "rh", rule, &fetch, HEADER_CAP, re, false);
+    for (k, h) in m.headers.iter().enumerate() {
+        if let Some(re) = &h.regex {
+            let fetch = format!("req.fhdr({})", h.name.to_ascii_lowercase());
+            regex_acl_lines(&mut lines, &header_stem(k), rule, &fetch, HEADER_CAP, re);
+        } else if m.headers.len() > INLINE_HEADERS {
+            lines.push(format!("acl rhe{k}_{id} {}", header_test(h)));
+        }
     }
-    if let Some(p) = &m.path_prefix {
-        lines.push(format!("acl rb_{} path_beg {p}", rule.id));
-        lines.push(format!("acl rb_{} var(txn.cpath) -m beg {p}", rule.id));
+    for p in &m.path_prefixes {
+        lines.push(format!("acl rb_{id} path_beg {p}"));
+        lines.push(format!("acl rb_{id} var(txn.cpath) -m beg {p}"));
+    }
+    if m.hosts.len() > 1 {
+        lines.extend(host_acl_lines(&format!("rhost_{id}"), &m.hosts));
     }
     let cidrs = rule_cidrs(rule);
     if cidrs.len() > INLINE_CIDRS {
@@ -480,6 +503,7 @@ fn rule_acl_lines(rule: &FirewallRule) -> Vec<String> {
 // HAProxy truncates a config line after 64 words, which is fatal, so long lists become named ACLs and a whole rule fits in 60.
 const INLINE_CIDRS: usize = 4;
 const INLINE_METHODS: usize = 4;
+const INLINE_HEADERS: usize = 2;
 const MAX_LINE_WORDS: usize = 60;
 // An effect condition above this many words is evaluated once into a variable instead of being repeated on every line that uses it.
 const MAX_COND_WORDS: usize = 30;
@@ -508,10 +532,10 @@ fn block_conds(rule: &FirewallRule, cfg: &EdgeConfig) -> Vec<String> {
     let m = &rule.matchers;
     let mut conds = vec![rule_cond(rule, cfg)];
     let mut over = Vec::new();
-    if m.path_regex.is_some() {
+    if !m.path_regexes.is_empty() {
         over.push(Field::Path);
     }
-    if m.user_agent_regex.as_ref().is_some_and(|re| re != "^$") {
+    if !m.user_agent_regexes.is_empty() && !is_empty_test(&m.user_agent_regexes) {
         over.push(Field::UserAgent);
     }
     conds.extend(over.into_iter().map(|f| rule_cond_over(rule, cfg, Some(f))));
@@ -561,24 +585,26 @@ fn rule_cond_over(rule: &FirewallRule, cfg: &EdgeConfig, over: Option<Field>) ->
     } else if !cidrs.is_empty() {
         parts.push(format!("{{ src {} }}", cidrs.join(" ")));
     }
-    if let Some(h) = &m.host {
-        parts.push(host_inline(h));
+    match m.hosts.as_slice() {
+        [] => {}
+        [one] => parts.push(host_inline(one)),
+        _ => parts.push(format!("rhost_{}", rule.id)),
     }
-    if m.path_prefix.is_some() {
+    if !m.path_prefixes.is_empty() {
         parts.push(format!("rb_{}", rule.id));
     }
-    if m.path_regex.is_some() {
+    if !m.path_regexes.is_empty() {
         regex_test(rule, "rp", Some(Field::Path), over, false, &mut parts);
     }
-    if let Some(re) = &m.user_agent_regex {
-        if re == "^$" {
+    if !m.user_agent_regexes.is_empty() {
+        if is_empty_test(&m.user_agent_regexes) {
             parts.push(empty_header_cond("user-agent"));
         } else {
             regex_test(rule, "ru", Some(Field::UserAgent), over, false, &mut parts);
         }
     }
-    if let Some(re) = &m.referer_regex {
-        if re == "^$" {
+    if !m.referer_regexes.is_empty() {
+        if is_empty_test(&m.referer_regexes) {
             parts.push(empty_header_cond("referer"));
         } else {
             regex_test(rule, "rr", None, over, false, &mut parts);
@@ -588,9 +614,12 @@ fn rule_cond_over(rule: &FirewallRule, cfg: &EdgeConfig, over: Option<Field>) ->
         // the frontend rewrites this header on every request, so it is the one place the visitor's scheme is trustworthy
         parts.push(format!("{{ req.fhdr(x-forwarded-proto) -m str {scheme} }}"));
     }
-    if let Some(h) = &m.header {
+    for (k, h) in m.headers.iter().enumerate() {
         if h.regex.is_some() {
-            regex_test(rule, "rh", None, over, h.negate, &mut parts);
+            regex_test(rule, &header_stem(k), None, over, h.negate, &mut parts);
+        } else if m.headers.len() > INLINE_HEADERS {
+            let bang = if h.negate { "!" } else { "" };
+            parts.push(format!("{bang}rhe{k}_{}", rule.id));
         } else {
             parts.push(header_cond(h));
         }
@@ -604,14 +633,17 @@ fn empty_header_cond(header: &str) -> String {
 }
 
 // A missing header yields no sample, so the plain test is false and the negated one is true.
-fn header_cond(h: &HeaderMatch) -> String {
+fn header_test(h: &HeaderMatch) -> String {
     let name = h.name.to_ascii_lowercase();
-    let test = match &h.equals {
+    match &h.equals {
         Some(v) => format!("req.fhdr({name}) -m str -- {v}"),
         None => format!("req.fhdr({name}) -m found"),
-    };
+    }
+}
+
+fn header_cond(h: &HeaderMatch) -> String {
     let bang = if h.negate { "!" } else { "" };
-    format!("{bang}{{ {test} }}")
+    format!("{bang}{{ {} }}", header_test(h))
 }
 
 // A caller that forgets to inject the lock must not get an open site, so rendering refuses instead.
@@ -621,7 +653,7 @@ fn check_zone_locks(cfg: &EdgeConfig) -> Result<(), ValidationError> {
             r.enabled
                 && r.action.is_some()
                 && r.site.as_deref() == Some(site.id.as_str())
-                && r.matchers.header.as_ref().is_some_and(|h| {
+                && r.matchers.headers.iter().any(|h| {
                     h.name.eq_ignore_ascii_case(ZONE_HEADER) && h.negate && h.equals.is_some()
                 })
         });
@@ -637,9 +669,9 @@ fn check_zone_locks(cfg: &EdgeConfig) -> Result<(), ValidationError> {
 
 fn is_zone_rule(rule: &FirewallRule) -> bool {
     rule.matchers
-        .header
-        .as_ref()
-        .is_some_and(|h| h.name.eq_ignore_ascii_case(ZONE_HEADER))
+        .headers
+        .iter()
+        .any(|h| h.name.eq_ignore_ascii_case(ZONE_HEADER))
 }
 
 fn render_global(cfg: &EdgeConfig, opts: &RenderOptions, tls: bool, out: &mut String) {
@@ -1074,7 +1106,9 @@ enum Segment<'a> {
 }
 
 fn is_plain(site: &Site) -> bool {
-    site.path_regex.is_none() && site.hosts.iter().all(|h| !h.starts_with('*'))
+    site.path_regexes.is_empty()
+        && site.path_prefixes.is_empty()
+        && site.hosts.iter().all(|h| !h.starts_with('*'))
 }
 
 // Config order decides which site claims a request, so only neighbouring plain sites share a map.
@@ -1207,7 +1241,7 @@ fn render_frontend(
         for line in host_acl_lines(&format!("host_{}", site.id), &site.hosts) {
             push_in(out, &line);
         }
-        if let Some(re) = &site.path_regex {
+        for re in &site.path_regexes {
             push_in(
                 out,
                 &format!(
@@ -1222,10 +1256,19 @@ fn render_frontend(
                     site.id
                 ),
             );
-            // a path longer than the cap routes nowhere, exactly like a path that does not match
+        }
+        if !site.path_regexes.is_empty() {
+            // a path longer than the cap routes nowhere through a regex, exactly like a path that does not match
             push_in(
                 out,
                 &format!("acl pathok_{} path,length le {PATH_CAP}", site.id),
+            );
+        }
+        for p in &site.path_prefixes {
+            push_in(out, &format!("acl pathp_{} path_beg {p}", site.id));
+            push_in(
+                out,
+                &format!("acl pathp_{} path,url_dec -m beg {p}", site.id),
             );
         }
     }
@@ -1233,14 +1276,17 @@ fn render_frontend(
     let mut run = 0;
     for seg in segs {
         match seg {
-            Segment::One(site) => push_in(
-                out,
-                &format!(
-                    "http-request set-var(txn.site) str({}) if !{{ var(txn.site) -m found }} {}",
-                    site.id,
-                    site_cond(site)
-                ),
-            ),
+            Segment::One(site) => {
+                for cond in site_conds(site) {
+                    push_in(
+                        out,
+                        &format!(
+                            "http-request set-var(txn.site) str({}) if !{{ var(txn.site) -m found }} {cond}",
+                            site.id
+                        ),
+                    );
+                }
+            }
             Segment::Map(_) => {
                 push_in(
                     out,
@@ -1565,7 +1611,7 @@ mod tests {
     #[test]
     fn path_regex_adds_path_acl_to_routing() {
         let mut s = site("a", "a.com");
-        s.path_regex = Some("^/api/".into());
+        s.path_regexes = vec!["^/api/".into()];
         let r = render(&config(vec![s]), &opts()).unwrap();
         assert_eq!(
             lines_with(&r, "acl path_a path,bytes(0,2048) -m reg -- ^/api/").len(),
@@ -1620,7 +1666,7 @@ mod tests {
     fn firewall_rules_keep_order_and_come_before_routing() {
         let mut cfg = config(vec![site("a", "a.com")]);
         let m = |p: &str| Matchers {
-            path_prefix: Some(p.into()),
+            path_prefixes: vec![p.into()],
             ..Default::default()
         };
         cfg.firewall.push(rule("first", m("/one")));
@@ -1659,7 +1705,7 @@ mod tests {
         let mut off = rule(
             "off",
             Matchers {
-                path_prefix: Some("/x".into()),
+                path_prefixes: vec!["/x".into()],
                 ..Default::default()
             },
         );
@@ -1675,9 +1721,9 @@ mod tests {
             "scoped",
             Matchers {
                 methods: vec!["TRACE".into(), "DEBUG".into()],
-                user_agent_regex: Some("(?i)bot".into()),
+                user_agent_regexes: vec!["(?i)bot".into()],
                 cidrs: vec!["10.0.0.0/8".into(), "2001:db8::1".into()],
-                host: Some("*.a.com".into()),
+                hosts: vec!["*.a.com".into()],
                 ..Default::default()
             },
         );
@@ -1686,7 +1732,7 @@ mod tests {
         cfg.firewall.push(rule(
             "global",
             Matchers {
-                path_regex: Some("^/admin".into()),
+                path_regexes: vec!["^/admin".into()],
                 ..Default::default()
             },
         ));
@@ -1731,19 +1777,217 @@ mod tests {
     }
 
     #[test]
+    fn lists_render_as_repeated_acl_names_and_one_condition() {
+        let mut cfg = config(vec![site("a", "a.com")]);
+        cfg.firewall.push(rule(
+            "multi",
+            Matchers {
+                path_prefixes: vec!["/one".into(), "/two".into()],
+                path_regexes: vec!["^/x".into(), "^/y".into()],
+                user_agent_regexes: vec!["bot".into(), "spider".into()],
+                referer_regexes: vec!["evil".into(), "worse".into()],
+                hosts: vec!["a.com".into(), "*.b.com".into()],
+                ..Default::default()
+            },
+        ));
+        let r = render(&cfg, &opts()).unwrap();
+        assert_eq!(
+            lines_with(&r, "acl rb_multi"),
+            [
+                "    acl rb_multi path_beg /one",
+                "    acl rb_multi var(txn.cpath) -m beg /one",
+                "    acl rb_multi path_beg /two",
+                "    acl rb_multi var(txn.cpath) -m beg /two",
+            ]
+        );
+        assert_eq!(
+            lines_with(&r, "acl rp_multi"),
+            [
+                "    acl rp_multi path,bytes(0,2048) -m reg -- ^/x",
+                "    acl rp_multi path,bytes(0,2048) -m reg -- ^/y",
+                "    acl rp_multi var(txn.cpath),bytes(0,2048) -m reg -- ^/x",
+                "    acl rp_multi var(txn.cpath),bytes(0,2048) -m reg -- ^/y",
+            ]
+        );
+        // one oversize ACL per field, however many patterns it holds
+        assert_eq!(
+            lines_with(&r, "acl rpbig_multi"),
+            [
+                "    acl rpbig_multi path,length gt 2048",
+                "    acl rpbig_multi var(txn.cpath),length gt 2048",
+            ]
+        );
+        assert_eq!(
+            lines_with(&r, "acl ru_multi"),
+            [
+                "    acl ru_multi req.fhdr(user-agent),bytes(0,512) -m reg -- bot",
+                "    acl ru_multi req.fhdr(user-agent),bytes(0,512) -m reg -- spider",
+            ]
+        );
+        assert_eq!(lines_with(&r, "acl rubig_multi").len(), 1);
+        assert_eq!(lines_with(&r, "acl rr_multi").len(), 2);
+        assert_eq!(lines_with(&r, "acl rrbig_multi").len(), 0);
+        assert_eq!(
+            lines_with(&r, "acl rhost_multi"),
+            [
+                "    acl rhost_multi var(txn.host) -m str a.com",
+                "    acl rhost_multi var(txn.host) -m end .b.com",
+            ]
+        );
+        // across fields every name appears once and all must hold; each regex field has one variant where an oversized value stands in
+        assert_eq!(
+            lines_with(&r, "str(multi) if"),
+            [
+                "    http-request set-var(txn.blocked) str(multi) if rhost_multi rb_multi rp_multi ru_multi rr_multi",
+                "    http-request set-var(txn.blocked) str(multi) if rhost_multi rb_multi rpbig_multi ru_multi rr_multi",
+                "    http-request set-var(txn.blocked) str(multi) if rhost_multi rb_multi rp_multi rubig_multi rr_multi",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_single_host_stays_inline_and_header_lists_use_named_acls_from_three_up() {
+        let eq = |name: &str, negate: bool| HeaderMatch {
+            name: name.into(),
+            equals: Some("1".into()),
+            negate,
+            ..HeaderMatch::default()
+        };
+        let re = |name: &str, negate: bool| HeaderMatch {
+            name: name.into(),
+            regex: Some("^v".into()),
+            negate,
+            ..HeaderMatch::default()
+        };
+        let mut cfg = config(vec![site("a", "a.com")]);
+        cfg.firewall.push(rule(
+            "two",
+            Matchers {
+                headers: vec![re("X-A", false), eq("X-B", true)],
+                hosts: vec!["*.a.com".into()],
+                ..Default::default()
+            },
+        ));
+        cfg.firewall.push(rule(
+            "three",
+            Matchers {
+                headers: vec![eq("X-A", false), re("X-B", true), eq("X-C", true)],
+                ..Default::default()
+            },
+        ));
+        let r = render(&cfg, &opts()).unwrap();
+        assert_eq!(
+            lines_with(&r, "str(two) if"),
+            [
+                "    http-request set-var(txn.blocked) str(two) if { var(txn.host) -m end .a.com } rh_two !{ req.fhdr(x-b) -m str -- 1 }"
+            ]
+        );
+        assert_eq!(lines_with(&r, "acl rhost_two").len(), 0);
+        assert_eq!(
+            lines_with(&r, "acl rh_two"),
+            ["    acl rh_two req.fhdr(x-a),bytes(0,1024) -m reg -- ^v"]
+        );
+        assert_eq!(
+            lines_with(&r, "acl rhe0_three"),
+            ["    acl rhe0_three req.fhdr(x-a) -m str -- 1"]
+        );
+        assert_eq!(
+            lines_with(&r, "acl rh1_three"),
+            ["    acl rh1_three req.fhdr(x-b),bytes(0,1024) -m reg -- ^v"]
+        );
+        assert_eq!(
+            lines_with(&r, "acl rhe2_three"),
+            ["    acl rhe2_three req.fhdr(x-c) -m str -- 1"]
+        );
+        assert_eq!(
+            lines_with(&r, "str(three) if"),
+            [
+                "    http-request set-var(txn.blocked) str(three) if rhe0_three !rh1_three !rhe2_three"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_site_with_prefixes_and_regexes_gets_one_routing_line_for_each() {
+        let mut both = site("b", "b.com");
+        both.path_prefixes = vec!["/a".into(), "/b".into()];
+        both.path_regexes = vec!["^/c".into(), "^/d".into()];
+        let mut only_prefix = site("c", "c.com");
+        only_prefix.path_prefixes = vec!["/p".into()];
+        let r = render(&config(vec![both, only_prefix]), &opts()).unwrap();
+        assert_eq!(
+            lines_with(&r, "set-var(txn.site)"),
+            [
+                "    http-request set-var(txn.site) str(b) if !{ var(txn.site) -m found } host_b pathp_b",
+                "    http-request set-var(txn.site) str(b) if !{ var(txn.site) -m found } host_b path_b pathok_b",
+                "    http-request set-var(txn.site) str(c) if !{ var(txn.site) -m found } host_c pathp_c",
+            ]
+        );
+        assert_eq!(
+            lines_with(&r, "acl pathp_b"),
+            [
+                "    acl pathp_b path_beg /a",
+                "    acl pathp_b path,url_dec -m beg /a",
+                "    acl pathp_b path_beg /b",
+                "    acl pathp_b path,url_dec -m beg /b",
+            ]
+        );
+        assert_eq!(lines_with(&r, "acl path_b ").len(), 4);
+        assert_eq!(lines_with(&r, "acl pathok_b").len(), 1);
+        assert_eq!(lines_with(&r, "acl pathok_c").len(), 0);
+    }
+
+    #[test]
+    fn full_lists_stay_under_the_line_limit_in_every_role() {
+        let mut big = maximal_matchers();
+        big.path_prefixes = (0..16).map(|i| format!("/pre{i}")).collect();
+        big.path_regexes = (0..8).map(|i| format!("^/re{i}/")).collect();
+        big.user_agent_regexes = (0..8).map(|i| format!("agent{i}")).collect();
+        big.referer_regexes = (0..8).map(|i| format!("^https://r{i}[.]com/")).collect();
+        big.hosts = (0..16).map(|i| format!("*.h{i}.example.com")).collect();
+        big.headers = (0..5)
+            .map(|i| HeaderMatch {
+                name: format!("X-H{i}"),
+                equals: Some("v".into()),
+                negate: i % 2 == 0,
+                ..HeaderMatch::default()
+            })
+            .collect();
+        let mut cfg = config(vec![site("a", "a.com")]);
+        let mut block = scoped_to(rule("blk", big.clone()), "a");
+        block.action = Some(FirewallAction::Drop);
+        cfg.firewall.push(block);
+        let mut cors = cors_rule(&["https://a.example.com"]);
+        cors.matchers = big.clone();
+        cfg.firewall.push(cors);
+        let mut redirect = scoped_to(effect("rdr"), "a");
+        redirect.matchers = big;
+        redirect.redirect = Some(Redirect {
+            to: "{scheme}://{www_host}{path}{query}".into(),
+            status: 301,
+        });
+        cfg.firewall.push(redirect);
+        let r = render(&cfg, &opts()).unwrap();
+        assert!(longest_line(&r) <= 60, "{}", longest_line(&r));
+        for line in lines_with(&r, "http-response") {
+            assert!(!line.contains("req."), "{line}");
+        }
+    }
+
+    #[test]
     fn user_agent_rules_read_the_whole_header_and_cover_a_missing_one() {
         let mut cfg = config(vec![site("a", "a.com")]);
         cfg.firewall.push(rule(
             "chrome",
             Matchers {
-                user_agent_regex: Some("KHTML,\\slike\\sGecko".into()),
+                user_agent_regexes: vec!["KHTML,\\slike\\sGecko".into()],
                 ..Default::default()
             },
         ));
         cfg.firewall.push(rule(
             "empty",
             Matchers {
-                user_agent_regex: Some("^$".into()),
+                user_agent_regexes: vec!["^$".into()],
                 ..Default::default()
             },
         ));
@@ -1772,7 +2016,7 @@ mod tests {
         cfg.firewall.push(rule(
             "r1",
             Matchers {
-                path_prefix: Some("/x".into()),
+                path_prefixes: vec!["/x".into()],
                 ..Default::default()
             },
         ));
@@ -1791,7 +2035,7 @@ mod tests {
         cfg.firewall.push(rule(
             "r1",
             Matchers {
-                path_prefix: Some("/x".into()),
+                path_prefixes: vec!["/x".into()],
                 ..Default::default()
             },
         ));
@@ -1886,7 +2130,7 @@ mod tests {
     #[test]
     fn site_label_is_set_for_the_first_matching_site() {
         let mut b = site("b", "b.com");
-        b.path_regex = Some("^/api".into());
+        b.path_regexes = vec!["^/api".into()];
         let r = render(&config(vec![site("a", "a.com"), b]), &opts()).unwrap();
         assert_eq!(
             lines_with(&r, "set-var(txn.site)"),
@@ -2124,7 +2368,7 @@ mod tests {
             );
         }
         let mut s = site("a", "a.com");
-        s.path_regex = Some("^/x\nbackend evil".into());
+        s.path_regexes = vec!["^/x\nbackend evil".into()];
         assert!(render(&config(vec![s]), &opts()).is_err());
         assert!(render(&config(vec![site("a\nbackend x", "a.com")]), &opts()).is_err());
         let mut cfg = config(vec![site("a", "a.com")]);
@@ -2139,7 +2383,7 @@ mod tests {
         cfg.firewall.push(rule(
             "r",
             Matchers {
-                user_agent_regex: Some("a#b".into()),
+                user_agent_regexes: vec!["a#b".into()],
                 ..Default::default()
             },
         ));
@@ -2235,12 +2479,10 @@ mod tests {
             .iter()
             .filter(|r| r.action.is_some())
             .map(|r| {
-                usize::from(r.matchers.path_regex.is_some())
+                usize::from(!r.matchers.path_regexes.is_empty())
                     + usize::from(
-                        r.matchers
-                            .user_agent_regex
-                            .as_ref()
-                            .is_some_and(|re| re != "^$"),
+                        !r.matchers.user_agent_regexes.is_empty()
+                            && !is_empty_test(&r.matchers.user_agent_regexes),
                     )
             })
             .sum::<usize>();
@@ -2529,7 +2771,7 @@ mod tests {
         cfg.firewall.push(rule(
             "r1",
             Matchers {
-                path_prefix: Some("/x".into()),
+                path_prefixes: vec!["/x".into()],
                 ..Default::default()
             },
         ));
@@ -2712,7 +2954,7 @@ mod tests {
         cfg.firewall.push(rule(
             "blk",
             Matchers {
-                path_prefix: Some("/x".into()),
+                path_prefixes: vec!["/x".into()],
                 ..Default::default()
             },
         ));
@@ -2732,7 +2974,7 @@ mod tests {
     fn static_redirects_use_their_status_and_escape_percent_signs() {
         let mut cfg = config(vec![site("a", "a.com")]);
         let mut mv = effect("mv");
-        mv.matchers.path_prefix = Some("/old".into());
+        mv.matchers.path_prefixes = vec!["/old".into()];
         mv.redirect = Some(Redirect {
             to: "/new/a%20b".into(),
             status: 308,
@@ -2960,7 +3202,7 @@ mod tests {
             to: "javascript:alert(1)".into(),
             status: 301,
         });
-        bad.matchers.path_prefix = Some("/x".into());
+        bad.matchers.path_prefixes = vec!["/x".into()];
         cfg.firewall.push(bad);
         assert!(
             render(&cfg, &opts())
@@ -2995,7 +3237,7 @@ mod tests {
         assert!(render(&other, &opts()).is_err());
         let mut weak = cfg;
         let mut r = zone_lock_rule("shop", SECRET);
-        r.matchers.header.as_mut().expect("header").negate = false;
+        r.matchers.headers[0].negate = false;
         weak.firewall.push(r);
         assert!(render(&weak, &opts()).is_err());
     }
@@ -3054,22 +3296,22 @@ mod tests {
 
     fn maximal_matchers() -> Matchers {
         Matchers {
-            path_regex: Some("^/api/v[0-9]+/".into()),
-            path_prefix: Some("/api".into()),
+            path_regexes: vec!["^/api/v[0-9]+/".into()],
+            path_prefixes: vec!["/api".into()],
             methods: (0..16)
                 .map(|i| format!("METHOD{}", "A".repeat(i % 5 + 1)))
                 .collect(),
-            user_agent_regex: Some("(?i)mozilla".into()),
+            user_agent_regexes: vec!["(?i)mozilla".into()],
             cidrs: (0..8).map(|i| format!("203.0.113.{i}")).collect(),
-            host: Some("*.a.com".into()),
-            header: Some(HeaderMatch {
+            hosts: vec!["*.a.com".into()],
+            headers: vec![HeaderMatch {
                 name: "X-Gate".into(),
                 equals: Some("v".into()),
                 negate: true,
                 ..HeaderMatch::default()
-            }),
+            }],
             scheme: Some("http".into()),
-            referer_regex: Some("^https://x[.]com/".into()),
+            referer_regexes: vec!["^https://x[.]com/".into()],
         }
     }
 
@@ -3152,22 +3394,22 @@ mod tests {
         cfg.firewall.push(response_rule(
             "neg",
             Matchers {
-                header: Some(hm(true)),
+                headers: vec![hm(true)],
                 ..Default::default()
             },
         ));
         cfg.firewall.push(response_rule(
             "ref",
             Matchers {
-                referer_regex: Some("^https://x[.]com/".into()),
+                referer_regexes: vec!["^https://x[.]com/".into()],
                 ..Default::default()
             },
         ));
         let mut deny = rule(
             "blk",
             Matchers {
-                header: Some(hm(false)),
-                referer_regex: Some("evil".into()),
+                headers: vec![hm(false)],
+                referer_regexes: vec!["evil".into()],
                 ..Default::default()
             },
         );
@@ -3218,7 +3460,7 @@ mod tests {
                 "ua",
                 "ruok_ua ru_ua",
                 Matchers {
-                    user_agent_regex: Some("(?i)bot".into()),
+                    user_agent_regexes: vec!["(?i)bot".into()],
                     ..Default::default()
                 },
             ),
@@ -3226,7 +3468,7 @@ mod tests {
                 "ref",
                 "rr_ref",
                 Matchers {
-                    referer_regex: Some("^https://x[.]com/".into()),
+                    referer_regexes: vec!["^https://x[.]com/".into()],
                     ..Default::default()
                 },
             ),
@@ -3234,7 +3476,7 @@ mod tests {
                 "hdr",
                 "req.fhdr(x-gate) -m str -- v",
                 Matchers {
-                    header: Some(hm(false)),
+                    headers: vec![hm(false)],
                     ..Default::default()
                 },
             ),
@@ -3242,7 +3484,7 @@ mod tests {
                 "neg",
                 "!{ req.fhdr(x-gate) -m str -- v }",
                 Matchers {
-                    header: Some(hm(true)),
+                    headers: vec![hm(true)],
                     ..Default::default()
                 },
             ),
@@ -3290,10 +3532,10 @@ mod tests {
     #[test]
     fn the_zone_header_is_removed_from_every_request_when_any_site_is_locked() {
         let mut shop = cf_site("shop", "shared.com", true, TlsMode::Full);
-        shop.path_regex = Some("^/shop".into());
+        shop.path_regexes = vec!["^/shop".into()];
         shop.access.zone_lock = true;
         let mut blog = site("blog", "shared.com");
-        blog.path_regex = Some("^/blog".into());
+        blog.path_regexes = vec!["^/blog".into()];
         let mut cfg = config(vec![shop, blog]);
         cfg.firewall.push(zone_lock_rule("shop", SECRET));
         let r = render(&cfg, &opts()).unwrap();
@@ -3388,7 +3630,7 @@ mod tests {
                 r.site = site_ix.map(|s| format!("s{s}"));
             }
             3 => {
-                r.matchers.path_prefix = Some(format!("/old{i}"));
+                r.matchers.path_prefixes = vec![format!("/old{i}")];
                 r.redirect = Some(Redirect {
                     to: format!("/new{i}/{{path}}x"),
                     status: [301, 302, 307, 308][status_ix % 4],
@@ -3425,12 +3667,12 @@ mod tests {
             }
             6 => {
                 r.action = Some(FirewallAction::Deny);
-                r.matchers.header = Some(HeaderMatch {
+                r.matchers.headers = vec![HeaderMatch {
                     name: "X-Gate".into(),
                     equals: Some("v-1.x".into()),
                     negate: flag,
                     ..HeaderMatch::default()
-                });
+                }];
             }
             _ => {
                 r = zone_lock_rule("s0", SECRET);
@@ -3578,9 +3820,9 @@ mod tests {
         fn random_hosts_never_add_directive_lines(host in "\\PC{0,40}", re in "\\PC{0,40}") {
             let baseline = render(&config(vec![site("a", "ok.example.com")]), &opts()).unwrap();
             let mut s = site("a", &host);
-            s.path_regex = Some(re);
+            s.path_regexes = vec![re];
             let mut base = site("a", "ok.example.com");
-            base.path_regex = Some("^/ok".into());
+            base.path_regexes = vec!["^/ok".into()];
             let expected = render(&config(vec![base]), &opts()).unwrap().config.lines().count();
             prop_assert!(baseline.config.lines().count() < expected);
             if let Ok(r) = render(&config(vec![s]), &opts()) {
