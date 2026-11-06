@@ -5,7 +5,11 @@ import {
   confirmDialog, toast, withBusy, formatError, kvList, skeletonBlock, fmtDate, relTime,
 } from '../ui.js';
 import { actionPill, slotPill, healthKind, healthDots, siteHref } from './common.js';
-import { targetEditor, regexTester } from './siteForm.js';
+import { targetEditor } from './siteForm.js';
+import { conditionList } from './conditions.js';
+import {
+  PATH_TYPES, pathFieldsFromRows, pathRowsFromSite, pathsProblem,
+} from '../conditionlib.js';
 import { pagePreview } from './maintenance.js';
 import { gitRefProblem } from '../siteCheck.js';
 import { accessForSave, accessOf, zoneLockTurnedOn } from '../accesslib.js';
@@ -79,7 +83,9 @@ function overviewPanel(site) {
     h('div', { class: 'two-col' },
       card({ title: 'Routing', body: kvList([
         ['Hosts', h('div', { class: 'chips' }, (site.hosts || []).map((x) => h('span', { class: 'chip chip-static mono' }, x)))],
-        ['Path regex', h('code', { class: 'mono' }, site.path_regex || 'any path')],
+        ['Paths', pathRowsFromSite(site).length
+          ? h('div', { class: 'chips' }, pathRowsFromSite(site).map((r) => h('span', { class: 'chip chip-static mono' }, (r.type === 'path_regex' ? '~ ' : '') + r.value)))
+          : h('span', { class: 'muted' }, 'any path')],
         ['Kind', site.kind === 'api' ? 'API' : 'Site'],
       ]) }),
       card({ title: 'Health', body: kvList([
@@ -200,7 +206,8 @@ function deploymentsPanel(ctx, site, reload) {
 function routingPanel(ctx, site, reload) {
   const name = h('input', { class: 'input', type: 'text', value: site.name, 'aria-label': 'Site name' });
   const hosts = chipInput({ values: site.hosts || [], label: 'Hosts', placeholder: 'Add host, then Enter', validate: (v) => (HOST_RE.test(v) ? null : `"${v}" is not a valid host name.`) });
-  const tool = regexTester(site.path_regex || '');
+  const pathRows = pathRowsFromSite(site);
+  const paths = conditionList({ rows: pathRows, types: PATH_TYPES, label: 'Path', addLabel: 'Add a path' });
   const numeric = (value, label) => h('input', { class: 'input mono', type: 'number', min: '0', value: String(value), 'aria-label': label });
   const path = h('input', { class: 'input mono', type: 'text', value: site.health.path, 'aria-label': 'Health check path' });
   const interval = numeric(site.health.interval_ms, 'Interval in ms');
@@ -217,7 +224,8 @@ function routingPanel(ctx, site, reload) {
     };
     if (!name.value.trim()) return fail('The site needs a name.');
     if (!hosts.get().length) return fail('Keep at least one host.');
-    if (tool.error()) return fail('The path regex is not valid.');
+    const pathBad = pathsProblem(pathRows);
+    if (pathBad) return fail(pathBad);
     if (!path.value.startsWith('/')) return fail('The health check path must start with /.');
     err.hidden = true;
     // Editable fields only; id, slots and active are what the Site schema requires and the server ignores them on update
@@ -228,7 +236,7 @@ function routingPanel(ctx, site, reload) {
       active: site.active,
       name: name.value.trim(),
       hosts: hosts.get(),
-      path_regex: tool.value() || null,
+      ...pathFieldsFromRows(pathRows),
       kind: site.kind,
       health: { path: path.value, interval_ms: Number(interval.value), rise: Number(rise.value), fall: Number(fall.value), timeout_ms: Number(timeout.value) },
       source: site.source,
@@ -253,7 +261,8 @@ function routingPanel(ctx, site, reload) {
     }
   });
   return h('div', { class: 'stack' },
-    card({ title: 'Routing', body: h('div', { class: 'form' }, field('Name', name), field('Hosts', hosts.el, null, { group: true }), tool.el) }),
+    card({ title: 'Routing', body: h('div', { class: 'form' }, field('Name', name), field('Hosts', hosts.el, null, { group: true }),
+      field('Only for these paths (optional)', paths.el, 'Leave empty to serve every path. A request matching any path is routed here.', { group: true })) }),
     access.el,
     card({ title: 'Health check', body: h('div', { class: 'form' },
       field('Path', path),

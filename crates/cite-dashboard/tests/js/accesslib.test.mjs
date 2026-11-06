@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  CLOUDFLARE_ONLY_HELP, CLOUDFLARE_ONLY_LABEL, TLS_FLEXIBLE_LABEL, ZONE_LOCK_HELP, ZONE_LOCK_LABEL, ZONE_LOCK_NEEDS_CLOUDFLARE, zoneLockOpenByDefault,
   BOT_POLICIES, FLEXIBLE_HELP, FULL_HELP, SEO_WARNING, ZONE_HEADER, ZONE_STEPS, accessForSave, accessOf, botWarning, flexibleWithoutCloudflare,
   SECRET_CLOSE_WARNING, ZONE_UNREADABLE_NOTE, createVerdict, isDefaultAccess, rotationFailureLines, rangesLine, secretCloseNeedsConfirm, tlsHelp, zoneLockTurnedOn, zoneStatusLine,
 } from '../../web/js/accesslib.js';
@@ -157,9 +158,26 @@ test('flexible without Cloudflare only is the case that warns', () => {
 test('each SSL mode has its own explanation', () => {
   assert.equal(tlsHelp('flexible'), FLEXIBLE_HELP);
   assert.equal(tlsHelp('full'), FULL_HELP);
-  assert.match(FLEXIBLE_HELP, /plain HTTP/);
-  assert.match(FLEXIBLE_HELP, /no certificate is needed/);
+  assert.match(FLEXIBLE_HELP, /plain http/);
+  assert.match(FLEXIBLE_HELP, /do not want to upload a certificate/);
   assert.match(FULL_HELP, /certificate/);
+});
+
+test('the plain Cloudflare options use plain words and never mention rules, secrets or headers', () => {
+  assert.equal(CLOUDFLARE_ONLY_LABEL, 'Only allow traffic through the Cloudflare proxy');
+  assert.equal(TLS_FLEXIBLE_LABEL, 'Cloudflare handles HTTPS (no certificate on the node)');
+  assert.equal(ZONE_LOCK_LABEL, 'Also require that requests come from MY Cloudflare account (advanced)');
+  for (const text of [CLOUDFLARE_ONLY_LABEL, CLOUDFLARE_ONLY_HELP, TLS_FLEXIBLE_LABEL, FLEXIBLE_HELP, FULL_HELP]) {
+    assert.doesNotMatch(text, /transform|secret|header|X-Cite/i, text);
+  }
+  assert.match(ZONE_LOCK_HELP, /Transform Rule/);
+  assert.match(ZONE_LOCK_NEEDS_CLOUDFLARE, /Only allow traffic through the Cloudflare proxy/);
+});
+
+test('the advanced account check stays folded away unless the site already uses it', () => {
+  assert.equal(zoneLockOpenByDefault({ cloudflare_only: true, tls: 'full', zone_lock: true }), true);
+  assert.equal(zoneLockOpenByDefault({ cloudflare_only: true, tls: 'full' }), false);
+  assert.equal(zoneLockOpenByDefault(null), false);
 });
 
 test('the ranges line names the source, date and count', () => {

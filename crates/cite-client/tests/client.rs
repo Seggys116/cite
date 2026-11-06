@@ -10,11 +10,14 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use cite_client::{
     ArchiveKind, CertificateUpload, ClientError, CutRequest, ExportFormat, ExportKind, ExportQuery,
-    MAX_PEM_BYTES, NodeClient, NodeConfig, NodeTargets, ReplicationMode, ReplicationPlan,
-    apply_site_to_nodes, fan_out,
+    FirewallBulk, MAX_PEM_BYTES, NodeClient, NodeConfig, NodeTargets, ReplicationMode,
+    ReplicationPlan, apply_site_to_nodes, fan_out,
 };
 use cite_edge::analytics::Summary;
-use cite_edge::model::{HealthCheck, Maintenance, Site, SiteKind, Slot, Source, Target, Upstream};
+use cite_edge::model::{
+    FirewallRule, HealthCheck, Maintenance, Redirect, Site, SiteKind, Slot, Source, Target,
+    Upstream,
+};
 use serde_json::{Value, json};
 
 struct Fake {
@@ -96,7 +99,8 @@ async fn node(State(s): State<Shared>, headers: HeaderMap) -> Response {
         "uptime_secs": 5,
         "haproxy": { "running": true },
         "sites": 0,
-        "firewall_rules": 0
+        "firewall_rules": 0,
+        "github": { "token_configured": true, "source": "env" }
     }))
     .into_response()
 }
@@ -500,6 +504,20 @@ async fn zone_secret_rotate(
     resp
 }
 
+async fn firewall_bulk_route(
+    State(s): State<Shared>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if let Err(resp) = check(&s, &headers) {
+        return resp;
+    }
+    let replace = body["replace"].as_array().map_or(0, Vec::len);
+    let delete = body["delete"].as_array().map_or(0, Vec::len);
+    s.created_bodies.lock().expect("lock").push(body);
+    Json(json!({ "created": replace, "replaced": 0, "deleted": delete })).into_response()
+}
+
 async fn haproxy_config() -> Response {
     ([(header::CONTENT_TYPE, "text/plain")], "global\n  daemon\n").into_response()
 }
@@ -551,6 +569,7 @@ async fn spawn(state: Shared) -> String {
                 .put(certificate_replace)
                 .delete(certificate_delete),
         )
+        .route("/api/v1/firewall/bulk", post(firewall_bulk_route))
         .route("/api/v1/cloudflare/ranges", get(cloudflare_ranges))
         .route(
             "/api/v1/sites/{id}/zone-secret",
@@ -591,7 +610,8 @@ fn site(id: &str) -> Site {
         id: id.to_string(),
         name: format!("Site {id}"),
         hosts: vec![format!("{id}.example.com")],
-        path_regex: None,
+        path_regexes: Vec::new(),
+        path_prefixes: Vec::new(),
         kind: SiteKind::Site,
         blue: Upstream {
             targets: vec![Target {
@@ -620,8 +640,31 @@ async fn node_info_sends_the_bearer_token_and_decodes() {
         .expect("info");
     assert_eq!(info.version, "9.9.9");
     assert_eq!(info.extra["uptime_secs"], 5);
+    let github = info.github.expect("github status");
+    assert!(github.token_configured);
+    assert_eq!(github.source, "env");
+    assert!(!info.extra.contains_key("github"));
     let seen = state.seen_auth.lock().expect("lock");
     assert_eq!(seen.as_slice(), [Some("Bearer cite_good".to_string())]);
+}
+
+#[test]
+fn node_info_decodes_with_and_without_the_github_status() {
+    let old: cite_client::NodeInfo =
+        serde_json::from_value(json!({ "name": "n", "version": "1.0.0", "sites": 2 }))
+            .expect("old node");
+    assert!(old.github.is_none());
+    assert_eq!(old.extra["sites"], 2);
+    let none: cite_client::NodeInfo = serde_json::from_value(
+        json!({ "name": "n", "version": "1", "github": { "token_configured": false, "source": "none" } }),
+    )
+    .expect("no token");
+    let status = none.github.expect("status");
+    assert!(!status.token_configured);
+    assert_eq!(status.source, "none");
+    let partial: cite_client::NodeInfo =
+        serde_json::from_value(json!({ "github": {} })).expect("partial");
+    assert!(!partial.github.expect("status").token_configured);
 }
 
 // Built at run time so the fake login does not look like a hard-coded credential.
@@ -1129,6 +1172,62 @@ async fn zone_secret_routes_round_trip_and_never_leak_in_debug() {
 
     let missing = c.zone_secret("ghost").await.expect_err("missing");
     assert_eq!(missing.status_code(), Some(404));
+}
+
+fn redirect_rule(id: &str) -> FirewallRule {
+    FirewallRule {
+        id: id.to_string(),
+        name: format!("Redirect {id}"),
+        enabled: true,
+        redirect: Some(Redirect {
+            to: "/new".to_string(),
+            status: 301,
+        }),
+        ..FirewallRule::default()
+    }
+}
+
+#[tokio::test]
+async fn firewall_bulk_sends_one_request_and_decodes_the_counts() {
+    let state = fake("cite_good", 0);
+    let url = spawn(state.clone()).await;
+    let c = client("n1", &url, "cite_good");
+    let bulk = FirewallBulk::new(
+        vec![redirect_rule("redirect-1"), redirect_rule("redirect-2")],
+        vec!["redirect-9".to_string()],
+    );
+    let done = c.firewall_bulk(&bulk).await.expect("bulk");
+    assert_eq!((done.created, done.replaced, done.deleted), (2, 0, 1));
+    let bodies = state.created_bodies.lock().expect("lock").clone();
+    assert_eq!(bodies.len(), 1);
+    assert_eq!(bodies[0]["replace"][1]["id"], "redirect-2");
+    assert_eq!(bodies[0]["replace"][0]["redirect"]["status"], 301);
+    assert_eq!(bodies[0]["delete"], json!(["redirect-9"]));
+}
+
+#[tokio::test]
+async fn firewall_bulk_is_validated_before_any_request() {
+    let state = fake("cite_good", 0);
+    let url = spawn(state.clone()).await;
+    let c = client("n1", &url, "cite_good");
+    let empty = c.firewall_bulk(&FirewallBulk::default()).await;
+    assert!(matches!(empty, Err(ClientError::Config(_))));
+    let twice = FirewallBulk::new(vec![redirect_rule("a"), redirect_rule("a")], vec![]);
+    assert!(matches!(
+        c.firewall_bulk(&twice).await,
+        Err(ClientError::Config(_))
+    ));
+    let overlap = FirewallBulk::new(vec![redirect_rule("a")], vec!["a".to_string()]);
+    assert!(matches!(
+        c.firewall_bulk(&overlap).await,
+        Err(ClientError::Config(_))
+    ));
+    let traversal = FirewallBulk::new(vec![], vec!["../x".to_string()]);
+    assert!(matches!(
+        c.firewall_bulk(&traversal).await,
+        Err(ClientError::Config(_))
+    ));
+    assert!(state.seen_auth.lock().expect("lock").is_empty());
 }
 
 #[tokio::test]

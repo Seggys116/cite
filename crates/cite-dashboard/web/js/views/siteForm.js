@@ -1,45 +1,56 @@
 import { h, clear } from '../dom.js';
-import { api } from '../api.js';
+import { api, nodeApi } from '../api.js';
 import { state } from '../state.js';
 import {
-  pageHeader, button, iconButton, card, field, segmented, chipInput, pill, toast, withBusy,
-  formatError, slugify, checkRegex,
+  pageHeader, button, iconButton, field, segmented, chipInput, toast, kvList, formatError, slugify,
 } from '../ui.js';
 import { noNodes, listOf } from './common.js';
-import { siteProblem, cleanToken, RUNTIMES, NODE_MAJORS } from '../siteCheck.js';
-import { accessForSave, createVerdict, rotationFailureLines } from '../accesslib.js';
+import {
+  RUNTIMES, NODE_MAJORS, TOKEN_TOGGLE, tokenPlan, tokenState, cleanToken,
+} from '../siteCheck.js';
+import { createVerdict, rotationFailureLines } from '../accesslib.js';
+import { PATH_TYPES } from '../conditionlib.js';
+import {
+  SOURCES, STEPS, buildSite, emptySiteForm, firstProblem, reviewLines, stepProblem,
+} from '../sitewizard.js';
 import { accessCard } from './accessCard.js';
+import { conditionList } from './conditions.js';
 import { rotateAndShow } from './zoneSecret.js';
+import { wizard } from './wizard.js';
 
 // Targets are host:port only, with no scheme or path, because they become HAProxy server addresses.
 const ADDR_RE =/^[^\s:/]+:\d{1,5}$/;
 const HOST_RE = /^(\*\.)?[a-z0-9]([a-z0-9.-]*[a-z0-9])?$/i;
 
 // Editable list of upstream addresses with weights, shared by site creation and deploy forms
-export function targetEditor({ targets = [] } = {}) {
+export function targetEditor({ targets = [], onChange } = {}) {
   const rows = targets.map((t) => ({ addr: t.addr, weight: t.weight ?? 100 }));
   if (!rows.length) rows.push({ addr: '', weight: 100 });
   const list = h('div', { class: 'target-list' });
+  const changed = () => {
+    if (onChange) onChange();
+  };
   const draw = () => {
     clear(list);
     rows.forEach((row, i) => {
       const addr = h('input', {
         class: 'input mono', type: 'text', value: row.addr, placeholder: '10.0.0.12:8080', spellcheck: 'false',
-        'aria-label': `Target ${i + 1} address`, onInput: (e) => { row.addr = e.target.value.trim(); },
+        'aria-label': `Target ${i + 1} address`, onInput: (e) => { row.addr = e.target.value.trim(); changed(); },
       });
       const weight = h('input', {
         class: 'input mono weight', type: 'number', min: '0', max: '256', value: String(row.weight),
-        'aria-label': `Target ${i + 1} weight`, onInput: (e) => { row.weight = Number(e.target.value) || 0; },
+        'aria-label': `Target ${i + 1} weight`, onInput: (e) => { row.weight = Number(e.target.value) || 0; changed(); },
       });
       list.appendChild(h('div', { class: 'target-row' }, addr, weight, iconButton('x', `Remove target ${i + 1}`, () => {
         rows.splice(i, 1);
         if (!rows.length) rows.push({ addr: '', weight: 100 });
         draw();
+        changed();
       })));
     });
   };
   draw();
-  const add = button('Add target', { size: 'sm', iconName: 'plus', onClick: () => { rows.push({ addr: '', weight: 100 }); draw(); } });
+  const add = button('Add target', { size: 'sm', iconName: 'plus', onClick: () => { rows.push({ addr: '', weight: 100 }); draw(); changed(); } });
   return {
     el: h('div', { class: 'target-editor' }, list, add),
     get: () => rows.filter((r) => r.addr).map((r) => ({ addr: r.addr, weight: r.weight })),
@@ -50,38 +61,11 @@ export function targetEditor({ targets = [] } = {}) {
   };
 }
 
-export function regexTester(initial = '') {
-  const input = h('input', { class: 'input mono', type: 'text', value: initial, placeholder: '^/api/', spellcheck: 'false', 'aria-label': 'Path regex' });
-  const sample = h('input', { class: 'input mono', type: 'text', placeholder: '/api/v1/users', spellcheck: 'false', 'aria-label': 'Sample path to test' });
-  const status = h('div', { class: 'regex-status', 'aria-live': 'polite' });
-  const result = h('div', { class: 'regex-result', 'aria-live': 'polite' });
-  const update = () => {
-    clear(status);
-    clear(result);
-    if (!input.value) {
-      status.append(pill('Matches every path', 'muted'));
-      return;
-    }
-    const problem = checkRegex(input.value);
-    if (problem) {
-      status.append(pill('Invalid', 'bad'), h('span', { class: 'error-text' }, problem));
-      return;
-    }
-    status.append(pill('Valid regex', 'ok'));
-    if (sample.value) {
-      const hit = new RegExp(input.value).test(sample.value);
-      result.append(pill(hit ? 'Sample matches' : 'Sample does not match', hit ? 'ok' : 'warn'));
-    }
-  };
-  input.addEventListener('input', update);
-  sample.addEventListener('input', update);
-  update();
-  return {
-    el: h('div', { class: 'regex-tool' }, field('Path regex', input, 'Optional. Leave empty to route every path for these hosts.'), status,
-      field('Test a path', sample), result),
-    value: () => input.value.trim(),
-    error: () => (input.value ? checkRegex(input.value) : null),
-  };
+function choiceCards(name, items, current, onPick) {
+  return h('div', { class: 'choice-cards', role: 'radiogroup', 'aria-label': name }, items.map((item) => {
+    const radio = h('input', { type: 'radio', name, value: item.value, checked: item.value === current, onChange: () => onPick(item.value) });
+    return h('label', { class: 'radio-card' }, radio, h('div', {}, h('b', {}, item.title), h('p', { class: 'muted' }, item.text)));
+  }));
 }
 
 export function newSiteView(ctx) {
@@ -90,138 +74,199 @@ export function newSiteView(ctx) {
     ctx.root.append(noNodes());
     return;
   }
-  let kind = 'site';
-  let idTouched = false;
-  const name = h('input', { class: 'input', type: 'text', placeholder: 'Storefront', autocomplete: 'off' });
-  const id = h('input', { class: 'input mono', type: 'text', placeholder: 'storefront', autocomplete: 'off', spellcheck: 'false' });
-  const idHint = h('span', { class: 'hint' }, 'Lowercase letters, digits and dashes. Used in URLs and cannot change later.');
-  name.addEventListener('input', () => {
-    // Stop deriving the id once the user edits it, since it cannot change after creation.
-    if (!idTouched) id.value = slugify(name.value);
-  });
-  id.addEventListener('input', () => { idTouched = true; });
-  const hosts = chipInput({ placeholder: 'shop.example.com, then Enter', label: 'Hosts', validate: (v) => (HOST_RE.test(v) ? null : `"${v}" is not a valid host name.`) });
-  const pathTool = regexTester('');
-  const blue = targetEditor();
-  const green = targetEditor();
-  const healthPath = h('input', { class: 'input mono', type: 'text', value: '/', 'aria-label': 'Health check path' });
-  let mode = 'upstreams';
-  const repo = h('input', { class: 'input mono', type: 'text', placeholder: 'owner/name', autocomplete: 'off', spellcheck: 'false', 'aria-label': 'GitHub repository' });
-  const branch = h('input', { class: 'input mono', type: 'text', value: 'main', autocomplete: 'off', spellcheck: 'false', 'aria-label': 'Branch' });
-  const runtime = h('select', { class: 'select', 'aria-label': 'Runtime' }, RUNTIMES.map((r) => h('option', { value: r }, r)));
-  const nodeMajor = h('select', { class: 'select', 'aria-label': 'Node major version' }, NODE_MAJORS.map((m) => h('option', { value: String(m) }, 'Node ' + m)));
-  const poll = h('input', { class: 'input mono', type: 'text', value: '5m', autocomplete: 'off', spellcheck: 'false', 'aria-label': 'Poll interval' });
-  const token = h('input', { class: 'input mono', type: 'password', autocomplete: 'off', spellcheck: 'false', 'aria-label': 'GitHub token' });
-  const upstreamsPane = h('div', { class: 'form' },
-    h('div', { class: 'two-col' },
-      h('div', {}, h('h4', { class: 'slot-title' }, pill('blue', 'blue'), 'Blue targets'), blue.el),
-      h('div', {}, h('h4', { class: 'slot-title' }, pill('green', 'green'), 'Green targets'), green.el)));
-  const githubPane = h('div', { class: 'form', hidden: true },
-    h('div', { class: 'two-col' }, field('Repository', repo, 'GitHub owner/name, for example acme/storefront.'), field('Branch', branch)),
-    h('div', { class: 'two-col' }, field('Runtime', runtime, 'Picks the build and run images.'), field('Node version', nodeMajor)),
-    h('div', { class: 'two-col' }, field('Poll interval', poll, 'How often the node checks the branch for new commits, such as 30s, 5m or 1h.'),
-      field('GitHub token', token, 'Required for private repositories. Stored only on the node and never shown again.')));
-  const syncRuntime = () => { nodeMajor.closest('.field').hidden = runtime.value === 'rust'; };
-  runtime.addEventListener('change', syncRuntime);
-  const modeControl = segmented({
-    label: 'Source', value: mode,
-    options: [{ value: 'upstreams', label: 'Existing upstreams' }, { value: 'github', label: 'Build from GitHub' }],
-    onChange: (v) => {
-      mode = v;
-      upstreamsPane.hidden = v === 'github';
-      githubPane.hidden = v !== 'github';
-    },
-  });
-  const kindControl = segmented({
-    label: 'Kind', value: kind,
-    options: [{ value: 'site', label: 'Site' }, { value: 'api', label: 'API' }],
-    onChange: (v) => { kind = v; },
-  });
-
+  const form = emptySiteForm();
   const onlineNames = state.nodes.map((n) => n.name);
   const preferred = state.node !== 'all' ? [state.node] : onlineNames.slice(0, 1);
-  const checks = state.nodes.map((n) => h('input', { type: 'checkbox', checked: preferred.includes(n.name), value: n.name, 'aria-label': 'Place on ' + n.name }));
-  const nodeList = h('div', { class: 'node-checks' }, state.nodes.map((n, i) => h('label', { class: 'check-row' }, checks[i], h('span', { class: 'mono' }, n.name),
-    n.online ? null : pill('offline', 'bad'))));
-  const modeEach = h('input', { type: 'radio', name: 'place', value: 'each', checked: true });
-  const modeAll = h('input', { type: 'radio', name: 'place', value: 'replicate' });
-  const syncMode = () => {
-    nodeList.classList.toggle('disabled', modeAll.checked);
-    checks.forEach((c) => { c.disabled = modeAll.checked; });
-  };
-  modeEach.addEventListener('change', syncMode);
-  modeAll.addEventListener('change', syncMode);
-  const placement = h('div', { class: 'stack-sm' },
-    h('label', { class: 'radio-card' }, modeEach, h('div', {}, h('b', {}, 'Selected nodes'), h('p', { class: 'muted' }, 'Create the site only on the nodes ticked below.'))),
-    nodeList,
-    h('label', { class: 'radio-card' }, modeAll, h('div', {}, h('b', {}, 'Replicate to all nodes'), h('p', { class: 'muted' }, `Create the same site on all ${state.nodes.length} connected nodes.`))));
+  form.nodes = [...preferred];
 
-  const access = accessCard({ node: preferred[0] || onlineNames[0], site: null });
-
+  // Controls whose state lives in the control itself are made once and moved into each step that shows them
+  let idTouched = false;
+  let tokenOpen = false;
+  const nodeStates = new Map();
+  const token = h('input', {
+    class: 'input mono', type: 'password', autocomplete: 'new-password', spellcheck: 'false', 'aria-label': 'GitHub token',
+    'data-lpignore': 'true', 'data-1p-ignore': 'true', 'data-bwignore': 'true',
+  });
+  const hosts = chipInput({
+    placeholder: 'shop.example.com, then Enter', label: 'Domains', validate: (v) => (HOST_RE.test(v) ? null : `"${v}" is not a valid host name.`),
+    onChange: (list) => { form.hosts = list; refresh(); },
+  });
+  const blue = targetEditor({ onChange: () => { syncTargets(); refresh(); } });
+  const green = targetEditor({ onChange: () => { syncTargets(); refresh(); } });
+  const access = accessCard({ node: preferred[0] || onlineNames[0], site: null, onChange: (value) => { form.access = value; } });
+  form.access = access.get();
   const err = h('p', { class: 'form-error', role: 'alert', hidden: true });
-  const fail = (message) => {
-    err.textContent = message;
-    err.hidden = !message;
-    return false;
+  let flow = null;
+  const refresh = () => {
+    if (flow) flow.refresh();
   };
-  const submit = button('Create site', { kind: 'primary', iconName: 'rocket' });
 
-  const validate = () => {
-    const problem = siteProblem({
-      name: name.value,
-      id: id.value,
-      hostCount: hosts.get().length,
-      pathError: pathTool.error(),
-      mode,
-      source: { repo: repo.value, branch: branch.value, runtime: runtime.value, poll: poll.value },
-      targetProblem: blue.validate() || green.validate(),
-      blueCount: blue.get().length,
-      healthPath: healthPath.value,
-      pickNodes: modeEach.checked,
-      nodePicked: checks.some((c) => c.checked),
+  function syncTargets() {
+    form.blue = blue.get();
+    form.green = green.get();
+    form.targetProblem = blue.validate() || green.validate();
+  }
+
+  const selectedNodes = () => (form.replicate ? onlineNames : form.nodes);
+  const currentPlan = () => tokenPlan(selectedNodes().map((n) => nodeStates.get(n) || 'unknown'));
+  const checkCtx = () => ({ tokenPlan: currentPlan(), token: token.value });
+  const input = (label, key, props = {}) => {
+    const el = h('input', { class: 'input mono', type: 'text', value: form[key], spellcheck: 'false', autocomplete: 'off', 'aria-label': label, ...props });
+    el.addEventListener('input', () => { form[key] = el.value; refresh(); });
+    return el;
+  };
+
+  // The token field is folded away when every selected node already holds a token
+  function tokenPane() {
+    const plan = currentPlan();
+    const box = h('div', { class: 'field' },
+      h('span', { class: 'field-label' }, plan.required ? 'GitHub token (required)' : 'GitHub token'), token,
+      h('span', { class: 'hint' }, plan.show ? plan.help : 'Used only for this site. Stored only on the node and never shown again.'));
+    box.hidden = !plan.show && !tokenOpen;
+    const open = button(TOKEN_TOGGLE, { size: 'sm' });
+    open.addEventListener('click', () => {
+      tokenOpen = true;
+      box.hidden = false;
+      open.hidden = true;
+      token.focus();
     });
-    fail(problem || '');
-    return !problem;
-  };
+    open.hidden = plan.show || tokenOpen;
+    token.oninput = refresh;
+    return h('div', { class: 'stack-sm' }, plan.show ? null : h('p', { class: 'muted' }, plan.help), open, box);
+  }
 
-  submit.addEventListener('click', async () => {
-    if (!validate()) return;
-    const github = mode === 'github';
-    const source = github ? {
-      repo: repo.value.trim(),
-      branch: branch.value.trim(),
-      runtime: runtime.value,
-      node_major: runtime.value === 'rust' ? null : Number(nodeMajor.value),
-      poll_interval: poll.value.trim(),
-    } : null;
+  function githubDetails() {
+    const runtime = h('select', { class: 'select', 'aria-label': 'Runtime', value: form.runtime }, RUNTIMES.map((r) => h('option', { value: r }, r)));
+    const major = h('select', { class: 'select', 'aria-label': 'Node major version', value: form.nodeMajor }, NODE_MAJORS.map((m) => h('option', { value: String(m) }, 'Node ' + m)));
+    const majorField = field('Node version', major);
+    majorField.hidden = form.runtime === 'rust';
+    runtime.addEventListener('change', () => {
+      form.runtime = runtime.value;
+      majorField.hidden = runtime.value === 'rust';
+      refresh();
+    });
+    major.addEventListener('change', () => { form.nodeMajor = major.value; });
+    return h('div', { class: 'form' },
+      h('div', { class: 'two-col' },
+        field('Repository', input('GitHub repository', 'repo', { placeholder: 'owner/name' }), 'GitHub owner/name, for example acme/storefront.'),
+        field('Branch', input('Branch', 'branch'))),
+      h('div', { class: 'two-col' }, field('Runtime', runtime, 'Picks the build and run images.'), majorField),
+      field('Check for new commits every', input('Poll interval', 'poll'), 'Such as 30s, 5m or 1h.'),
+      tokenPane());
+  }
+
+  function serverDetails() {
+    const healthPath = input('Health check path', 'healthPath');
+    return h('div', { class: 'form' },
+      h('div', { class: 'two-col' },
+        h('div', {}, h('h4', { class: 'slot-title' }, 'Live servers'), blue.el),
+        h('div', {}, h('h4', { class: 'slot-title' }, 'Standby servers (optional)'), green.el)),
+      field('Health check path', healthPath, 'Requested on every server to decide whether it is ready.'));
+  }
+
+  function domainDetails() {
+    const kindControl = segmented({
+      label: 'Kind', value: form.kind,
+      options: [{ value: 'site', label: 'Site' }, { value: 'api', label: 'API' }],
+      onChange: (v) => { form.kind = v; },
+    });
+    const name = input('Site name', 'name', { class: 'input', placeholder: 'Storefront' });
+    const id = input('Site id', 'id', { placeholder: 'storefront' });
+    name.addEventListener('input', () => {
+      // Stop deriving the id once the user edits it, since it cannot change after creation.
+      if (!idTouched) {
+        id.value = slugify(name.value);
+        form.id = id.value;
+        refresh();
+      }
+    });
+    id.addEventListener('input', () => { idTouched = true; });
+    hosts.set(form.hosts);
+    return h('div', { class: 'form' },
+      field('Kind', kindControl, 'APIs usually route by path prefix; sites by domain.', { group: true }),
+      h('div', { class: 'two-col' }, field('Name', name), field('Id', id, 'Lowercase letters, digits and dashes. Cannot change later.')),
+      field('Domains', hosts.el, 'Requests for these domains go to this site.', { group: true }),
+      h('div', { class: 'stack-sm' },
+        h('span', { class: 'field-label' }, 'Only for these paths (optional)'),
+        h('p', { class: 'hint' }, 'Leave empty to serve every path on the domains. Add several; a request matching any of them is routed here.'),
+        conditionList({ rows: form.paths, types: PATH_TYPES, label: 'Path', addLabel: 'Add a path', onChange: () => refresh() }).el));
+  }
+
+  function whereDetails() {
+    const each = h('input', { type: 'radio', name: 'place', value: 'each', checked: !form.replicate });
+    const all = h('input', { type: 'radio', name: 'place', value: 'replicate', checked: form.replicate });
+    const checks = state.nodes.map((n) => h('input', { type: 'checkbox', checked: form.nodes.includes(n.name), disabled: form.replicate, value: n.name, 'aria-label': 'Place on ' + n.name }));
+    const list = h('div', { class: 'node-checks' }, state.nodes.map((n, i) => h('label', { class: 'check-row' }, checks[i], h('span', { class: 'mono' }, n.name),
+      n.online ? null : h('span', { class: 'muted' }, '(offline)'))));
+    list.classList.toggle('disabled', form.replicate);
+    const review = h('div', {});
+    const drawReview = () => {
+      const tokenText = form.source === 'github' ? (token.value.trim() ? 'a token for this site' : currentPlan().show ? 'none' : 'the node token') : '';
+      review.replaceChildren(kvList(reviewLines(form, { tokenText }).map(([k, v]) => [k, h('span', { class: 'wrap-any' }, v)])));
+    };
+    const sync = () => {
+      form.replicate = all.checked;
+      form.nodes = checks.filter((c) => c.checked).map((c) => c.value);
+      checks.forEach((c) => { c.disabled = all.checked; });
+      list.classList.toggle('disabled', all.checked);
+      drawReview();
+      refresh();
+    };
+    [each, all, ...checks].forEach((el) => el.addEventListener('change', sync));
+    drawReview();
+    return h('div', { class: 'form' },
+      h('div', { class: 'stack-sm' },
+        h('label', { class: 'radio-card' }, each, h('div', {}, h('b', {}, 'Selected nodes'), h('p', { class: 'muted' }, 'Create the site only on the nodes ticked below.'))),
+        list,
+        h('label', { class: 'radio-card' }, all, h('div', {}, h('b', {}, 'Replicate to all nodes'), h('p', { class: 'muted' }, `Create the same site on all ${state.nodes.length} connected nodes.`)))),
+      h('h4', { class: 'section-title' }, 'Review'), review, err);
+  }
+
+  const steps = [
+    {
+      title: STEPS[0].title,
+      problem: () => stepProblem(form, 0),
+      render: () => h('div', { class: 'form' }, choiceCards('Source', SOURCES, form.source, (v) => { form.source = v; refresh(); })),
+    },
+    {
+      title: STEPS[1].title,
+      problem: () => { syncTargets(); return stepProblem(form, 1, checkCtx()); },
+      render: () => (form.source === 'github' ? githubDetails() : serverDetails()),
+    },
+    { title: STEPS[2].title, problem: () => stepProblem(form, 2), render: domainDetails },
+    { title: STEPS[3].title, problem: () => stepProblem(form, 3), render: () => access.el },
+    { title: STEPS[4].title, problem: () => stepProblem(form, 4, checkCtx()), render: whereDetails },
+  ];
+
+  async function create() {
+    err.hidden = true;
+    syncTargets();
+    form.access = access.get();
+    const bad = firstProblem(form, checkCtx());
+    if (bad) {
+      flow.go(bad.step);
+      return;
+    }
+    const github = form.source === 'github';
     const githubToken = github ? cleanToken(token.value) : undefined;
     // The secret now lives only in this closure, so the field is emptied before the request starts.
     token.value = '';
-    const site = {
-      id: id.value,
-      name: name.value.trim(),
-      hosts: hosts.get(),
-      path_regex: pathTool.value() || null,
-      kind,
-      blue: { targets: github ? [] : blue.get(), label: null },
-      green: { targets: github ? [] : green.get(), label: null },
-      active: 'blue',
-      maintenance: { enabled: false, page_id: null },
-      health: { path: healthPath.value, interval_ms: 2000, rise: 2, fall: 3, timeout_ms: 1500 },
-      source,
-    };
-    const accessValue = accessForSave(access.get(), null);
-    if (accessValue) site.access = accessValue;
-    const placeMode = modeAll.checked ? 'replicate' : 'each';
+    const site = buildSite(form);
+    const placeMode = form.replicate ? 'replicate' : 'each';
     // Replicate targets only online nodes, so an offline node cannot fail the whole request.
-    const nodes = placeMode === 'replicate' ? onlineNames : checks.filter((c) => c.checked).map((c) => c.value);
+    const nodes = placeMode === 'replicate' ? onlineNames : form.nodes;
     try {
-      const res = await withBusy(submit, () => api.post('/deployments', { nodes, site, mode: placeMode, github_token: githubToken }));
+      const res = await api.post('/deployments', { nodes, site, mode: placeMode, github_token: githubToken });
       const results = listOf(res && res.results ? res.results : null);
       const verdict = createVerdict({ results, nodes, zoneLock: Boolean(site.access && site.access.zone_lock) });
       const leave = () => { location.hash = '#/sites'; };
-      if (!verdict.ok) fail(verdict.error);
-      else toast(`Site ${site.name} created on ${nodes.length} node${nodes.length === 1 ? '' : 's'}`, 'success');
+      if (!verdict.ok) {
+        err.textContent = verdict.error;
+        err.hidden = false;
+        flow.go(steps.length - 1);
+      } else {
+        toast(`Site ${site.name} created on ${nodes.length} node${nodes.length === 1 ? '' : 's'}`, 'success');
+      }
       // The secret only comes from a rotate call, so a new zone lock fetches one per node that took the site and shows it once
       if (verdict.rotate.length) {
         const failures = await rotateAndShow(verdict.rotate, site.id, verdict.ok ? leave : null);
@@ -230,25 +275,20 @@ export function newSiteView(ctx) {
       }
       if (verdict.ok) leave();
     } catch (ex) {
-      fail(formatError(ex));
+      err.textContent = formatError(ex);
+      err.hidden = false;
+      flow.go(steps.length - 1);
     }
-  });
+  }
+
+  flow = wizard({ steps, finishLabel: 'Create site', onFinish: create, onCancel: () => { location.hash = '#/sites'; } });
+
+  // Each node reports whether it holds a GitHub token; until it answers (or if it is an older connector) the state is unknown
+  for (const name of onlineNames) {
+    nodeApi(name).get('/node').then((info) => nodeStates.set(name, tokenState(info)), () => nodeStates.set(name, 'unknown')).then(refresh);
+  }
 
   ctx.root.append(
-    pageHeader({ title: 'Create site', subtitle: 'Define routing and upstreams, then place it on your nodes' }),
-    h('div', { class: 'form-stack' },
-      card({ title: 'Basics', body: h('div', { class: 'form' },
-        field('Kind', kindControl, 'APIs usually route by path prefix; sites by host name.', { group: true }),
-        field('Name', name), field('Id', id, null), idHint) }),
-      card({ title: 'Routing', body: h('div', { class: 'form' }, field('Hosts', hosts.el, 'Requests with these Host headers go to this site.', { group: true }), pathTool.el) }),
-      access.el,
-      card({ title: 'Source', subtitle: 'Route to servers you run, or let the node build the site from a GitHub repository.', body: h('div', { class: 'form' },
-        field('Source', modeControl, 'Building from GitHub makes the node provision the stack for the live slot, so no targets are needed.', { group: true }),
-        upstreamsPane, githubPane) }),
-      card({ title: 'Health check', body: h('div', { class: 'form' }, field('Health check path', healthPath, 'Probed on every target to decide readiness.')) }),
-      card({ title: 'Placement', subtitle: 'Choose which nodes get this site', body: placement }),
-      err,
-      h('div', { class: 'form-actions' }, h('a', { class: 'btn', href: '#/sites' }, 'Cancel'), submit)));
-  syncMode();
-  syncRuntime();
+    pageHeader({ title: 'Create site', subtitle: 'Choose where the site comes from and which domains reach it' }),
+    h('div', { class: 'form-stack' }, flow.el));
 }

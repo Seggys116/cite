@@ -1,9 +1,14 @@
 export const TLS_MODES = ['full', 'flexible'];
 
-export const CLOUDFLARE_ONLY_HELP = 'Requests that do not come from a Cloudflare address are refused at the edge. Turn this on when the site sits behind the Cloudflare proxy so nobody can reach the node directly.';
-export const FULL_HELP = 'Cloudflare connects to this node over HTTPS, so the node needs a certificate that covers the host. Upload one under Settings, Certificates.';
-export const FLEXIBLE_HELP = 'Cloudflare terminates HTTPS and talks plain HTTP to this node, so no certificate is needed on the node. Pair it with Only accept traffic from Cloudflare.';
-export const FLEXIBLE_WARNING = 'Flexible is on but Cloudflare only is off. Anyone who reaches this node directly is served over plain HTTP with no encryption. Turn on Only accept traffic from Cloudflare.';
+export const CLOUDFLARE_ONLY_LABEL = 'Only allow traffic through the Cloudflare proxy';
+export const CLOUDFLARE_ONLY_HELP = 'Visitors must come through Cloudflare (orange cloud on). Direct requests to your server address are refused. You do not need to create any Cloudflare rule for this.';
+export const TLS_FULL_LABEL = 'Certificate on the node';
+export const TLS_FLEXIBLE_LABEL = 'Cloudflare handles HTTPS (no certificate on the node)';
+export const FULL_HELP = 'Visitors and Cloudflare connect over HTTPS, so the node needs a certificate that covers the host. Upload one under Settings, Certificates.';
+export const FLEXIBLE_HELP = 'Cloudflare serves the certificate to visitors and talks to your server over plain http. Pick this if you do not want to upload a certificate. Traffic between Cloudflare and your server is not encrypted.';
+export const FLEXIBLE_WARNING = 'Cloudflare handles HTTPS, but traffic is not limited to the Cloudflare proxy. Anyone who reaches your server address directly is served over plain http with no encryption. Turn on Only allow traffic through the Cloudflare proxy.';
+export const ZONE_LOCK_LABEL = 'Also require that requests come from MY Cloudflare account (advanced)';
+export const ZONE_LOCK_TOGGLE = 'Show the advanced account check';
 
 export const ZONE_HEADER = 'X-Cite-Origin-Secret';
 export const BOT_POLICIES = [
@@ -13,8 +18,13 @@ export const BOT_POLICIES = [
 ];
 export const BOT_SPOOF_NOTE = 'Bots are recognised by their user agent, which any client can fake, so this stops honest tools and lazy scripts and not a determined scraper. Blocked requests still appear in analytics.';
 export const SEO_WARNING = 'This also blocks search engine crawlers, link preview bots and uptime monitors, so the site can drop out of search results and shares lose their preview cards. Do not use it on a site that depends on search traffic.';
-export const ZONE_LOCK_HELP = 'Refuse requests that do not carry this site\'s secret header, so only your own Cloudflare zone can reach it and not other Cloudflare customers. You add the secret in Cloudflare once; it is shown a single time.';
-export const ZONE_LOCK_NEEDS_CLOUDFLARE = 'Turn on Only accept traffic from Cloudflare first.';
+export const ZONE_LOCK_HELP = 'Without this, anyone using Cloudflare could send traffic to your server address. This adds a secret header that you set once in a Cloudflare Transform Rule. Optional.';
+export const ZONE_LOCK_NEEDS_CLOUDFLARE = 'Turn on Only allow traffic through the Cloudflare proxy first.';
+
+// The advanced account check stays folded away unless the site already uses it, so the plain option never mentions rules or secrets
+export function zoneLockOpenByDefault(access) {
+  return Boolean(access && access.zone_lock);
+}
 export const ZONE_STEPS = [
   'Open your domain in the Cloudflare dashboard and go to Rules, then Transform Rules.',
   'Choose Modify Request Header and create a rule that matches this site\'s hostname.',

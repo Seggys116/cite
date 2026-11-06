@@ -1,12 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  buildRule, corsFromForm, corsProblem, effectView, emptyForm, headerMatcherProblem, headerOpProblem, matcherSummary, parseTemplate,
-  patternProblem, presetNeedsScopeWarning, redirectProblem, resaveBody, ruleKind, ruleToForm, splitList,
+  corsFromForm, corsProblem, effectView, hasMatcher, headerMatcherProblem, headerOpProblem, listsOf, parseTemplate,
+  patternProblem, presetNeedsScopeWarning, redirectProblem, resaveBody, ruleKind, splitList,
 } from '../../web/js/rulelib.js';
-
-const form = (over = {}) => ({ ...emptyForm(), name: 'Rule', id: 'r1', ...over });
-const withMatchers = (over) => ({ ...emptyForm().matchers, ...over });
+import { matcherSummary } from '../../web/js/conditionlib.js';
 
 test('good redirect templates parse and bad ones are explained', () => {
   for (const ok of ['https://example.com/', 'http://example.com', 'https://example.com:8443/x?y=1', '{scheme}://{www_host}{path}{query}',
@@ -42,15 +40,31 @@ test('redirects that would loop are refused like the node does', () => {
   assert.equal(redirectProblem(to('{scheme}://{www_host}{path}{query}'), {}), null);
   assert.equal(redirectProblem(to('{scheme}://{apex_host}{path}{query}'), {}), null);
   assert.equal(redirectProblem(to('https://{host}{path}{query}'), { scheme: 'http' }), null);
-  assert.match(redirectProblem(to('https://{host}{path}{query}'), {}), /scheme matcher set to http/);
-  assert.match(redirectProblem(to('/new'), {}), /path prefix or path regex/);
+  assert.match(redirectProblem(to('https://{host}{path}{query}'), {}), /scheme condition set to http/);
+  assert.match(redirectProblem(to('/new'), {}), /path condition/);
+  assert.equal(redirectProblem(to('/new'), { path_prefixes: ['/old'] }), null);
   assert.equal(redirectProblem(to('/new'), { path_prefix: '/old' }), null);
-  assert.match(redirectProblem(to('/old/new'), { path_prefix: '/old' }), /would loop/);
-  assert.match(redirectProblem(to('https://other.example.org/'), {}), /Add a matcher/);
-  assert.equal(redirectProblem(to('https://other.example.org/'), { host: 'a.example.com' }), null);
-  assert.match(redirectProblem(to('/x', 303), { path_prefix: '/a' }), /301, 302, 307 or 308/);
-  for (const status of [301, 302, 307, 308]) assert.equal(redirectProblem(to('/new', status), { path_regex: '^/old' }), null);
-  assert.match(redirectProblem(to('javascript:alert(1)'), { host: 'a.com' }), /redirect target/);
+  assert.match(redirectProblem(to('/old/new'), { path_prefixes: ['/old'] }), /would loop/);
+  assert.match(redirectProblem(to('/old/new'), { path_prefixes: ['/x', '/old'] }), /would loop/);
+  assert.match(redirectProblem(to('https://other.example.org/'), {}), /Add a condition/);
+  assert.equal(redirectProblem(to('https://other.example.org/'), { hosts: ['a.example.com'] }), null);
+  assert.match(redirectProblem(to('/x', 303), { path_prefixes: ['/a'] }), /301, 302, 307 or 308/);
+  for (const status of [301, 302, 307, 308]) assert.equal(redirectProblem(to('/new', status), { path_regexes: ['^/old'] }), null);
+  assert.match(redirectProblem(to('javascript:alert(1)'), { hosts: ['a.com'] }), /redirect target/);
+});
+
+test('matchers read as lists whether they are new lists or old single values', () => {
+  const l = listsOf({ path_prefix: '/a', path_prefixes: ['/b'], host: 'x.com', header: { name: 'X-A', equals: '1' }, scheme: 'http' });
+  assert.deepEqual(l.path_prefixes, ['/b', '/a']);
+  assert.deepEqual(l.hosts, ['x.com']);
+  assert.equal(l.headers.length, 1);
+  assert.equal(l.scheme, 'http');
+  assert.deepEqual(listsOf(null).methods, []);
+  assert.equal(hasMatcher({}), false);
+  assert.equal(hasMatcher({ path_prefixes: [], methods: [] }), false);
+  assert.equal(hasMatcher({ referer_regexes: ['^$'] }), true);
+  assert.equal(hasMatcher({ scheme: 'https' }), true);
+  assert.equal(hasMatcher({ headers: [{ name: 'X-A', equals: '1' }] }), true);
 });
 
 test('header changes follow the node rules', () => {
@@ -133,96 +147,12 @@ test('header matchers need exactly one test and keep secrets out of sight', () =
   assert.ok(headerMatcherProblem(eq({ mode: 'regex', value: 'a b' })));
 });
 
-test('a block rule keeps the old body shape and needs a matcher', () => {
-  const built = buildRule(form({ matchers: withMatchers({ path_prefix: '/admin' }) }));
-  assert.deepEqual(built.rule, {
-    id: 'r1', name: 'Rule', enabled: true, action: 'deny', site: null,
-    matchers: { path_regex: null, path_prefix: '/admin', methods: [], user_agent_regex: null, cidrs: [], host: null },
-  });
-  assert.match(buildRule(form()).error, /at least one matcher/);
-  assert.match(buildRule(form({ name: '  ' })).error, /name/);
-  assert.match(buildRule(form({ label: 'Bad Label', matchers: withMatchers({ host: 'a.com' }) })).error, /label/);
-  const labelled = buildRule(form({ label: 'my-label', site: 'shop', action: 'tarpit', matchers: withMatchers({ host: 'a.com' }) })).rule;
-  assert.equal(labelled.label, 'my-label');
-  assert.equal(labelled.site, 'shop');
-  assert.equal(labelled.action, 'tarpit');
-});
-
-test('new matchers appear only when set', () => {
-  const rule = buildRule(form({ matchers: withMatchers({ scheme: 'http', referer_regex: '^$' }) })).rule;
-  assert.equal(rule.matchers.scheme, 'http');
-  assert.equal(rule.matchers.referer_regex, '^$');
-  assert.equal('header' in rule.matchers, false);
-  assert.match(buildRule(form({ matchers: withMatchers({ scheme: 'ftp' }) })).error, /http or https/);
-  assert.match(buildRule(form({ matchers: withMatchers({ referer_regex: 'a b' }) })).error, /referer/);
-  const header = { name: ' X-Key ', mode: 'equals', value: 'abc123', negate: true, secret: true, stored: false };
-  const built = buildRule(form({ matchers: withMatchers({ header }) })).rule;
-  assert.deepEqual(built.matchers.header, { name: 'X-Key', regex: null, equals: 'abc123', negate: true, secret: true });
-});
-
-test('a stored secret is kept by sending a blank value and is never loaded into the form', () => {
-  const stored = {
-    id: 'r2', name: 'Key', enabled: true, action: 'deny', site: null,
-    matchers: { header: { name: 'X-Key', regex: null, equals: '', negate: true, secret: true } },
-  };
-  const f = ruleToForm(stored);
-  assert.equal(f.matchers.header.value, '');
-  assert.equal(f.matchers.header.secret, true);
-  assert.equal(f.matchers.header.stored, true);
-  const again = buildRule(f).rule;
-  assert.deepEqual(again.matchers.header, { name: 'X-Key', regex: null, equals: '', negate: true, secret: true });
-  f.matchers.header.value = 'newvalue';
-  assert.equal(buildRule(f).rule.matchers.header.equals, 'newvalue');
-  const plain = ruleToForm({ ...stored, matchers: { header: { name: 'X-Env', equals: 'staging', negate: false, secret: false } } });
-  assert.equal(plain.matchers.header.value, 'staging');
-  assert.equal(plain.matchers.header.stored, false);
-});
-
-test('a redirect rule carries redirect and no action', () => {
-  const f = form({ kind: 'redirect', redirect: { to: '{scheme}://{www_host}{path}{query}', status: '302' } });
-  const { rule } = buildRule(f);
-  assert.deepEqual(rule.redirect, { to: '{scheme}://{www_host}{path}{query}', status: 302 });
-  assert.equal('action' in rule, false);
-  assert.match(buildRule(form({ kind: 'redirect', redirect: { to: '/new', status: 301 } })).error, /path prefix/);
-  assert.match(buildRule(form({ kind: 'redirect', redirect: { to: '', status: 301 }, matchers: withMatchers({ host: 'a.com' }) })).error, /redirect target/);
-});
-
-test('a header rule carries headers and cors and needs at least one', () => {
-  assert.match(buildRule(form({ kind: 'headers' })).error, /at least one header change/);
-  const ops = [{ target: 'response', op: 'set', name: 'X-Frame-Options', value: 'DENY' }, { target: 'request', op: 'remove', name: 'X-Debug', value: 'ignored' }];
-  const { rule } = buildRule(form({ kind: 'headers', headers: ops }));
-  assert.deepEqual(rule.headers, [
-    { target: 'response', op: 'set', name: 'X-Frame-Options', value: 'DENY' },
-    { target: 'request', op: 'remove', name: 'X-Debug' },
-  ]);
-  assert.equal('cors' in rule, false);
-  assert.equal('action' in rule, false);
-  const cors = { enabled: true, origins: 'https://app.example.com', methods: 'GET POST', allow_headers: '', expose_headers: '', credentials: true, max_age: '600' };
-  const onlyCors = buildRule(form({ kind: 'headers', cors })).rule;
-  assert.equal(onlyCors.cors.max_age_secs, 600);
-  assert.equal('headers' in onlyCors, false);
-  assert.match(buildRule(form({ kind: 'headers', cors: { ...cors, origins: '*' } })).error, /Credentials/);
-  assert.match(buildRule(form({ kind: 'headers', headers: [{ target: 'request', op: 'set', name: 'Host', value: 'x' }] })).error, /Host/);
-  const many = Array.from({ length: 17 }, () => ({ target: 'response', op: 'set', name: 'X-A', value: 'v' }));
-  assert.match(buildRule(form({ kind: 'headers', headers: many })).error, /at most 16/);
-});
-
-test('rules load back into the form by kind', () => {
+test('rule kinds follow the rule fields', () => {
   assert.equal(ruleKind({ action: 'deny' }), 'block');
   assert.equal(ruleKind({ redirect: { to: '/x', status: 301 } }), 'redirect');
   assert.equal(ruleKind({ headers: [{ target: 'response', op: 'set', name: 'X-A', value: 'v' }] }), 'headers');
   assert.equal(ruleKind({ cors: { origins: ['*'] } }), 'headers');
-  assert.equal(ruleKind({ headers: [] , action: 'deny' }), 'block');
-  const f = ruleToForm({
-    id: 'c', name: 'Cors', enabled: false, site: 'api', label: 'cors-app', matchers: {},
-    cors: { origins: ['https://a.example.com', 'https://b.example.com'], methods: ['GET'], allow_headers: ['X-A'], expose_headers: [], credentials: true, max_age_secs: 600 },
-  });
-  assert.equal(f.kind, 'headers');
-  assert.equal(f.cors.enabled, true);
-  assert.equal(f.cors.origins, 'https://a.example.com\nhttps://b.example.com');
-  assert.equal(f.cors.max_age, '600');
-  assert.equal(f.enabled, false);
-  assert.equal(f.label, 'cors-app');
+  assert.equal(ruleKind({ headers: [], action: 'deny' }), 'block');
 });
 
 test('the list shows the effect and never a secret value', () => {
@@ -236,11 +166,12 @@ test('the list shows the effect and never a secret value', () => {
   assert.equal(effectView({ cors: { origins: ['a', 'b'] } }).label, 'CORS');
   assert.equal(effectView({ cors: { origins: ['a', 'b'] } }).detail, 'CORS for 2 origins');
   const hidden = ['top', 'value'].join('-') + '-1'.repeat(3);
-  const chips = matcherSummary({ scheme: 'http', referer_regex: '^$', header: { name: 'X-Key', equals: hidden, secret: true, negate: false } });
+  const chips = matcherSummary({ scheme: 'http', referer_regexes: ['^$'], headers: [{ name: 'X-Key', equals: hidden, secret: true, negate: false }] });
   assert.deepEqual(chips, ['scheme http', 'referer ~ ^$', 'header X-Key = (secret)']);
   assert.ok(!chips.join(' ').includes(hidden));
-  assert.deepEqual(matcherSummary({ header: { name: 'X-Env', equals: 'staging', negate: true } }), ['header X-Env not = staging']);
+  assert.deepEqual(matcherSummary({ headers: [{ name: 'X-Env', equals: 'staging', negate: true }] }), ['header X-Env not = staging']);
   assert.deepEqual(matcherSummary({ header: { name: 'X-A', regex: '^a', negate: false } }), ['header X-A ~ ^a']);
+  assert.deepEqual(matcherSummary({ path_prefixes: ['/a', '/b'], cidrs: ['1.2.3.0/24', '1.2.4.0/24', '1.2.5.0/24'] }), ['prefix /a', 'prefix /b', '1.2.3.0/24, 1.2.4.0/24 +1']);
 });
 
 test('switching a rule on or off keeps a stored secret by sending it blank', () => {
@@ -250,6 +181,10 @@ test('switching a rule on or off keeps a stored secret by sending it blank', () 
   assert.equal(body.matchers.header.equals, '');
   assert.equal(body.matchers.header.secret, true);
   assert.equal(rule.matchers.header.equals, null);
+  const list = { ...rule, matchers: { headers: [{ name: 'X-Key', equals: null, secret: true }, { name: 'X-Env', equals: 'staging', secret: false }] } };
+  const kept = resaveBody(list, { enabled: false }).matchers.headers;
+  assert.equal(kept[0].equals, '');
+  assert.equal(kept[1].equals, 'staging');
   const plain = { ...rule, matchers: { header: { name: 'X-Env', equals: 'staging', secret: false } } };
   assert.equal(resaveBody(plain, { enabled: false }).matchers.header.equals, 'staging');
   const viaRegex = { ...rule, matchers: { header: { name: 'X-Env', regex: '^a', equals: null, secret: false } } };

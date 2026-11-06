@@ -284,6 +284,7 @@ async fn spawn_fake(fake: Shared) -> String {
         .route("/api/v1/certificates/{id}", any(echo))
         .route("/api/v1/cloudflare/ranges", any(echo))
         .route("/api/v1/sites/{id}/zone-secret", any(echo))
+        .route("/api/v1/firewall/bulk", any(echo))
         .route("/api/v1/haproxy/stats", get(big))
         .route("/api/v1/sites", get(list_sites).post(create_site))
         .route("/api/v1/sites/{id}", get(get_site).put(put_site))
@@ -472,7 +473,8 @@ fn site(id: &str) -> Site {
         id: id.to_string(),
         name: format!("Site {id}"),
         hosts: vec![format!("{id}.example.com")],
-        path_regex: None,
+        path_regexes: Vec::new(),
+        path_prefixes: Vec::new(),
         kind: SiteKind::Site,
         blue: Upstream {
             targets: vec![Target {
@@ -1529,6 +1531,44 @@ async fn oversized_certificate_bodies_are_refused_and_unlisted_routes_stay_hidde
         let reply = send_json(&h.app, method.clone(), uri, &s.headers(), json!({})).await;
         assert_eq!(reply.status, StatusCode::NOT_FOUND, "{method} {uri}");
     }
+}
+
+#[tokio::test]
+async fn firewall_bulk_is_one_csrf_protected_post_with_a_512_kib_limit() {
+    let url = spawn_fake(new_fake(NODE_TOKEN)).await;
+    let h = harness_with_nodes(&[("edge-1", url.as_str(), NODE_TOKEN)]);
+    let s = login(&h).await;
+    let cookie_only = [("cookie", s.cookie.as_str())];
+    let uri = "/api/v1/nodes/edge-1/firewall/bulk";
+    let body = json!({ "replace": [{ "id": "redirect-1" }], "delete": ["redirect-2"] });
+
+    let no_csrf = send_json(&h.app, Method::POST, uri, &cookie_only, body.clone()).await;
+    assert_eq!(no_csrf.status, StatusCode::FORBIDDEN);
+    let ok = send_json(&h.app, Method::POST, uri, &s.headers(), body.clone()).await;
+    assert_eq!(ok.status, StatusCode::OK);
+    let relayed: Value =
+        serde_json::from_str(ok.json()["body"].as_str().expect("body")).expect("json");
+    assert_eq!(relayed, body);
+
+    let get = get_path(&h.app, uri, &s.headers()).await;
+    assert_eq!(get.status, StatusCode::NOT_FOUND);
+    for method in [Method::PUT, Method::DELETE, Method::PATCH] {
+        let reply = send_json(&h.app, method.clone(), uri, &s.headers(), json!({})).await;
+        assert_eq!(reply.status, StatusCode::NOT_FOUND, "{method}");
+    }
+    let extra = send_json(
+        &h.app,
+        Method::POST,
+        &format!("{uri}/extra"),
+        &s.headers(),
+        json!({}),
+    )
+    .await;
+    assert_eq!(extra.status, StatusCode::NOT_FOUND);
+
+    let huge = json!({ "replace": [], "delete": [], "padding": "x".repeat(600 * 1024) });
+    let refused = send_json(&h.app, Method::POST, uri, &s.headers(), huge).await;
+    assert_eq!(refused.status, StatusCode::PAYLOAD_TOO_LARGE);
 }
 
 #[tokio::test]

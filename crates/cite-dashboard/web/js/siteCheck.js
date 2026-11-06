@@ -40,6 +40,31 @@ export function cleanToken(token) {
   return t || undefined;
 }
 
+export const TOKEN_HELP_HAVE = 'This node already has a GitHub token (CITE_GITHUB_TOKEN). Leave this empty to use it.';
+export const TOKEN_HELP_HAVE_MANY = 'Every selected node already has a GitHub token (CITE_GITHUB_TOKEN). Leave this empty to use it.';
+export const TOKEN_HELP_NONE = 'Fine-grained token with Contents: read for this repository. Better: set CITE_GITHUB_TOKEN on the node once (see docs). Stored only on the node.';
+export const TOKEN_TOGGLE = 'Use a different token for this site';
+
+// A node reports whether it holds a token of its own; an older connector says nothing, which counts as unknown
+export function tokenState(info) {
+  if (!info || !info.github) return 'unknown';
+  return info.github.token_configured ? 'yes' : 'no';
+}
+
+// What the token field should do for the nodes picked: hidden when all have one, required when any has none
+export function tokenPlan(states) {
+  const list = Array.isArray(states) ? states : [];
+  const missing = list.filter((s) => s === 'no').length;
+  if (missing > 0) return { show: true, required: true, help: TOKEN_HELP_NONE };
+  if (list.length > 0 && list.every((s) => s === 'yes')) return { show: false, required: false, help: list.length === 1 ? TOKEN_HELP_HAVE : TOKEN_HELP_HAVE_MANY };
+  return { show: true, required: false, help: TOKEN_HELP_NONE };
+}
+
+export function tokenProblem(plan, token) {
+  if (plan.required && !cleanToken(token)) return 'Enter a GitHub token: a selected node has none configured.';
+  return null;
+}
+
 // Returns the first problem with the source fields, or null.
 export function sourceProblem(src) {
   return repoProblem(src.repo) || branchProblem(src.branch) || runtimeProblem(src.runtime) || pollProblem(src.poll);

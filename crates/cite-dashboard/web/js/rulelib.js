@@ -136,9 +136,27 @@ export function parseTemplate(to) {
   return { pieces, ...facts, usesWww: has('www_host'), usesApex: has('apex_host') };
 }
 
+const one = (v) => (v ? [v] : []);
+
+// Matchers as lists: the node sends the list fields, and rules saved before them carry single values, which count as one-item lists
+export function listsOf(m) {
+  const x = m || {};
+  return {
+    path_prefixes: [...(x.path_prefixes || []), ...one(x.path_prefix)],
+    path_regexes: [...(x.path_regexes || []), ...one(x.path_regex)],
+    user_agent_regexes: [...(x.user_agent_regexes || []), ...one(x.user_agent_regex)],
+    referer_regexes: [...(x.referer_regexes || []), ...one(x.referer_regex)],
+    hosts: [...(x.hosts || []), ...one(x.host)],
+    methods: [...(x.methods || [])],
+    cidrs: [...(x.cidrs || [])],
+    scheme: x.scheme || null,
+    headers: [...(x.headers || []), ...(x.header ? [x.header] : [])],
+  };
+}
+
 export function hasMatcher(m) {
-  return Boolean(m && (m.path_regex || m.path_prefix || (m.methods && m.methods.length) || m.user_agent_regex
-    || (m.cidrs && m.cidrs.length) || m.host || m.header || m.scheme || m.referer_regex));
+  const l = listsOf(m);
+  return Boolean(l.scheme) || Object.entries(l).some(([key, value]) => key !== 'scheme' && value.length > 0);
 }
 
 // The same loop checks the node makes, each one because the matchers would still select the request after it was redirected
@@ -146,17 +164,17 @@ export function redirectProblem(redirect, matchers) {
   if (!redirect || !REDIRECT_STATUSES.includes(redirect.status)) return 'The redirect status must be 301, 302, 307 or 308.';
   const t = parseTemplate(redirect.to);
   if (t.error) return `The redirect target ${t.error}.`;
-  const m = matchers || {};
-  const pathMatcher = Boolean(m.path_prefix || m.path_regex);
+  const l = listsOf(matchers);
+  const pathMatcher = l.path_prefixes.length > 0 || l.path_regexes.length > 0;
   const upgrade = !t.relative && t.https && t.sameHost;
   if (upgrade) {
-    if (m.scheme !== 'http') return 'An https redirect to the same host needs the scheme matcher set to http, or it loops.';
+    if (l.scheme !== 'http') return 'An https redirect to the same host needs the scheme condition set to http, or it loops.';
   } else if (t.relative || t.sameHost) {
-    if (!pathMatcher) return 'A redirect that keeps the host needs a path prefix or path regex matcher, or it loops.';
+    if (!pathMatcher) return 'A redirect that keeps the host needs a path condition (starts with or regex), or it loops.';
     const only = t.pieces.length === 1 && isLit(t.pieces[0]) ? t.pieces[0].lit : null;
-    if (m.path_prefix && only !== null && only.startsWith(m.path_prefix)) return 'The redirect target starts with the matched path prefix and would loop.';
-  } else if (!t.usesWww && !t.usesApex && !hasMatcher(m)) {
-    return 'Add a matcher, or use {www_host} or {apex_host}, so the redirect cannot loop.';
+    if (only !== null && l.path_prefixes.some((p) => only.startsWith(p))) return 'The redirect target starts with a matched path prefix and would loop.';
+  } else if (!t.usesWww && !t.usesApex && !hasMatcher(matchers)) {
+    return 'Add a condition, or use {www_host} or {apex_host}, so the redirect cannot loop.';
   }
   return null;
 }
@@ -248,76 +266,10 @@ export function headerMatcherProblem(h, { stored = Boolean(h && h.stored) } = {}
   return null;
 }
 
-export function matcherProblem(m) {
-  if (m.scheme && m.scheme !== 'http' && m.scheme !== 'https') return 'The scheme must be http or https.';
-  if (m.referer_regex) {
-    const problem = patternProblem(m.referer_regex, 'The referer regex');
-    if (problem) return problem;
-  }
-  return null;
-}
-
-const emptyHeader = () => ({ name: '', mode: 'equals', value: '', negate: false, secret: false, stored: false });
-
-export function emptyForm() {
-  return {
-    id: '', name: '', enabled: true, site: '', label: '', kind: 'block', action: 'deny',
-    matchers: {
-      path_prefix: '', path_regex: '', methods: [], user_agent_regex: '', cidrs: [], host: '', scheme: '', referer_regex: '', header: emptyHeader(),
-    },
-    redirect: { to: '', status: 301 },
-    headers: [],
-    cors: { enabled: false, origins: '', methods: '', allow_headers: '', expose_headers: '', credentials: false, max_age: '0' },
-  };
-}
-
 export function ruleKind(rule) {
   if (rule.redirect) return 'redirect';
   if ((rule.headers && rule.headers.length) || rule.cors) return 'headers';
   return 'block';
-}
-
-// A secret value is never returned by the node, so a stored secret matcher opens with a blank value and the stored flag
-export function ruleToForm(rule) {
-  const form = emptyForm();
-  const m = rule.matchers || {};
-  const hm = m.header;
-  form.id = rule.id;
-  form.name = rule.name;
-  form.enabled = rule.enabled;
-  form.site = rule.site || '';
-  form.label = rule.label || '';
-  form.kind = ruleKind(rule);
-  form.action = rule.action || 'deny';
-  form.matchers = {
-    path_prefix: m.path_prefix || '', path_regex: m.path_regex || '', methods: [...(m.methods || [])], user_agent_regex: m.user_agent_regex || '',
-    cidrs: [...(m.cidrs || [])], host: m.host || '', scheme: m.scheme || '', referer_regex: m.referer_regex || '',
-    header: hm ? {
-      name: hm.name,
-      mode: hm.regex ? 'regex' : 'equals',
-      value: hm.secret ? '' : (hm.regex || hm.equals || ''),
-      negate: Boolean(hm.negate),
-      secret: Boolean(hm.secret),
-      stored: Boolean(hm.secret),
-    } : emptyHeader(),
-  };
-  if (rule.redirect) form.redirect = { to: rule.redirect.to, status: rule.redirect.status };
-  form.headers = (rule.headers || []).map((op) => ({ target: op.target, op: op.op, name: op.name, value: op.value || '' }));
-  const c = rule.cors;
-  if (c) {
-    form.cors = {
-      enabled: true, origins: (c.origins || []).join('\n'), methods: (c.methods || []).join(' '), allow_headers: (c.allow_headers || []).join(' '),
-      expose_headers: (c.expose_headers || []).join(' '), credentials: Boolean(c.credentials), max_age: String(c.max_age_secs || 0),
-    };
-  }
-  return form;
-}
-
-function headerMatcherBody(h) {
-  const body = { name: h.name.trim(), regex: null, equals: null, negate: Boolean(h.negate), secret: Boolean(h.secret) };
-  if (h.mode === 'regex') body.regex = h.value;
-  else body.equals = h.value;
-  return body;
 }
 
 export function corsFromForm(c) {
@@ -332,92 +284,14 @@ export function corsFromForm(c) {
   };
 }
 
-// Returns the request body for the node, or the first problem found; matchers the form did not use are left out of the JSON
-export function buildRule(form) {
-  const name = String(form.name || '').trim();
-  if (!name) return { error: 'Give the rule a name.' };
-  const label = String(form.label || '').trim();
-  if (label && !isValidId(label)) return { error: 'The label is lowercase letters, digits and dashes, up to 40 characters.' };
-  const m = form.matchers;
-  const matchers = {
-    path_regex: m.path_regex.trim() || null,
-    path_prefix: m.path_prefix.trim() || null,
-    methods: [...m.methods],
-    user_agent_regex: m.user_agent_regex.trim() || null,
-    cidrs: [...m.cidrs],
-    host: m.host.trim() || null,
-  };
-  if (m.scheme) matchers.scheme = m.scheme;
-  const referer = m.referer_regex.trim();
-  if (referer) matchers.referer_regex = referer;
-  const found = matcherProblem({ scheme: m.scheme, referer_regex: referer });
-  if (found) return { error: found };
-  const hm = m.header;
-  if (String(hm.name || '').trim()) {
-    const bad = headerMatcherProblem(hm, { stored: hm.stored });
-    if (bad) return { error: bad };
-    matchers.header = headerMatcherBody(hm);
-  }
-  const rule = { id: form.id, name, enabled: form.enabled, matchers, site: form.site || null };
-  if (label) rule.label = label;
-  if (form.kind === 'redirect') {
-    const redirect = { to: form.redirect.to.trim(), status: Number(form.redirect.status) };
-    const bad = redirectProblem(redirect, matchers);
-    if (bad) return { error: bad };
-    rule.redirect = redirect;
-    return { rule };
-  }
-  if (form.kind === 'headers') {
-    const ops = form.headers.map((op) => {
-      const body = { target: op.target, op: op.op, name: op.name.trim() };
-      if (op.op !== 'remove') body.value = op.value;
-      return body;
-    });
-    if (ops.length > MAX_HEADER_OPS) return { error: `Use at most ${MAX_HEADER_OPS} header changes.` };
-    for (const op of ops) {
-      const bad = headerOpProblem(op);
-      if (bad) return { error: bad };
-    }
-    const cors = form.cors.enabled ? corsFromForm(form.cors) : null;
-    if (cors) {
-      const bad = corsProblem(cors);
-      if (bad) return { error: bad };
-    }
-    if (!ops.length && !cors) return { error: 'Add at least one header change or turn on CORS.' };
-    if (ops.length) rule.headers = ops;
-    if (cors) rule.cors = cors;
-    return { rule };
-  }
-  if (!hasMatcher(matchers)) return { error: 'A rule needs at least one matcher, otherwise it would block everything.' };
-  rule.action = form.action;
-  return { rule };
-}
-
-// A listed rule saved back as it is (the on/off switch) must keep a secret value: the node returns it blank, and a blank value with secret set means keep
+// A listed rule saved back as it is (the on/off switch) must keep secret values: the node returns them blank, and a blank value with secret set means keep
 export function resaveBody(rule, patch = {}) {
   const body = { ...rule, ...patch };
-  const hm = rule.matchers && rule.matchers.header;
-  if (hm && hm.secret && !hm.regex) body.matchers = { ...rule.matchers, header: { ...hm, equals: '' } };
+  const m = rule.matchers || {};
+  const keep = (h) => (h.secret && !h.regex ? { ...h, equals: '' } : h);
+  if (m.headers && m.headers.length) body.matchers = { ...m, headers: m.headers.map(keep) };
+  else if (m.header) body.matchers = { ...m, header: keep(m.header) };
   return body;
-}
-
-// Short chips for the rule list; a secret value is never shown
-export function matcherSummary(m) {
-  const out = [];
-  if (m.path_prefix) out.push('prefix ' + m.path_prefix);
-  if (m.path_regex) out.push('path ~ ' + m.path_regex);
-  if (m.methods && m.methods.length) out.push(m.methods.join(' '));
-  if (m.user_agent_regex) out.push('ua ~ ' + m.user_agent_regex);
-  if (m.cidrs && m.cidrs.length) out.push(m.cidrs.length > 2 ? `${m.cidrs.slice(0, 2).join(', ')} +${m.cidrs.length - 2}` : m.cidrs.join(', '));
-  if (m.host) out.push('host ' + m.host);
-  if (m.scheme) out.push('scheme ' + m.scheme);
-  if (m.referer_regex) out.push('referer ~ ' + m.referer_regex);
-  if (m.header) {
-    const h = m.header;
-    const test = h.regex ? `~ ${h.regex}` : h.secret ? '= (secret)' : `= ${h.equals}`;
-    out.push(`header ${h.name} ${h.negate ? 'not ' : ''}${test}`);
-  }
-  return out;
 }
 
 const ACTION_LABELS = { deny: ['Deny', 'bad'], drop: ['Drop silently', 'warn'], tarpit: ['Tarpit', 'info'] };

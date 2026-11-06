@@ -25,6 +25,7 @@ use crate::error::ClientError;
 use crate::export::{
     AnalyticsStats, EXPORT_TIMEOUT, ExportQuery, ExportReport, ExportStream, validate_top_kind,
 };
+use crate::firewall::{BulkResult, FirewallBulk};
 use crate::zone::{ZoneSecret, ZoneSecretStatus, validate_site_id};
 
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -54,12 +55,25 @@ impl fmt::Debug for LoginResponse {
     }
 }
 
+/// Whether the node holds a GitHub token of its own, and where it came from; the token itself is never reported.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GithubInfo {
+    #[serde(default)]
+    pub token_configured: bool,
+    /// "env", "file" or "none".
+    #[serde(default)]
+    pub source: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NodeInfo {
     #[serde(default)]
     pub name: String,
     #[serde(default)]
     pub version: String,
+    /// Absent on connectors that predate the node-level token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github: Option<GithubInfo>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -606,6 +620,21 @@ impl NodeClient {
     pub async fn delete_rule(&self, id: &str) -> Res<()> {
         self.unit(Method::DELETE, &format!("/firewall/rules/{}", enc(id)))
             .await
+    }
+
+    // One validation and one reload on the node, however many rules change; the rules are checked for ids and overlaps first.
+    pub async fn firewall_bulk(&self, bulk: &FirewallBulk) -> Res<BulkResult> {
+        bulk.validate()?;
+        let bytes = self
+            .exec(
+                Method::POST,
+                "/firewall/bulk",
+                &[],
+                body_of(bulk)?,
+                ACTION_OPTS,
+            )
+            .await?;
+        decode(&bytes)
     }
 
     pub async fn list_presets(&self) -> Res<Vec<PresetInfo>> {
