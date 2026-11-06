@@ -678,9 +678,10 @@ impl Deployer {
             let orch = self.orchestrator()?;
             orch.limits().check_source(source)?;
             let token = github_token.filter(|t| !t.is_empty());
-            // The secret name is assigned here; a client-supplied one could read another site's token.
+            // The secret name is assigned here (a client-supplied one could read another site's token); a Doppler binding only comes from its own route.
             if let Some(source) = site.source.as_mut() {
                 source.secret = None;
+                source.doppler = None;
             }
             if let Some(token) = &token {
                 let name = secret_name(&id);
@@ -782,6 +783,7 @@ impl Deployer {
         site.maintenance = existing.maintenance.clone();
         if let Some(source) = site.source.as_mut() {
             source.secret = existing.source.as_ref().and_then(|s| s.secret.clone());
+            source.doppler = existing.source.as_ref().and_then(|s| s.doppler.clone());
         }
         if site == existing {
             return Ok(existing);
@@ -847,7 +849,13 @@ impl Deployer {
             .await;
         for kind in [EnvKind::Build, EnvKind::Runtime] {
             self.store.delete_secret(&kind.secret(id)).await;
+            self.store
+                .delete_secret(&crate::doppler::snapshot_secret(id, kind))
+                .await;
         }
+        self.store
+            .delete_secret(&crate::doppler::token_secret(id))
+            .await;
         self.store.delete_secret(&repo_record(id)).await;
         self.site_ops.forget(id);
         drop(guard);
@@ -2684,11 +2692,18 @@ mod tests {
                 .deploy_and_wait("t", "shop", None, Some("v2".into()), None)
                 .await
         });
-        sleep(Duration::from_millis(400)).await;
+        let mut during = e.deployer.site_status("shop").await.unwrap();
+        for _ in 0..100 {
+            sleep(Duration::from_millis(100)).await;
+            during = e.deployer.site_status("shop").await.unwrap();
+            if during.operation.as_ref().is_some_and(|o| o.step == "building") {
+                break;
+            }
+        }
+        sleep(Duration::from_millis(300)).await;
         assert_eq!(current(&e, "shop").active, Slot::Blue);
         assert!(!green_promoted(&e), "the old release went live");
-        let during = e.deployer.site_status("shop").await.unwrap();
-        let op = during.operation.expect("a running deploy is visible");
+        let op = during.operation.clone().expect("a running deploy is visible");
         assert_eq!((op.kind.as_str(), op.step.as_str()), ("deploy", "building"));
         assert_eq!(op.slot, Some(Slot::Green));
         assert_eq!(during.phase, "building");

@@ -11,8 +11,8 @@ type Res<T> = std::result::Result<T, ClientError>;
 
 pub const MAX_GITHUB_TOKEN_BYTES: usize = 512;
 // These mirror BuildEnvPatch::validate on the node, which the runtime environment shares.
-pub const MAX_ENV_BYTES: usize = 12 * 1024;
-pub const MAX_ENV_ENTRIES: usize = 64;
+pub const MAX_ENV_BYTES: usize = 24 * 1024;
+pub const MAX_ENV_ENTRIES: usize = 128;
 pub const MAX_ENV_NAME_CHARS: usize = 64;
 pub const MAX_ENV_VALUE_BYTES: usize = 4096;
 pub const MAX_LOG_TAIL: u32 = 1000;
@@ -327,7 +327,12 @@ mod tests {
                 many.set.insert(format!("V{i}"), "1".into());
             }
             assert!(many.validate(kind).is_err());
+            many.set.remove(&format!("V{MAX_ENV_ENTRIES}"));
+            many.validate(kind).expect("128 variables fit");
         }
+        assert_eq!((MAX_ENV_ENTRIES, MAX_ENV_BYTES), (128, 24 * 1024));
+        assert_eq!(MAX_ENV_ENTRIES, cite_edge::status::MAX_ENV_KEYS);
+        assert_eq!(MAX_ENV_BYTES, cite_edge::status::MAX_ENV_BYTES);
     }
 
     #[test]

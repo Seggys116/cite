@@ -1,5 +1,5 @@
 ARG RUST_IMAGE=docker.io/library/rust:1.98-bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
-ARG BUN_IMAGE=docker.io/oven/bun:1-distroless@sha256:1a0c31c7c5f9d193aedf60fe1cebdeb76ac8f6e29f24be8dd8cbd6df72df26ec
+ARG BUN_IMAGE=docker.io/oven/bun:1-distroless@sha256:153a951ae40106e125898103e6e990ee0f38e6aee7f561029e26cf9fbed23470
 
 FROM ${RUST_IMAGE} AS build
 WORKDIR /src

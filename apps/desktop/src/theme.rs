@@ -3,6 +3,8 @@ use gpui::{Rgba, rgb};
 pub const BG: u32 = 0x0b0b0c;
 pub const SIDEBAR: u32 = 0x0e0e10;
 pub const TOPBAR: u32 = 0x1b1b1f;
+// The window behind the inset panels; Term paints its chrome in the top bar colour.
+pub const WINDOW: u32 = TOPBAR;
 pub const INPUT: u32 = 0x111113;
 pub const SURFACE: u32 = 0x141418;
 pub const SURFACE_HI: u32 = 0x1e1e23;
@@ -21,6 +23,50 @@ pub const RED: u32 = 0xf26b78;
 pub const CARD_RADIUS: f32 = 10.0;
 pub const ROW_RADIUS: f32 = 8.0;
 pub const CHIP_RADIUS: f32 = 7.0;
+pub const PANEL_RADIUS: f32 = CARD_RADIUS;
+
+// The one spacing scale: every gap and padding in the shared helpers comes from here.
+pub mod space {
+    pub const XXS: f32 = 2.0;
+    pub const XS: f32 = 4.0;
+    pub const SM: f32 = 8.0;
+    pub const MD: f32 = 12.0;
+    pub const LG: f32 = 16.0;
+    pub const XL: f32 = 24.0;
+    pub const XXL: f32 = 32.0;
+}
+
+pub mod font {
+    pub const XS: f32 = 11.0;
+    pub const SM: f32 = 12.0;
+    pub const BASE: f32 = 13.0;
+    pub const MD: f32 = 14.0;
+    pub const LG: f32 = 16.0;
+    pub const XL: f32 = 22.0;
+}
+
+// Shell geometry, matching Term's chrome metrics.
+pub mod layout {
+    pub const WINDOW_INSET: f32 = 8.0;
+    pub const SIDEBAR_W: f32 = 240.0;
+    pub const TOP_ROW_H: f32 = 36.0;
+    pub const TRAFFIC_LIGHTS_W: f32 = 76.0;
+    pub const CONTENT_MAX_W: f32 = 1100.0;
+    pub const CONTROL_H: f32 = 28.0;
+    pub const ROW_H: f32 = 32.0;
+    pub const INPUT_MIN_W: f32 = 96.0;
+    pub const FIELD_MIN_W: f32 = 96.0;
+    pub const COLUMN_MIN_W: f32 = 260.0;
+    pub const WINDOW_MIN_W: f32 = 720.0;
+    pub const WINDOW_MIN_H: f32 = 480.0;
+    pub const WINDOW_DEFAULT_W: f32 = 1280.0;
+    pub const WINDOW_DEFAULT_H: f32 = 820.0;
+
+    // Side padding of the page column: scales with the content width between 16 and 40.
+    pub fn page_padding(content_width: f32) -> f32 {
+        (content_width * 0.04).clamp(super::space::LG, 40.0)
+    }
+}
 
 #[cfg(target_os = "macos")]
 pub const MONO: &str = "Menlo";
@@ -103,6 +149,13 @@ mod tests {
         ] {
             assert_ne!(tone.color(), ACCENT);
         }
+    }
+
+    #[test]
+    fn page_padding_scales_between_its_bounds() {
+        assert_eq!(layout::page_padding(200.0), space::LG);
+        assert!((layout::page_padding(600.0) - 24.0).abs() < 0.01);
+        assert_eq!(layout::page_padding(4000.0), 40.0);
     }
 
     #[test]

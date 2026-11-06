@@ -15,6 +15,7 @@ pub const CAP_RUNTIME_ENV: &str = "site-runtime-env";
 pub const CAP_ASYNC_DEPLOY: &str = "deploy-async";
 pub const CAP_SOURCE_BUILD: &str = "source-build";
 pub const CAP_FORGES: &str = "forges";
+pub const CAP_DOPPLER: &str = "doppler";
 
 // A feature is offered only when the node says it has it, so nodes older than 0.4.0 show none of the new cards.
 pub fn has_cap(caps: &[String], name: &str) -> bool {

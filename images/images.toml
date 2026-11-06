@@ -1,13 +1,12 @@
-# Node digests resolved 2026-10-24 via `docker buildx imagetools inspect` (multi-arch index).
-# Other base digests resolved 2026-09-30 the same way; cc_digest resolved 2026-10-01.
+# Digests resolved 2026-11-06 via `docker buildx imagetools inspect` (multi-arch index); cc_digest unchanged.
 
 [meta]
 registry = "ghcr.io/seggys116"
 rust_image = "docker.io/library/rust:1.98-bookworm"
 rust_digest = "sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e"
-bun_version = "1.4.2"
-bun_linux_x64_sha256 = "36368faef7527875d5ffa52e53cd48021741f2a83eb6208a8dd64068d422a913"
-bun_linux_aarch64_sha256 = "54328bbc2d9c8e0c9f892c544d66c57a83b84139e34909e5ee81758f1ac8fda7"
+bun_version = "1.4.4"
+bun_linux_x64_sha256 = "bf8ccbfb2b0b80159e0f9a6d15c55317add8077534dbc6130a3edb52fccb395c"
+bun_linux_aarch64_sha256 = "baa6bb36f51d6e58561e02bbea825038a9df454f673d6d776e8bbf86f8c7850e"
 
 [images]
 manager = "cite-manager"
@@ -21,9 +20,9 @@ executor_rust = "cite-executor-rust"
 major = 22
 lts = true
 runtime_image = "docker.io/library/node:22-bookworm-slim"
-runtime_digest = "sha256:de170b39439eb0e5a3444ad7d60b015614a381e10fecae2e30ec9e735122f38d"
+runtime_digest = "sha256:5ec23b7c622b00547753bc6ffd78085dd868a68aeb41c8e0a1418f033e13d96d"
 executor_base = "gcr.io/distroless/nodejs22-debian13:nonroot"
-executor_digest = "sha256:10747a1323be68f206aed893599d43e6697ad67257e7c42703553f99fbce3d33"
+executor_digest = "sha256:8ad9cc935b7843c4024b7e1487b5ef472c354ea847b97c667023e2618552607e"
 manager_tag_suffix = "node22"
 executor_tag_suffix = "node22"
 
@@ -31,16 +30,16 @@ executor_tag_suffix = "node22"
 major = 24
 lts = true
 runtime_image = "docker.io/library/node:24-bookworm-slim"
-runtime_digest = "sha256:55fb5f5a527ea2c5c4a95f963e48ef90aa38c7b346054fdc8ee9957a2b55d205"
+runtime_digest = "sha256:01d566e8d94d8c619591d78652babfccd3c6992a3dffa9ed5ab39e11cf6c70e9"
 executor_base = "gcr.io/distroless/nodejs24-debian13:nonroot"
-executor_digest = "sha256:cb606325b7ec4af55462cb0b424a53b452a5b4a894ffe841fcf1048d216fb9f8"
+executor_digest = "sha256:b8cec4b2f2126ff7bd034ec9ac207ffb3272667dfdc48376e3b035d3270549ba"
 manager_tag_suffix = "node24"
 executor_tag_suffix = "node24"
 
 [bases]
 static_nonroot = "gcr.io/distroless/static:nonroot"
-static_digest = "sha256:e2e927ec666bae08560abb3c55d0659eceabb657f56b6782ab500a9fc7f555e3"
+static_digest = "sha256:25ac8f0c3b2334a9eb05452266bd4697864a8c8ef0ef71e5e6480d7f92868329"
 bun_distroless = "docker.io/oven/bun:1-distroless"
-bun_digest = "sha256:1a0c31c7c5f9d193aedf60fe1cebdeb76ac8f6e29f24be8dd8cbd6df72df26ec"
+bun_digest = "sha256:153a951ae40106e125898103e6e990ee0f38e6aee7f561029e26cf9fbed23470"
 cc_nonroot = "gcr.io/distroless/cc-debian12:nonroot"
 cc_digest = "sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f"

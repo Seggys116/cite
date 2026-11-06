@@ -63,11 +63,11 @@ The manager environment is a closed list of at most 32 entries, each key at most
 | `CITE_FORGE` | Exactly the proxy's `CITE_STACK_FORGE`. |
 | `CITE_FORGE_API_URL` | Exactly the proxy's `CITE_STACK_FORGE_API_URL`. |
 | `CITE_DEPLOY_ID` | Exactly 26 characters from `0-9A-Z`. |
-| `CITE_BUILD_ENV_JSON` | A JSON object of at most 12 KiB and 64 keys, with no duplicate keys. Keys match `[A-Z_][A-Z0-9_]{0,63}`, do not start with `CITE_`, and are not `LD_PRELOAD`, `LD_LIBRARY_PATH`, `LD_AUDIT`, `NODE_OPTIONS`, `NODE_EXTRA_CA_CERTS`, `HOME`, `PATH`, `TMPDIR`, `SSL_CERT_FILE`, `SSL_CERT_DIR`, `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, `ALL_PROXY`, `PNPM_HOME`, or start with `XDG_`, `GIT_` or `npm_config_` (compared without regard to case). Values are strings of at most 4096 bytes without control characters. |
+| `CITE_BUILD_ENV_JSON` | A JSON object of at most 24 KiB and 128 keys, with no duplicate keys. Keys match `[A-Z_][A-Z0-9_]{0,63}`, do not start with `CITE_`, and are not `LD_PRELOAD`, `LD_LIBRARY_PATH`, `LD_AUDIT`, `NODE_OPTIONS`, `NODE_EXTRA_CA_CERTS`, `HOME`, `PATH`, `TMPDIR`, `SSL_CERT_FILE`, `SSL_CERT_DIR`, `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, `ALL_PROXY`, `PNPM_HOME`, or start with `XDG_`, `GIT_` or `npm_config_` (compared without regard to case). Values are strings of at most 4096 bytes without control characters. |
 
 The executor environment is likewise closed: its fixed values, `CITE_NODE`, and `CITE_RUNTIME_ENV_JSON`, which follows the same rules as `CITE_BUILD_ENV_JSON` and also refuses `PORT`, `NODE_ENV`, `HOST`, `HOSTNAME` and `NITRO_HOST`, the names the executor sets itself.
 
-Anything else is refused, including `CITE_BUILD_UID`, `CITE_BUILD_GID`, `CITE_DEV_SAME_USER`, `CITE_BUILD_ENV_FILE`, the `CITE_MAX_*` limits, `CITE_BUILD_TIMEOUT`, any other directory key and per-site API URLs. With every key at its longest value and a 12 KiB build environment escaped twice, a create body stays well under the 64 KiB body cap.
+Anything else is refused, including `CITE_BUILD_UID`, `CITE_BUILD_GID`, `CITE_DEV_SAME_USER`, `CITE_BUILD_ENV_FILE`, the `CITE_MAX_*` limits, `CITE_BUILD_TIMEOUT`, any other directory key and per-site API URLs. With every key at its longest value and a 24 KiB build environment escaped twice, a create body still fits the 64 KiB body cap.
 
 The proxy also refuses, before any matching: request targets that are not origin-form, percent-encoding in paths, `.` and `..` segments, empty segments, backslashes and NUL bytes, API versions outside 1.45 to 1.99, duplicate query keys, any `Upgrade` or `Connection: upgrade` (so no attach, exec or hijack), any `Transfer-Encoding`, a body on a request that should have none, a body over 64 KiB, and a body without `Content-Type: application/json`. Client headers are not forwarded; the proxy builds its own request to the engine, so request smuggling toward Docker is not possible. Responses are streamed back (image pull progress) with a per-route deadline. Connections are capped (`CITE_PROXY_MAX_CONNS`, default 64) and request headers must arrive within 10 seconds.
 
@@ -125,6 +125,7 @@ The `source` object on a site:
 | `node_major` | `22` | `22` or `24`. Ignored by the `rust` runtime. |
 | `poll_interval` | `5m` | How often the manager checks GitHub. Minimum 60 seconds. |
 | `secret` | none | Set by the connector. A value sent by a client is discarded. |
+| `doppler` | none | `{project,config,build,runtime}`, set only through `PUT /sites/{id}/doppler`. A value sent when creating a site is discarded, and `PUT /sites/{id}` keeps the stored one. See [Doppler](#doppler). |
 
 Images come from `CITE_REGISTRY` (default `ghcr.io/seggys116`) at tag `CITE_STACK_VERSION`:
 
@@ -143,13 +144,17 @@ There are two ways to give a site its GitHub token.
 
 **1. On the connector, once for the node (recommended).** Set `CITE_GITHUB_TOKEN` in `.env` (as in the single-site stack). The orchestrator overlay passes it to the connector, which reads it at start and uses it for every site built from GitHub that has no token of its own. Use a fine-grained token with Contents:read, or a classic PAT with repo scope. `CITE_GITHUB_TOKEN_FILE` is the alternative for secret mounts: mount the file into the connector and set the variable to its path; the environment variable wins when both are set. Both follow the same rules as a per-site token (printable ASCII, up to 512 bytes), and an invalid value stops the connector at start with an error that never prints it. `GET /api/v1/node` reports `github.token_configured` and `github.source` (`env`, `file` or `none`), never the value.
 
-**2. Per site.** Send a `github_token` string beside the site object in the `POST /api/v1/sites` body. It overrides the node token for that site. The connector stores it in `secrets.json` (mode 0600, up to 512 secrets, 16 KiB each) under a name it chooses from the site id, and records only that name in the site.
+**2. Per site.** Send a `github_token` string beside the site object in the `POST /api/v1/sites` body. It overrides the node token for that site. The connector stores it in `secrets.json` (mode 0600, up to 512 secrets, 32 KiB each) under a name it chooses from the site id, and records only that name in the site.
 
 A site created with a `source` and neither token is refused with 400 ("No GitHub token: set CITE_GITHUB_TOKEN on the connector (or pass github_token for this site)"); the manager needs the token even for a public repository.
 
 **What is stored where.** The node token is held in the connector's memory only. It is never written to `secrets.json`, `edge.json`, the audit log, status output, error messages or container labels. It reaches each manager as `CITE_GITHUB_TOKEN` in the container's environment, resolved whenever the connector creates the manager container (create, deploy, switch and rollback). Anyone who can inspect containers through the Docker API (`docker inspect`) or read the connector's environment can read it, including the connector.
 
 **Rotating the node token.** Change `CITE_GITHUB_TOKEN` in `.env` and recreate the connector (`docker compose up -d connector`). Running managers keep the old token until their site's next deploy, switch or rollback, which recreates the manager with the new one; a startup reconcile does not recreate managers. To roll a site immediately, deploy it again. Per-site tokens are unaffected.
+
+## Doppler
+
+A site's build and runtime variables can come from a Doppler project and config. Set `CITE_DOPPLER_TOKEN` (or `CITE_DOPPLER_TOKEN_FILE`) in `.env`; the overlay passes it and `CITE_DOPPLER_POLL_SECS` (default 300 seconds, at least 60) to the connector, which holds the token in memory like the GitHub node token. A site can also carry its own Doppler token, stored in `secrets.json` as `site-<id>.doppler-token`. Bind a site with `PUT /api/v1/sites/{id}/doppler`. The connector syncs it at once and then on every poll, merges the Doppler values under the manual build and runtime variables, and redeploys the site when the synced values change; managers and executors receive the merged result through `CITE_BUILD_ENV_JSON` and `CITE_RUNTIME_ENV_JSON`, so the Docker proxy rules and limits above apply unchanged. Only the connector talks to Doppler, and only to `https://api.doppler.com`. See [Running a node](node.md#doppler) and [Connector API](node-api.md#doppler).
 
 ## GitHub Enterprise Server and the API URL
 

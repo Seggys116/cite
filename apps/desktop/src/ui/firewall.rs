@@ -462,7 +462,9 @@ impl Console {
                     .flex()
                     .flex_col()
                     .gap(px(8.))
-                    .w(px(340.))
+                    .flex_1()
+                    .min_w(px(260.))
+                    .max_w(px(420.))
                     .p(px(12.))
                     .rounded(px(crate::theme::CARD_RADIUS))
                     .border_1()
@@ -782,12 +784,19 @@ impl Console {
         };
         div()
             .flex()
+            .flex_wrap()
             .items_center()
             .gap(px(8.))
             .child(seg_row(targets))
             .child(seg_row(kinds))
-            .child(div().w(px(200.)).child(row.name.clone()))
-            .child(div().flex_1().child(value))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(140.))
+                    .max_w(px(220.))
+                    .child(row.name.clone()),
+            )
+            .child(div().flex_1().min_w(px(160.)).child(value))
             .child(
                 btn(id("fw-op-del", i), "Remove", BtnKind::Danger).on_click(cx.listener(
                     move |this, _, _, cx| {

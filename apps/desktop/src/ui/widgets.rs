@@ -4,8 +4,9 @@ use gpui::{
 
 use crate::theme::{
     ACCENT, BORDER, CARD_RADIUS, CHIP_RADIUS, DIM, DIVIDER, GREEN, INPUT, MONO, RED, ROW_RADIUS,
-    SURFACE, SURFACE_HI, TEXT, Tone, c, chip_fill, chip_stroke, tint,
+    SURFACE, SURFACE_HI, TEXT, Tone, c, chip_fill, chip_stroke, font, layout, space, tint,
 };
+use crate::ui::scroll::scroll_area;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum BtnKind {
@@ -24,7 +25,10 @@ pub fn text_dim(s: impl Into<SharedString>) -> Div {
 }
 
 pub fn mono(s: impl Into<SharedString>) -> Div {
-    div().font_family(MONO).text_size(px(12.)).child(s.into())
+    div()
+        .font_family(MONO)
+        .text_size(px(font::SM))
+        .child(s.into())
 }
 
 pub fn strong(s: impl Into<SharedString>) -> Div {
@@ -34,6 +38,7 @@ pub fn strong(s: impl Into<SharedString>) -> Div {
 // Single-line text that clips with an ellipsis instead of wrapping inside narrow cells.
 pub fn clip(s: impl Into<SharedString>) -> Div {
     div()
+        .min_w_0()
         .overflow_hidden()
         .text_ellipsis()
         .whitespace_nowrap()
@@ -52,14 +57,14 @@ pub fn btn(key: ElementId, label: &str, kind: BtnKind) -> Stateful<Div> {
         .items_center()
         .justify_center()
         .flex_none()
-        .h(px(28.))
-        .px(px(12.))
+        .h(px(layout::CONTROL_H))
+        .px(px(space::MD))
         .rounded(px(CHIP_RADIUS))
         .border_1()
         .border_color(border)
         .bg(bg)
         .text_color(fg)
-        .text_size(px(12.))
+        .text_size(px(font::SM))
         .font_weight(FontWeight::MEDIUM)
         .cursor_pointer()
         .whitespace_nowrap()
@@ -75,14 +80,14 @@ pub fn btn_off(label: &str) -> Div {
         .items_center()
         .justify_center()
         .flex_none()
-        .h(px(28.))
-        .px(px(12.))
+        .h(px(layout::CONTROL_H))
+        .px(px(space::MD))
         .rounded(px(CHIP_RADIUS))
         .border_1()
         .border_color(c(BORDER))
         .bg(c(INPUT))
         .text_color(c(DIM))
-        .text_size(px(12.))
+        .text_size(px(font::SM))
         .font_weight(FontWeight::MEDIUM)
         .whitespace_nowrap()
         .child(label.to_string())
@@ -104,7 +109,7 @@ pub fn checkbox(key: ElementId, on: bool) -> Stateful<Div> {
         boxed
             .bg(chip_fill())
             .border_color(chip_stroke())
-            .child(div().size(px(8.)).rounded(px(2.)).bg(c(0xffffff)))
+            .child(div().size(px(space::SM)).rounded(px(2.)).bg(c(0xffffff)))
     } else {
         boxed.bg(c(INPUT)).border_color(c(BORDER))
     };
@@ -121,14 +126,14 @@ pub fn pill_color(text: &str, color: u32) -> Div {
         .flex()
         .items_center()
         .flex_none()
-        .px(px(8.))
-        .py(px(2.))
+        .px(px(space::SM))
+        .py(px(space::XXS))
         .rounded(px(CHIP_RADIUS))
         .border_1()
         .border_color(tint(color, 0.3))
         .bg(tint(color, 0.12))
         .text_color(c(color))
-        .text_size(px(11.))
+        .text_size(px(font::XS))
         .font_weight(FontWeight::SEMIBOLD)
         .whitespace_nowrap()
         .child(text.to_string())
@@ -137,24 +142,25 @@ pub fn pill_color(text: &str, color: u32) -> Div {
 pub fn dot(tone: Tone) -> Div {
     div()
         .flex_none()
-        .size(px(8.))
+        .size(px(space::SM))
         .rounded_full()
         .bg(c(tone.color()))
 }
 
 pub fn card(title: Option<&str>, subtitle: Option<&str>, body: impl IntoElement) -> Div {
-    let mut head = div().flex().flex_col().gap(px(2.));
+    let mut head = div().flex().flex_col().gap(px(space::XXS));
     if let Some(t) = title {
-        head = head.child(strong(t.to_string()).text_size(px(14.)));
+        head = head.child(strong(t.to_string()).text_size(px(font::MD)));
     }
     if let Some(s) = subtitle {
-        head = head.child(text_dim(s.to_string()).text_size(px(12.)));
+        head = head.child(text_dim(s.to_string()).text_size(px(font::SM)));
     }
     let mut root = div()
         .flex()
         .flex_col()
-        .gap(px(12.))
-        .p(px(16.))
+        .gap(px(space::MD))
+        .min_w_0()
+        .p(px(space::LG))
         .rounded(px(CARD_RADIUS))
         .border_1()
         .border_color(c(BORDER))
@@ -174,60 +180,101 @@ pub fn stat(label: &str, value: String, sub: String, tone: Tone) -> Div {
     div()
         .flex()
         .flex_col()
-        .gap(px(4.))
+        .gap(px(space::XS))
         .flex_1()
         .min_w(px(150.))
-        .p(px(14.))
+        .p(px(space::MD))
         .rounded(px(CARD_RADIUS))
         .border_1()
         .border_color(c(BORDER))
         .bg(c(SURFACE))
-        .child(text_dim(label.to_string()).text_size(px(12.)))
+        .child(text_dim(label.to_string()).text_size(px(font::SM)))
         .child(
             mono(value)
                 .text_size(px(24.))
                 .text_color(c(value_color))
                 .font_weight(FontWeight::SEMIBOLD),
         )
-        .child(text_dim(sub).text_size(px(11.)))
+        .child(text_dim(sub).text_size(px(font::XS)))
 }
 
+// Fills its container and shares a row equally with its siblings, so an input inside is never sized to its text.
 pub fn field(label: &str, hint: Option<&str>, child: impl IntoElement) -> Div {
     let mut root = div()
         .flex()
         .flex_col()
-        .gap(px(5.))
+        .flex_1()
+        .w_full()
+        .min_w(px(layout::FIELD_MIN_W))
+        .gap(px(space::XS))
         .child(
             strong(label.to_string())
-                .text_size(px(12.))
+                .text_size(px(font::SM))
                 .text_color(c(DIM)),
         )
         .child(child);
     if let Some(h) = hint {
-        root = root.child(text_dim(h.to_string()).text_size(px(11.)));
+        root = root.child(text_dim(h.to_string()).text_size(px(font::XS)));
     }
     root
+}
+
+// Equal columns that wrap onto new lines once each would be narrower than COLUMN_MIN_W.
+pub fn grid(children: Vec<AnyElement>) -> Div {
+    grid_min(layout::COLUMN_MIN_W, children)
+}
+
+pub fn grid_min(min_width: f32, children: Vec<AnyElement>) -> Div {
+    let mut root = div().flex().flex_wrap().w_full().gap(px(space::MD));
+    for child in children {
+        root = root.child(
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_w(px(min_width))
+                .child(child),
+        );
+    }
+    root
+}
+
+// Form rows: fields side by side on wide pages, stacked on narrow ones.
+pub fn form_grid(children: Vec<AnyElement>) -> Div {
+    grid_min(220.0, children)
 }
 
 pub fn page_header(title: &str, subtitle: &str, actions: Vec<AnyElement>) -> Div {
     div()
         .flex()
+        .flex_wrap()
         .items_center()
         .justify_between()
-        .gap(px(12.))
+        .gap(px(space::MD))
         .child(
             div()
                 .flex()
                 .flex_col()
-                .gap(px(2.))
-                .child(strong(title.to_string()).text_size(px(22.)))
-                .child(text_dim(subtitle.to_string()).text_size(px(13.))),
+                .flex_1()
+                .min_w(px(220.))
+                .gap(px(space::XXS))
+                .child(strong(title.to_string()).text_size(px(font::XL)))
+                .child(text_dim(subtitle.to_string()).text_size(px(font::BASE))),
         )
-        .child(div().flex().items_center().gap(px(8.)).children(actions))
+        .child(
+            div()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap(px(space::SM))
+                .children(actions),
+        )
 }
 
 pub fn section_title(text: &str) -> Div {
-    strong(text.to_string()).text_size(px(15.)).mt(px(6.))
+    strong(text.to_string())
+        .text_size(px(15.))
+        .mt(px(space::SM))
 }
 
 pub fn skeleton(height: f32) -> Div {
@@ -240,21 +287,21 @@ pub fn skeleton(height: f32) -> Div {
         .border_color(c(BORDER))
         .flex()
         .items_center()
-        .px(px(16.))
-        .child(text_dim("Loading...").text_size(px(12.)))
+        .px(px(space::LG))
+        .child(text_dim("Loading...").text_size(px(font::SM)))
 }
 
 pub fn notice(message: &str, tone: Tone) -> Div {
     let color = tone.color();
     div()
-        .px(px(12.))
-        .py(px(8.))
+        .px(px(space::MD))
+        .py(px(space::SM))
         .rounded(px(ROW_RADIUS))
         .border_1()
         .border_color(tint(color, 0.4))
         .bg(tint(color, 0.1))
         .text_color(c(color))
-        .text_size(px(13.))
+        .text_size(px(font::BASE))
         .child(message.to_string())
 }
 
@@ -263,10 +310,28 @@ pub fn empty_state(title: &str, text: &str) -> Div {
         .flex()
         .flex_col()
         .items_center()
-        .gap(px(4.))
+        .gap(px(space::XS))
         .py(px(28.))
         .child(strong(title.to_string()))
-        .child(text_dim(text.to_string()).text_size(px(12.)))
+        .child(text_dim(text.to_string()).text_size(px(font::SM)))
+}
+
+// Monospace text in an inset box that scrolls on its own and only hands the wheel to the page at its ends.
+pub fn code_block(key: impl Into<SharedString>, text: impl Into<SharedString>, max_height: f32) -> Div {
+    div()
+        .w_full()
+        .min_w_0()
+        .rounded(px(ROW_RADIUS))
+        .border_1()
+        .border_color(c(BORDER))
+        .bg(c(INPUT))
+        .overflow_hidden()
+        .child(
+            scroll_area(key)
+                .max_h(px(max_height))
+                .p(px(space::MD))
+                .child(mono(text).text_color(c(TEXT))),
+        )
 }
 
 // A drawn switch: the knob sits at the end that matches the state.
@@ -296,7 +361,7 @@ pub fn seg_item(key: ElementId, label: &str, active: bool) -> Stateful<Div> {
         .id(key)
         .px(px(11.))
         .py(px(5.))
-        .text_size(px(12.))
+        .text_size(px(font::SM))
         .font_weight(FontWeight::MEDIUM)
         .cursor_pointer()
         .whitespace_nowrap();
@@ -318,6 +383,46 @@ pub fn seg_row(items: Vec<AnyElement>) -> Div {
         .border_1()
         .border_color(chip_stroke())
         .bg(c(INPUT))
+        .children(items)
+}
+
+// Term-style page tab: a rounded chip that fills when selected.
+pub fn tab_item(key: ElementId, label: &str, active: bool) -> Stateful<Div> {
+    let mut item = div()
+        .id(key)
+        .flex()
+        .items_center()
+        .flex_none()
+        .h(px(layout::CONTROL_H))
+        .px(px(space::MD))
+        .rounded(px(ROW_RADIUS))
+        .border_1()
+        .text_size(px(font::BASE))
+        .font_weight(FontWeight::MEDIUM)
+        .cursor_pointer()
+        .whitespace_nowrap();
+    item = if active {
+        item.bg(chip_fill())
+            .border_color(chip_stroke())
+            .text_color(c(0xffffff))
+    } else {
+        item.border_color(tint(0xffffff, 0.0))
+            .text_color(c(DIM))
+            .hover(|s| s.bg(tint(0xffffff, 0.04)))
+    };
+    item.child(label.to_string())
+}
+
+// The strip of tab_item chips above a tabbed page; wraps rather than clipping on narrow windows.
+pub fn tab_bar(items: Vec<AnyElement>) -> Div {
+    div()
+        .flex()
+        .flex_wrap()
+        .items_center()
+        .gap(px(space::XS))
+        .pb(px(space::SM))
+        .border_b_1()
+        .border_color(c(DIVIDER))
         .children(items)
 }
 
@@ -373,7 +478,7 @@ pub fn table(cols: &[Col], rows: Vec<Vec<AnyElement>>, empty: Option<Div>) -> Di
     let mut head = div()
         .flex()
         .px(px(10.))
-        .py(px(8.))
+        .py(px(space::SM))
         .border_b_1()
         .border_color(c(BORDER))
         .text_size(px(10.))
@@ -382,7 +487,7 @@ pub fn table(cols: &[Col], rows: Vec<Vec<AnyElement>>, empty: Option<Div>) -> Di
     for col in cols {
         head = head.child(cell(col, col.label.to_uppercase().into_any_element()));
     }
-    let mut root = div().flex().flex_col().w_full().child(head);
+    let mut root = div().flex().flex_col().w_full().min_w_0().child(head);
     if rows.is_empty() {
         if let Some(e) = empty {
             root = root.child(e);
@@ -396,7 +501,7 @@ pub fn table(cols: &[Col], rows: Vec<Vec<AnyElement>>, empty: Option<Div>) -> Di
             .min_h(px(34.))
             .px(px(10.))
             .py(px(6.))
-            .text_size(px(13.))
+            .text_size(px(font::BASE))
             .border_b_1()
             .border_color(c(DIVIDER))
             .hover(|s| s.bg(tint(0xffffff, 0.025)));

@@ -1,6 +1,6 @@
-export const MAX_KEYS = 64;
+export const MAX_KEYS = 128;
 export const MAX_VALUE = 4096;
-export const MAX_BYTES = 12 * 1024;
+export const MAX_BYTES = 24 * 1024;
 const NAME_RE = /^[A-Z_][A-Z0-9_]{0,63}$/;
 const DENIED = [
   'LD_PRELOAD', 'LD_LIBRARY_PATH', 'LD_AUDIT', 'NODE_OPTIONS', 'NODE_EXTRA_CA_CERTS', 'HOME', 'PATH', 'TMPDIR', 'SSL_CERT_FILE', 'SSL_CERT_DIR',
@@ -53,7 +53,7 @@ export function buildPatch(pending, existing = [], kind = 'build') {
   const total = Object.keys(set).length + existing.filter((n) => !unset.includes(n) && !(n in set)).length;
   if (total > MAX_KEYS) return { problem: `A site holds at most ${MAX_KEYS} variables.` };
   const size = new TextEncoder().encode(JSON.stringify({ set, unset })).length;
-  if (size > MAX_BYTES) return { problem: 'The change is larger than 12 KiB.' };
+  if (size > MAX_BYTES) return { problem: 'The change is larger than 24 KiB.' };
   return { patch: { set, unset } };
 }
 

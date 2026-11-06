@@ -1255,7 +1255,7 @@ impl DemoNode {
         );
         Ok(NodeInfo {
             name: self.name.clone(),
-            version: if self.index == 0 { "0.4.0" } else { "0.3.1" }.into(),
+            version: if self.index == 0 { "0.4.1" } else { "0.3.1" }.into(),
             // The second node plays a release from before the capability list, so the new cards stay hidden there.
             capabilities: if self.index == 0 {
                 cite_edge::status::CAPABILITIES
@@ -1270,6 +1270,10 @@ impl DemoNode {
                 token_configured: self.index == 0,
                 source: if self.index == 0 { "env" } else { "none" }.into(),
                 api_host: (self.index == 0).then(|| "api.github.com".to_string()),
+            }),
+            doppler: (self.index == 0).then(|| cite_client::DopplerInfo {
+                configured: true,
+                source: "env".into(),
             }),
             extra,
         })
@@ -2888,12 +2892,7 @@ mod tests {
                 .contains("did not pass health checks within 120s")
         );
         assert_eq!(failure.slot, Slot::Green);
-        assert_eq!(banner.commands.len(), 2);
-        assert!(
-            banner.commands[0]
-                .command
-                .contains("cite-docs-green-manager")
-        );
+        assert_eq!(banner.logs_slot, Slot::Green);
         let green = banner
             .slots
             .iter()

@@ -8,13 +8,17 @@ use serde_json::Value;
 use crate::app::{Confirm, Console, Load, View, new_input};
 use crate::certs::zone_newly_enabled;
 use crate::demo::now_ms;
-use crate::diagnose::{Banner, NO_REASON_NOTE, banner, deploy_outcome, failure_text, save_outcome};
+use crate::diagnose::{
+    Banner, NOTE_PREVIEW, banner, deploy_outcome, failure_text, save_outcome, shown_output,
+    slot_lines, split_note,
+};
 use crate::model::{
-    draft_from_site, edit_site, fmt_targets, parse_rfc3339_ms, parse_targets, rel_time,
-    site_change, source_deploy_request,
+    SiteChange, draft_from_site, edit_site, fmt_targets, parse_rfc3339_ms, parse_targets,
+    rel_time, site_change, source_deploy_request,
 };
 use crate::scope::{error_survives, foreign_notice};
-use crate::theme::{CARD_RADIUS, DIM, Tone, c, tint};
+use crate::siteops::{CAP_BUILD_ENV, CAP_LOGS, CAP_RUNTIME_ENV, has_cap, is_busy_phase};
+use crate::theme::{BORDER, CARD_RADIUS, DIM, ROW_RADIUS, SURFACE, Tone, c, tint};
 use crate::ui::certs::{access_body, access_controls};
 use crate::ui::input::TextInput;
 use crate::ui::overview::{action_pill, slot_pill};
@@ -22,14 +26,26 @@ use crate::ui::paths::PathRow;
 use crate::ui::siteform::{Home, SiteFields, basics, domains, health_fields, source_fields};
 use crate::ui::sites::health_tone;
 use crate::ui::widgets::{
-    BtnKind, Col, btn, btn_off, card, dot, empty_state, field, id, mono, notice, page_header, pill,
-    seg_item, seg_row, skeleton, strong, table, text_dim, toggle,
+    BtnKind, Col, btn, btn_off, card, code_block, dot, empty_state, field, form_grid, id, mono,
+    notice, page_header, pill, seg_item, seg_row, skeleton, strong, table, text_dim, toggle,
 };
-use crate::wizard::field_problems;
+use crate::wizard::{FieldProblems, field_problems};
 use crate::zone::{
     CLOUDFLARE_STEPS, NOT_SHOWN_AGAIN, ROTATE_WARNING, ZoneReveal, ZoneStatus, reveal_meta,
     reveal_nodes_elsewhere, reveals_for, rotation_failed, status_text,
 };
+
+// The site page's own parts live beside this file; they are declared here so the page stays one module tree.
+#[path = "doppler.rs"]
+pub(crate) mod doppler;
+#[path = "env.rs"]
+pub(crate) mod env;
+#[path = "logs.rs"]
+pub(crate) mod logs;
+#[path = "tabs.rs"]
+pub(crate) mod tabs;
+
+use self::tabs::{SiteTab, TabMemory, TabOffer, shown_tab, visible_tabs};
 
 // A new zone secret (or why none came) and the outcome of a redeploy, when one was asked for.
 type SaveDone = (
@@ -52,6 +68,8 @@ pub struct State {
     pub note: Entity<TextInput>,
     pub busy: bool,
     pub error: Option<String>,
+    // The slot whose build log explains the error on screen, when it came from a deploy.
+    pub error_slot: Option<Slot>,
     pub maint_enabled: bool,
     pub maint_page: Option<String>,
     // The edit form, built from the same fields as the create wizard.
@@ -61,6 +79,9 @@ pub struct State {
     // The node and site id the form belongs to, so edits never carry over to another site.
     pub edit_for: (String, String),
     pub reveals: Vec<ZoneReveal>,
+    pub tabs: TabMemory,
+    // Keys of the multi-line notes the owner has opened in full.
+    pub open_notes: Vec<&'static str>,
 }
 
 fn edit_fields(c: &mut Console) -> &mut SiteFields {
@@ -87,14 +108,33 @@ impl State {
             note: new_input(cx, "Release notes (optional)", |i| i),
             busy: false,
             error: None,
+            error_slot: None,
             maint_enabled: false,
             maint_page: None,
             edit: SiteFields::new(cx),
             edit_base: None,
             edit_for: (String::new(), String::new()),
             reveals: Vec::new(),
+            tabs: TabMemory::default(),
+            open_notes: Vec::new(),
         }
     }
+}
+
+// Where Open takes the owner: the first host that names one machine, over https.
+pub fn open_url(hosts: &[String]) -> Option<String> {
+    hosts
+        .iter()
+        .map(|h| h.trim())
+        .find(|h| !h.is_empty() && !h.contains('*'))
+        .map(|h| format!("https://{h}"))
+}
+
+// The form as typed, checked, and compared with the stored site.
+struct FormState {
+    problems: FieldProblems,
+    change: SiteChange,
+    blocker: Option<String>,
 }
 
 impl Console {
@@ -103,7 +143,7 @@ impl Console {
         self.detail.data = Load::Loading;
         // An action's error must still be on screen after the reload that follows it, so it is cleared only for another site.
         if !error_survives(&self.detail.node, &self.detail.site_id, &node, &site_id) {
-            self.detail.error = None;
+            self.clear_error();
         }
         self.detail.node = node.clone();
         self.detail.site_id = site_id.clone();
@@ -139,6 +179,63 @@ impl Console {
         });
     }
 
+    fn fail(&mut self, msg: String, slot: Option<Slot>) {
+        self.detail.error = Some(msg);
+        self.detail.error_slot = slot;
+    }
+
+    fn clear_error(&mut self) {
+        self.detail.error = None;
+        self.detail.error_slot = None;
+    }
+
+    fn tab_offer(&self, data: &Data) -> TabOffer {
+        let source = data.site.source.is_some();
+        // Until the node has said what it offers, a remembered tab stays open instead of jumping to Overview.
+        if !self.ops.loaded {
+            return TabOffer {
+                source,
+                env: true,
+                logs: true,
+            };
+        }
+        let caps = &self.ops.extras.caps;
+        TabOffer {
+            source,
+            env: has_cap(caps, CAP_BUILD_ENV)
+                || has_cap(caps, CAP_RUNTIME_ENV)
+                || self.ops.doppler.offered,
+            logs: has_cap(caps, CAP_LOGS),
+        }
+    }
+
+    pub(crate) fn site_tab(&self) -> SiteTab {
+        let Some(data) = self.detail.data.ready() else {
+            return SiteTab::Overview;
+        };
+        let tabs = visible_tabs(self.tab_offer(data));
+        shown_tab(self.detail.tabs.get(&self.detail.node, &data.site.id), &tabs)
+    }
+
+    pub(crate) fn remember_tab(&mut self, tab: SiteTab) {
+        let Some(site) = self.detail.data.ready().map(|d| d.site.id.clone()) else {
+            return;
+        };
+        let node = self.detail.node.clone();
+        self.detail.tabs.set(&node, &site, tab);
+    }
+
+    pub(crate) fn select_tab(&mut self, tab: SiteTab, cx: &mut Context<Self>) {
+        self.remember_tab(tab);
+        if tab == SiteTab::Logs {
+            self.open_logs(cx);
+        }
+    }
+
+    pub(crate) fn logs_offered(&self, data: &Data) -> bool {
+        data.site.source.is_some() && self.ops.loaded && has_cap(&self.ops.extras.caps, CAP_LOGS)
+    }
+
     // Runs a mutation, then reloads the site so the page always shows the node's own state.
     // If the user has moved to another site or node by the time the node answers, the outcome is a toast naming the place and the page is left alone.
     fn site_action<T, F>(
@@ -146,13 +243,14 @@ impl Console {
         cx: &mut Context<Self>,
         what: &'static str,
         fut: F,
+        logs_slot: Option<Slot>,
         outcome: impl FnOnce(&T) -> Result<String, String> + 'static,
     ) where
         T: Send + 'static,
         F: Future<Output = Result<T, ClientError>> + Send + 'static,
     {
         self.detail.busy = true;
-        self.detail.error = None;
+        self.clear_error();
         self.fetch_origin(cx, fut, move |this, res, here, origin, cx| {
             let result = res.map_err(|e| e.to_string()).and_then(|v| outcome(&v));
             if !here {
@@ -167,7 +265,7 @@ impl Console {
             this.detail.busy = false;
             match result {
                 Ok(msg) => this.say(msg, Tone::Ok),
-                Err(msg) => this.detail.error = Some(msg),
+                Err(msg) => this.fail(msg, logs_slot),
             }
             this.reload_detail(cx);
             cx.notify();
@@ -186,7 +284,7 @@ impl Console {
         };
         let target = site.active.other();
         let fut = async move { h.switch(&site.id, target).await };
-        self.site_action(cx, "Switch", fut, move |_| {
+        self.site_action(cx, "Switch", fut, None, move |_| {
             Ok(format!("{} is now active", target.as_str()))
         });
     }
@@ -196,7 +294,7 @@ impl Console {
             return;
         };
         let fut = async move { h.rollback(&site.id).await };
-        self.site_action(cx, "Rollback", fut, |_| Ok("Rolled back".into()));
+        self.site_action(cx, "Rollback", fut, None, |_| Ok("Rolled back".into()));
     }
 
     // Deploy waits on health checks, so the busy notice stays up until the node answers.
@@ -213,17 +311,19 @@ impl Console {
             match parse_targets(self.detail.targets.read(cx).text()) {
                 Ok(t) if !t.is_empty() => DeployRequest { targets: t, note },
                 Ok(_) => {
-                    self.detail.error = Some("Add at least one target to deploy.".into());
+                    self.fail("Add at least one target to deploy.".into(), None);
                     return;
                 }
                 Err(e) => {
-                    self.detail.error = Some(e);
+                    self.fail(e, None);
                     return;
                 }
             }
         };
+        let idle = site.active.other();
+        let logs_slot = site.source.is_some().then_some(idle);
         let fut = async move { h.deploy(&site.id, &req).await };
-        self.site_action(cx, "Deploy", fut, deploy_outcome);
+        self.site_action(cx, "Deploy", fut, logs_slot, deploy_outcome);
     }
 
     // The form follows the node: it is refilled after every load unless the owner has unsaved edits in it.
@@ -251,7 +351,7 @@ impl Console {
             self.detail.edit.load(&draft_from_site(&site), cx);
             self.detail.edit_base = Some(site);
         }
-        self.detail.error = None;
+        self.clear_error();
     }
 
     // Saves the whole form through the normal site update; with redeploy it then starts a deploy so a source change takes effect.
@@ -265,7 +365,7 @@ impl Console {
         let edited = match edit_site(&existing, &draft) {
             Ok(s) => s,
             Err(e) => {
-                self.detail.error = Some(e);
+                self.fail(e, None);
                 return;
             }
         };
@@ -277,8 +377,9 @@ impl Console {
         let req = source_deploy_request(
             Some(self.detail.note.read(cx).text().trim().to_string()).filter(|n| !n.is_empty()),
         );
+        let idle = existing.active.other();
         self.detail.busy = true;
-        self.detail.error = None;
+        self.clear_error();
         let fut = async move {
             h.update_site(&edited.id, &edited).await?;
             let reveal = if rotate {
@@ -303,6 +404,11 @@ impl Console {
             move |this, res: Result<SaveDone, ClientError>, here, origin, cx| {
                 const WHAT: &str = "Save site";
                 let saved = res.is_ok();
+                let deploy_slot = match &res {
+                    Ok((_, Some(Ok(d)))) => Some(d.slot),
+                    Ok((_, Some(Err(_)))) => Some(idle),
+                    _ => None,
+                };
                 let (reveal, outcome) = match res {
                     Ok((reveal, deploy)) => (reveal, save_outcome(deploy.as_ref())),
                     Err(e) => (None, Err(e.to_string())),
@@ -332,13 +438,14 @@ impl Console {
                 this.detail.busy = false;
                 match (outcome, warn) {
                     (Ok(t), None) => this.say(t, Tone::Ok),
-                    (Ok(t), Some(w)) => this.detail.error = Some(format!("{t} {w}")),
-                    (Err(t), w) => {
-                        this.detail.error = Some(match w {
+                    (Ok(t), Some(w)) => this.fail(format!("{t} {w}"), None),
+                    (Err(t), w) => this.fail(
+                        match w {
                             Some(w) => format!("{t} {w}"),
                             None => t,
-                        })
-                    }
+                        },
+                        deploy_slot,
+                    ),
                 }
                 this.reload_detail(cx);
                 cx.notify();
@@ -346,61 +453,14 @@ impl Console {
         );
     }
 
-    // Everything the node accepts on a site, from the same fields the create wizard uses.
-    fn edit_cards(&self, data: &Data, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        let f = &self.detail.edit;
-        let draft = f.draft(cx);
+    fn form_state(&self, data: &Data, cx: &mut Context<Self>) -> FormState {
+        let draft = self.detail.edit.draft(cx);
         let problems = field_problems(&draft, false);
-        let mut cards = vec![
-            card(
-                Some("General"),
-                Some("Name, kind and the domains and paths this site answers for"),
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(16.))
-                    .child(basics(f, HOME, &problems, true, cx))
-                    .child(domains(f, HOME, &problems, true, cx)),
-            )
-            .into_any_element(),
-        ];
-        if data.site.source.is_some() {
-            cards.push(
-                card(
-                    Some("Source"),
-                    Some("Where the node builds this site from. Changes take effect on the next deploy."),
-                    source_fields(f, HOME, &problems, cx),
-                )
-                .into_any_element(),
-            );
-            cards.extend(self.build_card(data, cx));
-        }
-        cards.push(
-            card(
-                Some("Health check"),
-                Some("How the node decides a target is ready"),
-                health_fields(f, &problems),
-            )
-            .into_any_element(),
-        );
-        cards.push(self.access_card(data, cx));
-        cards.push(self.save_bar(data, &draft, &problems, cx));
-        cards
-    }
-
-    // One Save for the whole form, with what it will do spelled out under the buttons.
-    fn save_bar(
-        &self,
-        data: &Data,
-        draft: &crate::model::SiteDraft,
-        problems: &crate::wizard::FieldProblems,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let edited = edit_site(&data.site, draft);
+        let edited = edit_site(&data.site, &draft);
         let change = edited
             .as_ref()
             .map(|e| site_change(&data.site, e))
-            .unwrap_or(crate::model::SiteChange {
+            .unwrap_or(SiteChange {
                 dirty: true,
                 needs_redeploy: false,
             });
@@ -408,9 +468,30 @@ impl Console {
             .first()
             .cloned()
             .or_else(|| edited.as_ref().err().cloned());
+        FormState {
+            problems,
+            change,
+            blocker,
+        }
+    }
+
+    // One Save for the whole form, shown at the foot of every tab that holds part of it.
+    fn save_bar(&self, data: &Data, form: &FormState, cx: &mut Context<Self>) -> AnyElement {
+        let change = &form.change;
         let busy = self.detail.busy;
-        let can_save = !busy && change.dirty && blocker.is_none();
-        let save = if can_save {
+        let can_save = !busy && change.dirty && form.blocker.is_none();
+        let mut buttons = div().flex().items_center().gap(px(8.));
+        if change.dirty && !busy {
+            buttons = buttons.child(
+                btn(id("detail", "discard"), "Discard", BtnKind::Plain).on_click(cx.listener(
+                    |this, _, _, cx| {
+                        this.discard_edits(cx);
+                        cx.notify();
+                    },
+                )),
+            );
+        }
+        buttons = buttons.child(if can_save {
             btn(id("detail", "save"), "Save", BtnKind::Primary)
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.do_save(false, cx);
@@ -419,11 +500,9 @@ impl Console {
                 .into_any_element()
         } else {
             btn_off("Save").into_any_element()
-        };
-        let mut row = div().flex().items_center().gap(px(8.)).child(save);
-        let redeploy = data.site.source.is_some() && change.needs_redeploy;
-        if redeploy {
-            row = row.child(if can_save {
+        });
+        if data.site.source.is_some() {
+            buttons = buttons.child(if can_save {
                 btn(
                     id("detail", "save-redeploy"),
                     "Save and redeploy",
@@ -438,30 +517,56 @@ impl Console {
                 btn_off("Save and redeploy").into_any_element()
             });
         }
-        if change.dirty && !busy {
-            row = row.child(pill("Unsaved changes", Tone::Warn)).child(
-                btn(id("detail", "discard"), "Discard changes", BtnKind::Plain).on_click(
-                    cx.listener(|this, _, _, cx| {
-                        this.discard_edits(cx);
-                        cx.notify();
-                    }),
-                ),
-            );
-        }
-        let explain = if data.site.source.is_some() {
-            "Save stores the settings on the node. Routing, health check and access apply at once; a change to the repository, branch, runtime, Node version, poll interval, build settings or resources only takes effect on the next deploy. Save and redeploy stores everything and then builds the branch again. The stored GitHub token is kept."
+        let state = if busy {
+            text_dim("Saving...").text_size(px(12.)).into_any_element()
+        } else if change.dirty {
+            div()
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .child(pill("Unsaved changes", Tone::Warn))
+                .children(
+                    change
+                        .needs_redeploy
+                        .then(|| text_dim("Takes effect on the next deploy").text_size(px(12.))),
+                )
+                .into_any_element()
         } else {
-            "Save stores the settings on the node and they apply to routing at once. To change the targets, deploy new ones below."
+            text_dim("All changes saved").text_size(px(12.)).into_any_element()
         };
-        let mut col = div().flex().flex_col().gap(px(8.)).child(row);
-        if let Some(b) = blocker.filter(|_| change.dirty) {
-            col = col.child(
-                text_dim(b)
+        let mut bar = div()
+            .flex()
+            .flex_col()
+            .gap(px(8.))
+            .px(px(16.))
+            .py(px(12.))
+            .rounded(px(CARD_RADIUS))
+            .border_1()
+            .border_color(c(BORDER))
+            .bg(c(SURFACE))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(12.))
+                    .child(state)
+                    .child(buttons),
+            );
+        if let Some(b) = form.blocker.as_ref().filter(|_| change.dirty) {
+            bar = bar.child(
+                text_dim(b.clone())
                     .text_size(px(12.))
                     .text_color(c(Tone::Bad.color())),
             );
         }
-        card(None, None, col.child(text_dim(explain).text_size(px(12.)))).into_any_element()
+        let explain = if data.site.source.is_some() {
+            "Routing, health check and access apply at once. Repository, build settings and resources take effect on the next deploy; Save and redeploy builds the branch again. The stored GitHub token is kept."
+        } else {
+            "Saved settings apply to routing at once. To change the targets, deploy new ones on the Overview tab."
+        };
+        bar.child(text_dim(explain).text_size(px(11.)))
+            .into_any_element()
     }
 
     // A newer secret for the same node and site replaces the older one, so only the valid value is ever on screen.
@@ -483,7 +588,7 @@ impl Console {
             return;
         };
         self.detail.busy = true;
-        self.detail.error = None;
+        self.clear_error();
         self.fetch_origin(
             cx,
             async move { h.rotate_zone_secret(&site.id).await },
@@ -509,7 +614,7 @@ impl Console {
                         this.keep_reveal(reveal);
                         this.say("Zone secret rotated", Tone::Ok);
                     }
-                    Err(e) => this.detail.error = Some(e.to_string()),
+                    Err(e) => this.fail(e.to_string(), None),
                 }
                 this.reload_detail(cx);
                 cx.notify();
@@ -523,7 +628,7 @@ impl Console {
         };
         let (enabled, page) = (self.detail.maint_enabled, self.detail.maint_page.clone());
         let fut = async move { h.maintenance(&site.id, enabled, page.as_deref()).await };
-        self.site_action(cx, "Maintenance change", fut, move |_| {
+        self.site_action(cx, "Maintenance change", fut, None, move |_| {
             Ok(if enabled {
                 "Maintenance mode enabled".into()
             } else {
@@ -558,7 +663,7 @@ impl Console {
                         this.say(format!("Site {name} deleted"), Tone::Ok);
                         this.navigate(View::Sites, cx);
                     }
-                    Err(e) => this.detail.error = Some(e.to_string()),
+                    Err(e) => this.fail(e.to_string(), None),
                 }
                 cx.notify();
             },
@@ -599,41 +704,73 @@ impl Console {
         }
     }
 
-    fn detail_body(
+    pub(crate) fn view_logs_button(
         &self,
-        data: &Data,
-        back: impl IntoElement,
+        key: &'static str,
+        slot: Slot,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        btn(id("view-logs", key), "View build logs", BtnKind::Plain)
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.show_build_logs(slot, cx);
+                cx.notify();
+            }))
+            .into_any_element()
+    }
+
+    // A node note: the reason on one monospace line, and any build output under it, newest lines first in view and the rest a click away.
+    pub(crate) fn note_block(
+        &self,
+        key: &'static str,
+        note: &str,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let parts = split_note(note);
+        let open = self.detail.open_notes.contains(&key);
+        let mut col = div()
+            .flex()
+            .flex_col()
+            .gap(px(6.))
+            .child(mono(parts.reason.clone()));
+        if parts.output.is_empty() {
+            return col.into_any_element();
+        }
+        let shown = shown_output(&parts.output, open);
+        let hidden = parts.output.len() - shown.len();
+        if hidden > 0 {
+            col = col.child(text_dim(format!("{hidden} earlier lines hidden")).text_size(px(11.)));
+        }
+        let scope = format!("note-{key}-{}-{}", self.detail.node, self.detail.site_id);
+        col = col.child(code_block(scope, shown.join("\n"), 320.));
+        if parts.output.len() > NOTE_PREVIEW {
+            let label = if open {
+                "Show fewer lines".to_string()
+            } else {
+                format!("Show all {} lines", parts.output.len())
+            };
+            col = col.child(div().flex().child(
+                btn(id("note-toggle", key), &label, BtnKind::Plain).on_click(cx.listener(
+                    move |this, _, _, cx| {
+                        let notes = &mut this.detail.open_notes;
+                        if notes.contains(&key) {
+                            notes.retain(|k| *k != key);
+                        } else {
+                            notes.push(key);
+                        }
+                        cx.notify();
+                    },
+                )),
+            ));
+        }
+        col.into_any_element()
+    }
+
+    fn header(&self, data: &Data, back: impl IntoElement, cx: &mut Context<Self>) -> AnyElement {
         let site = &data.site;
         let idle = site.active.other();
-        let busy = self.detail.busy;
-        let switch = btn(
-            id("detail", "switch"),
-            &format!("Switch to {}", idle.as_str()),
-            BtnKind::Primary,
-        )
-        .on_click(cx.listener(move |this, _, _, cx| {
-            let name = this
-                .detail
-                .data
-                .ready()
-                .map(|d| d.site.name.clone())
-                .unwrap_or_default();
-            this.ask(Confirm {
-                title: "Switch active slot".into(),
-                message: format!(
-                    "Send all traffic for {name} to the {} slot now?",
-                    idle.as_str()
-                ),
-                label: "Switch".into(),
-                danger: false,
-                action: Box::new(|this, cx| this.do_switch(cx)),
-            });
-            cx.notify();
-        }));
         let pills = div()
             .flex()
+            .flex_wrap()
             .items_center()
             .gap(px(8.))
             .child(pill(
@@ -657,49 +794,264 @@ impl Console {
             )
             .children(
                 (site.access.tls == TlsMode::Flexible).then(|| pill("Flexible SSL", Tone::Warn)),
+            );
+        let mut health = div().flex().items_center().gap(px(12.));
+        for line in slot_lines(site, data.live.as_ref()) {
+            health = health.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(5.))
+                    .child(dot(line.state.tone()))
+                    .child(
+                        text_dim(format!("{} {}", line.slot.as_str(), line.state.label()))
+                            .text_size(px(11.)),
+                    ),
+            );
+        }
+        let hosts = if site.hosts.is_empty() {
+            "No hosts".to_string()
+        } else {
+            site.hosts.join(", ")
+        };
+        let busy = self.detail.busy
+            || self
+                .ops
+                .extras
+                .status
+                .as_ref()
+                .is_some_and(|s| is_busy_phase(&s.phase));
+        let mut actions = div().flex().items_center().gap(px(8.)).child(back);
+        if let Some(url) = open_url(&site.hosts) {
+            actions = actions.child(btn(id("detail", "open"), "Open", BtnKind::Plain).on_click(
+                cx.listener(move |_, _, _, cx| cx.open_url(&url)),
+            ));
+        }
+        actions = actions.child(
+            btn(
+                id("detail", "switch"),
+                &format!("Switch to {}", idle.as_str()),
+                BtnKind::Plain,
             )
-            .child(mono(format!("{} on {}", site.id, self.detail.node)).text_color(c(DIM)));
-        let header = div()
+            .on_click(cx.listener(move |this, _, _, cx| {
+                let name = this
+                    .detail
+                    .data
+                    .ready()
+                    .map(|d| d.site.name.clone())
+                    .unwrap_or_default();
+                this.ask(Confirm {
+                    title: "Switch active slot".into(),
+                    message: format!(
+                        "Send all traffic for {name} to the {} slot now?",
+                        idle.as_str()
+                    ),
+                    label: "Switch".into(),
+                    danger: false,
+                    action: Box::new(|this, cx| this.do_switch(cx)),
+                });
+                cx.notify();
+            })),
+        );
+        if site.source.is_some() {
+            actions = actions.child(if busy {
+                btn_off("Redeploy").into_any_element()
+            } else {
+                btn(id("detail", "redeploy"), "Redeploy", BtnKind::Primary)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.do_deploy(cx);
+                        cx.notify();
+                    }))
+                    .into_any_element()
+            });
+        }
+        div()
             .flex()
-            .items_center()
+            .items_start()
             .justify_between()
+            .gap(px(16.))
             .child(
                 div()
                     .flex()
                     .flex_col()
                     .gap(px(6.))
+                    .min_w_0()
                     .child(strong(site.name.clone()).text_size(px(22.)))
-                    .child(pills),
+                    .child(mono(hosts).text_color(c(DIM)))
+                    .child(pills)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .items_center()
+                            .gap(px(12.))
+                            .child(health)
+                            .child(
+                                mono(format!("{} on {}", site.id, self.detail.node))
+                                    .text_size(px(11.))
+                                    .text_color(c(DIM)),
+                            ),
+                    ),
             )
-            .child(div().flex().gap(px(8.)).child(back).child(switch));
-        let mut col = div().flex().flex_col().gap(px(16.)).child(header);
-        if busy {
+            .child(actions)
+            .into_any_element()
+    }
+
+    // The error of the last action, compact: the node's words, a way to its build log, and the form stays below.
+    fn error_notice(&self, msg: &str, data: &Data, cx: &mut Context<Self>) -> AnyElement {
+        let red = Tone::Bad.color();
+        let mut actions = div().flex().items_center().gap(px(8.));
+        if let Some(slot) = self.detail.error_slot.filter(|_| self.logs_offered(data)) {
+            actions = actions.child(self.view_logs_button("error", slot, cx));
+        }
+        let text = msg.to_string();
+        actions = actions
+            .child(
+                btn(id("detail", "error-copy"), "Copy", BtnKind::Plain).on_click(cx.listener(
+                    move |this, _, _, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+                        this.say("Copied", Tone::Ok);
+                        cx.notify();
+                    },
+                )),
+            )
+            .child(
+                btn(id("detail", "error-dismiss"), "Dismiss", BtnKind::Plain).on_click(
+                    cx.listener(|this, _, _, cx| {
+                        this.clear_error();
+                        cx.notify();
+                    }),
+                ),
+            );
+        div()
+            .flex()
+            .items_start()
+            .gap(px(12.))
+            .px(px(12.))
+            .py(px(10.))
+            .rounded(px(ROW_RADIUS))
+            .border_1()
+            .border_color(tint(red, 0.5))
+            .bg(tint(red, 0.08))
+            .text_color(c(red))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .child(self.note_block("error-note", msg, cx)),
+            )
+            .child(actions)
+            .into_any_element()
+    }
+
+    fn detail_body(
+        &self,
+        data: &Data,
+        back: impl IntoElement,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let site = &data.site;
+        let source = site.source.is_some();
+        let form = self.form_state(data, cx);
+        let tabs = visible_tabs(self.tab_offer(data));
+        let tab = shown_tab(self.detail.tabs.get(&self.detail.node, &site.id), &tabs);
+        let mut col = div()
+            .flex()
+            .flex_col()
+            .gap(px(16.))
+            .child(self.header(data, back, cx));
+        if self.detail.busy {
             col = col.child(notice("Working on the node...", Tone::Info));
         }
         if let Some(err) = &self.detail.error {
-            col = col.child(notice(err, Tone::Bad));
+            col = col.child(self.error_notice(err, data, cx));
         }
-        if let Some(found) = banner(site, data.live.as_ref()) {
-            col = col.child(self.failure_banner(&found, cx));
+        if let Some(e) = &self.ops.error {
+            col = col.child(notice(e, Tone::Bad));
         }
-        col = col.children(self.status_card(data, cx));
         col = col.children(self.rebuild_prompt_card(cx));
         col = col.children(self.reveal_panels(&site.id, cx));
-        col = col
-            .child(
-                div()
-                    .flex()
-                    .gap(px(16.))
-                    .child(self.slot_card(data, Slot::Blue))
-                    .child(self.slot_card(data, Slot::Green)),
-            )
-            .child(self.deploy_card(site, cx))
-            .children(self.edit_cards(data, cx))
-            .children(self.ops_cards(data, cx))
-            .child(self.maintenance_card(data, cx))
-            .child(self.history_card(site, cx))
-            .child(self.danger_card(site, cx));
-        col.into_any_element()
+        col = col.child(self.tab_strip(&tabs, tab, source, form.change.dirty, cx));
+        let mut body: Vec<AnyElement> = Vec::new();
+        match tab {
+            SiteTab::Overview => {
+                if let Some(found) = banner(site, data.live.as_ref()) {
+                    body.push(self.failure_banner(&found, self.logs_offered(data), cx));
+                }
+                body.extend(self.status_card(data, cx));
+                body.push(
+                    div()
+                        .flex()
+                        .gap(px(16.))
+                        .child(self.slot_card(data, Slot::Blue))
+                        .child(self.slot_card(data, Slot::Green))
+                        .into_any_element(),
+                );
+                body.push(self.deploy_card(site, cx));
+                body.extend(self.builds_card(data, cx));
+                body.push(self.history_card(site, cx));
+            }
+            SiteTab::Build => {
+                if source {
+                    body.push(
+                        card(
+                            Some("Source"),
+                            Some("Where the node builds this site from. Changes take effect on the next deploy."),
+                            source_fields(&self.detail.edit, HOME, &form.problems, cx),
+                        )
+                        .into_any_element(),
+                    );
+                    body.extend(self.build_cards(data, cx));
+                }
+                body.push(
+                    card(
+                        Some("Health check"),
+                        Some("How the node decides a target is ready"),
+                        health_fields(&self.detail.edit, &form.problems),
+                    )
+                    .into_any_element(),
+                );
+                body.push(self.save_bar(data, &form, cx));
+            }
+            SiteTab::Environment => body.extend(self.env_tab(data, cx)),
+            SiteTab::Logs => {
+                if self.ops.loaded {
+                    body.push(self.logs_panel(data, cx));
+                } else {
+                    body.push(skeleton(320.).into_any_element());
+                }
+            }
+            SiteTab::Domains => {
+                body.push(
+                    card(
+                        Some("General"),
+                        Some("Name and kind of the site"),
+                        basics(&self.detail.edit, HOME, &form.problems, true, cx),
+                    )
+                    .into_any_element(),
+                );
+                body.push(
+                    card(
+                        Some("Domains and routing"),
+                        Some("The hosts and paths this site answers for"),
+                        domains(&self.detail.edit, HOME, &form.problems, true, cx),
+                    )
+                    .into_any_element(),
+                );
+                body.push(self.save_bar(data, &form, cx));
+            }
+            SiteTab::Access => {
+                body.push(self.access_card(data, cx));
+                body.extend(self.token_card(data, cx));
+                body.push(self.save_bar(data, &form, cx));
+            }
+            SiteTab::Danger => {
+                body.push(self.maintenance_card(data, cx));
+                body.push(self.danger_card(site, cx));
+            }
+        }
+        col.child(div().flex().flex_col().gap(px(16.)).children(body))
+            .into_any_element()
     }
 
     // The live block maps each slot to its targets, joined here by address.
@@ -801,12 +1153,16 @@ impl Console {
         } else {
             "Deploy"
         };
-        let deploy = btn(id("detail", "deploy"), label, BtnKind::Primary).on_click(cx.listener(
-            |this, _, _, cx| {
-                this.do_deploy(cx);
-                cx.notify();
-            },
-        ));
+        let deploy = if self.detail.busy {
+            btn_off(label).into_any_element()
+        } else {
+            btn(id("detail", "deploy"), label, BtnKind::Primary)
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.do_deploy(cx);
+                    cx.notify();
+                }))
+                .into_any_element()
+        };
         if let Some(src) = source {
             let branch = src.branch.clone().unwrap_or_else(|| "main".into());
             return card(
@@ -819,10 +1175,15 @@ impl Console {
                 )),
                 div()
                     .flex()
-                    .flex_col()
+                    .items_end()
                     .gap(px(12.))
-                    .child(field("Note", None, self.detail.note.clone()))
-                    .child(div().flex().child(deploy)),
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(field("Note", None, self.detail.note.clone())),
+                    )
+                    .child(deploy),
             )
             .into_any_element();
         }
@@ -830,12 +1191,15 @@ impl Console {
             .flex()
             .flex_col()
             .gap(px(12.))
-            .child(field(
-                "Targets for the new version",
-                Some(&format!("host:port with an optional weight, separated by commas. Idle slot now holds: {}", if current.is_empty() { "nothing".into() } else { current })),
-                self.detail.targets.clone(),
-            ))
-            .child(field("Note", None, self.detail.note.clone()))
+            .child(form_grid(vec![
+                field(
+                    "Targets for the new version",
+                    Some(&format!("host:port with an optional weight, separated by commas. Idle slot now holds: {}", if current.is_empty() { "nothing".into() } else { current })),
+                    self.detail.targets.clone(),
+                )
+                .into_any_element(),
+                field("Note", None, self.detail.note.clone()).into_any_element(),
+            ]))
             .child(div().flex().child(deploy));
         card(
             Some("Deploy new version"),
@@ -848,127 +1212,66 @@ impl Console {
         .into_any_element()
     }
 
-    // A Copy button that puts the given text on the clipboard.
-    fn copy_button(
-        &self,
-        key: String,
-        label: &str,
-        text: String,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        btn(id("banner-copy", key), label, BtnKind::Plain)
-            .on_click(cx.listener(move |this, _, _, cx| {
-                cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
-                this.say("Copied", Tone::Ok);
-                cx.notify();
-            }))
-            .into_any_element()
-    }
-
-    // Shown first whenever the last deploy failed or the live slot is unhealthy; the node's note is kept whole and copyable.
-    fn failure_banner(&self, b: &Banner, cx: &mut Context<Self>) -> AnyElement {
+    // Shown on Overview whenever the last deploy failed or the live slot is unhealthy; compact, with the node's note kept whole and copyable.
+    fn failure_banner(&self, b: &Banner, logs_ok: bool, cx: &mut Context<Self>) -> AnyElement {
         let red = Tone::Bad.color();
+        let mut head = div()
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .child(
+                div().flex_1().min_w_0().child(
+                    strong(b.headline.clone())
+                        .text_size(px(14.))
+                        .text_color(c(red)),
+                ),
+            );
+        if logs_ok {
+            head = head.child(self.view_logs_button("banner", b.logs_slot, cx));
+        }
+        if let Some(f) = &b.failure {
+            let text = failure_text(f);
+            head = head.child(
+                btn(id("banner-copy", "note"), "Copy", BtnKind::Plain).on_click(cx.listener(
+                    move |this, _, _, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+                        this.say("Copied", Tone::Ok);
+                        cx.notify();
+                    },
+                )),
+            );
+        }
         let mut col = div()
             .flex()
             .flex_col()
-            .gap(px(10.))
+            .gap(px(8.))
             .p(px(14.))
             .rounded(px(CARD_RADIUS))
             .border_1()
             .border_color(tint(red, 0.6))
             .bg(tint(red, 0.08))
-            .child(
-                strong(b.headline.clone())
-                    .text_size(px(15.))
-                    .text_color(c(red)),
-            );
+            .child(head);
         if let Some(f) = &b.failure {
             let when = rel_time(now_ms(), parse_rfc3339_ms(&f.at).unwrap_or(0));
-            col = col.child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(6.))
-                    .child(
-                        text_dim(format!("{when} - the {} slot", f.slot.as_str()))
-                            .text_size(px(12.)),
-                    )
-                    .child(mono(f.note.clone()))
-                    .child(div().flex().child(self.copy_button(
-                        "note".into(),
-                        "Copy the node's note",
-                        failure_text(f),
-                        cx,
-                    ))),
-            );
-        }
-        let mut slots = div().flex().flex_col().gap(px(6.));
-        for line in &b.slots {
-            let mut row = div()
-                .flex()
-                .flex_wrap()
-                .items_center()
-                .gap(px(8.))
-                .child(slot_pill(line.slot))
-                .child(text_dim(format!(
-                    "{}: {}",
-                    if line.active { "active" } else { "idle" },
-                    line.state.label()
-                )));
-            for t in &line.targets {
-                row = row.child(pill(
-                    &format!("{} {}", t.addr, t.status),
-                    health_tone(&t.status),
-                ));
-            }
-            slots = slots.child(row);
-        }
-        col = col
-            .child(slots)
-            .child(text_dim(NO_REASON_NOTE).text_size(px(12.)));
-        if !b.checks.is_empty() {
-            let mut list = div().flex().flex_col().gap(px(4.));
-            for (i, check) in b.checks.iter().enumerate() {
-                list = list.child(text_dim(format!("{}. {check}", i + 1)).text_size(px(12.)));
-            }
             col = col
-                .child(strong("What to check").text_size(px(13.)))
-                .child(list);
+                .child(
+                    text_dim(format!("{when}, {} slot", f.slot.as_str())).text_size(px(12.)),
+                )
+                .child(self.note_block("banner-note", &f.note, cx));
         }
-        for (i, cmd) in b.commands.iter().enumerate() {
-            col = col.child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(4.))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(8.))
-                            .child(strong(format!(
-                                "{} ({} slot)",
-                                cmd.label,
-                                cmd.slot.as_str()
-                            )))
-                            .child(text_dim(cmd.explains).text_size(px(12.))),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(8.))
-                            .child(div().flex_1().child(mono(cmd.command.clone())))
-                            .child(self.copy_button(
-                                format!("cmd-{i}"),
-                                "Copy",
-                                cmd.command.clone(),
-                                cx,
-                            )),
-                    ),
-            );
+        let mut chips = div().flex().flex_wrap().items_center().gap(px(6.));
+        for line in &b.slots {
+            chips = chips.child(pill(
+                &format!(
+                    "{} {}: {}",
+                    line.slot.as_str(),
+                    if line.active { "live" } else { "idle" },
+                    line.state.label()
+                ),
+                line.state.tone(),
+            ));
         }
-        col.into_any_element()
+        col.child(chips).into_any_element()
     }
 
     // Both choices are staged locally and only sent by Save.
@@ -1006,7 +1309,7 @@ impl Console {
         body = body.children(self.bot_trust_block(data));
         card(
             Some("Access"),
-            Some("Saved with the rest of the form. Older nodes reject these fields: if saving fails, update the node."),
+            Some("Saved with the Save bar below. Older nodes reject these fields: if saving fails, update the node."),
             body,
         )
         .into_any_element()
@@ -1233,7 +1536,7 @@ impl Console {
                         .child(if d.note.is_empty() {
                             "-".to_string()
                         } else {
-                            d.note.clone()
+                            split_note(&d.note).reason
                         })
                         .into_any_element(),
                     mono(d.id.clone()).text_color(c(DIM)).into_any_element(),
@@ -1256,14 +1559,14 @@ impl Console {
                     .map(|d| d.site.active.other().as_str())
                     .unwrap_or("previous");
                 this.ask(Confirm {
-                title: "Roll back".into(),
-                message: format!(
-                    "Return traffic to the previous version? The {other} slot becomes active again."
-                ),
-                label: "Roll back".into(),
-                danger: true,
-                action: Box::new(|this, cx| this.do_rollback(cx)),
-            });
+                    title: "Roll back".into(),
+                    message: format!(
+                        "Return traffic to the previous version? The {other} slot becomes active again."
+                    ),
+                    label: "Roll back".into(),
+                    danger: true,
+                    action: Box::new(|this, cx| this.do_rollback(cx)),
+                });
                 cx.notify();
             }),
         );
@@ -1279,7 +1582,7 @@ impl Console {
             .flex()
             .items_center()
             .justify_between()
-            .child(strong("History").text_size(px(14.)))
+            .child(strong("Deployment history").text_size(px(14.)))
             .child(rollback);
         card(
             None,
@@ -1299,14 +1602,14 @@ impl Console {
         let del = btn(id("detail", "delete"), "Delete site", BtnKind::Danger).on_click(
             cx.listener(move |this, _, _, cx| {
                 this.ask(Confirm {
-                title: "Delete site".into(),
-                message: format!(
-                    "This removes {name} and stops routing its hosts. Deployment history is lost."
-                ),
-                label: "Delete site".into(),
-                danger: true,
-                action: Box::new(|this, cx| this.do_delete(cx)),
-            });
+                    title: "Delete site".into(),
+                    message: format!(
+                        "This removes {name} and stops routing its hosts. Deployment history is lost."
+                    ),
+                    label: "Delete site".into(),
+                    danger: true,
+                    action: Box::new(|this, cx| this.do_delete(cx)),
+                });
                 cx.notify();
             }),
         );
@@ -1325,6 +1628,22 @@ impl Console {
                     ),
             )
             .child(del);
-        card(Some("Danger zone"), None, body).into_any_element()
+        card(Some("Delete"), None, body).into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn open_goes_to_the_first_concrete_host() {
+        let hosts = |l: &[&str]| l.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            open_url(&hosts(&["*.example.com", " docs.example.com "])).as_deref(),
+            Some("https://docs.example.com")
+        );
+        assert_eq!(open_url(&hosts(&["*.example.com"])), None);
+        assert_eq!(open_url(&[]), None);
     }
 }

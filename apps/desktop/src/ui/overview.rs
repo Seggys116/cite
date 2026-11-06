@@ -8,11 +8,11 @@ use crate::model::{
     NodeSnapshot, OVERVIEW_WINDOW_MINUTES, aggregate, fmt_int, fmt_num, fmt_pct, fmt_uptime,
     parse_rfc3339_ms, read_info, rel_time,
 };
-use crate::theme::{BORDER, DIM, GREEN, Tone, c};
-use crate::ui::chart::spark;
+use crate::theme::{BORDER, DIM, GREEN, MONO, Tone, c};
+use crate::ui::chart::{STAT_MIN, clip_tip, spark, wide};
 use crate::ui::widgets::{
-    BtnKind, Col, btn, card, empty_state, id, mono, page_header, pill, section_title, skeleton,
-    stat, strong, table, text_dim,
+    BtnKind, Col, btn, card, empty_state, grid, grid_min, id, mono, page_header, pill,
+    section_title, skeleton, stat, table, text_dim,
 };
 
 pub struct DeployRow {
@@ -184,11 +184,8 @@ fn overview_body(data: &Data, cx: &mut Context<Console>) -> AnyElement {
     } else {
         Tone::Muted
     };
-    let stats = div()
-        .flex()
-        .flex_wrap()
-        .gap(px(12.))
-        .child(stat(
+    let tiles = vec![
+        stat(
             "Nodes online",
             format!("{}/{}", t.nodes_online, t.nodes_total),
             if all_up {
@@ -197,50 +194,65 @@ fn overview_body(data: &Data, cx: &mut Context<Console>) -> AnyElement {
                 format!("{} unreachable", t.nodes_total - t.nodes_online)
             },
             if all_up { Tone::Muted } else { Tone::Warn },
-        ))
-        .child(stat(
+        ),
+        stat(
             "Sites",
             fmt_int(t.sites as u64),
             "Across all nodes".into(),
             Tone::Muted,
-        ))
-        .child(stat(
+        ),
+        stat(
             "Requests / min",
             fmt_num(t.req_per_min.round() as u64),
             "Averaged over 15 minutes".into(),
             Tone::Muted,
-        ))
-        .child(stat(
+        ),
+        stat(
             "Error rate",
             fmt_pct(t.error_rate, 2),
             format!("{} 4xx and 5xx responses", fmt_int(t.errors)),
             rate_tone,
-        ))
-        .child(stat(
+        ),
+        stat(
             "Blocked",
             fmt_num(t.blocked),
             "Stopped by the firewall".into(),
             Tone::Muted,
-        ));
-    let mut cards = div().flex().flex_wrap().gap(px(12.));
-    for snap in &data.snaps {
-        cards = cards.child(node_card(snap, cx));
-    }
+        ),
+    ];
+    let stats = grid_min(
+        STAT_MIN,
+        tiles
+            .into_iter()
+            .map(|t| t.min_w_0().h_full().into_any_element())
+            .collect(),
+    );
+    let cards = grid(
+        data.snaps.iter().map(|snap| node_card(snap, cx)).collect(),
+    );
     let rows: Vec<Vec<AnyElement>> = data
         .deploys
         .iter()
-        .map(|d| {
+        .enumerate()
+        .map(|(i, d)| {
             vec![
                 text_dim(rel_time(now_ms(), d.at_ms)).into_any_element(),
-                mono(d.node.clone()).into_any_element(),
-                div().child(d.site.clone()).into_any_element(),
+                clip_tip(id("ov-dep-node", i), d.node.clone())
+                    .font_family(MONO)
+                    .text_size(px(12.))
+                    .into_any_element(),
+                clip_tip(id("ov-dep-site", i), d.site.clone()).into_any_element(),
                 action_pill(d.action),
                 slot_pill(d.slot),
-                text_dim(if d.note.is_empty() {
-                    "-".into()
-                } else {
-                    d.note.clone()
-                })
+                clip_tip(
+                    id("ov-dep-note", i),
+                    if d.note.is_empty() {
+                        "-".to_string()
+                    } else {
+                        d.note.clone()
+                    },
+                )
+                .text_color(c(DIM))
                 .into_any_element(),
             ]
         })
@@ -256,13 +268,17 @@ fn overview_body(data: &Data, cx: &mut Context<Console>) -> AnyElement {
     let recent = card(
         Some("Recent deployments"),
         Some("Latest activity across nodes"),
-        table(
-            &cols,
-            rows,
-            Some(empty_state(
-                "No deployments yet",
-                "Deploys, switches and rollbacks are listed here.",
-            )),
+        wide(
+            id("ov", "deploys"),
+            620.,
+            table(
+                &cols,
+                rows,
+                Some(empty_state(
+                    "No deployments yet",
+                    "Deploys, switches and rollbacks are listed here.",
+                )),
+            ),
         ),
     );
     div()
@@ -293,11 +309,17 @@ fn node_card(snap: &NodeSnapshot, cx: &mut Context<Console>) -> AnyElement {
         .flex()
         .items_center()
         .justify_between()
+        .gap(px(12.))
         .child(
             div()
                 .flex()
                 .flex_col()
-                .child(strong(snap.name.clone()))
+                .flex_1()
+                .min_w_0()
+                .child(
+                    clip_tip(id("ov-node-name", &name), snap.name.clone())
+                        .font_weight(gpui::FontWeight::SEMIBOLD),
+                )
                 .child(mono(version).text_color(c(DIM))),
         )
         .child(pill(label, tone));
@@ -327,7 +349,9 @@ fn node_card(snap: &NodeSnapshot, cx: &mut Context<Console>) -> AnyElement {
             .child(
                 div()
                     .flex()
-                    .gap(px(22.))
+                    .flex_wrap()
+                    .gap_x(px(22.))
+                    .gap_y(px(10.))
                     .child(metric(
                         "Uptime",
                         mono(fmt_uptime(snap.uptime_secs)).into_any_element(),
@@ -351,6 +375,8 @@ fn node_card(snap: &NodeSnapshot, cx: &mut Context<Console>) -> AnyElement {
         } else {
             snap.error.clone()
         })
+        .text_size(px(12.))
+        .min_w_0()
         .into_any_element()
     };
     let open = btn(id("open-sites", &name), "Open sites", BtnKind::Plain).on_click(cx.listener(
@@ -363,7 +389,9 @@ fn node_card(snap: &NodeSnapshot, cx: &mut Context<Console>) -> AnyElement {
         .flex()
         .flex_col()
         .gap(px(12.))
-        .w(px(358.))
+        .w_full()
+        .h_full()
+        .min_w_0()
         .p(px(16.))
         .rounded(px(crate::theme::CARD_RADIUS))
         .border_1()

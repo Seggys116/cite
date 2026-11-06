@@ -20,7 +20,7 @@ const MAX_TAIL: u32 = 1000;
 const MAX_CURSOR_BYTES: usize = 256;
 const DEFAULT_API_HOST: &str = "api.github.com";
 // Capability names containing these need the orchestrator; certificate, alert and status ones do not.
-const ORCHESTRATED: [&str; 4] = ["logs", "token", "env", "build"];
+const ORCHESTRATED: [&str; 5] = ["logs", "token", "env", "build", "doppler"];
 
 pub(super) fn capabilities(orchestrated: bool) -> Vec<String> {
     CAPABILITIES

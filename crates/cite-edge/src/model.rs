@@ -233,6 +233,20 @@ pub struct Source {
     pub build_memory_mb: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_cpus: Option<Cpus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doppler: Option<DopplerBinding>,
+}
+
+/// A Doppler project and config whose secrets feed the build and/or runtime variables of a site.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DopplerBinding {
+    pub project: String,
+    pub config: String,
+    #[serde(default)]
+    pub build: bool,
+    #[serde(default)]
+    pub runtime: bool,
 }
 
 // A plain f32 would stop Source, Site and EdgeConfig from deriving Eq; comparing bits keeps them hashable-equal and the JSON is still a number.

@@ -3,7 +3,7 @@
 
 services:
   dockerproxy:
-    image: ghcr.io/seggys116/cite-dockerproxy:${CITE_VERSION:-0.4.0}
+    image: ghcr.io/seggys116/cite-dockerproxy:${CITE_VERSION:-0.4.1}
     restart: unless-stopped
     init: true
     user: "10001:10001"
@@ -61,6 +61,10 @@ services:
       # Node-wide GitHub token for sites that carry none of their own; empty means not set. The _FILE form needs the file mounted into the connector.
       CITE_GITHUB_TOKEN: ${CITE_GITHUB_TOKEN:-}
       CITE_GITHUB_TOKEN_FILE: ${CITE_GITHUB_TOKEN_FILE:-}
+      # Node-wide Doppler token for sites bound to Doppler without one of their own, and how often bound sites are synced.
+      CITE_DOPPLER_TOKEN: ${CITE_DOPPLER_TOKEN:-}
+      CITE_DOPPLER_TOKEN_FILE: ${CITE_DOPPLER_TOKEN_FILE:-}
+      CITE_DOPPLER_POLL_SECS: ${CITE_DOPPLER_POLL_SECS:-300}
     networks:
       - docker_api
 

@@ -5,6 +5,7 @@ pub mod archive;
 pub mod certificate;
 pub mod client;
 pub mod config;
+pub mod doppler;
 pub mod error;
 pub mod export;
 pub mod firewall;
@@ -35,6 +36,10 @@ pub use client::{
 pub use config::{
     CONFIG_VERSION, ConfigFile, DEFAULT_LISTEN, DashboardConfig, MAX_NODES, NodeConfig,
     is_loopback_host, parse_node_url,
+};
+pub use doppler::{
+    DopplerBindRequest, DopplerBinding, DopplerConfig, DopplerInfo, DopplerProject,
+    MAX_DOPPLER_SLUG_CHARS, MAX_DOPPLER_TOKEN_BYTES, validate_doppler_slug,
 };
 pub use error::{ClientError, ConfigError};
 pub use export::{

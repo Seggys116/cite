@@ -1,6 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Mutex, OnceLock};
 
-use cite_client::{EnvPatch, TokenStatus};
+use cite_client::{
+    DopplerBindRequest, DopplerBinding, DopplerConfig, DopplerInfo, DopplerProject, EnvPatch,
+    TokenStatus,
+};
 use cite_edge::model::{Site, Slot};
 use cite_edge::status::{
     DeployOutcome, LastFailure, LogLine, LogsResponse, ManagerReport, SiteStatus, SlotStatus,
@@ -10,7 +14,13 @@ use serde_json::json;
 use crate::demo::iso;
 
 const DEMO_FAILURE: &str = "green slot did not pass health checks within 60s";
+// The last lines of build output the node appends to a failure note, one per line after the reason.
+const DEMO_BUILD_TAIL: &str = "> docs@1.4.0 start\n> astro preview --port 3000\n[astro] Starting preview server\nError: listen EADDRINUSE: address already in use :::3000\n    at Server.setupListenHandle (node:net:1817:16)\n    at listenInCluster (node:net:1865:12)\nprocess exited with code 1";
 const BASE_LINES: u64 = 120;
+
+fn demo_failure_note() -> String {
+    format!("{DEMO_FAILURE}\n{DEMO_BUILD_TAIL}")
+}
 
 // The docs site is the one whose last build failed, so the status panel has a failure to explain.
 pub fn is_failing(site: &Site) -> bool {
@@ -86,13 +96,13 @@ pub fn status_for(site: &Site, now_ms: i64) -> SiteStatus {
     let failing = is_failing(site);
     SiteStatus {
         phase: if failing { "failed" } else { "idle" }.into(),
-        error: failing.then(|| DEMO_FAILURE.to_string()),
+        error: failing.then(demo_failure_note),
         active: site.active,
         operation: None,
         last_failure: failing.then(|| LastFailure {
             at: iso(now_ms - 8 * 60_000),
             slot: Some(site.active.other()),
-            note: DEMO_FAILURE.into(),
+            note: demo_failure_note(),
         }),
         slots: [Slot::Blue, Slot::Green]
             .into_iter()
@@ -257,6 +267,130 @@ impl DemoOps {
     }
 }
 
+pub fn doppler_info() -> DopplerInfo {
+    DopplerInfo {
+        configured: true,
+        source: "env".into(),
+    }
+}
+
+pub fn doppler_projects() -> Vec<DopplerProject> {
+    [("docs-site", "Docs site"), ("storefront", "Storefront"), ("shared", "Shared")]
+        .into_iter()
+        .map(|(slug, name)| DopplerProject {
+            slug: slug.into(),
+            name: name.into(),
+        })
+        .collect()
+}
+
+pub fn doppler_configs(project: &str) -> Vec<DopplerConfig> {
+    let envs: &[(&str, &str)] = match project {
+        "shared" => &[("prd", "Production")],
+        _ => &[("dev", "Development"), ("stg", "Staging"), ("prd", "Production")],
+    };
+    envs.iter()
+        .map(|(name, environment)| DopplerConfig {
+            name: (*name).into(),
+            environment: (*environment).into(),
+        })
+        .collect()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DemoBinding {
+    project: String,
+    config: String,
+    build: bool,
+    runtime: bool,
+    own_token: bool,
+    synced_at: i64,
+}
+
+// The demo node keeps its bindings for the life of the app, keyed by node and site; tokens are never kept.
+fn bindings() -> &'static Mutex<BTreeMap<(String, String), DemoBinding>> {
+    static STORE: OnceLock<Mutex<BTreeMap<(String, String), DemoBinding>>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+// A pretend variable count that differs per config, so switching config visibly changes it.
+fn demo_keys(project: &str, config: &str) -> u32 {
+    let h = short_hash(&format!("{project}/{config}"));
+    6 + u32::from(h.as_bytes()[0] % 10)
+}
+
+fn render(b: Option<&DemoBinding>) -> DopplerBinding {
+    match b {
+        Some(b) => DopplerBinding {
+            bound: true,
+            project: Some(b.project.clone()),
+            config: Some(b.config.clone()),
+            build: b.build,
+            runtime: b.runtime,
+            token_source: if b.own_token { "site" } else { "node" }.into(),
+            status: "synced".into(),
+            last_sync_at: Some(iso(b.synced_at)),
+            last_error: None,
+            keys: demo_keys(&b.project, &b.config),
+        },
+        None => DopplerBinding {
+            bound: false,
+            project: None,
+            config: None,
+            build: false,
+            runtime: false,
+            token_source: "none".into(),
+            status: "idle".into(),
+            last_sync_at: None,
+            last_error: None,
+            keys: 0,
+        },
+    }
+}
+
+fn store_key(node: &str, site: &str) -> (String, String) {
+    (node.to_string(), site.to_string())
+}
+
+pub fn doppler_binding(node: &str, site: &str) -> DopplerBinding {
+    let store = bindings().lock().unwrap_or_else(|e| e.into_inner());
+    render(store.get(&store_key(node, site)))
+}
+
+pub fn doppler_bind(node: &str, site: &str, req: &DopplerBindRequest, now_ms: i64) -> DopplerBinding {
+    let mut store = bindings().lock().unwrap_or_else(|e| e.into_inner());
+    let own_token = req.token.as_deref().is_some_and(|t| !t.trim().is_empty())
+        || store.get(&store_key(node, site)).is_some_and(|b| b.own_token);
+    let b = DemoBinding {
+        project: req.project.clone(),
+        config: req.config.clone(),
+        build: req.build,
+        runtime: req.runtime,
+        own_token,
+        synced_at: now_ms,
+    };
+    store.insert(store_key(node, site), b.clone());
+    render(Some(&b))
+}
+
+pub fn doppler_clear(node: &str, site: &str) -> DopplerBinding {
+    let mut store = bindings().lock().unwrap_or_else(|e| e.into_inner());
+    store.remove(&store_key(node, site));
+    render(None)
+}
+
+pub fn doppler_sync(node: &str, site: &str, now_ms: i64) -> DopplerBinding {
+    let mut store = bindings().lock().unwrap_or_else(|e| e.into_inner());
+    let found = store.get_mut(&store_key(node, site));
+    match found {
+        Some(b) => {
+            b.synced_at = now_ms;
+            render(Some(&*b))
+        }
+        None => render(None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,7 +430,9 @@ mod tests {
         let st = status_for(&site("docs", true), 1_700_000_000_000);
         assert_eq!(st.phase, "failed");
         assert!(!st.settings_current);
-        assert_eq!(st.error.as_deref(), Some(DEMO_FAILURE));
+        let note = st.error.clone().expect("error");
+        assert!(note.starts_with(DEMO_FAILURE) && note.lines().count() > 3);
+        assert_eq!(crate::diagnose::split_note(&note).reason, DEMO_FAILURE);
         let bad = st
             .slots
             .iter()
@@ -356,6 +492,41 @@ mod tests {
         assert!(exec.lines.iter().all(|l| l.text.starts_with("GET ")));
         assert_eq!(log_total(0), BASE_LINES);
         assert_eq!(log_total(10), BASE_LINES + 5);
+    }
+
+    #[test]
+    fn demo_doppler_binds_syncs_and_clears_per_node_and_site() {
+        let node = "demo-doppler-test";
+        assert!(!doppler_binding(node, "docs").bound);
+        assert!(doppler_info().configured);
+        assert_eq!(doppler_projects().len(), 3);
+        assert_eq!(doppler_configs("shared").len(), 1);
+        assert_eq!(doppler_configs("docs-site")[2].name, "prd");
+        let req = DopplerBindRequest {
+            project: "docs-site".into(),
+            config: "prd".into(),
+            build: true,
+            runtime: false,
+            token: None,
+        };
+        let b = doppler_bind(node, "docs", &req, 1_700_000_000_000);
+        assert!(b.bound && b.build && !b.runtime && b.status == "synced");
+        assert_eq!(b.token_source, "node");
+        assert!(b.keys >= 6);
+        assert!(!doppler_binding(node, "shop").bound);
+        assert!(!doppler_binding("other-node", "docs").bound);
+        let later = doppler_sync(node, "docs", 1_700_000_060_000);
+        assert_eq!(later.last_sync_at, Some(iso(1_700_000_060_000)));
+        let own = DopplerBindRequest {
+            project: "docs-site".into(),
+            config: "prd".into(),
+            build: true,
+            runtime: false,
+            token: Some("dp.st.x".into()),
+        };
+        assert_eq!(doppler_bind(node, "docs", &own, 0).token_source, "site");
+        assert!(!doppler_clear(node, "docs").bound);
+        assert!(!doppler_sync(node, "docs", 0).bound);
     }
 
     #[test]

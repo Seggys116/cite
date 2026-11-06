@@ -20,7 +20,10 @@ use crate::promote::{
     promote, write_action,
 };
 use crate::reconcile::{load_or_init_state, reconcile};
-use crate::report::{BuildEvent, Phase, Progress, ReportParts, build_report, ellipsize};
+use crate::report::{
+    BuildEvent, Phase, Progress, ReportParts, build_report, ellipsize_lines, failure_phase,
+    failure_reason,
+};
 use crate::{ManagerError, Result};
 
 #[derive(Debug, Clone)]
@@ -607,7 +610,8 @@ impl Deployer {
                 if err.to_string().contains("token_invalid") {
                     self.mark_token_invalid(&mut *self.state.lock().await);
                 }
-                self.record_transient_failure(sha, &err.to_string()).await?;
+                self.record_transient_failure(sha, &err.to_string(), "fetch")
+                    .await?;
                 return Err(err);
             }
         };
@@ -618,7 +622,7 @@ impl Deployer {
 
         self.with_progress(|p| p.enter(Phase::Building));
         let observe = |event: BuildEvent| match event {
-            BuildEvent::Detected(detected) => self.with_progress(|p| p.detected = Some(detected)),
+            BuildEvent::Detected(detected) => self.with_progress(|p| p.detected = Some(*detected)),
             BuildEvent::Packing => self.with_progress(|p| p.enter(Phase::Packing)),
         };
         let built = match run_build_observed(
@@ -635,12 +639,18 @@ impl Deployer {
                 if self.shutting_down.load(Ordering::SeqCst) {
                     return Err(err);
                 }
+                let reason = err.to_string();
+                let phase = failure_phase(&reason);
                 if failure.is_transient() {
-                    self.record_transient_failure(sha, &err.to_string()).await?;
+                    self.record_transient_failure(sha, &reason, phase).await?;
                 } else {
                     let mut state = self.state.lock().await;
                     state.last_failed_sha = Some(sha.to_string());
-                    state.last_failed_reason = Some(redactor.redact_line(&err.to_string()));
+                    state.last_failed_reason = Some(ellipsize_lines(
+                        &redactor.redact_line(&reason),
+                        MAX_OUTCOME_REASON,
+                    ));
+                    state.last_failed_phase = Some(phase.to_string());
                     write_state(&self.cfg.state_path(), &state)?;
                 }
                 return Err(err);
@@ -680,7 +690,9 @@ impl Deployer {
                 if fell_back {
                     warn!(%sha, "executor fell back to the previous release");
                     state.last_failed_sha = Some(sha.to_string());
-                    let reason = state.last_failed_reason.clone().unwrap_or_default();
+                    let reason = start_failure_reason(&self.cfg, &redactor);
+                    state.last_failed_reason = Some(reason.clone());
+                    state.last_failed_phase = Some("start".into());
                     state.history.push(DeployRecord {
                         sha: sha.to_string(),
                         release_id: built.release_id.clone(),
@@ -688,6 +700,7 @@ impl Deployer {
                         at: now_rfc3339(),
                         outcome: "fallback".into(),
                         reason,
+                        phase: Some("start".into()),
                     });
                     write_state(&self.cfg.state_path(), &state)?;
                     if let Err(err) = wipe_work(&self.cfg) {
@@ -698,6 +711,7 @@ impl Deployer {
                 state.last_deployed_sha = Some(sha.to_string());
                 state.last_failed_sha = None;
                 state.last_failed_reason = None;
+                state.last_failed_phase = None;
                 state.history.push(DeployRecord {
                     sha: sha.to_string(),
                     release_id: built.release_id.clone(),
@@ -705,6 +719,7 @@ impl Deployer {
                     at: now_rfc3339(),
                     outcome: "live".into(),
                     reason: String::new(),
+                    phase: None,
                 });
                 if state.history.len() > 20 {
                     let drop_n = state.history.len() - 20;
@@ -717,16 +732,19 @@ impl Deployer {
                 Ok(serde_json::json!({"outcome": "live", "sha": sha}))
             }
             Ok(PromoteOutcome::FailedHealth) => {
+                let reason = start_failure_reason(&self.cfg, &redactor);
                 let mut state = self.state.lock().await;
                 state.last_failed_sha = Some(sha.to_string());
-                state.last_failed_reason = Some("health gate failed".into());
+                state.last_failed_reason = Some(reason.clone());
+                state.last_failed_phase = Some("start".into());
                 state.history.push(DeployRecord {
                     sha: sha.to_string(),
                     release_id: built.release_id.clone(),
                     slot: free_slot_guess(&self.cfg),
                     at: now_rfc3339(),
                     outcome: format!("{:?}", Outcome::Failed).to_ascii_lowercase(),
-                    reason: "health gate failed".into(),
+                    reason,
+                    phase: Some("start".into()),
                 });
                 write_state(&self.cfg.state_path(), &state)?;
                 if let Err(err) = wipe_work(&self.cfg) {
@@ -737,7 +755,8 @@ impl Deployer {
             Err(err) => {
                 // Promote errors (evict timeout, executor down) are transient, so last_failed_sha is not set.
                 warn!(%sha, error = %err, "promote failed");
-                self.record_transient_failure(sha, &err.to_string()).await?;
+                self.record_transient_failure(sha, &err.to_string(), "start")
+                    .await?;
                 if let Err(err) = wipe_work(&self.cfg) {
                     warn!(error = %err, "work-dir wipe failed; continuing");
                 }
@@ -788,11 +807,12 @@ impl Deployer {
         let redactor = self.report_redactor();
         let mut state = self.state.lock().await;
         let current_sha = self.progress().sha;
-        let (outcome, sha, reason) = match result {
+        let (outcome, sha, reason, phase) = match result {
             Ok(done) if done["outcome"] == "live" => (
                 DeployResult::Live,
                 done["sha"].as_str().map(str::to_string),
                 String::new(),
+                None,
             ),
             Ok(done) if done["outcome"] == "failed" => {
                 let reason = state
@@ -800,22 +820,38 @@ impl Deployer {
                     .clone()
                     .filter(|reason| !reason.is_empty())
                     .unwrap_or_else(|| "the new release did not become healthy".into());
+                let phase = state
+                    .last_failed_phase
+                    .clone()
+                    .unwrap_or_else(|| "start".into());
                 (
                     DeployResult::Failed,
                     done["sha"].as_str().map(str::to_string),
                     reason,
+                    Some(phase),
                 )
             }
             Ok(_) => return Ok(()),
             Err(_) if self.shutting_down.load(Ordering::SeqCst) => return Ok(()),
-            Err(err) => (DeployResult::Failed, current_sha, err.to_string()),
+            Err(err) => {
+                let reason = err.to_string();
+                let first_line = |text: &str| redactor.redact_line(text.lines().next().unwrap_or(""));
+                let recorded = state.last_failed_reason.as_deref().map(first_line);
+                let phase = state
+                    .last_failed_phase
+                    .clone()
+                    .filter(|_| recorded == Some(first_line(&reason)))
+                    .unwrap_or_else(|| failure_phase(&reason).to_string());
+                (DeployResult::Failed, current_sha, reason, Some(phase))
+            }
         };
-        let reason = ellipsize(&redactor.redact_line(&reason), MAX_OUTCOME_REASON);
+        let reason = ellipsize_lines(&redactor.redact_line(&reason), MAX_OUTCOME_REASON);
         state.last_outcome = Some(DeployOutcome {
             deploy_id: id.to_string(),
             result: outcome,
             sha,
             reason,
+            phase,
             started_at: started_at.to_string(),
             finished_at: now_rfc3339(),
         });
@@ -852,9 +888,15 @@ impl Deployer {
         )
     }
 
-    async fn record_transient_failure(self: &Arc<Self>, _sha: &str, reason: &str) -> Result<()> {
+    async fn record_transient_failure(
+        self: &Arc<Self>,
+        _sha: &str,
+        reason: &str,
+        phase: &str,
+    ) -> Result<()> {
         let mut state = self.state.lock().await;
-        state.last_failed_reason = Some(reason.to_string());
+        state.last_failed_reason = Some(ellipsize_lines(reason, MAX_OUTCOME_REASON));
+        state.last_failed_phase = Some(phase.to_string());
         state.last_failed_attempts = state.last_failed_attempts.saturating_add(1);
         write_state(&self.cfg.state_path(), &state)?;
         Ok(())
@@ -898,6 +940,7 @@ impl Deployer {
             "last_deployed_sha": state.last_deployed_sha,
             "last_failed_sha": state.last_failed_sha,
             "last_failed_reason": state.last_failed_reason,
+            "last_failed_phase": state.last_failed_phase,
             "next_poll_at": state.next_poll_at,
             "history": state.history,
             "desired": desired,
@@ -926,6 +969,48 @@ impl Deployer {
         let next = state.next_poll_at.as_deref().and_then(parse_rfc3339);
         crate::poll::decide_poll(self.cfg.poll, next, now)
     }
+}
+
+/// The executor's reason and the server's last output lines for a release that never became healthy.
+fn start_failure_reason(cfg: &ManagerConfig, redactor: &Redactor) -> String {
+    let result = cite_core::read_status(&cfg.status_path())
+        .ok()
+        .and_then(|status| status.last_result)
+        .filter(|result| result.outcome != Outcome::Live);
+    let Some(result) = result else {
+        return "start failed: the new release did not become healthy".into();
+    };
+    let detail = if result.reason.is_empty() {
+        "the new release did not become healthy"
+    } else {
+        result.reason.as_str()
+    };
+    let lines: Vec<String> = result
+        .log_tail
+        .iter()
+        .map(|line| strip_child_prefix(line).to_string())
+        .filter(|line| line.as_str() != detail)
+        .collect();
+    failure_reason(
+        &format!("start failed: {detail}"),
+        &lines,
+        redactor,
+        MAX_OUTCOME_REASON,
+    )
+}
+
+/// Drops the `[slot/release] out: ` prefix the executor puts on child output lines.
+fn strip_child_prefix(line: &str) -> &str {
+    if line.starts_with('[')
+        && let Some(end) = line.find("] ")
+    {
+        let rest = &line[end + 2..];
+        return rest
+            .strip_prefix("out: ")
+            .or_else(|| rest.strip_prefix("err: "))
+            .unwrap_or(rest);
+    }
+    line
 }
 
 fn free_slot_guess(cfg: &ManagerConfig) -> Slot {
@@ -1186,7 +1271,47 @@ mod tests {
         assert!(outcome.reason.contains("second line"));
         assert!(!outcome.reason.contains("hunter2-build-secret"));
         assert!(outcome.reason.contains("[REDACTED]"));
+        assert_eq!(outcome.phase.as_deref(), Some("install"));
         assert!(!outcome.started_at.is_empty() && !outcome.finished_at.is_empty());
+    }
+
+    #[test]
+    fn start_failures_name_the_executor_reason_and_the_server_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = id_cfg(tmp.path(), ID_ONE);
+        assert_eq!(
+            super::start_failure_reason(&cfg, &cite_core::Redactor::new()),
+            "start failed: the new release did not become healthy"
+        );
+        let mut status = cite_core::ExecutorStatus::initial("t");
+        status.last_result = Some(cite_core::LastResult {
+            generation: 3,
+            outcome: cite_core::Outcome::Failed,
+            reason: "the server process exited with code 1 before it listened on port 3001"
+                .into(),
+            log_tail: vec![
+                "[green/01ARZ3NDEKTSV4RRFFQ69G5FAV] err: Error: Cannot find module 'express'"
+                    .into(),
+                format!(
+                    "[green/01ARZ3NDEKTSV4RRFFQ69G5FAV] out: token ghp_{}",
+                    "A".repeat(36)
+                ),
+                "the server process exited with code 1 before it listened on port 3001".into(),
+            ],
+        });
+        std::fs::create_dir_all(cfg.status_path().parent().unwrap()).unwrap();
+        cite_core::write_status(&cfg.status_path(), &status).unwrap();
+        let reason = super::start_failure_reason(&cfg, &cite_core::Redactor::new());
+        let lines: Vec<&str> = reason.lines().collect();
+        assert_eq!(
+            lines,
+            [
+                "start failed: the server process exited with code 1 before it listened on port 3001",
+                "Error: Cannot find module 'express'",
+                "token [REDACTED]",
+            ]
+        );
+        assert_eq!(crate::report::failure_phase(&reason), "start");
     }
 
     #[tokio::test]

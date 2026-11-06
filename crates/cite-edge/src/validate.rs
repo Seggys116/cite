@@ -430,6 +430,36 @@ pub fn validate_source(src: &crate::model::Source) -> Result<(), ValidationError
             "the forge is set for the whole node by the operator (CITE_STACK_FORGE); a per-site forge is not supported",
         );
     }
+    if let Some(binding) = &src.doppler {
+        validate_doppler_binding(binding)?;
+    }
+    Ok(())
+}
+
+const MAX_DOPPLER_SLUG: usize = 100;
+
+/// A Doppler project or config name: 1 to 100 of letters, digits, '.', '_' and '-'.
+pub fn is_valid_doppler_slug(s: &str) -> bool {
+    (1..=MAX_DOPPLER_SLUG).contains(&s.len())
+        && s.bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'-'))
+}
+
+pub fn validate_doppler_binding(b: &crate::model::DopplerBinding) -> Result<(), ValidationError> {
+    for (field, value) in [("project", &b.project), ("config", &b.config)] {
+        if !is_valid_doppler_slug(value) {
+            return source_error(
+                &format!("doppler {field}"),
+                "must be 1 to 100 characters of letters, digits, '.', '_' and '-'",
+            );
+        }
+    }
+    if !b.build && !b.runtime {
+        return source_error(
+            "doppler",
+            "must feed the build variables, the runtime variables or both",
+        );
+    }
     Ok(())
 }
 

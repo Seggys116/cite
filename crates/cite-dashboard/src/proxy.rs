@@ -8,7 +8,8 @@ use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use cite_client::{
     ClientError, NodeClient, archive_download_name, archive_kind_from_name, export_file_name,
-    validate_archive_name, validate_certificate_id, validate_job_id, validate_site_id,
+    validate_archive_name, validate_certificate_id, validate_doppler_slug, validate_job_id,
+    validate_site_id,
 };
 
 use crate::error::ApiError;
@@ -24,6 +25,8 @@ pub const MAX_TOKEN_BODY: usize = 1024;
 pub const MAX_ENV_BODY: usize = 64 * 1024;
 pub const MAX_ISSUE_BODY: usize = 16 * 1024;
 pub const MAX_ALERTS_BODY: usize = 64 * 1024;
+// A Doppler binding is two names, two flags and an optional token.
+pub const MAX_DOPPLER_BODY: usize = 4 * 1024;
 
 const PREFIX: &str = "/api/v1/nodes/";
 const PROXY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -51,8 +54,9 @@ const ANALYTICS_ROUTES: [&str; 9] = [
 ];
 const ANALYTICS_WRITE_ROUTES: [&str; 3] = ["backup", "cut", "restore"];
 const ARCHIVE_PREFIX: &str = "analytics/archives/";
-const ALLOWED_PREFIXES: [&str; 12] = [
+const ALLOWED_PREFIXES: [&str; 13] = [
     "alerts",
+    "doppler",
     "node",
     "settings",
     "audit",
@@ -175,8 +179,15 @@ fn bulk_route_ok(method: &Method, rest: &str) -> bool {
     segments.next().is_none() && method == Method::POST
 }
 
-// Site status, logs, token and environment routes are exact (method, route) pairs; the other site actions keep prefix-level access.
-const SITE_OPS: [&str; 5] = ["status", "logs", "github-token", "build-env", "runtime-env"];
+// Site status, logs, token, environment and Doppler routes are exact (method, route) pairs; the other site actions keep prefix-level access.
+const SITE_OPS: [&str; 6] = [
+    "status",
+    "logs",
+    "github-token",
+    "build-env",
+    "runtime-env",
+    "doppler",
+];
 
 fn site_ops_action(rest: &str) -> Option<&str> {
     let segments: Vec<&str> = rest.split('/').collect();
@@ -191,18 +202,34 @@ fn site_ops_route_ok(method: &Method, rest: &str) -> bool {
         return true;
     };
     let segments: Vec<&str> = rest.split('/').collect();
-    let [_, id, _] = segments.as_slice() else {
-        return false;
+    let (id, sub) = match segments.as_slice() {
+        [_, id, _] => (*id, None),
+        [_, id, "doppler", "sync"] => (*id, Some("sync")),
+        _ => return false,
     };
     if validate_site_id(id).is_err() {
         return false;
     }
-    match action {
-        "status" | "logs" => method == Method::GET,
-        "github-token" => {
+    match (action, sub) {
+        ("doppler", Some(_)) => method == Method::POST,
+        (_, Some(_)) => false,
+        ("status" | "logs", None) => method == Method::GET,
+        ("github-token" | "doppler", None) => {
             method == Method::GET || method == Method::PUT || method == Method::DELETE
         }
-        _ => method == Method::GET || method == Method::PATCH,
+        (_, None) => method == Method::GET || method == Method::PATCH,
+    }
+}
+
+// The project list and a project's configs are the only node-level Doppler reads.
+fn doppler_route_ok(method: &Method, rest: &str) -> bool {
+    let segments: Vec<&str> = rest.split('/').collect();
+    match segments.as_slice() {
+        ["doppler", ..] if method != Method::GET => false,
+        ["doppler", "projects"] => true,
+        ["doppler", "projects", project, "configs"] => validate_doppler_slug(project).is_ok(),
+        ["doppler", ..] => false,
+        _ => true,
     }
 }
 
@@ -236,7 +263,7 @@ fn is_no_store(rest: &str) -> bool {
         (
             Some("certificates"),
             Some("generate" | "origin-ca" | "acme")
-        ) | (Some("alerts"), _)
+        ) | (Some("alerts" | "doppler"), _)
     )
 }
 
@@ -247,6 +274,7 @@ fn route_ok(method: &Method, rest: &str) -> bool {
         && bulk_route_ok(method, rest)
         && site_ops_route_ok(method, rest)
         && alerts_route_ok(method, rest)
+        && doppler_route_ok(method, rest)
 }
 
 fn body_limit_for(method: &Method, rest: &str) -> usize {
@@ -261,6 +289,8 @@ fn body_limit_for(method: &Method, rest: &str) -> usize {
         ["firewall", "bulk"] if *method == Method::POST => MAX_BULK_BODY,
         ["sites", _, "github-token"] if *method == Method::PUT => MAX_TOKEN_BODY,
         ["sites", _, "build-env" | "runtime-env"] if *method == Method::PATCH => MAX_ENV_BODY,
+        ["sites", _, "doppler"] if *method == Method::PUT => MAX_DOPPLER_BODY,
+        ["sites", _, "doppler", "sync"] => MAX_TOKEN_BODY,
         ["alerts"] if *method == Method::PUT => MAX_ALERTS_BODY,
         ["alerts", "test"] => MAX_TOKEN_BODY,
         _ => MAX_REQUEST_BODY,
@@ -699,6 +729,54 @@ mod tests {
         assert!(is_no_store("sites/shop/status") && is_no_store("sites/shop/github-token"));
         assert!(is_no_store("sites/shop/logs") && is_no_store("certificates/acme"));
         assert!(!is_no_store("sites/shop") && !is_no_store("sites/shop/deploy"));
+    }
+
+    #[test]
+    fn doppler_routes_are_exact_pairs_with_small_bodies() {
+        let yes = [
+            (Method::GET, "doppler/projects"),
+            (Method::GET, "doppler/projects/shop.web/configs"),
+            (Method::GET, "sites/shop/doppler"),
+            (Method::PUT, "sites/shop/doppler"),
+            (Method::DELETE, "sites/shop/doppler"),
+            (Method::POST, "sites/shop/doppler/sync"),
+        ];
+        for (method, rest) in yes {
+            assert!(allowed(rest) && route_ok(&method, rest), "{method} {rest}");
+            assert!(is_no_store(rest), "{rest}");
+        }
+        let long = format!("doppler/projects/{}/configs", "a".repeat(101));
+        let no = [
+            (Method::POST, "doppler/projects"),
+            (Method::DELETE, "doppler/projects"),
+            (Method::GET, "doppler"),
+            (Method::GET, "doppler/other"),
+            (Method::GET, "doppler/projects/shop"),
+            (Method::GET, "doppler/projects/shop/configs/extra"),
+            (Method::PUT, "doppler/projects/shop/configs"),
+            (Method::GET, long.as_str()),
+            (Method::POST, "sites/shop/doppler"),
+            (Method::PATCH, "sites/shop/doppler"),
+            (Method::GET, "sites/shop/doppler/sync"),
+            (Method::PUT, "sites/shop/doppler/sync"),
+            (Method::POST, "sites/shop/doppler/other"),
+            (Method::POST, "sites/shop/doppler/sync/extra"),
+            (Method::POST, "sites/Bad_Id/doppler/sync"),
+            (Method::GET, "sites/Bad_Id/doppler"),
+            (Method::POST, "sites/shop/github-token/sync"),
+        ];
+        for (method, rest) in no {
+            assert!(!route_ok(&method, rest), "{method} {rest}");
+        }
+        assert_eq!(body_limit_for(&Method::PUT, "sites/a/doppler"), 4 * 1024);
+        assert_eq!(
+            body_limit_for(&Method::POST, "sites/a/doppler/sync"),
+            MAX_TOKEN_BODY
+        );
+        assert_eq!(
+            timeout_for(&Method::PUT, "sites/a/doppler"),
+            PROXY_TIMEOUT
+        );
     }
 
     #[test]

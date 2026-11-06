@@ -10,6 +10,40 @@ Precedence: `CITE_PACKAGE_MANAGER`, then the `packageManager` field in `package.
 
 pnpm, Yarn and Corepack caches live on the `cite_cache` volume, so later builds reuse downloads.
 
+Install commands: `npm ci` (`npm install` without a lockfile), `pnpm install --frozen-lockfile`, `yarn install --frozen-lockfile` for Yarn 1 and `yarn install --immutable` for Yarn 2+, `bun install --frozen-lockfile`. Corepack runs the pnpm or Yarn version the `packageManager` field names; pin it when the lockfile comes from an older pnpm or from Yarn 2+, and the detection notes say so when it is missing. A Yarn 2+ SSR site without `nodeLinker: node-modules` installs with `YARN_NODE_LINKER=node-modules`, because the server needs a real `node_modules`.
+
+## Framework detection
+
+The manager reads `package.json` (dependencies, scripts, `main`, `engines.node`, `packageManager`), the lockfiles and the framework config files (`next.config.*`, `nuxt.config.*`, `svelte.config.*`, `astro.config.*`, `vite.config.*`, `remix.config.*`, `react-router.config.*`, `angular.json`). Comments in config files are ignored, and only literal values are read.
+
+| Framework | Rendering | Build output | Start command |
+| --- | --- | --- | --- |
+| Next.js | SSR | the site | `node node_modules/next/dist/bin/next start -H 127.0.0.1` |
+| Next.js, `output: 'standalone'` | SSR | `<distDir>/standalone` | `node server.js` |
+| Next.js, `output: 'export'` | static | `out` | |
+| Nuxt 3 | SSR | `.output` | `node server/index.mjs` |
+| Nuxt `generate` or `ssr: false` | static | `.output/public` | |
+| SvelteKit, adapter-node | SSR | the site | `node build/index.js` |
+| SvelteKit, adapter-static | static | `build` (`pages`) | |
+| Astro | static | `dist` (`outDir`) | |
+| Astro, `@astrojs/node` standalone | SSR | the site | `node dist/server/entry.mjs` |
+| Remix | SSR | the site | `node node_modules/@remix-run/serve/dist/cli.js ./build/server/index.js` |
+| React Router 7 | SSR | the site | `react-router-serve` through node |
+| React Router 7, `ssr: false` | static | `build/client` | |
+| Angular | static | `dist/<project>/browser` | |
+| Angular with `@angular/ssr` | SSR | the site | `node dist/<project>/server/server.mjs` |
+| Vite (React, Vue, Svelte, Solid) | static, SPA fallback | `dist` (`build.outDir`) | |
+| Create React App, Vue CLI | static, SPA fallback | `build`, `dist` | |
+| Docusaurus, Gatsby, Eleventy, VitePress | static | `build`, `public`, `_site`, `.vitepress/dist` | |
+| Express, Fastify, Koa, Nest, Hono and other Node servers | SSR | the site | `scripts.start` (or `start:prod` for Nest, or `main`) as an argv |
+| No framework, no build script | static | the first of `.`, `public`, `dist`, `build` with `index.html` | |
+
+The build runs `<package manager> run build` when the site has a build script, and the framework CLI (for example `pnpm exec next build`) when it does not. Start commands never go through a shell: `npm run x` style scripts are followed to the command they run, `cross-env` and `VAR=value` prefixes are dropped (the dropped names are noted), and a script that needs a shell (`&&`, `|`, `;`, `$`, redirects) is refused with a message asking for `CITE_START_COMMAND`. `npm`, `npx`, `pnpm`, `yarn`, `bunx`, `bun run`, `sh`, `bash` and `env` cannot start a site. `bun <file>` works only with `CITE_RUNTIME=bun`.
+
+The manager reports what it detected, with a `confidence` (`high`, `medium` or `low`) and `notes` that name anything it assumed. When detection is unsure it picks the safer behaviour and says so; when it cannot tell whether a site is static or a server, it asks for `CITE_RENDERING`. After the build, a static release is served from the first of the detected output directories that holds `index.html`, and the report shows the directory it used. For a monorepo, set `CITE_ROOT_DIR` to the app: lockfiles, `packageManager` and `.nvmrc` are also read from the directories above it, and the build user owns the whole checkout so the workspace install can write its `node_modules`. Only the app directory is packed, so a monorepo SSR site needs a self-contained output such as Next.js `output: 'standalone'` or Nuxt's `.output`.
+
+`engines.node` ranges such as `>=18` accept the stack's `CITE_NODE`; `.nvmrc` and `.node-version` must match it.
+
 ## Sites that call external APIs
 
 The executor has no outbound internet by default (`no_egress` network), so a compromised site cannot phone home. SSR code that calls external APIs (for example `fetch("https://api.github.com")`) needs egress:
@@ -66,7 +100,7 @@ To keep data from an existing deployment, declare the old volume instead: `site_
 
 ## Next.js
 
-- `output: 'standalone'` in `next.config.*` runs `.next/standalone/server.js`; otherwise Cite runs `next start` from `node_modules/.bin`, including the shell shim pnpm writes there (the executor has no shell, so Cite runs the script the shim points at with node). Keep `next` in `dependencies`, because SSR builds prune dev dependencies (`CITE_PRUNE=false` turns that off).
+- `output: 'standalone'` in `next.config.*` packs only `<distDir>/standalone` and runs its `server.js`; the build copies `<distDir>/static` and `public` next to the server first, and a monorepo's nested `apps/web/server.js` is found automatically. If the build writes a standalone server without the config saying so literally (for example `output: process.env.X`), Cite still uses it. Otherwise Cite runs `next start` with node from `node_modules/next`, with `-H 127.0.0.1` and the port from `PORT` (a `-p` in `scripts.start` is dropped). Keep `next` in `dependencies`, because SSR builds prune dev dependencies (`CITE_PRUNE=false` turns that off).
 - Every SSR child is bound to loopback (`HOST`, `HOSTNAME` and `NITRO_HOST` are forced to `127.0.0.1`), so the blue and green ports are never reachable from other containers; only the executor's port is.
 - ISR and on-demand revalidation try to write regenerated pages into `.next`, which is read-only in a release, so the site logs `EROFS`/`ENOENT` "Failed to update prerender cache" errors. Pages still serve, and the regenerated copy is kept in memory. To stop the errors, keep the cache in memory with a cache handler:
 

@@ -22,7 +22,7 @@ The three `/tokens` routes need a session token from login. An API token gets 40
 | Route | Response |
 |---|---|
 | `GET /healthz` | `{ok:true}` |
-| `GET /node` | `{name,version,uptime_secs,haproxy:{running,config_hash,last_reload_at,last_reload_ok,last_error},sites,firewall_rules,orchestrator:{enabled,reachable},analytics}` where `analytics` has the fields of `GET /analytics/stats`, or is `null` when the database cannot be read |
+| `GET /node` | `{name,version,uptime_secs,haproxy:{running,config_hash,last_reload_at,last_reload_ok,last_error},sites,firewall_rules,orchestrator:{enabled,reachable},github:{token_configured,source,api_host},doppler:{configured,source},capabilities,analytics}` where `analytics` has the fields of `GET /analytics/stats`, or is `null` when the database cannot be read, and `source` is `env`, `file` or `none` |
 | `POST /haproxy/reload` | `{ok,config_hash,reloaded}` |
 | `GET /haproxy/config` | `text/plain` rendered haproxy.cfg, with zone secrets and secret header values replaced by `<redacted>` |
 | `GET /haproxy/stats` | `{backends:[{name,status,sessions,bytes_in,bytes_out,servers:[{name,status,check}]}]}` |
@@ -63,6 +63,27 @@ Every site, firewall, page and settings change uses the same sequence: validate 
 `switch` and `rollback` start a stopped slot again on the git ref it last ran, not on the site's current branch.
 
 `deploy` writes the targets into the idle slot, waits for every target to pass health checks (up to 60 s, or the build wait of 600 s by default for a site built from a repo), flips the active slot through the HAProxy runtime API, and records a `Deployment`. A failed health check leaves the active slot untouched and records `failed`.
+
+## Doppler
+
+A site built from a repository can take build and runtime variables from a Doppler project and config. How syncing, merging and redeploys work is in [Running a node](node.md#doppler). A node with the orchestrator lists the capability `doppler`.
+
+| Route | Body | Response |
+|---|---|---|
+| `GET /doppler/projects` | none | `[{slug,name}]` the node token can see |
+| `GET /doppler/projects/{project}/configs` | none | `[{name,environment}]` |
+| `GET /sites/{id}/doppler` | none | `DopplerBinding` |
+| `PUT /sites/{id}/doppler` | `{project,config,build,runtime,token?}` | `DopplerBinding` after the first sync |
+| `DELETE /sites/{id}/doppler` | none | `DopplerBinding` (unbound) |
+| `POST /sites/{id}/doppler/sync` | none | `DopplerBinding` after the sync |
+
+`DopplerBinding` is `{bound,project,config,build,runtime,token_source,status,last_sync_at,last_error,keys,redeploy_needed,pending_redeploy,skipped:[{name,reason}]}`. `token_source` is `site`, `node` or `none`; `status` is `synced`, `syncing`, `error` or `idle` (unbound, or not synced since the connector started); `keys` counts the distinct synced names. `last_error` holds the last sync error, otherwise a note naming the skipped variables or saying the synced values wait for a deploy. Values and tokens are never returned.
+
+`project` and `config` are 1 to 100 characters from letters, digits, `.`, `_` and `-`; at least one of `build` and `runtime` must be true; `token` is 1 to 512 printable ASCII characters. Unknown fields are refused and the body is capped at 4 KiB (413 above). The routes answer 400 for a site without a `source`, 404 for an unknown site, and 400 with "No Doppler token: set CITE_DOPPLER_TOKEN on the connector or pass a token for this site" when no token is available. The project routes use the node token only.
+
+`PUT` stores the binding through the normal site update path (with the strict source validation), stores the optional token as the site's own, then syncs once. When that sync fails the error is returned (400 for a rejected token or an unknown project or config, 429 when Doppler rate limits, 503 when it cannot be reached) and the previous binding, token and synced values are put back. A successful bind redeploys the site. `DELETE` removes the binding, the site's Doppler token and the synced values, keeps the manual variables and does not redeploy; the answer has `redeploy_needed: true` while the running site still holds Doppler values. `POST /sites/{id}/doppler/sync` is 400 for an unbound site; it redeploys only when the values changed.
+
+Binding, restoring and removing are audited as `site.doppler.bind` (site, project, config and the two flags), `site.doppler.restore` and `site.doppler.unbind`; a new site token as `site.doppler.token.set`; a requested sync as `site.doppler.sync.request`; and a sync that changed the values as `site.doppler.sync` with the counts. No entry holds a value or a token.
 
 ## Maintenance pages
 

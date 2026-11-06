@@ -37,6 +37,7 @@ mod alerts;
 mod analytics_api;
 mod archives;
 mod certificates;
+mod doppler_api;
 mod export;
 mod handlers;
 mod health;
@@ -74,6 +75,7 @@ pub struct Inner {
     exports: Arc<Semaphore>,
     certs: Arc<CertStore>,
     alerts: Arc<crate::alerts::Alerts>,
+    doppler: Arc<crate::dopplersync::DopplerSync>,
     limiter: StdMutex<LoginLimiter>,
     token_limiter: StdMutex<LoginLimiter>,
     started: Instant,
@@ -95,6 +97,11 @@ impl Inner {
         let certs = Arc::new(CertStore::new(cfg.certs_dir.clone(), cfg.certs_mode));
         let alerts = crate::alerts::Alerts::new(&cfg.data_dir);
         alerts.attach_certs(Arc::clone(&certs));
+        let doppler = crate::dopplersync::DopplerSync::new(
+            Arc::clone(&deployer),
+            cfg.doppler_token.as_ref(),
+            cfg.doppler_poll_secs,
+        );
         Arc::new(Inner {
             cfg,
             store,
@@ -106,6 +113,7 @@ impl Inner {
             exports: Arc::new(Semaphore::new(MAX_EXPORTS)),
             certs,
             alerts,
+            doppler,
             limiter: StdMutex::new(LoginLimiter::new()),
             token_limiter: StdMutex::new(LoginLimiter::new()),
             started: Instant::now(),
@@ -518,6 +526,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/cloudflare/ranges", get(h::cloudflare_ranges))
         .merge(certificates::issue_routes())
         .merge(alerts::routes())
+        .merge(doppler_api::routes())
         .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
     Router::new()
         .merge(public)
@@ -699,6 +708,7 @@ pub async fn run(cfg: ConnectorConfig) -> Result<()> {
         ingest,
     );
     crate::alerts::spawn_watcher(Arc::clone(&state.alerts), Arc::clone(&state.deployer));
+    state.doppler.spawn();
     certificates::spawn_renewals(Arc::clone(&state));
     tokio::select! {
         () = serve(listener, state, acceptor) => {}

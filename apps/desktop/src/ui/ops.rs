@@ -1,12 +1,12 @@
 use std::future::Future;
 
 use cite_client::ClientError;
-use cite_edge::model::{BotPolicy, Slot};
+use cite_edge::model::BotPolicy;
 use cite_edge::status::SiteStatus;
 use gpui::{AnyElement, ClipboardItem, Context, Div, Entity, div, prelude::*, px};
 
 use crate::api::NodeHandle;
-use crate::app::{Confirm, Console, View, new_input};
+use crate::app::{Console, View, new_input};
 use crate::certs::wipe;
 use crate::model::{
     BUILD_RESOURCE_HINT, PACKAGE_MANAGERS, RENDERINGS, RESOURCE_NOTE, SERVE_RESOURCE_HINT,
@@ -14,38 +14,22 @@ use crate::model::{
 use crate::scope::{Sequence, foreign_notice};
 use crate::siteops::{
     CAP_ASYNC_DEPLOY, CAP_BUILD_ENV, CAP_FORGES, CAP_LOGS, CAP_RUNTIME_ENV, CAP_SOURCE_BUILD,
-    CAP_STATUS, CAP_TOKEN, LogBuffer, NodeExtras, STATUS_TICKS, auto_placeholder, bot_trust, clock,
-    detected_value, env_patch, forge_note, has_cap, is_busy_phase, log_query, outcome_rows,
-    phase_label, phase_tone, ref_problem, report_lines, should_poll_logs, slot_rows, status_reason,
-    token_detail, token_summary,
+    CAP_STATUS, CAP_TOKEN, NodeExtras, STATUS_TICKS, auto_placeholder, bot_trust, clock,
+    detected_value, forge_note, has_cap, is_busy_phase, outcome_rows, phase_label, phase_tone,
+    ref_problem, report_lines, should_poll_logs, slot_rows, status_reason, token_detail,
+    token_summary,
 };
 use crate::theme::{CARD_RADIUS, Tone, c, tint};
 use crate::ui::detail::Data;
+use crate::ui::detail::doppler::{DopplerLoad, DopplerState, load_doppler};
+use crate::ui::detail::env::EnvState;
+use crate::ui::detail::logs::LogView;
+use crate::ui::detail::tabs::SiteTab;
 use crate::ui::input::TextInput;
 use crate::ui::widgets::{
-    BtnKind, Col, btn, btn_off, card, empty_state, field, id, mono, notice, pill, seg_item,
-    seg_row, strong, table, text_dim, toggle,
+    BtnKind, Col, btn, btn_off, card, empty_state, field, form_grid, id, mono, notice, pill,
+    seg_item, seg_row, strong, table, text_dim,
 };
-
-// Most rows the log view paints at once; the buffer behind it keeps more.
-const SHOWN_LOG_ROWS: usize = 300;
-
-pub struct EnvEditor {
-    pub name: Entity<TextInput>,
-    pub value: Entity<TextInput>,
-}
-
-pub struct LogView {
-    pub source: &'static str,
-    pub slot: Slot,
-    pub follow: bool,
-    pub in_flight: bool,
-    // Bumped whenever the stream changes, so a late reply for the old stream is dropped.
-    pub generation: u64,
-    pub buf: LogBuffer,
-    pub error: Option<String>,
-    pub search: Entity<TextInput>,
-}
 
 // Everything the site page learns beyond the site itself, for the one site it is showing.
 pub struct OpsState {
@@ -60,16 +44,12 @@ pub struct OpsState {
     pub logs: LogView,
     pub token: Entity<TextInput>,
     pub git_ref: Entity<TextInput>,
-    pub build_env: EnvEditor,
-    pub runtime_env: EnvEditor,
+    pub env: EnvState,
+    pub doppler: DopplerState,
 }
 
 impl OpsState {
     pub fn new(cx: &mut Context<Console>) -> Self {
-        let env = |cx: &mut Context<Console>| EnvEditor {
-            name: new_input(cx, "API_BASE_URL", |i| i.mono()),
-            value: new_input(cx, "Value (never shown again)", |i| i.masked().mono()),
-        };
         Self {
             for_site: (String::new(), String::new()),
             loaded: false,
@@ -79,38 +59,35 @@ impl OpsState {
             rebuild_prompt: false,
             status_in_flight: false,
             seq: Sequence::default(),
-            logs: LogView {
-                source: "manager",
-                slot: Slot::Blue,
-                follow: true,
-                in_flight: false,
-                generation: 0,
-                buf: LogBuffer::default(),
-                error: None,
-                search: new_input(cx, "Search the log", |i| i),
-            },
+            logs: LogView::new(cx),
             token: new_input(cx, "GitHub token for this site", |i| i.masked().mono()),
             git_ref: new_input(cx, "main, a tag or a commit", |i| i.mono()),
-            build_env: env(cx),
-            runtime_env: env(cx),
+            env: EnvState::new(cx),
+            doppler: DopplerState::new(cx),
         }
     }
 }
 
+struct Loaded {
+    extras: NodeExtras,
+    doppler: DopplerLoad,
+}
+
 // Reads what the node offers for one site. Anything a node cannot serve is left out instead of failing the page.
-async fn load_extras(
-    h: NodeHandle,
-    site: String,
-    has_source: bool,
-) -> Result<NodeExtras, ClientError> {
+async fn load_extras(h: NodeHandle, site: String, has_source: bool) -> Result<Loaded, ClientError> {
     let info = h.node_info().await.ok();
     let caps = info
         .as_ref()
         .map(|i| i.capabilities.clone())
         .unwrap_or_default();
-    let api_host = info.and_then(|i| i.github).and_then(|g| g.api_host);
+    let api_host = info
+        .as_ref()
+        .and_then(|i| i.github.as_ref())
+        .and_then(|g| g.api_host.clone());
+    let dp_offered = has_source && h.offers_doppler(&caps);
+    let dp_node = h.doppler_node(info);
     let want = |cap: &str| has_source && has_cap(&caps, cap);
-    let (status, token, build_env, runtime_env, rules) = tokio::join!(
+    let (status, token, build_env, runtime_env, rules, doppler) = tokio::join!(
         async {
             if want(CAP_STATUS) {
                 Some(h.site_status(&site).await)
@@ -140,21 +117,25 @@ async fn load_extras(
             }
         },
         async { h.list_rules().await.ok() },
+        load_doppler(&h, &site, dp_offered, dp_node),
     );
     let (status, status_error) = match status {
         Some(Ok(s)) => (Some(s), None),
         Some(Err(e)) => (None, Some(e.to_string())),
         None => (None, None),
     };
-    Ok(NodeExtras {
-        caps,
-        api_host,
-        status,
-        status_error,
-        token,
-        build_env,
-        runtime_env,
-        rules,
+    Ok(Loaded {
+        extras: NodeExtras {
+            caps,
+            api_host,
+            status,
+            status_error,
+            token,
+            build_env,
+            runtime_env,
+            rules,
+        },
+        doppler,
     })
 }
 
@@ -168,10 +149,19 @@ fn copy_button(key: String, label: &str, text: String, cx: &mut Context<Console>
         .into_any_element()
 }
 
-fn problem_line(text: &str) -> Div {
-    text_dim(text.to_string())
-        .text_size(px(12.))
-        .text_color(c(Tone::Bad.color()))
+// The help under a build field, with what the node detected appended so a long value is never cut.
+pub fn help_with(base: Option<&str>, detected: Option<&str>) -> Option<String> {
+    match (base, detected.filter(|d| !d.is_empty())) {
+        (Some(b), Some(d)) => Some(format!("{b} Detected: {d}.")),
+        (Some(b), None) => Some(b.to_string()),
+        (None, Some(d)) => Some(format!("Detected: {d}.")),
+        (None, None) => None,
+    }
+}
+
+// Two fields side by side that fill their columns and stack on a narrow window.
+fn pair(left: impl IntoElement, right: impl IntoElement) -> Div {
+    form_grid(vec![left.into_any_element(), right.into_any_element()])
 }
 
 impl Console {
@@ -183,24 +173,17 @@ impl Console {
         self.ops.error = None;
         self.ops.rebuild_prompt = false;
         self.ops.status_in_flight = false;
-        self.ops.logs.buf.clear();
-        self.ops.logs.in_flight = false;
-        self.ops.logs.error = None;
-        self.ops.logs.generation += 1;
-        self.ops.logs.follow = true;
-        self.ops.logs.source = "manager";
-        self.ops.logs.slot = Slot::Blue;
+        self.ops.logs.reset();
         for input in [
             self.ops.logs.search.clone(),
             self.ops.token.clone(),
             self.ops.git_ref.clone(),
-            self.ops.build_env.name.clone(),
-            self.ops.build_env.value.clone(),
-            self.ops.runtime_env.name.clone(),
-            self.ops.runtime_env.value.clone(),
         ] {
             input.update(cx, |i, cx| i.set_text("", cx));
         }
+        self.ops.env.build.reset(cx);
+        self.ops.env.runtime.reset(cx);
+        self.ops.doppler.reset(cx);
         self.detail.edit.build.show_detected(None, cx);
     }
 
@@ -228,20 +211,19 @@ impl Console {
                 if this.ops.for_site != key || !this.ops.seq.accept(seq) {
                     return;
                 }
-                let Ok(extras) = res else {
+                let Ok(loaded) = res else {
                     return;
                 };
-                if !this.ops.loaded
-                    && let Some(st) = &extras.status
-                {
-                    this.ops.logs.slot = st.active;
-                }
                 this.detail
                     .edit
                     .build
-                    .show_detected(extras.status.as_ref(), cx);
-                this.ops.extras = extras;
+                    .show_detected(loaded.extras.status.as_ref(), cx);
+                this.ops.extras = loaded.extras;
+                this.ops.doppler.apply(loaded.doppler);
                 this.ops.loaded = true;
+                if this.site_tab() == SiteTab::Logs {
+                    this.open_logs(cx);
+                }
                 cx.notify();
             },
         );
@@ -301,65 +283,12 @@ impl Console {
         );
     }
 
-    pub fn poll_logs(&mut self, cx: &mut Context<Self>) {
-        let View::SiteDetail { node, id: site } = self.view.clone() else {
-            return;
-        };
-        let Some(h) = self.handle_named(&node) else {
-            return;
-        };
-        if self.ops.logs.in_flight {
-            return;
-        }
-        self.ops.logs.in_flight = true;
-        let query = log_query(
-            self.ops.logs.source,
-            self.ops.logs.slot,
-            self.ops.logs.buf.cursor(),
-        );
-        let (key, generation) = ((node, site.clone()), self.ops.logs.generation);
-        self.fetch(
-            cx,
-            async move { h.site_logs(&site, &query).await },
-            move |this, res, cx| {
-                if this.ops.for_site != key || this.ops.logs.generation != generation {
-                    return;
-                }
-                this.ops.logs.in_flight = false;
-                match res {
-                    Ok(reply) => {
-                        this.ops.logs.error = None;
-                        if this.ops.logs.buf.push(reply) > 0 {
-                            cx.notify();
-                        }
-                    }
-                    Err(e) => {
-                        this.ops.logs.error = Some(e.to_string());
-                        cx.notify();
-                    }
-                }
-            },
-        );
-    }
-
-    // Moving to another log stream starts from an empty buffer and its own cursor.
-    fn switch_log_stream(&mut self, source: &'static str, slot: Slot, cx: &mut Context<Self>) {
-        let logs = &mut self.ops.logs;
-        logs.source = source;
-        logs.slot = slot;
-        logs.buf.clear();
-        logs.error = None;
-        logs.in_flight = false;
-        logs.generation += 1;
-        self.poll_logs(cx);
-    }
-
-    // Runs on the half-second tick: follow polling and the status refresh stop whenever the page is not on screen.
+    // Runs on the half-second tick: log polling runs only while the Logs tab is open, and both stop when the page is not on screen.
     pub fn ops_tick(&mut self, cx: &mut Context<Self>) {
         let on_site = matches!(self.view, View::SiteDetail { .. });
         let ready = self.ops.loaded && on_site;
         let caps = &self.ops.extras.caps;
-        let logs_on = ready && has_cap(caps, CAP_LOGS) && self.ops.extras.status.is_some();
+        let logs_on = ready && has_cap(caps, CAP_LOGS) && self.site_tab() == SiteTab::Logs;
         if logs_on
             && should_poll_logs(
                 self.ops.logs.follow,
@@ -383,7 +312,7 @@ impl Console {
     }
 
     // A change on the site page that is not the site itself: the page reloads its extras afterwards.
-    fn ops_action<T, F>(
+    pub(crate) fn ops_action<T, F>(
         &mut self,
         cx: &mut Context<Self>,
         what: &'static str,
@@ -448,63 +377,6 @@ impl Console {
         });
     }
 
-    fn set_env(&mut self, runtime: bool, cx: &mut Context<Self>) {
-        let Some((h, site)) = self.ops_handle() else {
-            return;
-        };
-        let editor = if runtime {
-            &self.ops.runtime_env
-        } else {
-            &self.ops.build_env
-        };
-        let (name_in, value_in) = (editor.name.clone(), editor.value.clone());
-        let name = name_in.read(cx).text().to_string();
-        let mut value = value_in.read(cx).text().to_string();
-        let patch = match env_patch(runtime, &[(name.clone(), value.clone())], &[]) {
-            Ok(p) => p,
-            Err(e) => {
-                wipe(&mut value);
-                self.ops.error = Some(e);
-                return;
-            }
-        };
-        wipe(&mut value);
-        name_in.update(cx, |i, cx| i.set_text("", cx));
-        value_in.update(cx, |i, cx| i.set_text("", cx));
-        let label = if runtime {
-            "Runtime variable"
-        } else {
-            "Build variable"
-        };
-        let key = crate::siteops::env_name(&name);
-        let fut = async move { h.env_patch(&site, runtime, &patch).await };
-        self.ops_action(cx, label, fut, move |_| {
-            format!("{key} saved. It applies on the next redeploy.")
-        });
-    }
-
-    fn remove_env(&mut self, runtime: bool, name: String, cx: &mut Context<Self>) {
-        let Some((h, site)) = self.ops_handle() else {
-            return;
-        };
-        let patch = match env_patch(runtime, &[], std::slice::from_ref(&name)) {
-            Ok(p) => p,
-            Err(e) => {
-                self.ops.error = Some(e);
-                return;
-            }
-        };
-        let label = if runtime {
-            "Runtime variable"
-        } else {
-            "Build variable"
-        };
-        let fut = async move { h.env_patch(&site, runtime, &patch).await };
-        self.ops_action(cx, label, fut, move |_| {
-            format!("{name} removed. It applies on the next redeploy.")
-        });
-    }
-
     fn deploy_ref(&mut self, cx: &mut Context<Self>) {
         let Some((h, site)) = self.ops_handle() else {
             return;
@@ -521,9 +393,14 @@ impl Console {
         });
     }
 
-    // The red box on the status panel: the node's reason, whole and copyable.
-    fn reason_box(&self, reason: String, cx: &mut Context<Self>) -> AnyElement {
+    // The red box on the status panel: the node's reason, whole and copyable, with any build output under it.
+    fn reason_box(&self, reason: String, logs_slot: Option<cite_edge::model::Slot>, cx: &mut Context<Self>) -> AnyElement {
         let red = Tone::Bad.color();
+        let mut actions = div().flex().gap(px(8.));
+        if let Some(slot) = logs_slot {
+            actions = actions.child(self.view_logs_button("status-logs", slot, cx));
+        }
+        actions = actions.child(copy_button("reason".into(), "Copy", reason.clone(), cx));
         div()
             .flex()
             .flex_col()
@@ -533,13 +410,16 @@ impl Console {
             .border_1()
             .border_color(tint(red, 0.6))
             .bg(tint(red, 0.08))
-            .child(strong("The last deploy failed").text_color(c(red)))
-            .child(mono(reason.clone()))
             .child(
                 div()
                     .flex()
-                    .child(copy_button("reason".into(), "Copy the reason", reason, cx)),
+                    .items_center()
+                    .justify_between()
+                    .gap(px(8.))
+                    .child(strong("The last deploy failed").text_color(c(red)))
+                    .child(actions),
             )
+            .child(self.note_block("status-note", &reason, cx))
             .into_any_element()
     }
 
@@ -596,7 +476,12 @@ impl Console {
         });
         let mut col = div().flex().flex_col().gap(px(12.)).child(head);
         if let Some(reason) = status_reason(st) {
-            col = col.child(self.reason_box(reason, cx));
+            let slot = st
+                .last_failure
+                .as_ref()
+                .and_then(|f| f.slot)
+                .filter(|_| self.logs_offered(data));
+            col = col.child(self.reason_box(reason, slot, cx));
         }
         if !st.settings_current {
             col = col.child(
@@ -720,17 +605,18 @@ impl Console {
         div().flex().child(seg_row(items))
     }
 
-    // Build commands, serving mode and resource limits of a source-built site; every blank field is detected or defaulted by the node.
-    pub(super) fn build_card(&self, data: &Data, cx: &mut Context<Self>) -> Option<AnyElement> {
+    // Build commands, serving mode and resource limits of a source-built site, as a two-column grid; every blank field is detected or defaulted by the node.
+    pub(super) fn build_cards(&self, data: &Data, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let ex = &self.ops.extras;
         if data.site.source.is_none() || !has_cap(&ex.caps, CAP_SOURCE_BUILD) {
-            return None;
+            return Vec::new();
         }
         let b = &self.detail.edit.build;
         let st = ex.status.as_ref();
-        let hint = |key: &str| auto_placeholder(st.and_then(|s| detected_value(s, key)).as_deref());
-        let small = |label: &str, help: Option<&str>, input: &Entity<TextInput>| {
-            div().flex_1().child(field(label, help, input.clone()))
+        let found = |key: &str| st.and_then(|s| detected_value(s, key));
+        let text = |label: &str, base: Option<&str>, key: &str, input: &Entity<TextInput>| {
+            let help = help_with(base, found(key).as_deref());
+            field(label, help.as_deref(), input.clone())
         };
         let pm = self.choice_row(
             "build-pm",
@@ -753,97 +639,112 @@ impl Console {
             |this, v| this.detail.edit.build.prune = v,
             cx,
         );
+        let choice_help = |key: &str, base: Option<&str>| {
+            let detected = auto_placeholder(found(key).as_deref());
+            match base {
+                Some(b) => format!("{b} Blank is {detected}."),
+                None => format!("Blank is {detected}."),
+            }
+        };
         let mut body = div()
             .flex()
             .flex_col()
-            .gap(px(12.))
-            .child(
-                div()
-                    .flex()
-                    .gap(px(12.))
-                    .child(small(
-                        "Root directory",
-                        Some("Folder of the project inside the repository."),
-                        &b.root_dir,
-                    ))
-                    .child(small(
-                        "Output directory",
-                        Some("Folder the build writes the site to."),
-                        &b.output_dir,
-                    )),
-            )
-            .child(
-                div()
-                    .flex()
-                    .gap(px(12.))
-                    .child(small("Install command", None, &b.install_command))
-                    .child(small("Build command", None, &b.build_command)),
-            )
-            .child(field(
-                "Package manager",
-                Some(hint("package_manager").as_str()),
-                pm,
+            .gap(px(18.))
+            .child(pair(
+                text(
+                    "Root directory",
+                    Some("Folder of the project inside the repository."),
+                    "root_dir",
+                    &b.root_dir,
+                ),
+                text(
+                    "Output directory",
+                    Some("Folder the build writes the site to."),
+                    "output_dir",
+                    &b.output_dir,
+                ),
             ))
-            .child(field("Rendering", Some(hint("rendering").as_str()), render))
-            .child(
-                div()
-                    .flex()
-                    .gap(px(12.))
-                    .child(small(
-                        "Start command",
-                        Some("Only for server-rendered sites."),
-                        &b.start_command,
-                    ))
-                    .child(small(
-                        "Single-page fallback",
-                        Some("File served for unknown paths, such as index.html."),
-                        &b.spa_fallback,
-                    )),
-            )
-            .child(small("Framework", None, &b.framework))
-            .child(field(
-                "Prune dependencies",
-                Some("Remove development packages after the build."),
-                prune,
+            .child(pair(
+                text("Install command", None, "install_command", &b.install_command),
+                text("Build command", None, "build_command", &b.build_command),
+            ))
+            .child(pair(
+                field(
+                    "Package manager",
+                    Some(choice_help("package_manager", None).as_str()),
+                    pm,
+                ),
+                field(
+                    "Rendering",
+                    Some(choice_help("rendering", None).as_str()),
+                    render,
+                ),
+            ))
+            .child(pair(
+                text(
+                    "Start command",
+                    Some("Only for server-rendered sites."),
+                    "start_command",
+                    &b.start_command,
+                ),
+                text(
+                    "Single-page fallback",
+                    Some("File served for unknown paths, such as index.html."),
+                    "spa_fallback",
+                    &b.spa_fallback,
+                ),
+            ))
+            .child(pair(
+                text("Framework", None, "framework", &b.framework),
+                field(
+                    "Prune dependencies",
+                    Some(
+                        choice_help("prune", Some("Remove development packages after the build."))
+                            .as_str(),
+                    ),
+                    prune,
+                ),
             ));
         if has_cap(&ex.caps, CAP_FORGES)
             && let Some(note) = forge_note(ex.api_host.as_deref())
         {
             body = body.child(text_dim(note).text_size(px(12.)));
         }
-        body = body
-            .child(strong("Resources").text_size(px(13.)))
-            .child(
-                div()
-                    .flex()
-                    .gap(px(12.))
-                    .child(small(
-                        "Serving memory (MiB)",
-                        Some(SERVE_RESOURCE_HINT),
-                        &b.memory_mb,
-                    ))
-                    .child(small("Serving CPUs", None, &b.cpus)),
-            )
-            .child(
-                div()
-                    .flex()
-                    .gap(px(12.))
-                    .child(small(
-                        "Build memory (MiB)",
-                        Some(BUILD_RESOURCE_HINT),
-                        &b.build_memory_mb,
-                    ))
-                    .child(small("Build CPUs", None, &b.build_cpus)),
-            )
+        let resources = div()
+            .flex()
+            .flex_col()
+            .gap(px(18.))
+            .child(pair(
+                field(
+                    "Serving memory (MiB)",
+                    Some(SERVE_RESOURCE_HINT),
+                    b.memory_mb.clone(),
+                ),
+                field("Serving CPUs", None, b.cpus.clone()),
+            ))
+            .child(pair(
+                field(
+                    "Build memory (MiB)",
+                    Some(BUILD_RESOURCE_HINT),
+                    b.build_memory_mb.clone(),
+                ),
+                field("Build CPUs", None, b.build_cpus.clone()),
+            ))
             .child(text_dim(RESOURCE_NOTE).text_size(px(12.)));
-        Some(
+        vec![
             card(
                 Some("Build settings"),
-                Some("Blank fields are detected by the node from your repository. Saved with the form below."),
+                Some("Blank fields are detected by the node from your repository."),
                 body,
             )
             .into_any_element(),
-        )
+            card(
+                Some("Resources"),
+                Some("Memory and CPU limits of the build and serving containers."),
+                resources,
+            )
+            .into_any_element(),
+        ]
     }
 
     pub(super) fn token_card(&self, data: &Data, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -915,236 +816,6 @@ impl Console {
         )
     }
 
-    fn env_card(&self, data: &Data, runtime: bool, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let ex = &self.ops.extras;
-        let cap = if runtime {
-            CAP_RUNTIME_ENV
-        } else {
-            CAP_BUILD_ENV
-        };
-        if data.site.source.is_none() || !has_cap(&ex.caps, cap) {
-            return None;
-        }
-        let names = if runtime {
-            ex.runtime_env.as_ref()?
-        } else {
-            ex.build_env.as_ref()?
-        };
-        let editor = if runtime {
-            &self.ops.runtime_env
-        } else {
-            &self.ops.build_env
-        };
-        let key = if runtime { "runtime-env" } else { "build-env" };
-        let mut list = div().flex().flex_col().gap(px(6.));
-        if names.is_empty() {
-            list = list.child(text_dim("No variables are set.").text_size(px(12.)));
-        }
-        for name in names {
-            let drop_name = name.clone();
-            list =
-                list.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(8.))
-                        .child(div().flex_1().child(mono(name.clone())))
-                        .child(text_dim("value hidden").text_size(px(11.)))
-                        .child(btn(id(key, name), "Remove", BtnKind::Danger).on_click(
-                            cx.listener(move |this, _, _, cx| {
-                                let victim = drop_name.clone();
-                                this.ask(Confirm {
-                                    title: "Remove variable".into(),
-                                    message: format!(
-                                        "Remove {victim}? It stops applying on the next redeploy."
-                                    ),
-                                    label: "Remove".into(),
-                                    danger: true,
-                                    action: Box::new(move |this, cx| {
-                                        this.remove_env(runtime, victim, cx)
-                                    }),
-                                });
-                                cx.notify();
-                            }),
-                        )),
-                );
-        }
-        let ready = !self.ops.busy && !editor.name.read(cx).text().trim().is_empty();
-        let add = if ready {
-            btn(id(key, "set"), "Set variable", BtnKind::Primary)
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.set_env(runtime, cx);
-                    cx.notify();
-                }))
-                .into_any_element()
-        } else {
-            btn_off("Set variable").into_any_element()
-        };
-        let (title, sub) = if runtime {
-            (
-                "Runtime environment",
-                "Variables the running site can read. Values are never shown again.",
-            )
-        } else {
-            (
-                "Build environment",
-                "Variables available while the site builds. Values are never shown again.",
-            )
-        };
-        let body = div()
-            .flex()
-            .flex_col()
-            .gap(px(12.))
-            .child(list)
-            .child(
-                div()
-                    .flex()
-                    .gap(px(12.))
-                    .child(div().flex_1().child(field(
-                        "Name",
-                        Some("Upper case letters, digits and _"),
-                        editor.name.clone(),
-                    )))
-                    .child(
-                        div()
-                            .flex_1()
-                            .child(field("Value", None, editor.value.clone())),
-                    ),
-            )
-            .child(div().flex().child(add))
-            .child(text_dim("Changes apply on the next redeploy.").text_size(px(12.)));
-        Some(card(Some(title), Some(sub), body).into_any_element())
-    }
-
-    pub(super) fn logs_card(&self, data: &Data, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let ex = &self.ops.extras;
-        if data.site.source.is_none() || !has_cap(&ex.caps, CAP_LOGS) || ex.status.is_none() {
-            return None;
-        }
-        let logs = &self.ops.logs;
-        let mut sources = Vec::new();
-        for source in ["manager", "executor"] {
-            sources.push(
-                seg_item(id("logs-source", source), source, logs.source == source)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        let slot = this.ops.logs.slot;
-                        this.switch_log_stream(source, slot, cx);
-                        cx.notify();
-                    }))
-                    .into_any_element(),
-            );
-        }
-        let mut slots = Vec::new();
-        for slot in [Slot::Blue, Slot::Green] {
-            slots.push(
-                seg_item(
-                    id("logs-slot", slot.as_str()),
-                    slot.as_str(),
-                    logs.slot == slot,
-                )
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    let source = this.ops.logs.source;
-                    this.switch_log_stream(source, slot, cx);
-                    cx.notify();
-                }))
-                .into_any_element(),
-            );
-        }
-        let needle = logs.search.read(cx).text().to_string();
-        let matching = logs.buf.matching(&needle);
-        let total = matching.len();
-        let mut lines = div().flex().flex_col().gap(px(1.));
-        for row in matching.iter().rev().take(SHOWN_LOG_ROWS) {
-            lines = lines.child(
-                div()
-                    .flex()
-                    .gap(px(8.))
-                    .child(
-                        text_dim(clock(&row.ts))
-                            .text_size(px(11.))
-                            .w(px(60.))
-                            .flex_none(),
-                    )
-                    .child(
-                        mono(row.text.clone())
-                            .text_color(c(row.level.tone().color()))
-                            .flex_1()
-                            .min_w_0(),
-                    ),
-            );
-        }
-        if total == 0 {
-            lines = lines.child(text_dim("No log lines yet.").text_size(px(12.)));
-        }
-        let follow =
-            toggle(id("logs", "follow"), logs.follow).on_click(cx.listener(|this, _, _, cx| {
-                this.ops.logs.follow = !this.ops.logs.follow;
-                cx.notify();
-            }));
-        let refresh = btn(id("logs", "refresh"), "Refresh now", BtnKind::Plain).on_click(
-            cx.listener(|this, _, _, cx| {
-                this.poll_logs(cx);
-                cx.notify();
-            }),
-        );
-        let copy = btn(id("logs", "copy"), "Copy", BtnKind::Plain).on_click(cx.listener(
-            |this, _, _, cx| {
-                let needle = this.ops.logs.search.read(cx).text().to_string();
-                let text = this.ops.logs.buf.copy_text(&needle);
-                cx.write_to_clipboard(ClipboardItem::new_string(text));
-                this.say("Copied", Tone::Ok);
-                cx.notify();
-            },
-        ));
-        let mut head = div()
-            .flex()
-            .flex_wrap()
-            .items_center()
-            .gap(px(10.))
-            .child(seg_row(sources))
-            .child(seg_row(slots))
-            .child(follow)
-            .child(text_dim("Follow").text_size(px(12.)))
-            .child(refresh)
-            .child(copy);
-        if needle.trim().is_empty() {
-            head = head.child(text_dim(format!("{total} lines")).text_size(px(11.)));
-        } else {
-            head = head.child(text_dim(format!("{total} matching lines")).text_size(px(11.)));
-        }
-        let mut body = div()
-            .flex()
-            .flex_col()
-            .gap(px(10.))
-            .child(head)
-            .child(div().w(px(320.)).child(logs.search.clone()));
-        if let Some(e) = &logs.error {
-            body = body.child(problem_line(e));
-        }
-        if logs.buf.truncated() {
-            body = body.child(text_dim("Older lines were cut by the node.").text_size(px(12.)));
-        }
-        body = body.child(
-            div()
-                .id("log-lines")
-                .max_h(px(360.))
-                .overflow_y_scroll()
-                .p(px(8.))
-                .rounded(px(CARD_RADIUS))
-                .border_1()
-                .border_color(tint(0xffffff, 0.08))
-                .child(lines),
-        );
-        Some(
-            card(
-                Some("Logs"),
-                Some("Newest lines first. Colour follows the level; the last 5000 lines are kept."),
-                body,
-            )
-            .into_any_element(),
-        )
-    }
-
     // Builds, redeploys and deploying one commit for a source-built site.
     pub(super) fn builds_card(&self, data: &Data, cx: &mut Context<Self>) -> Option<AnyElement> {
         let ex = &self.ops.extras;
@@ -1164,7 +835,9 @@ impl Console {
                     mono(r.slot.as_str()).into_any_element(),
                     pill(&r.result, tone).into_any_element(),
                     mono(r.sha).into_any_element(),
-                    div().child(r.reason).into_any_element(),
+                    div()
+                        .child(crate::diagnose::split_note(&r.reason).reason)
+                        .into_any_element(),
                     text_dim(clock(&r.finished)).into_any_element(),
                 ]
             })
@@ -1201,13 +874,18 @@ impl Console {
             } else {
                 btn_off("Deploy this commit").into_any_element()
             };
-            body = body
-                .child(field(
-                    "Deploy a branch, tag or commit",
-                    Some("Builds this ref into the idle slot without waiting here; watch the status above."),
-                    self.ops.git_ref.clone(),
-                ))
-                .child(div().flex().child(go));
+            body = body.child(
+                div()
+                    .flex()
+                    .items_end()
+                    .gap(px(12.))
+                    .child(div().flex_1().min_w_0().child(field(
+                        "Deploy a branch, tag or commit",
+                        Some("Builds this ref into the idle slot without waiting here; watch the status above."),
+                        self.ops.git_ref.clone(),
+                    )))
+                    .child(div().pb(px(18.)).child(go)),
+            );
         }
         Some(
             card(
@@ -1241,17 +919,24 @@ impl Console {
         }
         Some(col.into_any_element())
     }
+}
 
-    pub(super) fn ops_cards(&self, data: &Data, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        let mut cards = Vec::new();
-        cards.extend(self.token_card(data, cx));
-        cards.extend(self.env_card(data, false, cx));
-        cards.extend(self.env_card(data, true, cx));
-        cards.extend(self.builds_card(data, cx));
-        cards.extend(self.logs_card(data, cx));
-        if let Some(e) = &self.ops.error {
-            cards.insert(0, notice(e, Tone::Bad).into_any_element());
-        }
-        cards
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_help_carries_the_detected_value_whole() {
+        let long = "pnpm install --frozen-lockfile --prefer-offline";
+        assert_eq!(
+            help_with(Some("Folder of the project."), Some(".")).as_deref(),
+            Some("Folder of the project. Detected: .."),
+        );
+        assert_eq!(
+            help_with(None, Some(long)),
+            Some(format!("Detected: {long}."))
+        );
+        assert_eq!(help_with(Some("Base."), Some("")).as_deref(), Some("Base."));
+        assert_eq!(help_with(None, None), None);
     }
 }

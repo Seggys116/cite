@@ -1987,6 +1987,7 @@ mod tests {
             version: "1".into(),
             capabilities: Vec::new(),
             github: None,
+            doppler: None,
             extra,
         };
         assert_eq!(
@@ -2003,6 +2004,7 @@ mod tests {
             version: String::new(),
             capabilities: Vec::new(),
             github: None,
+            doppler: None,
             extra: Default::default(),
         };
         assert_eq!(read_info(&bare), InfoView::default());

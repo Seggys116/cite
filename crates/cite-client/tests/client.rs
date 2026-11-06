@@ -10,7 +10,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use cite_client::{
     AnalyticsQuery, ArchiveKind, BlockedFilter, CertificateUpload, ClientError, CutRequest,
-    EnvPatch, ExportFormat, ExportKind, ExportQuery, FirewallBulk, GithubTokenBody, LogsQuery,
+    DopplerBindRequest, EnvPatch, ExportFormat, ExportKind, ExportQuery, FirewallBulk, GithubTokenBody, LogsQuery,
     MAX_PEM_BYTES, NodeClient, NodeConfig, NodeTargets, ReplicationMode, ReplicationPlan,
     RequestCursor, TopSort, apply_site_to_nodes, fan_out,
 };
@@ -101,7 +101,8 @@ async fn node(State(s): State<Shared>, headers: HeaderMap) -> Response {
         "haproxy": { "running": true },
         "sites": 0,
         "firewall_rules": 0,
-        "github": { "token_configured": true, "source": "env" }
+        "github": { "token_configured": true, "source": "env" },
+        "doppler": { "configured": true, "source": "file" }
     }))
     .into_response()
 }
@@ -630,6 +631,60 @@ async fn status_route(
     Json(json!({ "phase": "idle", "query": query })).into_response()
 }
 
+fn doppler_view(bound: bool) -> Value {
+    json!({
+        "bound": bound, "project": bound.then_some("shop"), "config": bound.then_some("prd"),
+        "build": bound, "runtime": false, "token_source": "site", "status": "synced",
+        "last_sync_at": "2026-11-06T10:00:00Z", "last_error": null, "keys": 2,
+        "redeploy_needed": true, "skipped": []
+    })
+}
+
+async fn doppler_projects_route(State(s): State<Shared>, headers: HeaderMap) -> Response {
+    if let Err(resp) = check(&s, &headers) {
+        return resp;
+    }
+    Json(json!([{ "slug": "shop", "name": "Shop" }, { "slug": "api" }])).into_response()
+}
+
+async fn doppler_configs_route(
+    State(s): State<Shared>,
+    headers: HeaderMap,
+    Path(project): Path<String>,
+) -> Response {
+    if let Err(resp) = check(&s, &headers) {
+        return resp;
+    }
+    *s.last_query.lock().expect("lock") = Some(project);
+    Json(json!([{ "name": "prd", "environment": "production" }])).into_response()
+}
+
+async fn doppler_site_get(State(s): State<Shared>, headers: HeaderMap) -> Response {
+    if let Err(resp) = check(&s, &headers) {
+        return resp;
+    }
+    Json(doppler_view(true)).into_response()
+}
+
+async fn doppler_site_put(
+    State(s): State<Shared>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if let Err(resp) = check(&s, &headers) {
+        return resp;
+    }
+    s.created_bodies.lock().expect("lock").push(body);
+    Json(doppler_view(true)).into_response()
+}
+
+async fn doppler_site_delete(State(s): State<Shared>, headers: HeaderMap) -> Response {
+    if let Err(resp) = check(&s, &headers) {
+        return resp;
+    }
+    Json(doppler_view(false)).into_response()
+}
+
 async fn haproxy_config() -> Response {
     ([(header::CONTENT_TYPE, "text/plain")], "global\n  daemon\n").into_response()
 }
@@ -694,6 +749,18 @@ async fn spawn(state: Shared) -> String {
             "/api/v1/sites/{id}/build-env",
             axum::routing::patch(env_route),
         )
+        .route("/api/v1/doppler/projects", get(doppler_projects_route))
+        .route(
+            "/api/v1/doppler/projects/{project}/configs",
+            get(doppler_configs_route),
+        )
+        .route(
+            "/api/v1/sites/{id}/doppler",
+            get(doppler_site_get)
+                .put(doppler_site_put)
+                .delete(doppler_site_delete),
+        )
+        .route("/api/v1/sites/{id}/doppler/sync", post(doppler_site_get))
         .route("/api/v1/sites/{id}/status", get(status_route))
         .route("/api/v1/sites/{id}/logs", get(status_route))
         .route("/api/v1/cloudflare/ranges", get(cloudflare_ranges))
@@ -770,6 +837,10 @@ async fn node_info_sends_the_bearer_token_and_decodes() {
     assert!(github.token_configured);
     assert_eq!(github.source, "env");
     assert!(!info.extra.contains_key("github"));
+    let doppler = info.doppler.expect("doppler status");
+    assert!(doppler.configured);
+    assert_eq!(doppler.source, "file");
+    assert!(!info.extra.contains_key("doppler"));
     let seen = state.seen_auth.lock().expect("lock");
     assert_eq!(seen.as_slice(), [Some("Bearer cite_good".to_string())]);
 }
@@ -780,6 +851,7 @@ fn node_info_decodes_with_and_without_the_github_status() {
         serde_json::from_value(json!({ "name": "n", "version": "1.0.0", "sites": 2 }))
             .expect("old node");
     assert!(old.github.is_none());
+    assert!(old.doppler.is_none());
     assert_eq!(old.extra["sites"], 2);
     let none: cite_client::NodeInfo = serde_json::from_value(
         json!({ "name": "n", "version": "1", "github": { "token_configured": false, "source": "none" } }),
@@ -1516,6 +1588,78 @@ async fn site_token_and_env_calls_send_the_documented_bodies() {
     let bodies = state.created_bodies.lock().expect("lock").clone();
     assert!(bodies[0]["token"] == value.as_str(), "token not sent");
     assert_eq!(bodies[1]["set"]["API_URL"], "https://x.example");
+}
+
+#[tokio::test]
+async fn doppler_calls_send_the_documented_bodies_and_validate_first() {
+    let state = fake("cite_good", 0);
+    let url = spawn(state.clone()).await;
+    let c = client("n1", &url, "cite_good");
+    let projects = c.doppler_projects().await.expect("projects");
+    assert_eq!(projects.len(), 2);
+    assert_eq!((projects[0].slug.as_str(), projects[0].name.as_str()), ("shop", "Shop"));
+    assert_eq!(projects[1].name, "", "a missing name decodes as empty");
+    let configs = c.doppler_configs("shop.web").await.expect("configs");
+    assert_eq!(configs[0].name, "prd");
+    assert_eq!(configs[0].environment, "production");
+    assert_eq!(
+        state.last_query.lock().expect("lock").as_deref(),
+        Some("shop.web")
+    );
+
+    let view = c.site_doppler("shop").await.expect("view");
+    assert!(view.bound && view.build && !view.runtime);
+    assert_eq!((view.keys, view.status.as_str()), (2, "synced"));
+    assert_eq!(view.token_source, "site");
+
+    let token = ["dp.st.", "prd.", "secret"].concat();
+    let req = DopplerBindRequest {
+        project: "shop".into(),
+        config: "prd".into(),
+        build: true,
+        runtime: false,
+        token: Some(token.clone()),
+    };
+    let set = c.site_doppler_set("shop", &req).await.expect("set");
+    assert_eq!(set.project.as_deref(), Some("shop"));
+    let bodies = state.created_bodies.lock().expect("lock").clone();
+    assert_eq!(
+        bodies.last().expect("body"),
+        &json!({ "project": "shop", "config": "prd", "build": true, "runtime": false, "token": token })
+    );
+    let cleared = c.site_doppler_clear("shop").await.expect("clear");
+    assert!(!cleared.bound && cleared.project.is_none());
+    let synced = c.site_doppler_sync("shop").await.expect("sync");
+    assert_eq!(synced.last_sync_at.as_deref(), Some("2026-11-06T10:00:00Z"));
+
+    let sent = state.seen_auth.lock().expect("lock").len();
+    for bad in ["a/b", "", "a b"] {
+        assert!(matches!(
+            c.doppler_configs(bad).await,
+            Err(ClientError::Config(_))
+        ));
+    }
+    assert!(matches!(
+        c.site_doppler("Bad Id").await,
+        Err(ClientError::Config(_))
+    ));
+    let neither = DopplerBindRequest {
+        project: "shop".into(),
+        config: "prd".into(),
+        build: false,
+        runtime: false,
+        token: None,
+    };
+    assert!(matches!(
+        c.site_doppler_set("shop", &neither).await,
+        Err(ClientError::Config(_))
+    ));
+    assert!(!format!("{req:?}").contains("secret"));
+    assert_eq!(
+        state.seen_auth.lock().expect("lock").len(),
+        sent,
+        "invalid input never reaches the node"
+    );
 }
 
 #[tokio::test]

@@ -253,6 +253,10 @@ pub(super) async fn node(State(st): State<AppState>) -> ApiResult<Response> {
             "source": st.cfg.github_token.as_ref().map_or("none", |t| t.source().as_str()),
             "api_host": site_ops::github_api_host(st.cfg.github_api_url.as_deref()),
         },
+        "doppler": {
+            "configured": st.cfg.doppler_token.is_some(),
+            "source": st.cfg.doppler_token.as_ref().map_or("none", |t| t.source().as_str()),
+        },
         "capabilities": site_ops::capabilities(st.orchestrator.is_some()),
         "analytics": analytics,
     }))

@@ -25,6 +25,10 @@ use crate::certificate::{
     validate_certificate_id,
 };
 use crate::config::{NodeConfig, parse_node_url};
+use crate::doppler::{
+    DopplerBindRequest, DopplerBinding, DopplerConfig, DopplerInfo, DopplerProject,
+    validate_doppler_slug,
+};
 use crate::error::ClientError;
 use crate::export::{
     AnalyticsStats, EXPORT_TIMEOUT, ExportQuery, ExportReport, ExportStream, validate_top_kind,
@@ -88,6 +92,9 @@ pub struct NodeInfo {
     /// Absent on connectors that predate the node-level token.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub github: Option<GithubInfo>,
+    /// Absent on connectors that predate Doppler sync.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doppler: Option<DopplerInfo>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -1052,6 +1059,82 @@ impl NodeClient {
                 &format!("/sites/{}/{which}", enc(id)),
                 &[],
                 body_of(patch)?,
+                ACTION_OPTS,
+            )
+            .await?;
+        decode(&bytes)
+    }
+
+    /// Projects the node's own Doppler token can see.
+    pub async fn doppler_projects(&self) -> Res<Vec<DopplerProject>> {
+        self.json(Method::GET, "/doppler/projects", &[], None).await
+    }
+
+    pub async fn doppler_configs(&self, project: &str) -> Res<Vec<DopplerConfig>> {
+        let project = validate_doppler_slug(project)?;
+        self.json(
+            Method::GET,
+            &format!("/doppler/projects/{}/configs", enc(project)),
+            &[],
+            None,
+        )
+        .await
+    }
+
+    pub async fn site_doppler(&self, id: &str) -> Res<DopplerBinding> {
+        let id = validate_site_id(id)?;
+        self.json(
+            Method::GET,
+            &format!("/sites/{}/doppler", enc(id)),
+            &[],
+            None,
+        )
+        .await
+    }
+
+    /// Binds the site and syncs once; a failed first sync leaves the previous binding in place.
+    pub async fn site_doppler_set(
+        &self,
+        id: &str,
+        req: &DopplerBindRequest,
+    ) -> Res<DopplerBinding> {
+        let id = validate_site_id(id)?;
+        req.validate()?;
+        let bytes = self
+            .exec(
+                Method::PUT,
+                &format!("/sites/{}/doppler", enc(id)),
+                &[],
+                body_of(req)?,
+                ACTION_OPTS,
+            )
+            .await?;
+        decode(&bytes)
+    }
+
+    /// Removes the binding and the synced values; the running site keeps them until its next deploy.
+    pub async fn site_doppler_clear(&self, id: &str) -> Res<DopplerBinding> {
+        let id = validate_site_id(id)?;
+        let bytes = self
+            .exec(
+                Method::DELETE,
+                &format!("/sites/{}/doppler", enc(id)),
+                &[],
+                None,
+                ACTION_OPTS,
+            )
+            .await?;
+        decode(&bytes)
+    }
+
+    pub async fn site_doppler_sync(&self, id: &str) -> Res<DopplerBinding> {
+        let id = validate_site_id(id)?;
+        let bytes = self
+            .exec(
+                Method::POST,
+                &format!("/sites/{}/doppler/sync", enc(id)),
+                &[],
+                Some(json!({})),
                 ACTION_OPTS,
             )
             .await?;
