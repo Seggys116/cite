@@ -570,9 +570,15 @@ impl Deployer {
         let site = self.get_site(id)?;
         let probe = self.probe()?;
         let _permits = self.site_ops.log_permits(id)?;
+        let failed_slot = site
+            .history
+            .last()
+            .filter(|d| d.action == DeployAction::Failed)
+            .map(|d| d.slot);
         let slot = q
             .slot
             .or_else(|| self.site_ops.ops.current(id).and_then(|op| op.slot))
+            .or(failed_slot)
             .unwrap_or(site.active);
         let role = match q.source {
             LogSource::Manager => LogRole::Manager,
