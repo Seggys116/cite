@@ -16,11 +16,16 @@ use crate::archive::{
     ArchiveEntry, ArchiveList, CutReport, CutRequest, RestoreReport, archive_download_name,
     archive_kind_from_name, validate_archive_name,
 };
+use crate::certificate::{
+    CertificateInfo, CertificateList, CertificateSaved, CertificateUpload, CloudflareRanges,
+    validate_certificate_id,
+};
 use crate::config::{NodeConfig, parse_node_url};
 use crate::error::ClientError;
 use crate::export::{
     AnalyticsStats, EXPORT_TIMEOUT, ExportQuery, ExportReport, ExportStream, validate_top_kind,
 };
+use crate::zone::{ZoneSecret, ZoneSecretStatus, validate_site_id};
 
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -365,6 +370,33 @@ impl NodeClient {
         if let Some(timeout) = opts.timeout {
             req = req.timeout(timeout);
         }
+        Self::finish(req).await
+    }
+
+    // For bodies that hold a secret and were serialised straight from borrowed fields.
+    async fn exec_json_bytes(
+        &self,
+        method: Method,
+        path: &str,
+        body: Vec<u8>,
+        opts: Opts,
+    ) -> Res<Vec<u8>> {
+        let url = format!("{}/api/v1{path}", self.base);
+        let mut req = self
+            .http
+            .request(method, url)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body);
+        if opts.auth && !self.token.is_empty() {
+            req = req.bearer_auth(&self.token);
+        }
+        if let Some(timeout) = opts.timeout {
+            req = req.timeout(timeout);
+        }
+        Self::finish(req).await
+    }
+
+    async fn finish(req: reqwest::RequestBuilder) -> Res<Vec<u8>> {
         let resp = req.send().await.map_err(ClientError::from_reqwest)?;
         let (status, _, buf) = read_capped(resp).await?;
         if status.is_success() {
@@ -742,6 +774,90 @@ impl NodeClient {
             .await?;
         report.suggested_name = Some(archive_download_name(name, archive_kind_from_name(name)));
         Ok(report)
+    }
+
+    pub async fn certificates(&self) -> Res<CertificateList> {
+        self.json(Method::GET, "/certificates", &[], None).await
+    }
+
+    pub async fn certificate(&self, id: &str) -> Res<CertificateInfo> {
+        let id = validate_certificate_id(id)?;
+        self.json(
+            Method::GET,
+            &format!("/certificates/{}", enc(id)),
+            &[],
+            None,
+        )
+        .await
+    }
+
+    pub async fn certificate_create(&self, upload: &CertificateUpload) -> Res<CertificateSaved> {
+        upload.validate(true)?;
+        let bytes = self
+            .exec_json_bytes(
+                Method::POST,
+                "/certificates",
+                upload.body_json()?,
+                ACTION_OPTS,
+            )
+            .await?;
+        decode(&bytes)
+    }
+
+    pub async fn certificate_replace(
+        &self,
+        id: &str,
+        upload: &CertificateUpload,
+    ) -> Res<CertificateSaved> {
+        let id = validate_certificate_id(id)?;
+        upload.validate(false)?;
+        let bytes = self
+            .exec_json_bytes(
+                Method::PUT,
+                &format!("/certificates/{}", enc(id)),
+                upload.body_json()?,
+                ACTION_OPTS,
+            )
+            .await?;
+        decode(&bytes)
+    }
+
+    pub async fn certificate_delete(&self, id: &str) -> Res<()> {
+        let id = validate_certificate_id(id)?;
+        self.unit(Method::DELETE, &format!("/certificates/{}", enc(id)))
+            .await
+    }
+
+    pub async fn zone_secret(&self, site_id: &str) -> Res<ZoneSecretStatus> {
+        let id = validate_site_id(site_id)?;
+        self.json(
+            Method::GET,
+            &format!("/sites/{}/zone-secret", enc(id)),
+            &[],
+            None,
+        )
+        .await
+    }
+
+    // The node shows the new secret once, so a malformed body is reported without echoing any of it.
+    pub async fn rotate_zone_secret(&self, site_id: &str) -> Res<ZoneSecret> {
+        let id = validate_site_id(site_id)?;
+        let bytes = self
+            .exec(
+                Method::POST,
+                &format!("/sites/{}/zone-secret", enc(id)),
+                &[],
+                Some(json!({})),
+                ACTION_OPTS,
+            )
+            .await?;
+        serde_json::from_slice(&bytes)
+            .map_err(|_| ClientError::Decode("malformed zone secret response".into()))
+    }
+
+    pub async fn cloudflare_ranges(&self) -> Res<CloudflareRanges> {
+        self.json(Method::GET, "/cloudflare/ranges", &[], None)
+            .await
     }
 
     // Callers must validate `rest`; the body is streamed back untouched.

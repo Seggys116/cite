@@ -280,6 +280,10 @@ async fn spawn_fake(fake: Shared) -> String {
         .route("/api/v1/analytics/cut", any(echo))
         .route("/api/v1/analytics/restore", any(echo))
         .route("/api/v1/settings", any(echo))
+        .route("/api/v1/certificates", any(echo))
+        .route("/api/v1/certificates/{id}", any(echo))
+        .route("/api/v1/cloudflare/ranges", any(echo))
+        .route("/api/v1/sites/{id}/zone-secret", any(echo))
         .route("/api/v1/haproxy/stats", get(big))
         .route("/api/v1/sites", get(list_sites).post(create_site))
         .route("/api/v1/sites/{id}", get(get_site).put(put_site))
@@ -483,6 +487,7 @@ fn site(id: &str) -> Site {
         health: HealthCheck::default(),
         source: None,
         history: Vec::new(),
+        access: Default::default(),
     }
 }
 
@@ -1449,6 +1454,113 @@ async fn unlisted_archive_routes_and_methods_stay_hidden() {
     ] {
         let reply = send_json(&h.app, method.clone(), &uri, &s.headers(), json!({})).await;
         assert_eq!(reply.status, StatusCode::NOT_FOUND, "{method} {uri}");
+    }
+}
+
+#[tokio::test]
+async fn certificate_routes_need_csrf_and_relay_the_body() {
+    let url = spawn_fake(new_fake(NODE_TOKEN)).await;
+    let h = harness_with_nodes(&[("edge-1", url.as_str(), NODE_TOKEN)]);
+    let s = login(&h).await;
+    let cookie_only = [("cookie", s.cookie.as_str())];
+    let list_uri = "/api/v1/nodes/edge-1/certificates";
+    let item_uri = "/api/v1/nodes/edge-1/certificates/01JC9ZQ7M3X8V4N2B6T5R0WHYA";
+    let upload = json!({ "name": "main", "certificate": "c", "private_key": "k" });
+
+    let no_csrf = send_json(&h.app, Method::POST, list_uri, &cookie_only, upload.clone()).await;
+    assert_eq!(no_csrf.status, StatusCode::FORBIDDEN);
+    let no_csrf = send_json(&h.app, Method::PUT, item_uri, &cookie_only, upload.clone()).await;
+    assert_eq!(no_csrf.status, StatusCode::FORBIDDEN);
+    let no_csrf = call(&h.app, Method::DELETE, item_uri, &cookie_only, None).await;
+    assert_eq!(no_csrf.status, StatusCode::FORBIDDEN);
+
+    let created = send_json(&h.app, Method::POST, list_uri, &s.headers(), upload.clone()).await;
+    assert_eq!(created.status, StatusCode::OK);
+    let relayed: Value =
+        serde_json::from_str(created.json()["body"].as_str().expect("body")).expect("json");
+    assert_eq!(relayed, upload);
+    let replaced = send_json(&h.app, Method::PUT, item_uri, &s.headers(), upload).await;
+    assert_eq!(replaced.status, StatusCode::OK);
+    let deleted = call(&h.app, Method::DELETE, item_uri, &s.headers(), None).await;
+    assert_eq!(deleted.status, StatusCode::OK);
+    for uri in [list_uri, item_uri, "/api/v1/nodes/edge-1/cloudflare/ranges"] {
+        let reply = get_path(&h.app, uri, &s.headers()).await;
+        assert_eq!(reply.status, StatusCode::OK, "GET {uri}");
+    }
+}
+
+#[tokio::test]
+async fn oversized_certificate_bodies_are_refused_and_unlisted_routes_stay_hidden() {
+    let url = spawn_fake(new_fake(NODE_TOKEN)).await;
+    let h = harness_with_nodes(&[("edge-1", url.as_str(), NODE_TOKEN)]);
+    let s = login(&h).await;
+    let list_uri = "/api/v1/nodes/edge-1/certificates";
+    let huge = json!({ "name": "main", "certificate": "c".repeat(150 * 1024), "private_key": "k" });
+    let refused = send_json(&h.app, Method::POST, list_uri, &s.headers(), huge).await;
+    assert_eq!(refused.status, StatusCode::PAYLOAD_TOO_LARGE);
+
+    let hex_uri = "/api/v1/nodes/edge-1/certificates/0123456789abcdef0123456789abcdef";
+    let hex_get = get_path(&h.app, hex_uri, &s.headers()).await;
+    assert_eq!(hex_get.status, StatusCode::NOT_FOUND);
+    for method in [Method::PUT, Method::DELETE] {
+        let reply = send_json(&h.app, method.clone(), hex_uri, &s.headers(), json!({})).await;
+        assert_eq!(reply.status, StatusCode::NOT_FOUND, "{method}");
+    }
+
+    for uri in [
+        "/api/v1/nodes/edge-1/certificates/..",
+        "/api/v1/nodes/edge-1/certificates/NOT-A-ULID",
+        "/api/v1/nodes/edge-1/certificates/01JC9ZQ7M3X8V4N2B6T5R0WHYA/extra",
+        "/api/v1/nodes/edge-1/cloudflare",
+        "/api/v1/nodes/edge-1/cloudflare/other",
+    ] {
+        let reply = get_path(&h.app, uri, &s.headers()).await;
+        assert_eq!(reply.status, StatusCode::NOT_FOUND, "GET {uri}");
+    }
+    for (method, uri) in [
+        (Method::PUT, list_uri),
+        (Method::DELETE, list_uri),
+        (
+            Method::POST,
+            "/api/v1/nodes/edge-1/certificates/01JC9ZQ7M3X8V4N2B6T5R0WHYA",
+        ),
+        (Method::POST, "/api/v1/nodes/edge-1/cloudflare/ranges"),
+    ] {
+        let reply = send_json(&h.app, method.clone(), uri, &s.headers(), json!({})).await;
+        assert_eq!(reply.status, StatusCode::NOT_FOUND, "{method} {uri}");
+    }
+}
+
+#[tokio::test]
+async fn zone_secret_routes_are_exact_pairs_and_never_cached() {
+    let url = spawn_fake(new_fake(NODE_TOKEN)).await;
+    let h = harness_with_nodes(&[("edge-1", url.as_str(), NODE_TOKEN)]);
+    let s = login(&h).await;
+    let cookie_only = [("cookie", s.cookie.as_str())];
+    let uri = "/api/v1/nodes/edge-1/sites/shop/zone-secret";
+
+    let status = get_path(&h.app, uri, &s.headers()).await;
+    assert_eq!(status.status, StatusCode::OK);
+    assert_eq!(status.header("cache-control"), "no-store");
+    let no_csrf = send_json(&h.app, Method::POST, uri, &cookie_only, json!({})).await;
+    assert_eq!(no_csrf.status, StatusCode::FORBIDDEN);
+    let rotated = send_json(&h.app, Method::POST, uri, &s.headers(), json!({})).await;
+    assert_eq!(rotated.status, StatusCode::OK);
+    assert_eq!(rotated.header("cache-control"), "no-store");
+
+    for method in [Method::PUT, Method::DELETE, Method::PATCH] {
+        let reply = send_json(&h.app, method.clone(), uri, &s.headers(), json!({})).await;
+        assert_eq!(reply.status, StatusCode::NOT_FOUND, "{method}");
+    }
+    for bad in [
+        "/api/v1/nodes/edge-1/sites/shop/zone-secret/extra",
+        "/api/v1/nodes/edge-1/sites/Shop/zone-secret",
+        "/api/v1/nodes/edge-1/sites/-x/zone-secret",
+    ] {
+        let reply = get_path(&h.app, bad, &s.headers()).await;
+        assert_eq!(reply.status, StatusCode::NOT_FOUND, "GET {bad}");
+        let reply = send_json(&h.app, Method::POST, bad, &s.headers(), json!({})).await;
+        assert_eq!(reply.status, StatusCode::NOT_FOUND, "POST {bad}");
     }
 }
 

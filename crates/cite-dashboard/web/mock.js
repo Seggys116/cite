@@ -1,5 +1,6 @@
 // Dev aid: an in-memory stand-in for the dashboard API, enabled with ?mock=1 (add &setup=1 for onboarding, &login=1 to start signed out)
 import { ApiError } from './js/api.js';
+import { corsProblem, hasMatcher, headerOpProblem, redirectProblem } from './js/rulelib.js';
 
 const query = new URLSearchParams(location.search);
 const state = {
@@ -67,6 +68,7 @@ function seedSites(nodeIdx, now) {
       blue: { targets: [target(2, 11, 9000)], label: null },
       green: { targets: [target(2, 21, 9000)], label: null },
       active: 'green', maintenance: { enabled: false, page_id: null }, health: { ...health, path: '/v1/health' }, source: null,
+      access: { cloudflare_only: true, tls: 'full', bots: 'block_bad', zone_lock: true },
       history: hist([[300, 'blue', 'promote', 'Initial deploy'], [28, 'green', 'promote', 'Add pagination to orders'], [27, 'blue', 'switch', 'Manual flip while testing'], [26, 'green', 'switch', 'Back to green']]),
     },
     {
@@ -74,8 +76,17 @@ function seedSites(nodeIdx, now) {
       blue: { targets: [target(3, 11, 3000)], label: null },
       green: { targets: [target(3, 21, 3000)], label: null },
       active: 'blue', maintenance: { enabled: nodeIdx === 1, page_id: 'scheduled' }, health, source: { repo: 'acme/docs', branch: 'main', runtime: 'static', node_major: 22, poll_interval: '5m' },
+      access: { cloudflare_only: true, tls: 'flexible' },
       history: hist([[400, 'blue', 'promote', 'Initial deploy'], [90, 'green', 'failed', 'Health check timed out']]),
     },
+    ...(nodeIdx === 0 ? [{
+      id: 'legacy', name: 'Legacy portal', hosts: ['legacy.example.com'], path_regex: null, kind: 'site',
+      blue: { targets: [target(4, 11, 8080)], label: null },
+      green: { targets: [target(4, 21, 8080)], label: null },
+      active: 'blue', maintenance: { enabled: false, page_id: null }, health, source: null,
+      access: { cloudflare_only: true, tls: 'full', zone_lock: true },
+      history: hist([[500, 'blue', 'promote', 'Initial deploy']]),
+    }] : []),
   ];
 }
 
@@ -88,6 +99,15 @@ function seedRules() {
     { id: 'r-scanner-ua', name: 'Known scanner agents', enabled: true, action: 'tarpit', matchers: { ...none, user_agent_regex: '(sqlmap|nikto|masscan)' }, site: null },
     { id: 'r-trace', name: 'Odd HTTP methods', enabled: true, action: 'deny', matchers: { ...none, methods: ['TRACE', 'CONNECT'] }, site: null },
     { id: 'r-badnet', name: 'Abusive network', enabled: false, action: 'deny', matchers: { ...none, cidrs: ['203.0.113.0/24'] }, site: 'shop' },
+    {
+      id: 'r-sec-headers', name: 'Security headers', enabled: true, matchers: { ...none }, site: 'shop',
+      headers: [{ target: 'response', op: 'set', name: 'X-Frame-Options', value: 'DENY' }, { target: 'response', op: 'set', name: 'Referrer-Policy', value: 'strict-origin' }, { target: 'request', op: 'remove', name: 'X-Debug' }],
+    },
+    {
+      id: 'r-cors-api', name: 'CORS for the app', enabled: true, matchers: { ...none }, site: 'api', label: 'cors-app',
+      cors: { origins: ['https://app.example.com'], methods: ['GET', 'POST'], allow_headers: ['Content-Type', 'Authorization'], expose_headers: ['X-Request-Id'], credentials: true, max_age_secs: 600 },
+    },
+    { id: 'r-old-blog', name: 'Old blog moved', enabled: true, matchers: { ...none, path_prefix: '/blog' }, site: 'shop', redirect: { to: 'https://blog.example.com/', status: 308 } },
   ];
 }
 
@@ -96,11 +116,15 @@ const RULE_HITS = [['r-wp-login', 14], ['r-env', 11], ['r-phpmyadmin', 7], ['r-s
 function seedPresets() {
   const none = { path_regex: null, path_prefix: null, methods: [], user_agent_regex: null, cidrs: [], host: null };
   const rule = (name, action, matchers) => ({ id: '', name, enabled: true, action, matchers: { ...none, ...matchers }, site: null });
+  const redirect = (name, to, matchers) => ({ id: '', name, enabled: true, matchers: { ...none, ...matchers }, site: null, redirect: { to, status: 301 } });
   return [
     { name: 'sensitive-files', title: 'Sensitive files', description: 'Blocks requests for dotfiles, backups, dumps and key material that should never be public.', rules: [rule('Dotfiles', 'deny', { path_regex: '/\\.(env|git|svn|htaccess)' }), rule('Backups and dumps', 'deny', { path_regex: '\\.(bak|sql|old|swp)$' }), rule('Key material', 'deny', { path_regex: '\\.(pem|key|p12)$' })] },
     { name: 'cms-probes', title: 'CMS probes', description: 'Stops WordPress, Joomla and phpMyAdmin probing on sites that do not run them.', rules: [rule('WordPress', 'deny', { path_regex: '^/wp-(admin|login|content|includes)' }), rule('xmlrpc', 'deny', { path_prefix: '/xmlrpc.php' }), rule('phpMyAdmin', 'drop', { path_prefix: '/phpmyadmin' })] },
     { name: 'scanners', title: 'Scanners', description: 'Tarpits well-known vulnerability scanners by their user agent.', rules: [rule('Scanner agents', 'tarpit', { user_agent_regex: '(sqlmap|nikto|masscan|nmap|zgrab)' })] },
     { name: 'odd-methods', title: 'Odd methods', description: 'Rejects TRACE, CONNECT and other methods no real client sends to a website.', rules: [rule('Unusual methods', 'deny', { methods: ['TRACE', 'CONNECT'] })] },
+    { name: 'redirect-to-www', title: 'Redirect to www', description: 'Sends the bare domain to its www address with a permanent redirect, keeping the path and query.', rules: [redirect('Redirect to www', '{scheme}://{www_host}{path}{query}', {})] },
+    { name: 'redirect-to-apex', title: 'Redirect to apex', description: 'Sends the www address to the bare domain with a permanent redirect, keeping the path and query.', rules: [redirect('Redirect to apex', '{scheme}://{apex_host}{path}{query}', {})] },
+    { name: 'force-https', title: 'Force HTTPS', description: 'Sends plain HTTP requests to the HTTPS address. Skipped for Flexible SSL sites and nodes without HTTPS.', rules: [redirect('Force HTTPS', 'https://{host}{path}{query}', { scheme: 'http' })] },
   ];
 }
 
@@ -181,6 +205,126 @@ function cutRoute(node, body) {
   return report;
 }
 
+const CLOUDFLARE_BUILTIN = {
+  updated: '2026-11-06',
+  ranges: [
+    '173.245.48.0/20', '103.21.244.0/22', '103.22.200.0/22', '103.31.4.0/22', '141.101.64.0/18', '108.162.192.0/18', '190.93.240.0/20',
+    '188.114.96.0/20', '197.234.240.0/22', '198.41.128.0/17', '162.158.0.0/15', '104.16.0.0/13', '104.24.0.0/14', '172.64.0.0/13',
+    '131.0.72.0/22', '2400:cb00::/32', '2606:4700::/32', '2803:f800::/32', '2405:b500::/32', '2405:8100::/32', '2a06:98c0::/29', '2c0f:f248::/32',
+  ],
+};
+
+const CERT_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}$/;
+const CERT_BLOCK = /-----BEGIN CERTIFICATE-----[\s\S]+?-----END CERTIFICATE-----/;
+const KEY_BLOCK = /-----BEGIN (?:[A-Z]+ )?PRIVATE KEY-----[\s\S]+?-----END (?:[A-Z]+ )?PRIVATE KEY-----/;
+const CIDR_LIKE = /^(?:\d{1,3}(?:\.\d{1,3}){3}|[0-9a-f:]+)\/\d{1,3}$/i;
+const PEM_LIMIT = 100 * 1024;
+const CERT_ID_RE = /^[0-9A-Z]{26}$/;
+
+// 26 characters of [0-9A-Z], shaped like the ULIDs the connector issues
+function fakeUlid(seed) {
+  return '01J' + fakeSha(seed).slice(0, 23).toUpperCase();
+}
+
+function seedCert(name, subject, sans, issuer, days, keyType) {
+  const created = Date.now() - 40 * DAY;
+  return { id: fakeUlid('cert-' + name), name, subject, sans, issuer, expires: Date.now() + days * DAY, key_type: keyType, created_at: iso(created), fingerprint: fakeSha('fp-' + name) };
+}
+
+function seedCerts(idx) {
+  if (idx === 1) return [];
+  return [
+    seedCert('storefront', 'CN=shop.example.com', ['shop.example.com', 'www.example.com'], "R11 (Let's Encrypt)", 212, 'ECDSA P-256'),
+    seedCert('public-api', 'CN=api.example.com', ['api.example.com'], 'Sectigo RSA Domain Validation CA', 9, 'RSA 2048'),
+  ];
+}
+
+function hostCovered(host, san) {
+  const h = host.toLowerCase();
+  const s = san.toLowerCase();
+  if (!s.startsWith('*.')) return h === s;
+  const rest = s.slice(1);
+  return h.endsWith(rest) && h.length > rest.length && !h.slice(0, h.length - rest.length).includes('.');
+}
+
+function coveredHosts(node, sans) {
+  return node.sites.flatMap((s) => s.hosts).filter((host) => sans.some((san) => hostCovered(host, san)));
+}
+
+// A file placed in the node's certificate directory by hand: listed read-only, with no item routes
+function manualCert() {
+  return {
+    id: 'file:legacy.pem', name: 'legacy.pem', subject: '', sans: [], issuer: '', not_before: '', not_after: '', days_left: 0,
+    fingerprint_sha256: '', key_type: '', created_at: '', covers: [], source: 'manual', warning: 'The file could not be read: no private key block found.',
+  };
+}
+
+function certView(node, c) {
+  const days = Math.floor((c.expires - Date.now()) / DAY);
+  return {
+    source: 'api', warning: null,
+    id: c.id, name: c.name, subject: c.subject, sans: [...c.sans], issuer: c.issuer, not_before: iso(c.expires - 90 * DAY).slice(0, 10), not_after: iso(c.expires).slice(0, 10),
+    days_left: days, fingerprint_sha256: c.fingerprint, key_type: c.key_type, created_at: c.created_at, covers: coveredHosts(node, c.sans),
+  };
+}
+
+// Checks the same things the connector does with an uploaded pair, without parsing the PEM itself
+function checkCertBody(node, body, existing) {
+  const name = body.name === undefined && existing ? existing.name : body.name;
+  if (typeof name !== 'string' || !CERT_NAME_RE.test(name) || name.endsWith(' ') || name.includes('-----')) throw new ApiError(400, 'name must be 1 to 64 letters, digits, spaces, dots, dashes or underscores, start with a letter or digit, not end with a space and not contain -----');
+  if (node.certs.some((c) => c !== existing && c.name === name)) throw new ApiError(409, `a certificate named ${name} already exists`);
+  if (typeof body.certificate !== 'string' || !CERT_BLOCK.test(body.certificate)) throw new ApiError(400, 'certificate is not valid PEM');
+  if (typeof body.private_key !== 'string' || !KEY_BLOCK.test(body.private_key)) throw new ApiError(400, 'private key is not valid PEM');
+  if (body.certificate.length + body.private_key.length > PEM_LIMIT) throw new ApiError(413, 'certificate and key are too large');
+  return name;
+}
+
+function certificateRoute(node, method, id, body) {
+  if (node.idx === 1) throw new ApiError(404, 'Not Found');
+  if (!id) {
+    if (method === 'GET') {
+      const hosts = node.sites.flatMap((s) => s.hosts);
+      return {
+        items: [...node.certs.map((c) => certView(node, c)), manualCert()], https_port: node.settings.https_port ?? null, dir_ready: true,
+        uncovered_hosts: hosts.filter((host) => !node.certs.some((c) => c.sans.some((san) => hostCovered(host, san)))),
+      };
+    }
+    if (method === 'POST') {
+      const name = checkCertBody(node, body, null);
+      const base = /^[a-z0-9-]+(\.[a-z0-9-]+)+$/i.test(name) ? name.toLowerCase() : 'example.com';
+      const cert = seedCert(name, 'CN=' + base, [base, '*.' + base], 'Mock issuing CA', 90, 'ECDSA P-256');
+      cert.id = fakeUlid(name + Date.now());
+      cert.created_at = iso(Date.now());
+      node.certs.push(cert);
+      audit(node, 'certificate.create', `certificate ${name} uploaded`);
+      const view = certView(node, cert);
+      return view.covers.length ? view : { ...view, warning: 'This certificate does not cover any site host on this node yet.' };
+    }
+    throw new ApiError(405, 'method not allowed');
+  }
+  const cert = CERT_ID_RE.test(id) ? node.certs.find((c) => c.id === id) : null;
+  if (!cert) throw new ApiError(404, 'no such certificate');
+  if (method === 'GET') return certView(node, cert);
+  if (method === 'PUT') {
+    cert.name = checkCertBody(node, body, cert);
+    cert.expires = Date.now() + 90 * DAY;
+    cert.fingerprint = fakeSha(cert.name + Date.now());
+    audit(node, 'certificate.replace', `certificate ${cert.name} replaced`);
+    return certView(node, cert);
+  }
+  if (method === 'DELETE') {
+    node.certs = node.certs.filter((c) => c !== cert);
+    audit(node, 'certificate.delete', `certificate ${cert.name} deleted`);
+    return '';
+  }
+  throw new ApiError(405, 'method not allowed');
+}
+
+function cloudflareRoute(node) {
+  const custom = node.settings.cloudflare_ranges || [];
+  return { source: custom.length ? 'custom' : 'builtin', updated: CLOUDFLARE_BUILTIN.updated, ranges: custom.length ? [...custom] : [...CLOUDFLARE_BUILTIN.ranges] };
+}
+
 function seedNode(name, url, idx) {
   const now = Date.now();
   const node = {
@@ -191,11 +335,15 @@ function seedNode(name, url, idx) {
       { id: 'incident', name: 'Incident notice', status: 503, html: PAGE_HTML('We are on it', 'Something went wrong on our side. Engineers are already working on a fix.', '#ce422b') },
     ],
     settings: {
-      http_port: 80, https_port: 443, max_conn: 20000, client_timeout_ms: 30000, server_timeout_ms: 60000, connect_timeout_ms: 3000,
-      per_ip_rate_limit: 600, max_body_bytes: null,
+      // The first node starts with HTTPS off so the certificates tab can show the port control
+      http_port: 80, https_port: idx === 0 ? null : 443, max_conn: 20000, client_timeout_ms: 30000, server_timeout_ms: 60000, connect_timeout_ms: 3000,
+      per_ip_rate_limit: 600, max_body_bytes: null, cloudflare_ranges: [],
       retention: { recent_events: 5000, minute_buckets_hours: 48, hour_buckets_days: 0, archive_before_delete: true, audit_days: 365, persist_interval_secs: 60, store_user_agents: true, store_client_ips: true },
     },
     archives: seedArchives(now, idx),
+    certs: seedCerts(idx),
+    zones: { api: { created_at: iso(now - 12 * DAY), fingerprint: fakeSha('zone-api').slice(0, 12) } },
+    ruleSecrets: {},
     tokens: [
       { id: 't-1', name: 'ci-deploy', created_at: iso(now - 40 * 86400 * 1000), last_used_at: iso(now - 3 * 3600 * 1000) },
       { id: 't-2', name: 'grafana-readonly', created_at: iso(now - 12 * 86400 * 1000), last_used_at: null },
@@ -449,6 +597,9 @@ function checkSiteShape(site) {
       throw new ApiError(400, 'invalid path regex');
     }
   }
+  if (site.access && (!['full', 'flexible'].includes(site.access.tls || 'full') || typeof (site.access.cloudflare_only ?? false) !== 'boolean')) throw new ApiError(400, 'invalid access settings');
+  if (site.access && !['allow', 'block_bad', 'block_all'].includes(site.access.bots || 'allow')) throw new ApiError(400, 'bots must be allow, block_bad or block_all');
+  if (site.access && site.access.zone_lock && !site.access.cloudflare_only) throw new ApiError(400, 'zone_lock needs cloudflare_only');
 }
 
 // Not scannable: three finder squares plus seeded noise, enough to preview the onboarding layout.
@@ -506,6 +657,35 @@ function nodeInfo(node) {
   };
 }
 
+const ZONE_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+const TOKEN_ALPHABET = 'abcdefghijklmnopqrstuvwxyz0123456789';
+
+// Secret-looking values come from the platform's random source, even though the mock is only a stand-in
+function randomText(length, alphabet) {
+  const bytes = new Uint8Array(length);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes, (b) => alphabet[b % alphabet.length]).join('');
+}
+
+// The secret is returned once by a rotate and never by a read, as on the real node
+function zoneSecretRoute(node, site, method) {
+  const header = 'X-Cite-Origin-Secret';
+  const lockOn = Boolean(site.access && site.access.zone_lock);
+  if (method === 'GET') {
+    // A site named legacy plays a node whose secret store could not be read, so that path can be tried by hand
+    if (site.id === 'legacy') return { configured: false, readable: false, header, created_at: null, fingerprint: null };
+    const kept = node.zones[site.id];
+    return { configured: Boolean(kept), readable: true, header, created_at: kept ? kept.created_at : null, fingerprint: kept ? kept.fingerprint : null };
+  }
+  if (method !== 'POST') throw new ApiError(405, 'method not allowed');
+  if (!lockOn) throw new ApiError(409, `site ${site.id} does not use the zone lock`);
+  const secret = randomText(43, ZONE_ALPHABET);
+  const kept = { created_at: iso(Date.now()), fingerprint: fakeSha(secret).slice(0, 12) };
+  node.zones[site.id] = kept;
+  audit(node, 'site.zone-secret', `site ${site.id} zone secret rotated`);
+  return { secret, header, ...kept };
+}
+
 async function siteRoute(node, method, seg, body) {
   const [id, action] = seg;
   if (!id) {
@@ -524,8 +704,10 @@ async function siteRoute(node, method, seg, body) {
     if (method === 'GET') return withLive(node, site);
     if (method === 'PUT') {
       checkSiteShape(body);
-      const { name, hosts, path_regex: pathRegex, kind, health, source } = clone(body);
-      Object.assign(site, { name, hosts, path_regex: pathRegex, kind, health, source });
+      const { name, hosts, path_regex: pathRegex, kind, health, source, access } = clone(body);
+      Object.assign(site, { name, hosts, path_regex: pathRegex, kind, health, source, access: access || { cloudflare_only: false, tls: 'full' } });
+      if (!site.access.zone_lock) delete node.zones[id];
+      else if (!node.zones[id]) node.zones[id] = { created_at: iso(Date.now()), fingerprint: fakeSha(id + Date.now()).slice(0, 12) };
       audit(node, 'site.update', `site ${id} updated`);
       return clone(site);
     }
@@ -535,6 +717,7 @@ async function siteRoute(node, method, seg, body) {
       return { ok: true };
     }
   }
+  if (action === 'zone-secret') return zoneSecretRoute(node, site, method);
   if (method !== 'POST') throw new ApiError(405, 'method not allowed');
   const idle = site.active === 'blue' ? 'green' : 'blue';
   if (action === 'deploy') {
@@ -616,6 +799,38 @@ function collectionRoute(list, label, method, id, body, node, usedCheck) {
     return { ok: true };
   }
   throw new ApiError(405, 'method not allowed');
+}
+
+// Mirrors the node's rule checks, and holds secret header values apart so the API never returns them
+function checkRuleShape(rule) {
+  const effects = Boolean(rule.redirect) || Boolean(rule.cors) || (rule.headers || []).length > 0;
+  if (rule.action && effects) throw new ApiError(400, `rule ${rule.id}: a rule either blocks (action) or has effects (redirect, headers, cors), not both`);
+  if (rule.redirect && (rule.cors || (rule.headers || []).length)) throw new ApiError(400, `rule ${rule.id}: a redirect cannot be combined with headers or cors`);
+  if (!rule.action && !effects) throw new ApiError(400, `rule ${rule.id}: needs an action or an effect (redirect, headers or cors)`);
+  const m = rule.matchers || {};
+  if (rule.action && !hasMatcher(m)) throw new ApiError(400, `rule ${rule.id}: needs at least one matcher`);
+  const problem = (rule.redirect && redirectProblem(rule.redirect, m))
+    || (rule.headers || []).map(headerOpProblem).find(Boolean)
+    || (rule.cors && corsProblem(rule.cors));
+  if (problem) throw new ApiError(400, `rule ${rule.id}: ${problem}`);
+  const hm = m.header;
+  if (hm && Boolean(hm.regex) === Boolean(hm.equals) && !(hm.secret && hm.equals === '')) throw new ApiError(400, `rule ${rule.id} header matcher: set exactly one of regex or equals`);
+}
+
+function ruleRoute(node, method, id, body) {
+  if (method === 'DELETE' && id) delete node.ruleSecrets[id];
+  if (method !== 'POST' && method !== 'PUT') return collectionRoute(node.rules, 'rule', method, id, body, node);
+  const rule = clone(body);
+  checkRuleShape(rule);
+  const hm = rule.matchers && rule.matchers.header;
+  if (hm && hm.secret) {
+    if (hm.equals) node.ruleSecrets[rule.id] = hm.equals;
+    else if (!node.ruleSecrets[rule.id] && !hm.regex) throw new ApiError(400, `rule ${rule.id} header matcher: enter the secret value`);
+    hm.equals = '';
+  } else {
+    delete node.ruleSecrets[rule.id];
+  }
+  return collectionRoute(node.rules, 'rule', method, id, rule, node);
 }
 
 function eventsIn(node, win, siteId) {
@@ -717,7 +932,7 @@ async function nodeRoute(node, method, seg, q, body) {
     const inUse = (id) => (node.sites.find((s) => s.maintenance.page_id === id) || {}).name;
     return collectionRoute(node.pages, 'page', method, b, body, node, inUse);
   }
-  if (a === 'firewall' && b === 'rules') return collectionRoute(node.rules, 'rule', method, c, body, node);
+  if (a === 'firewall' && b === 'rules') return ruleRoute(node, method, c, body);
   if (a === 'firewall' && b === 'presets') {
     if (c && seg[3] === 'apply') {
       const preset = node.presets.find((p) => p.name === c);
@@ -751,9 +966,14 @@ async function nodeRoute(node, method, seg, q, body) {
     if (node.idx === 1 && ['archives', 'backup', 'cut', 'restore'].includes(b)) throw new ApiError(404, 'Not Found');
     if (['archives', 'backup', 'cut', 'restore'].includes(b)) return archiveRoute(node, method, b, seg[2], body);
   }
+  if (a === 'certificates') return certificateRoute(node, method, b, body);
+  if (a === 'cloudflare' && b === 'ranges' && method === 'GET') return cloudflareRoute(node);
   if (a === 'settings') {
     if (method === 'PUT') {
       if (!body || !body.retention) throw new ApiError(400, 'invalid settings');
+      if (body.https_port !== null && body.https_port !== undefined && !(Number.isInteger(body.https_port) && body.https_port >= 1 && body.https_port <= 65535)) throw new ApiError(400, 'https_port must be between 1 and 65535');
+      const ranges = body.cloudflare_ranges || [];
+      if (!Array.isArray(ranges) || ranges.some((r) => typeof r !== 'string' || !CIDR_LIKE.test(r))) throw new ApiError(400, 'cloudflare_ranges must be CIDR ranges');
       node.settings = clone(body);
       audit(node, 'settings.update', 'settings changed');
     }
@@ -767,7 +987,7 @@ async function nodeRoute(node, method, seg, q, body) {
       const token = { id: 't-' + Math.random().toString(36).slice(2, 7), name: body.name, created_at: iso(Date.now()), last_used_at: null };
       node.tokens.push(token);
       audit(node, 'token.create', `token ${body.name} created`);
-      return { id: token.id, name: token.name, token: 'cite_' + Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2) };
+      return { id: token.id, name: token.name, token: 'cite_' + randomText(40, TOKEN_ALPHABET) };
     }
     if (method === 'DELETE') {
       node.tokens = node.tokens.filter((t) => t.id !== b);

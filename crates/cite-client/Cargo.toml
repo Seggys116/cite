@@ -21,6 +21,7 @@ reqwest.workspace = true
 ulid.workspace = true
 futures-util.workspace = true
 bytes.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 axum.workspace = true

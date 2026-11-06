@@ -8,6 +8,9 @@ import { actionPill, slotPill, healthKind, healthDots, siteHref } from './common
 import { targetEditor, regexTester } from './siteForm.js';
 import { pagePreview } from './maintenance.js';
 import { gitRefProblem } from '../siteCheck.js';
+import { accessForSave, accessOf, zoneLockTurnedOn } from '../accesslib.js';
+import { accessCard } from './accessCard.js';
+import { rotateAndShow } from './zoneSecret.js';
 
 const TABS = [
   { id: 'overview', label: 'Overview', icon: 'activity' },
@@ -204,6 +207,7 @@ function routingPanel(ctx, site, reload) {
   const rise = numeric(site.health.rise, 'Rise');
   const fall = numeric(site.health.fall, 'Fall');
   const timeout = numeric(site.health.timeout_ms, 'Timeout in ms');
+  const access = accessCard({ node: ctx.node, site });
   const err = h('p', { class: 'form-error', role: 'alert', hidden: true });
   const save = button('Save routing', { kind: 'primary', iconName: 'check' });
   save.addEventListener('click', async () => {
@@ -229,9 +233,20 @@ function routingPanel(ctx, site, reload) {
       health: { path: path.value, interval_ms: Number(interval.value), rise: Number(rise.value), fall: Number(fall.value), timeout_ms: Number(timeout.value) },
       source: site.source,
     };
+    const accessValue = accessForSave(access.get(), site.access);
+    if (accessValue) next.access = accessValue;
     try {
       await withBusy(save, () => nodeApi(ctx.node).put(`/sites/${encodeURIComponent(site.id)}`, next));
       toast('Routing saved', 'success');
+      // The node makes the secret when the lock goes on, and only a rotate call hands it back
+      if (zoneLockTurnedOn(accessOf(site), access.get())) {
+        const failures = await rotateAndShow([ctx.node], site.id, reload);
+        if (failures.length) {
+          toast(formatError(failures[0].error), 'error');
+          reload();
+        }
+        return;
+      }
       reload();
     } catch (ex) {
       fail(formatError(ex));
@@ -239,6 +254,7 @@ function routingPanel(ctx, site, reload) {
   });
   return h('div', { class: 'stack' },
     card({ title: 'Routing', body: h('div', { class: 'form' }, field('Name', name), field('Hosts', hosts.el, null, { group: true }), tool.el) }),
+    access.el,
     card({ title: 'Health check', body: h('div', { class: 'form' },
       field('Path', path),
       h('div', { class: 'four-col' }, field('Interval (ms)', interval), field('Timeout (ms)', timeout), field('Rise', rise), field('Fall', fall))) }),
