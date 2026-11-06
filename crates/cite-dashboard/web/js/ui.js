@@ -1,4 +1,5 @@
 import { h, icon, clear } from './dom.js';
+import { compileProblem } from './regexlib.js';
 
 export function formatError(err) {
   return err && err.message ? err.message : String(err);
@@ -92,12 +93,7 @@ export function escapeRegex(text) {
 }
 
 export function checkRegex(source) {
-  try {
-    new RegExp(source);
-    return null;
-  } catch (err) {
-    return err.message.replace(/^Invalid regular expression: /, '');
-  }
+  return compileProblem(source);
 }
 
 
@@ -439,7 +435,8 @@ export function closeAllLayers() {
   for (const layer of [...layers]) layer.close();
 }
 
-function openLayer(panel, { onClose, focus } = {}) {
+// A layer that is not dismissable closes only through its own buttons, never on Escape or a click outside
+function openLayer(panel, { onClose, focus, dismissable = true } = {}) {
   const returnFocus = document.activeElement;
   let closed = false;
   const handle = { el: null, close };
@@ -447,12 +444,12 @@ function openLayer(panel, { onClose, focus } = {}) {
     if (layers[layers.length - 1] !== handle) return;
     if (e.key === 'Escape') {
       e.preventDefault();
-      close();
+      if (dismissable) close();
     } else {
       trapTab(e, panel);
     }
   };
-  const wrap = h('div', { class: 'layer' }, h('div', { class: 'backdrop', onClick: () => close() }), panel);
+  const wrap = h('div', { class: 'layer' }, h('div', { class: 'backdrop', onClick: () => { if (dismissable) close(); } }), panel);
   handle.el = wrap;
   function close(result) {
     if (closed) return;
@@ -491,12 +488,12 @@ export function openDrawer({ title, subtitle, content, footer, wide = false, onC
   return handle;
 }
 
-export function openModal({ title, content, actions, wide = false, onClose }) {
+export function openModal({ title, content, actions, wide = false, onClose, dismissable = true }) {
   const panel = h('div', { class: 'modal' + (wide ? ' modal-wide' : ''), role: 'dialog', 'aria-modal': 'true', 'aria-label': title, tabindex: '-1' },
-    h('header', { class: 'modal-head' }, h('h2', { class: 'modal-title' }, title), iconButton('x', 'Close', () => handle.close())),
+    h('header', { class: 'modal-head' }, h('h2', { class: 'modal-title' }, title), dismissable ? iconButton('x', 'Close', () => handle.close()) : null),
     h('div', { class: 'modal-body' }, content),
     actions ? h('footer', { class: 'modal-foot' }, actions) : null);
-  const handle = openLayer(panel, { onClose });
+  const handle = openLayer(panel, { onClose, dismissable });
   return handle;
 }
 

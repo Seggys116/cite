@@ -4,9 +4,11 @@ use gpui::{AnyElement, ClipboardItem, Context, Entity, div, prelude::*, px};
 
 use crate::app::{Confirm, Console, Load, new_input};
 use crate::archive::retention_warning;
+use crate::certs::ensure_same_node;
 use crate::config::KEYCHAIN_SERVICE;
 use crate::demo::now_ms;
 use crate::model::{SettingsDraft, parse_rfc3339_ms, rel_time};
+use crate::scope::{TokenShelf, foreign_notice};
 use crate::theme::{DIM, Tone, c};
 use crate::ui::input::TextInput;
 use crate::ui::nodes::hostname;
@@ -22,12 +24,15 @@ pub struct Data {
 
 pub struct State {
     pub data: Load<Data>,
+    // The node the loaded data came from; saves are refused for any other node.
+    pub data_node: String,
     pub error: Option<String>,
     pub store_ua: bool,
     pub store_ip: bool,
     pub keep_forever: bool,
     pub archive_before_delete: bool,
-    pub created: Option<String>,
+    // New API tokens by node; each is shown only while its node is selected and stays until dismissed.
+    pub created: TokenShelf,
     pub recent: Entity<TextInput>,
     pub minutes: Entity<TextInput>,
     pub hours: Entity<TextInput>,
@@ -41,12 +46,13 @@ impl State {
     pub fn new(cx: &mut Context<Console>) -> Self {
         Self {
             data: Load::Idle,
+            data_node: String::new(),
             error: None,
             store_ua: true,
             store_ip: true,
             keep_forever: true,
             archive_before_delete: true,
-            created: None,
+            created: TokenShelf::default(),
             recent: new_input(cx, "5000", |i| i.mono()),
             minutes: new_input(cx, "48", |i| i.mono()),
             hours: new_input(cx, "365", |i| i.mono()),
@@ -65,18 +71,21 @@ impl Console {
             self.settings.data = Load::Idle;
             return;
         };
+        let node = h.name().to_string();
         let fut = async move {
             let settings = h.get_settings().await?;
             let tokens = h.list_tokens().await.unwrap_or_default();
             Ok(Data { settings, tokens })
         };
-        self.fetch(cx, fut, |this, res, cx| {
+        self.fetch_scoped(cx, fut, move |this, res, cx| {
             if let Ok(data) = &res {
                 this.fill_settings(&SettingsDraft::from_settings(&data.settings), cx);
+                this.settings.data_node = node;
             }
             this.settings.data = Load::from_result(res);
             cx.notify();
         });
+        self.load_certs(cx);
     }
 
     // Inputs mirror the node's values so unchanged fields round trip untouched.
@@ -121,6 +130,11 @@ impl Console {
         let (Some(h), Some(data)) = (self.active_handle(), self.settings.data.ready()) else {
             return;
         };
+        if let Err(msg) = ensure_same_node(&self.settings.data_node, self.active_name().as_deref())
+        {
+            self.settings.error = Some(msg);
+            return;
+        }
         match self.current_draft(cx).apply(&data.settings) {
             Ok(next) => {
                 self.settings.error = None;
@@ -148,16 +162,30 @@ impl Console {
         self.settings
             .token_name
             .update(cx, |i, cx| i.set_text("", cx));
-        self.fetch(
+        let node = h.name().to_string();
+        self.fetch_origin(
             cx,
             async move { h.create_token(&name).await },
-            |this, res, cx| {
+            move |this, res, here, origin, cx| {
                 match res {
                     Ok(created) => {
-                        this.settings.created = Some(created.token);
-                        this.load_settings(cx);
+                        this.settings.created.put(&node, created.token);
+                        if here {
+                            this.load_settings(cx);
+                        } else {
+                            this.say(
+                                format!(
+                                    "API token created on {node}: open its Settings page to copy it"
+                                ),
+                                Tone::Ok,
+                            );
+                        }
                     }
-                    Err(e) => this.say(e.to_string(), Tone::Bad),
+                    Err(e) if here => this.say(e.to_string(), Tone::Bad),
+                    Err(e) => this.say(
+                        foreign_notice("Create token", origin, &e.to_string()),
+                        Tone::Bad,
+                    ),
                 }
                 cx.notify();
             },
@@ -188,6 +216,8 @@ impl Console {
             Load::Ready(data) => {
                 col = col
                     .child(self.retention_card(cx))
+                    .child(self.certs_card(cx))
+                    .child(self.ranges_card(cx))
                     .child(self.tokens_card(data, cx));
             }
         }
@@ -421,8 +451,10 @@ impl Console {
             Col::fixed("", 90.),
         ];
         let mut body = div().flex().flex_col().gap(px(12.));
-        if let Some(token) = self.settings.created.clone() {
-            let copy_value = token.clone();
+        let active = self.active_name().unwrap_or_default();
+        let shown = self.settings.created.for_node(&active).map(str::to_string);
+        if let Some(token) = shown {
+            let (copy_node, done_node) = (active.clone(), active.clone());
             body = body.child(
                 div()
                     .flex()
@@ -449,15 +481,20 @@ impl Console {
                             .flex()
                             .gap(px(8.))
                             .child(btn(id("tok", "copy"), "Copy", BtnKind::Primary).on_click(
-                                cx.listener(move |_, _, _, cx| {
-                                    cx.write_to_clipboard(ClipboardItem::new_string(
-                                        copy_value.clone(),
-                                    ));
+                                cx.listener(move |this, _, _, cx| {
+                                    let found = this
+                                        .settings
+                                        .created
+                                        .for_node(&copy_node)
+                                        .map(str::to_string);
+                                    if let Some(token) = found {
+                                        cx.write_to_clipboard(ClipboardItem::new_string(token));
+                                    }
                                 }),
                             ))
                             .child(btn(id("tok", "dismiss"), "Done", BtnKind::Plain).on_click(
-                                cx.listener(|this, _, _, cx| {
-                                    this.settings.created = None;
+                                cx.listener(move |this, _, _, cx| {
+                                    this.settings.created.dismiss(&done_node);
                                     cx.notify();
                                 }),
                             )),

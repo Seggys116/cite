@@ -1,15 +1,20 @@
 use std::collections::BTreeSet;
 
-use cite_client::NodeOutcome;
+use cite_client::{ClientError, NodeOutcome};
 use gpui::{AnyElement, Context, Entity, div, prelude::*, px};
 
 use crate::api::apply_to_handles;
 use crate::app::{Console, View, new_input};
+use crate::certs::AccessDraft;
 use crate::model::{
     Placement, SiteDraft, build_site, draft_github_token, plan_placement, regex_matches,
     regex_problem, slugify,
 };
 use crate::theme::{DIM, Tone, c};
+use crate::ui::certs::{access_body, access_controls};
+use crate::zone::{ZoneReveal, create_verdict};
+
+type CreateDone = (Vec<NodeOutcome>, Vec<ZoneReveal>, Vec<String>);
 use crate::ui::input::{InputEvent, TextInput};
 use crate::ui::widgets::{
     BtnKind, btn, card, field, id, mono, notice, page_header, pill, seg_item, seg_row, text_dim,
@@ -18,6 +23,7 @@ use crate::ui::widgets::{
 
 pub struct State {
     pub api: bool,
+    pub access: AccessDraft,
     pub placement: Placement,
     pub picked: BTreeSet<String>,
     pub busy: bool,
@@ -41,6 +47,7 @@ impl State {
         let name = new_input(cx, "Storefront", |i| i);
         let state = Self {
             api: false,
+            access: AccessDraft::default(),
             placement: Placement::Selected,
             picked: BTreeSet::new(),
             busy: false,
@@ -96,6 +103,7 @@ impl Console {
         }
         c.health.update(cx, |i, cx| i.set_text("/", cx));
         self.create.last_auto_id.clear();
+        self.create.access = AccessDraft::default();
         self.create.error = None;
         self.create.busy = false;
         self.create.picked = self.active_name().into_iter().collect();
@@ -116,6 +124,7 @@ impl Console {
             repo: t(&c.repo),
             branch: t(&c.branch),
             github_token: t(&c.gh_token),
+            access: c.access,
         }
     }
 
@@ -158,14 +167,33 @@ impl Console {
         self.create.busy = true;
         self.create.error = None;
         let name = site.name.clone();
-        let fut = async move { Ok(apply_to_handles(handles, plan).await) };
-        self.fetch(
+        let (lock, site_id) = (site.access.zone_lock, site.id.clone());
+        let rotate_on = handles.clone();
+        // A new zone lock has no visible secret yet, so one is rotated in on every node that took the site.
+        let fut = async move {
+            let outcomes = apply_to_handles(handles, plan).await;
+            let (mut reveals, mut problems) = (Vec::new(), Vec::new());
+            if lock {
+                for h in rotate_on
+                    .iter()
+                    .filter(|h| outcomes.iter().any(|o| o.ok && o.node == h.name()))
+                {
+                    match h.rotate_zone_secret(&site_id).await {
+                        Ok(r) => reveals.push(r),
+                        Err(e) => problems.push(format!("{}: {e}", h.name())),
+                    }
+                }
+            }
+            Ok((outcomes, reveals, problems))
+        };
+        let reveal_site = site.id.clone();
+        self.fetch_origin(
             cx,
             fut,
-            move |this, res: Result<Vec<NodeOutcome>, _>, cx| {
+            move |this, res: Result<CreateDone, ClientError>, here, _origin, cx| {
                 this.create.busy = false;
                 match res {
-                    Ok(outcomes) => {
+                    Ok((outcomes, reveals, problems)) => {
                         let failed: Vec<String> = outcomes
                             .iter()
                             .filter(|o| !o.ok)
@@ -177,17 +205,44 @@ impl Console {
                                 )
                             })
                             .collect();
-                        if failed.is_empty() {
-                            this.say(
-                                format!("Site {name} created on {} node(s)", outcomes.len()),
-                                Tone::Ok,
-                            );
-                            this.navigate(View::Sites, cx);
-                        } else {
-                            this.create.error = Some(failed.join("; "));
+                        let created = outcomes.iter().filter(|o| o.ok).count();
+                        let nodes: Vec<String> = reveals.iter().map(|r| r.node.clone()).collect();
+                        let verdict = create_verdict(&name, created, &failed, &problems, &nodes);
+                        let has_secrets = !reveals.is_empty();
+                        this.detail.reveals.extend(reveals);
+                        if !here {
+                            // The user moved on: the outcome is a toast, and secrets wait on their own site page.
+                            let mut text = verdict
+                                .toast
+                                .map(|(t, _)| t)
+                                .or(verdict.error)
+                                .unwrap_or_default();
+                            if has_secrets {
+                                text.push_str(" Open the site to copy its zone secret.");
+                            }
+                            this.say(text, Tone::Warn);
+                            cx.notify();
+                            return;
+                        }
+                        if let Some((text, ok)) = verdict.toast {
+                            this.say(text, if ok { Tone::Ok } else { Tone::Warn });
+                        }
+                        this.create.error = verdict.error;
+                        if this.create.error.is_none() {
+                            match verdict.open_node {
+                                Some(node) => this.navigate(
+                                    View::SiteDetail {
+                                        node,
+                                        id: reveal_site.clone(),
+                                    },
+                                    cx,
+                                ),
+                                None => this.navigate(View::Sites, cx),
+                            }
                         }
                     }
-                    Err(e) => this.create.error = Some(e.to_string()),
+                    Err(e) if here => this.create.error = Some(e.to_string()),
+                    Err(e) => this.say(format!("Create site {name}: {e}"), Tone::Bad),
                 }
                 cx.notify();
             },
@@ -324,6 +379,10 @@ impl Console {
                 Some("Probed on every target to decide readiness."),
                 s.health.clone(),
             ));
+        let access = access_body(
+            access_controls(cx, "create-access", s.access, |c| &mut c.create.access),
+            s.access,
+        );
         let source = div()
             .flex()
             .gap(px(12.))
@@ -350,6 +409,11 @@ impl Console {
             .child(header)
             .child(card(Some("Basics"), None, basics))
             .child(card(Some("Routing"), None, routing))
+            .child(card(
+                Some("Access"),
+                Some("Who may reach this site and how Cloudflare connects to it."),
+                access,
+            ))
             .child(card(
                 Some("Upstreams"),
                 Some("Both slots can be filled now."),

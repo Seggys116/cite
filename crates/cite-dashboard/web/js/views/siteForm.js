@@ -7,6 +7,9 @@ import {
 } from '../ui.js';
 import { noNodes, listOf } from './common.js';
 import { siteProblem, cleanToken, RUNTIMES, NODE_MAJORS } from '../siteCheck.js';
+import { accessForSave, createVerdict, rotationFailureLines } from '../accesslib.js';
+import { accessCard } from './accessCard.js';
+import { rotateAndShow } from './zoneSecret.js';
 
 // Targets are host:port only, with no scheme or path, because they become HAProxy server addresses.
 const ADDR_RE =/^[^\s:/]+:\d{1,5}$/;
@@ -153,6 +156,8 @@ export function newSiteView(ctx) {
     nodeList,
     h('label', { class: 'radio-card' }, modeAll, h('div', {}, h('b', {}, 'Replicate to all nodes'), h('p', { class: 'muted' }, `Create the same site on all ${state.nodes.length} connected nodes.`))));
 
+  const access = accessCard({ node: preferred[0] || onlineNames[0], site: null });
+
   const err = h('p', { class: 'form-error', role: 'alert', hidden: true });
   const fail = (message) => {
     err.textContent = message;
@@ -205,19 +210,25 @@ export function newSiteView(ctx) {
       health: { path: healthPath.value, interval_ms: 2000, rise: 2, fall: 3, timeout_ms: 1500 },
       source,
     };
+    const accessValue = accessForSave(access.get(), null);
+    if (accessValue) site.access = accessValue;
     const placeMode = modeAll.checked ? 'replicate' : 'each';
     // Replicate targets only online nodes, so an offline node cannot fail the whole request.
     const nodes = placeMode === 'replicate' ? onlineNames : checks.filter((c) => c.checked).map((c) => c.value);
     try {
       const res = await withBusy(submit, () => api.post('/deployments', { nodes, site, mode: placeMode, github_token: githubToken }));
       const results = listOf(res && res.results ? res.results : null);
-      const failed = results.filter((r) => r && (r.error || r.ok === false));
-      if (failed.length) {
-        fail(failed.map((r) => `${r.node || 'node'}: ${r.error || 'failed'}`).join('; '));
+      const verdict = createVerdict({ results, nodes, zoneLock: Boolean(site.access && site.access.zone_lock) });
+      const leave = () => { location.hash = '#/sites'; };
+      if (!verdict.ok) fail(verdict.error);
+      else toast(`Site ${site.name} created on ${nodes.length} node${nodes.length === 1 ? '' : 's'}`, 'success');
+      // The secret only comes from a rotate call, so a new zone lock fetches one per node that took the site and shows it once
+      if (verdict.rotate.length) {
+        const failures = await rotateAndShow(verdict.rotate, site.id, verdict.ok ? leave : null);
+        rotationFailureLines(failures, formatError).forEach((line) => toast(line, 'error'));
         return;
       }
-      toast(`Site ${site.name} created on ${nodes.length} node${nodes.length === 1 ? '' : 's'}`, 'success');
-      location.hash = '#/sites';
+      if (verdict.ok) leave();
     } catch (ex) {
       fail(formatError(ex));
     }
@@ -230,6 +241,7 @@ export function newSiteView(ctx) {
         field('Kind', kindControl, 'APIs usually route by path prefix; sites by host name.', { group: true }),
         field('Name', name), field('Id', id, null), idHint) }),
       card({ title: 'Routing', body: h('div', { class: 'form' }, field('Hosts', hosts.el, 'Requests with these Host headers go to this site.', { group: true }), pathTool.el) }),
+      access.el,
       card({ title: 'Source', subtitle: 'Route to servers you run, or let the node build the site from a GitHub repository.', body: h('div', { class: 'form' },
         field('Source', modeControl, 'Building from GitHub makes the node provision the stack for the live slot, so no targets are needed.', { group: true }),
         upstreamsPane, githubPane) }),

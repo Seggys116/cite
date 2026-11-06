@@ -48,11 +48,11 @@ The connector's certificate comes from a self-signed authority created by `init`
 | Overview | Health and traffic across every connected node, and recent deployments from all of them. |
 | Nodes | Add and remove connectors. |
 | Sites | A table of sites with node, kind (site or API), hosts, active slot, health and state. Create site opens the form described below. |
-| Site page | Routing, health check settings, a live view of targets in each slot, deploy history, Deploy new version, Switch active slot, Roll back, a maintenance toggle with page choice, and Delete site. |
+| Site page | Routing, access (Cloudflare only and SSL mode), health check settings, a live view of targets in each slot, deploy history, Deploy new version, Switch active slot, Roll back, a maintenance toggle with page choice, and Delete site. |
 | Traffic | Requests over time, status classes, methods, latency (average, p50, p95, p99), response sizes, content types, top paths, client IPs, user agents, hosts and blocking rules, and a live request list that refreshes every 3 seconds. A time window selector offers 15 minutes, 1 hour, 24 hours, 7 days and 30 days, and a site selector narrows every panel to one site. The request list filters by status, method, path, client IP and blocked only, and a request can be turned into a rule that blocks its path or its address. |
-| Firewall | An ordered list of rules ("evaluated in order; the first match wins" in the UI) with path prefix, path regex, user agent regex, host, methods and client address matchers, an action (deny, drop silently or tarpit) and a scope of one site or all. Each row shows its hits over 24 hours and can be switched on or off. Presets sit below the list. |
+| Firewall | An ordered list of rules. A rule blocks (deny, drop silently or tarpit), redirects, or changes headers and handles CORS, and has a scope of one site or all. Each row shows its effect, label, matchers and hits over 24 hours and can be switched on or off. Presets sit below the list. See Firewall rules below. |
 | Maintenance | Custom maintenance pages: a name, a status code and the HTML (up to 15000 bytes). A page that a site uses cannot be deleted. |
-| Settings | Data retention, connection limits, API tokens, the audit log (most recent 200 entries), the rendered `haproxy.cfg` with process and backend status, and dashboard appearance and session. |
+| Settings | Data retention, connection limits, certificates, Cloudflare ranges, API tokens, the audit log (most recent 200 entries), the rendered `haproxy.cfg` with process and backend status, and dashboard appearance and session. |
 
 Connection limit changes apply on the next HAProxy reload. The retention form edits the settings described in [Analytics and retention](analytics.md): recent events, minute history, how long hourly history is kept (forever by default) and whether old data is archived before it is deleted, audit days, the persist interval and the two privacy flags. See Retention, backup, cut and restore below.
 
@@ -106,6 +106,7 @@ Download is a same-origin download like an export, so large files stream to disk
 | Hosts | Host names that route to the site. |
 | Path regex | Optional. A built-in tester shows whether the regex is valid and whether a sample path matches. Empty means every path on those hosts. |
 | Source | Existing upstreams (the default) or Build from GitHub. See below. |
+| Access | Whether to accept traffic only from Cloudflare, and the SSL mode (Full or Flexible). Both default to off and Full. See Access below. |
 | Blue and green targets | Existing upstreams only. `host:port` addresses for each slot. At least one blue target is required. |
 | Health check path | Must start with `/`. The form sends an interval of 2000 ms, a timeout of 1500 ms, 2 passes to be healthy and 3 failures to be down. |
 | Placement | Selected nodes, or Replicate to all nodes. |
@@ -125,6 +126,63 @@ Build from GitHub hides the targets, because the connector provisions the stack 
 The connector accepts `github_token` only for a site with a `source`. In `each` mode `POST /deployments` also takes `per_node`, a map of node name to `{blue, green}` target lists, so each node can get its own upstreams.
 
 On a site with a `source`, the overview tab lists the repository, branch, runtime and poll interval, and the Deploy new version panel asks for a Git ref (a branch, tag or commit sha, up to 100 characters of letters, digits, dot, underscore, dash and slash, not starting with a dash or containing `..`) instead of targets. It posts `{git_ref, note}` to the node's `/sites/{id}/deploy`.
+
+## Access
+
+The Access card appears in the create form and on the Routing tab of a site. It stores `access` on the site as `{"cloudflare_only": bool, "tls": "full" | "flexible"}`. The console leaves `access` out of the request while it holds the default (off, Full) and the site has none, so a node that predates the field never receives it.
+
+| Setting | Meaning |
+|---|---|
+| Only accept traffic from Cloudflare | The edge refuses requests that do not come from a Cloudflare address, so nobody can bypass Cloudflare and reach the node directly. The addresses come from the node's Cloudflare ranges, shown below the toggle with their source (built-in or custom) and date. |
+| SSL mode: Full | Cloudflare connects to the node over HTTPS. The node needs a certificate that covers the host. |
+| SSL mode: Flexible | Cloudflare terminates HTTPS and talks plain HTTP to the node, so no certificate is needed on the node. Pair it with Only accept traffic from Cloudflare. |
+
+Choosing Flexible without Cloudflare only shows a warning on the card: anyone who reaches the node directly is then served over plain HTTP. The warning does not block saving.
+
+Settings, Cloudflare shows the active list for the selected node, with its source, date and count. The override box takes one CIDR range per line, IPv4 or IPv6. A bare address counts as a single host (`/32` or `/128`). The console applies the node's width rules before saving: IPv4 ranges must be `/12` or narrower, IPv6 ranges `/28` or narrower, `/0` is refused as trusting every address, and an IPv6 range that overlaps `::ffff:0:0/96`, `::/96`, `2002::/16` or `64:ff9b::/96` is refused because it would also match IPv4 clients (an IPv4-mapped address such as `::ffff:198.51.100.0/120` is read as the IPv4 range). Octets and prefix lengths with leading zeros (`010.0.0.1`, `/08`) are refused, as the node refuses them. Lines that are not addresses or ranges are refused, and up to 256 ranges are allowed. Save ranges writes `cloudflare_ranges` through `PUT /settings`; an empty box, or Use built-in list, saves an empty list so the node falls back to its built-in one. A wrong custom list locks real visitors out of sites that only accept Cloudflare traffic, so use it only when Cloudflare publishes ranges the node does not know yet.
+
+### Bot policy and zone lock
+
+The Access card also holds two settings that are stored in the same `access` object. Neither is sent while it has its default value and the site has no `access` yet.
+
+| Setting | Meaning |
+|---|---|
+| Bot policy | `bots`: Allow all bots (default), Block scraper and tool bots (`block_bad`) or Block all bots including search engines (`block_all`). The last choice shows a warning that search engines, link previews and uptime monitors are blocked too. A note on the card says user-agent matching can be faked and that blocked requests still appear in analytics. |
+| Only my Cloudflare zone | `zone_lock`. The checkbox is enabled only while Only accept traffic from Cloudflare is on, and turning that off clears it. The edge then refuses requests that lack the site's secret header `X-Cite-Origin-Secret`. |
+
+The node generates the zone secret and returns it only from `POST /sites/{id}/zone-secret`. After you save a site whose zone lock was off and is now on (in the create form, once per node the site was created on, even when other nodes failed: the error then lists the failed nodes and says the secret for the others is shown in the dialog), the console calls that route and shows the secret in a dialog: the header name, the secret with a copy button, the secret's fingerprint and date, and numbered Cloudflare steps (Rules, Transform Rules, Modify Request Header, Set static header). The dialog warns that the secret is not shown again. It has no close icon and ignores Escape and clicks outside; it closes only with the I have saved it button, which asks for confirmation first if Copy was never pressed. Closing it empties the text and drops the copies held by the page. The secret is not written to storage, the address or any log.
+
+On the Routing tab of a site with the lock on, the card shows when the secret was created and its fingerprint (`GET /sites/{id}/zone-secret`, which never returns the secret) and a Rotate secret button. When the node reports `readable: false` (it could not read its secret store at start), the line says the lock state is unknown and to fix the file or rotate after restoring it, instead of claiming no secret exists. Rotating asks for confirmation, because the old secret stops working at once. The dashboard proxy passes only `GET` and `POST` on `sites/{id}/zone-secret`, checks the site id, and marks both answers `Cache-Control: no-store`.
+
+## Firewall rules
+
+Add rule and Edit rule open a drawer with a Kind control.
+
+| Kind | Fields |
+|---|---|
+| Block | The action: Deny, Drop silently or Tarpit. At least one matcher is required, as before. |
+| Redirect | A target template and a status of 301, 302, 307 or 308. The placeholders `{scheme}`, `{host}`, `{www_host}`, `{apex_host}`, `{path}` and `{query}` are buttons that insert themselves at the cursor. The template and the loop checks (a redirect that keeps the host needs a path matcher, an https redirect to the same host needs the scheme matcher set to http) are checked with the same rules as the node before saving. |
+| Headers and CORS | A list of header changes (request or response, set, add or remove, name, value) and an optional CORS block: allowed origins one per line, methods, allowed and exposed headers, credentials and a max age. Inline checks mirror the node: at most 16 changes, reserved and identity headers refused, `*` cannot be combined with credentials or other origins, at most 32 entries per list, max age up to 86400. |
+
+Every kind also takes an optional label, which replaces the rule id in logs and the blocked-by-rule table. The new matchers are the connection scheme (any, http or https), a referer regex and a request header test: a header name, Equals or Matches regex, a value, an option to match when the test fails, and Secret value. A secret value is typed into a password box, is not shown again after saving, and the editor opens with the box empty and a note that the stored value is kept; leave it empty to keep it or type a new value to replace it. Switching a rule on or off from the list keeps a stored secret as well. A secret value is never shown in the list, where the matcher appears as `header X-Key = (secret)`.
+
+The rule list shows an Effect column: Deny, Drop silently or Tarpit for blocks, the status and target for redirects, and the number of header changes or the CORS origin for the rest. The three redirect presets (`redirect-to-www`, `redirect-to-apex`, `force-https`) appear with the other presets. They have no site, so Apply asks for confirmation first and says they act on every site on the node. See [Firewall and maintenance](firewall.md) for the rules the node enforces.
+
+## Certificates
+
+Settings, Certificates lists the TLS certificates stored on the selected node and manages them through the connector's `/certificates` routes. Each row shows the name and subject, the names the certificate is valid for as chips, the issuer, the expiry date with the days left, the key type, a short SHA-256 fingerprint and the site hosts the certificate covers. The expiry gets a warning chip under 30 days and a danger chip under 7 days or once expired. The private key is never returned by the node, so it is never shown.
+
+| Action | What it does |
+|---|---|
+| Upload certificate | Opens a dialog with a name, the certificate chain and the private key. Paste the PEM text or choose a file, which the browser reads into the box. The dialog checks for the PEM markers, refuses an encrypted key, a key pasted into the certificate box, a name that does not start with a letter or digit, starts or ends with a space or contains `-----`, and a certificate and key that together exceed 100 KiB before sending (the connector caps the whole JSON body at 128 KiB). A server error is shown in the dialog exactly as the node wrote it, and the private key box is cleared when an upload fails. A warning from the node is shown as a message and left in the status line. |
+| Replace | The same dialog for an existing certificate, with the name pre-filled. Both blocks are required. |
+| Delete | Asks for confirmation, then removes the certificate. Hosts only that certificate covered stop being served over HTTPS. |
+
+Certificate files placed in the node's certificate directory by hand are listed too, with source `manual` and an id such as `file:legacy.pem`. They are read-only through the API (the item routes answer 404), so the row shows the badge "Placed on the node by hand: read-only" instead of Replace and Delete, plus the node's per-certificate warning when the file could not be read. The proxy still refuses `file:` ids, because only 26-character ULIDs are allowed in the path.
+
+The key and chain are held only in the dialog's text boxes and the one request. The boxes are cleared when the upload succeeds or the dialog closes, the key box is also cleared when an upload fails, they have autocomplete and spellcheck off, and nothing is logged or kept in local storage, session storage or the URL. The dashboard proxy passes `GET` and `POST /certificates`, `GET`, `PUT` and `DELETE /certificates/{id}` and `GET /cloudflare/ranges` and nothing else under those prefixes, requires an id of exactly 26 uppercase letters or digits (a ULID), needs the session's CSRF token for writes and refuses certificate bodies over 144 KiB.
+
+A note above the table lists site hosts that no certificate covers. Visitors to those hosts over HTTPS get a certificate warning, unless the site uses Flexible SSL behind Cloudflare. When the node's `https_port` is empty, HTTPS is off and certificates are stored but not served. The tab then shows a port field (443 by default) that saves `https_port` with `PUT /settings`. A node that answers 404 for the certificate routes predates them, and the tab shows a note that it needs a connector update.
 
 ## How the console talks to connectors
 

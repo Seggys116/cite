@@ -194,7 +194,7 @@ pub fn format_json(p: &Provisioned) -> Result<String> {
 }
 
 pub async fn run_init(cfg: &ConnectorConfig, opts: InitOptions) -> Result<()> {
-    let store = Store::open(cfg).await?;
+    let store = Store::open_read_only(cfg).await?;
     if opts.renew_tls {
         if !cfg.tls {
             return Err(ConnectorError::BadRequest(
@@ -231,7 +231,7 @@ pub async fn run_reset(
     username: Option<String>,
     non_interactive: bool,
 ) -> Result<()> {
-    let store = Store::open(cfg).await?;
+    let store = Store::open_read_only(cfg).await?;
     let existing = store.credentials().map(|c| c.username);
     let username = resolve_username(username, non_interactive, existing.as_deref())?;
     let provisioned = provision(cfg, &store, &username, Mode::Reset).await?;

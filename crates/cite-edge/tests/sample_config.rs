@@ -21,6 +21,14 @@ fn sample() -> EdgeConfig {
                 "blue": {"targets": [{"addr": "10.0.0.5:9000", "weight": 100}]},
                 "green": {"targets": []},
                 "active": "blue"
+            },
+            {
+                "id": "edge", "name": "Behind Cloudflare", "hosts": ["edge.example.com"],
+                "kind": "site",
+                "blue": {"targets": [{"addr": "10.0.0.6:8080", "weight": 100}]},
+                "green": {"targets": []},
+                "active": "blue",
+                "access": {"cloudflare_only": true, "tls": "flexible"}
             }
         ],
         "pages": [{"id": "down", "name": "Down", "html": "<html><body>back soon</body></html>", "status": 503}],
@@ -46,6 +54,14 @@ fn sample() -> EdgeConfig {
     for p in presets() {
         cfg.firewall.extend(p.rules);
     }
+    // the opposing www and apex redirects must not share a scope
+    for r in &mut cfg.firewall {
+        match r.id.as_str() {
+            "preset-redirect-to-www-1" => r.site = Some("shop".into()),
+            "preset-redirect-to-apex-1" => r.site = Some("api".into()),
+            _ => {}
+        }
+    }
     cfg
 }
 
@@ -64,6 +80,7 @@ fn opts() -> RenderOptions {
         runtime_addr: "ipv4@172.30.250.3:9999".into(),
         log_addr: "172.30.250.2:5140".into(),
         tls_dir: None,
+        cloudflare_file: Some("/conf/haproxy/maps/cloudflare.lst".into()),
     }
 }
 
@@ -72,6 +89,12 @@ fn sample_config_renders_and_optionally_dumps() {
     let rendered = render(&sample(), &opts()).expect("render");
     assert!(rendered.config.contains("be_shop_blue"));
     assert!(rendered.config.contains("be_api_green"));
+    assert!(
+        rendered
+            .config
+            .contains("acl cf_peer fc_src -f /conf/haproxy/maps/cloudflare.lst")
+    );
+    assert!(rendered.cloudflare_list.starts_with("173.245.48.0/20\n"));
     let unix = render(&sample(), &opts_unix()).expect("render unix");
     assert!(
         unix.config
@@ -90,6 +113,7 @@ fn sample_config_renders_and_optionally_dumps() {
         std::fs::write(dir.join("haproxy-unix.cfg"), &unix.config).expect("unix cfg");
         std::fs::write(dir.join("maps/active.map"), &rendered.active_map).expect("active");
         std::fs::write(dir.join("maps/maint.map"), &rendered.maint_map).expect("maint");
+        std::fs::write(dir.join("maps/cloudflare.lst"), &rendered.cloudflare_list).expect("cf");
         for (name, html) in &rendered.pages {
             std::fs::write(dir.join("pages").join(name), html).expect("page");
         }

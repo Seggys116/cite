@@ -9,10 +9,13 @@ import { noNodes, nodeNotice, healthKind, healthDots } from './common.js';
 import {
   ARCHIVE_NOTE, DELETE_WARNING, FOREVER_NOTE, MAX_RETENTION_DAYS, applyRetentionForm, deletesWithoutArchive, retentionFormFrom,
 } from '../archivelib.js';
+import { certificatesPanel, cloudflarePanel } from './certificates.js';
 
 const TABS = [
   { id: 'retention', label: 'Retention', icon: 'clock' },
   { id: 'limits', label: 'Limits', icon: 'bolt' },
+  { id: 'certificates', label: 'Certificates', icon: 'lock' },
+  { id: 'cloudflare', label: 'Cloudflare', icon: 'globe' },
   { id: 'tokens', label: 'API tokens', icon: 'key' },
   { id: 'audit', label: 'Audit log', icon: 'file' },
   { id: 'haproxy', label: 'HAProxy', icon: 'terminal' },
@@ -360,6 +363,8 @@ export function settingsView(ctx) {
   }
   switch (tab) {
     case 'limits': holder.appendChild(limitsPanel(node)); break;
+    case 'certificates': holder.appendChild(certificatesPanel(node)); break;
+    case 'cloudflare': holder.appendChild(cloudflarePanel(node)); break;
     case 'tokens': holder.appendChild(tokensPanel(node)); break;
     case 'audit': holder.appendChild(auditPanel(node)); break;
     case 'haproxy': holder.appendChild(haproxyPanel(node)); break;

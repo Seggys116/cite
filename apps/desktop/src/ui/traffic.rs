@@ -82,7 +82,7 @@ impl Console {
                 recent,
             })
         };
-        self.fetch(cx, fut, |this, res, cx| {
+        self.fetch_scoped(cx, fut, |this, res, cx| {
             this.traffic.data = Load::from_result(res);
             // Screenshot mode opens the detail card on the first request that raised signals.
             if std::mem::take(&mut this.traffic.auto_inspect)
@@ -123,7 +123,7 @@ impl Console {
             recent.truncate(RECENT_LIMIT);
             Ok(recent)
         };
-        self.fetch(cx, fut, |this, res, cx| {
+        self.fetch_scoped(cx, fut, |this, res, cx| {
             if let (Ok(recent), Load::Ready(data)) = (res, &mut this.traffic.data) {
                 data.recent = recent;
                 cx.notify();

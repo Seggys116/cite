@@ -13,6 +13,7 @@ use crate::api::{NodeHandle, spawn_io};
 use crate::config::{DesktopConfig, DesktopNode};
 use crate::demo::{demo_config, demo_nodes};
 use crate::keychain::KeychainTokenStore;
+use crate::scope::{Origin, Scope, apply_if_current, foreign_notice};
 use crate::theme::{
     ACCENT, BG, BLUE, BORDER, CARD_RADIUS, CHIP_RADIUS, DIM, DIVIDER, GREEN, INPUT, RED,
     ROW_RADIUS, SIDEBAR, SURFACE, TEXT, TOPBAR, Tone, c, chip_fill, chip_stroke, tint,
@@ -20,8 +21,10 @@ use crate::theme::{
 use crate::ui::input::TextInput;
 use crate::ui::widgets::{BtnKind, btn, id, strong, text_dim};
 use crate::ui::{
-    bots, create, detail, firewall, maintenance, nodes, overview, settings, sites, storage, traffic,
+    bots, certs, create, detail, firewall, maintenance, nodes, overview, settings, sites, storage,
+    traffic,
 };
+use crate::zone::keep_for_site;
 
 const TICK: Duration = Duration::from_millis(500);
 const LOGO_FLIP_TICKS: u64 = 5;
@@ -162,6 +165,7 @@ pub struct Console {
     pub toast: Option<Toast>,
     pub confirm: Option<Confirm>,
     pub tick: u64,
+    pub scope: Scope,
     pub overview: overview::State,
     pub nodes: nodes::State,
     pub sites: sites::State,
@@ -170,6 +174,7 @@ pub struct Console {
     pub traffic: traffic::State,
     pub bots: bots::State,
     pub archives: storage::State,
+    pub certs: certs::State,
     pub firewall: firewall::State,
     pub maintenance: maintenance::State,
     pub settings: settings::State,
@@ -203,6 +208,7 @@ impl Console {
             toast: None,
             confirm: None,
             tick: 0,
+            scope: Scope::default(),
             overview: overview::State::default(),
             nodes: nodes::State::new(cx),
             sites: sites::State::new(cx),
@@ -214,6 +220,7 @@ impl Console {
             },
             bots: bots::State::new(cx),
             archives: storage::State::new(cx),
+            certs: certs::State::new(cx),
             firewall: firewall::State::new(cx),
             maintenance: maintenance::State::new(cx),
             settings: settings::State::new(cx),
@@ -243,6 +250,8 @@ impl Console {
 
     // Rebuilds the per-node clients from the config, recording why a node could not be reached.
     pub fn connect(&mut self) {
+        self.scope.advance();
+        self.reset_node_data();
         self.handles.clear();
         self.connect_errors.clear();
         if self.demo {
@@ -312,6 +321,72 @@ impl Console {
         .detach();
     }
 
+    // Where the user is right now, in the terms an action is tagged with.
+    pub fn origin(&self) -> Origin {
+        match &self.view {
+            View::SiteDetail { .. } => {
+                Origin::new(&self.detail.node, Some(&self.detail.site_id), &self.view)
+            }
+            _ => Origin::new(
+                self.active_name().as_deref().unwrap_or(""),
+                None,
+                &self.view,
+            ),
+        }
+    }
+
+    pub fn still_here(&self, origin: &Origin) -> bool {
+        self.origin() == *origin
+    }
+
+    // Actions use this: the completion learns whether the user is still where the action was issued.
+    pub fn fetch_origin<T, F>(
+        &mut self,
+        cx: &mut Context<Self>,
+        fut: F,
+        apply: impl FnOnce(&mut Self, Result<T, ClientError>, bool, &Origin, &mut Context<Self>)
+        + 'static,
+    ) where
+        T: Send + 'static,
+        F: Future<Output = Result<T, ClientError>> + Send + 'static,
+    {
+        let origin = self.origin();
+        self.fetch(cx, fut, move |this, res, cx| {
+            let here = this.still_here(&origin);
+            apply(this, res, here, &origin, cx);
+        });
+    }
+
+    // Loaders use this: a result that finishes after a node or view change belongs to the old scope and is dropped.
+    pub fn fetch_scoped<T, F>(
+        &mut self,
+        cx: &mut Context<Self>,
+        fut: F,
+        apply: impl FnOnce(&mut Self, Result<T, ClientError>, &mut Context<Self>) + 'static,
+    ) where
+        T: Send + 'static,
+        F: Future<Output = Result<T, ClientError>> + Send + 'static,
+    {
+        let issued = self.scope;
+        self.fetch(cx, fut, move |this, res, cx| {
+            apply_if_current(this.scope, issued, res, |res| apply(this, res, cx));
+        });
+    }
+
+    // Data loaded for one node must not stay on screen, or be saved back, once another node is selected.
+    pub fn reset_node_data(&mut self) {
+        self.settings.data = Load::Idle;
+        self.settings.data_node.clear();
+        self.settings.error = None;
+        self.certs.note = None;
+        self.certs.ranges_note = None;
+        self.certs.list = Load::Idle;
+        self.certs.ranges = Load::Idle;
+        self.certs.unsupported = false;
+        self.certs.ranges_unsupported = false;
+        self.archives.list = Load::Idle;
+    }
+
     // Toasts expire on the tick loop so no timer is held per message.
     pub fn say(&mut self, text: impl Into<String>, tone: Tone) {
         self.toast = Some(Toast {
@@ -327,14 +402,40 @@ impl Console {
 
     // Switching view always reloads, so stale data from an earlier visit never shows.
     pub fn navigate(&mut self, view: View, cx: &mut Context<Self>) {
+        // A zone secret is shown once and only on its own site page, so leaving that page drops it.
+        let keep = match &view {
+            View::SiteDetail { id, .. } => Some(id.clone()),
+            _ => None,
+        };
+        keep_for_site(&mut self.detail.reveals, keep.as_deref());
+        self.detail.busy = false;
+        // A key typed on the certificate panel must not outlive the visit to Settings.
+        self.close_panel(cx);
+        // Arriving on a site page starts without the error of an earlier visit.
+        self.detail.error = None;
+        self.detail.site_id.clear();
         self.view = view;
         self.switcher_open = false;
         self.load_current(cx);
         cx.notify();
     }
 
-    pub fn select_node(&mut self, name: Option<String>, cx: &mut Context<Self>) {
+    // Every change of the selected node goes through here, so nothing loaded for the old node survives.
+    pub fn set_node(&mut self, name: Option<String>, cx: &mut Context<Self>) {
         self.selected = name;
+        self.close_panel(cx);
+        self.detail.error = None;
+        self.detail.busy = false;
+        self.detail.site_id.clear();
+        self.scope.advance();
+        self.reset_node_data();
+        self.certs
+            .ranges_input
+            .update(cx, |input, cx| input.set_text("", cx));
+    }
+
+    pub fn select_node(&mut self, name: Option<String>, cx: &mut Context<Self>) {
+        self.set_node(name, cx);
         self.switcher_open = false;
         self.load_current(cx);
         cx.notify();
@@ -342,6 +443,7 @@ impl Console {
 
     // Each view owns its loader; the switcher and navigation both funnel through here.
     pub fn load_current(&mut self, cx: &mut Context<Self>) {
+        self.scope.advance();
         match self.view.clone() {
             View::Overview | View::Nodes => self.load_overview(cx),
             View::Sites => self.load_sites(cx),
@@ -827,12 +929,18 @@ impl Console {
         T: Send + 'static,
         F: Future<Output = Result<T, ClientError>> + Send + 'static,
     {
-        self.fetch(cx, fut, move |this, res, cx| {
-            match res {
-                Ok(_) => this.say(done, Tone::Ok),
-                Err(e) => this.say(e.to_string(), Tone::Bad),
+        self.fetch_origin(cx, fut, move |this, res, here, origin, cx| {
+            match (res, here) {
+                (Ok(_), true) => this.say(done, Tone::Ok),
+                (Err(e), true) => this.say(e.to_string(), Tone::Bad),
+                (Ok(_), false) => this.say(foreign_notice(&done, origin, ""), Tone::Ok),
+                (Err(e), false) => {
+                    this.say(foreign_notice("Change", origin, &e.to_string()), Tone::Bad)
+                }
             }
-            this.load_current(cx);
+            if here {
+                this.load_current(cx);
+            }
             cx.notify();
         });
     }

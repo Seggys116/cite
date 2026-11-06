@@ -9,8 +9,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use cite_client::{
-    ArchiveKind, ClientError, CutRequest, ExportFormat, ExportKind, ExportQuery, NodeClient,
-    NodeConfig, NodeTargets, ReplicationMode, ReplicationPlan, apply_site_to_nodes, fan_out,
+    ArchiveKind, CertificateUpload, ClientError, CutRequest, ExportFormat, ExportKind, ExportQuery,
+    MAX_PEM_BYTES, NodeClient, NodeConfig, NodeTargets, ReplicationMode, ReplicationPlan,
+    apply_site_to_nodes, fan_out,
 };
 use cite_edge::analytics::Summary;
 use cite_edge::model::{HealthCheck, Maintenance, Site, SiteKind, Slot, Source, Target, Upstream};
@@ -346,6 +347,159 @@ async fn archive_delete(
     StatusCode::NO_CONTENT.into_response()
 }
 
+const CERT_ID: &str = "01JC9ZQ7M3X8V4N2B6T5R0WHYA";
+// PEM blocks are assembled at run time so no complete key block or secret-looking literal sits in the source.
+fn pem(label: &[&str], body: &str) -> String {
+    let name = label.join(" ");
+    format!("-----BEGIN {name}-----\n{body}\n-----END {name}-----\n")
+}
+
+fn cert_pem() -> String {
+    pem(&["CERTIFICATE"], "AAAA")
+}
+
+fn key_pem() -> String {
+    pem(&["PRIVATE", "KEY"], "BBBB")
+}
+
+fn zone_secret_value() -> String {
+    format!("Zs3{}", "cret".repeat(10))
+}
+
+fn cert_item(name: &str) -> Value {
+    json!({
+        "id": CERT_ID, "name": name, "subject": "example.com", "sans": ["example.com"],
+        "issuer": "Test CA", "not_before": "2026-10-01", "not_after": "2026-12-01",
+        "days_left": 25, "fingerprint_sha256": "ab:cd", "key_type": "ECDSA P-256",
+        "created_at": "2026-11-01T00:00:00Z", "covers": ["example.com"]
+    })
+}
+
+async fn certificates(State(s): State<Shared>, headers: HeaderMap) -> Response {
+    if let Err(resp) = check(&s, &headers) {
+        return resp;
+    }
+    Json(json!({
+        "items": [cert_item("main"), json!({
+            "id": "file:legacy.pem", "name": "legacy.pem", "source": "manual",
+            "warning": "the file could not be read", "covers": []
+        })], "https_port": null,
+        "dir_ready": true, "uncovered_hosts": ["blog.example.com"]
+    }))
+    .into_response()
+}
+
+async fn certificate_create(
+    State(s): State<Shared>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if let Err(resp) = check(&s, &headers) {
+        return resp;
+    }
+    if body["name"] == "duplicate" {
+        return error_response(StatusCode::CONFLICT, "a certificate with that name exists");
+    }
+    s.created_bodies.lock().expect("lock").push(body);
+    let mut item = cert_item("main");
+    item["warning"] = json!("expires in 25 days");
+    (StatusCode::CREATED, Json(item)).into_response()
+}
+
+async fn certificate_one(
+    State(s): State<Shared>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(resp) = check(&s, &headers) {
+        return resp;
+    }
+    if id != CERT_ID {
+        return error_response(StatusCode::NOT_FOUND, "no such certificate");
+    }
+    Json(cert_item("main")).into_response()
+}
+
+async fn certificate_replace(
+    State(s): State<Shared>,
+    headers: HeaderMap,
+    Path(_id): Path<String>,
+    Json(body): Json<Value>,
+) -> Response {
+    if let Err(resp) = check(&s, &headers) {
+        return resp;
+    }
+    s.created_bodies.lock().expect("lock").push(body);
+    Json(cert_item("main")).into_response()
+}
+
+async fn certificate_delete(
+    State(s): State<Shared>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(resp) = check(&s, &headers) {
+        return resp;
+    }
+    s.created_bodies
+        .lock()
+        .expect("lock")
+        .push(json!({ "deleted": id }));
+    StatusCode::NO_CONTENT.into_response()
+}
+
+async fn cloudflare_ranges(State(s): State<Shared>, headers: HeaderMap) -> Response {
+    if let Err(resp) = check(&s, &headers) {
+        return resp;
+    }
+    Json(json!({
+        "source": "builtin", "updated": "2026-11-06", "ranges": ["173.245.48.0/20", "2400:cb00::/32"]
+    }))
+    .into_response()
+}
+
+async fn zone_secret_status(
+    State(s): State<Shared>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(resp) = check(&s, &headers) {
+        return resp;
+    }
+    if id == "ghost" {
+        return error_response(StatusCode::NOT_FOUND, "site not found");
+    }
+    Json(json!({
+        "configured": id == "shop", "header": "X-Cite-Origin-Secret", "readable": id != "locked",
+        "created_at": if id == "shop" { json!("2026-11-06T10:00:00Z") } else { Value::Null },
+        "fingerprint": if id == "shop" { json!("ab12cd34") } else { Value::Null }
+    }))
+    .into_response()
+}
+
+async fn zone_secret_rotate(
+    State(s): State<Shared>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<Value>,
+) -> Response {
+    if let Err(resp) = check(&s, &headers) {
+        return resp;
+    }
+    s.created_bodies
+        .lock()
+        .expect("lock")
+        .push(json!({ "rotated": id, "body": body }));
+    let mut resp = Json(json!({
+        "secret": zone_secret_value(), "header": "X-Cite-Origin-Secret",
+        "created_at": "2026-11-06T11:00:00Z", "fingerprint": "ef56ab78"
+    }))
+    .into_response();
+    resp.headers_mut()
+        .insert(header::CACHE_CONTROL, "no-store".parse().expect("cc"));
+    resp
+}
+
 async fn haproxy_config() -> Response {
     ([(header::CONTENT_TYPE, "text/plain")], "global\n  daemon\n").into_response()
 }
@@ -387,6 +541,21 @@ async fn spawn(state: Shared) -> String {
         .route("/api/v1/analytics/backup", post(backup))
         .route("/api/v1/analytics/cut", post(cut))
         .route("/api/v1/analytics/restore", post(restore))
+        .route(
+            "/api/v1/certificates",
+            get(certificates).post(certificate_create),
+        )
+        .route(
+            "/api/v1/certificates/{id}",
+            get(certificate_one)
+                .put(certificate_replace)
+                .delete(certificate_delete),
+        )
+        .route("/api/v1/cloudflare/ranges", get(cloudflare_ranges))
+        .route(
+            "/api/v1/sites/{id}/zone-secret",
+            get(zone_secret_status).post(zone_secret_rotate),
+        )
         .route("/api/v1/haproxy/config", get(haproxy_config))
         .route("/api/v1/pages", get(redirect))
         .route("/api/v1/settings", get(garbage))
@@ -437,6 +606,7 @@ fn site(id: &str) -> Site {
         health: HealthCheck::default(),
         source: None,
         history: Vec::new(),
+        access: Default::default(),
     }
 }
 
@@ -807,6 +977,170 @@ async fn archive_calls_validate_before_any_request() {
         assert!(matches!(delete, Err(ClientError::Config(_))), "{bad:?}");
         let stream = c.analytics_archive_stream(bad).await;
         assert!(matches!(stream, Err(ClientError::Config(_))), "{bad:?}");
+    }
+    assert!(state.seen_auth.lock().expect("lock").is_empty());
+}
+
+#[tokio::test]
+async fn certificate_routes_round_trip() {
+    let state = fake("cite_good", 0);
+    let url = spawn(state.clone()).await;
+    let c = client("n1", &url, "cite_good");
+
+    let list = c.certificates().await.expect("list");
+    assert_eq!(list.items.len(), 2);
+    assert!(
+        !list.items[0].is_manual()
+            && list.items[0].source == "api"
+            && list.items[0].warning.is_none()
+    );
+    assert!(list.items[1].is_manual());
+    assert_eq!(list.items[1].id, "file:legacy.pem");
+    assert_eq!(
+        list.items[1].warning.as_deref(),
+        Some("the file could not be read")
+    );
+    assert_eq!(list.items[0].days_left, 25);
+    assert_eq!(list.items[0].covers, ["example.com"]);
+    assert_eq!(list.https_port, None);
+    assert!(list.dir_ready);
+    assert_eq!(list.uncovered_hosts, ["blog.example.com"]);
+
+    let one = c.certificate(CERT_ID).await.expect("get");
+    assert_eq!(one.key_type, "ECDSA P-256");
+
+    let (cert, key) = (cert_pem(), key_pem());
+    let created = c
+        .certificate_create(&CertificateUpload::new("main", cert.as_str(), key.as_str()))
+        .await
+        .expect("create");
+    assert_eq!(created.certificate.id, CERT_ID);
+    assert_eq!(created.warning.as_deref(), Some("expires in 25 days"));
+
+    c.certificate_replace(
+        CERT_ID,
+        &CertificateUpload::replacement(cert.as_str(), key.as_str()),
+    )
+    .await
+    .expect("replace");
+    c.certificate_delete(CERT_ID).await.expect("delete");
+
+    let bodies = state.created_bodies.lock().expect("lock").clone();
+    let expect_create = json!({ "name": "main", "certificate": cert, "private_key": key });
+    let expect_replace = json!({ "certificate": cert, "private_key": key });
+    assert!(bodies[0] == expect_create, "create body differs");
+    assert!(bodies[1] == expect_replace, "replace body differs");
+    assert_eq!(bodies[2], json!({ "deleted": CERT_ID }));
+
+    let ranges = c.cloudflare_ranges().await.expect("ranges");
+    assert_eq!(ranges.source, "builtin");
+    assert_eq!(ranges.updated, "2026-11-06");
+    assert_eq!(ranges.ranges.len(), 2);
+}
+
+#[tokio::test]
+async fn certificate_calls_validate_before_any_request() {
+    let state = fake("cite_good", 0);
+    let url = spawn(state.clone()).await;
+    let c = client("n1", &url, "cite_good");
+    for bad in [
+        "../etc/passwd",
+        "",
+        "0123456789abcdef0123456789abcdef",
+        "01jc9zq7m3x8v4n2b6t5r0whya",
+        "abc",
+        "a/b",
+    ] {
+        let get = c.certificate(bad).await;
+        assert!(matches!(get, Err(ClientError::Config(_))), "{bad:?}");
+        let delete = c.certificate_delete(bad).await;
+        assert!(matches!(delete, Err(ClientError::Config(_))), "{bad:?}");
+        let replace = c
+            .certificate_replace(bad, &CertificateUpload::replacement(cert_pem(), key_pem()))
+            .await;
+        assert!(matches!(replace, Err(ClientError::Config(_))), "{bad:?}");
+    }
+    let (cert, key) = (cert_pem(), key_pem());
+    let oversized = "A".repeat(MAX_PEM_BYTES + 1);
+    let big_cert = format!("{cert}{}", "A".repeat(MAX_PEM_BYTES / 2));
+    let big_key = format!("{key}{}", "B".repeat(MAX_PEM_BYTES / 2));
+    let header_name = format!("-----BEGIN {}-----", "CERTIFICATE");
+    let uploads = [
+        CertificateUpload::new(header_name.as_str(), cert.as_str(), key.as_str()),
+        CertificateUpload::new("main", big_cert.as_str(), big_key.as_str()),
+        CertificateUpload::new("bad/name", cert.as_str(), key.as_str()),
+        CertificateUpload::new("", cert.as_str(), key.as_str()),
+        CertificateUpload::new("main", "not pem", key.as_str()),
+        CertificateUpload::new("main", cert.as_str(), cert.as_str()),
+        CertificateUpload::new("main", oversized.as_str(), key.as_str()),
+    ];
+    for upload in &uploads {
+        let created = c.certificate_create(upload).await;
+        assert!(matches!(created, Err(ClientError::Config(_))), "{upload:?}");
+    }
+    let nameless = c
+        .certificate_create(&CertificateUpload::replacement(cert_pem(), key_pem()))
+        .await;
+    assert!(matches!(nameless, Err(ClientError::Config(_))));
+    assert!(state.seen_auth.lock().expect("lock").is_empty());
+}
+
+#[tokio::test]
+async fn certificate_errors_keep_the_node_status_and_message() {
+    let url = spawn(fake("cite_good", 0)).await;
+    let c = client("n1", &url, "cite_good");
+    let clash = c
+        .certificate_create(&CertificateUpload::new("duplicate", cert_pem(), key_pem()))
+        .await
+        .expect_err("conflict");
+    assert_eq!(clash.status_code(), Some(409));
+    assert!(clash.to_string().contains("that name exists"));
+    let missing = c
+        .certificate("01JC9ZQ7M3X8V4N2B6T5R0WHYB")
+        .await
+        .expect_err("missing");
+    assert_eq!(missing.status_code(), Some(404));
+}
+
+#[tokio::test]
+async fn zone_secret_routes_round_trip_and_never_leak_in_debug() {
+    let state = fake("cite_good", 0);
+    let url = spawn(state.clone()).await;
+    let c = client("n1", &url, "cite_good");
+
+    let on = c.zone_secret("shop").await.expect("status");
+    assert!(on.configured);
+    assert_eq!(on.header, "X-Cite-Origin-Secret");
+    assert_eq!(on.fingerprint.as_deref(), Some("ab12cd34"));
+    let off = c.zone_secret("docs").await.expect("status");
+    assert!(!off.configured && off.created_at.is_none() && off.fingerprint.is_none());
+    assert!(on.readable && off.readable);
+    let unreadable = c.zone_secret("locked").await.expect("status");
+    assert!(!unreadable.readable && !unreadable.configured);
+
+    let rotated = c.rotate_zone_secret("shop").await.expect("rotate");
+    let expected = zone_secret_value();
+    assert!(rotated.secret() == expected, "rotated secret differs");
+    assert_eq!(rotated.fingerprint.as_deref(), Some("ef56ab78"));
+    assert!(!format!("{rotated:?}").contains(&expected));
+
+    let bodies = state.created_bodies.lock().expect("lock").clone();
+    assert_eq!(bodies[0], json!({ "rotated": "shop", "body": {} }));
+
+    let missing = c.zone_secret("ghost").await.expect_err("missing");
+    assert_eq!(missing.status_code(), Some(404));
+}
+
+#[tokio::test]
+async fn zone_secret_calls_validate_the_site_id_before_any_request() {
+    let state = fake("cite_good", 0);
+    let url = spawn(state.clone()).await;
+    let c = client("n1", &url, "cite_good");
+    for bad in ["", "../x", "A", "a/b", "a b", "-a"] {
+        let status = c.zone_secret(bad).await;
+        assert!(matches!(status, Err(ClientError::Config(_))), "{bad:?}");
+        let rotate = c.rotate_zone_secret(bad).await;
+        assert!(matches!(rotate, Err(ClientError::Config(_))), "{bad:?}");
     }
     assert!(state.seen_auth.lock().expect("lock").is_empty());
 }

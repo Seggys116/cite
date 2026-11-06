@@ -140,7 +140,7 @@ impl Console {
             deploys.truncate(8);
             Ok(Data { snaps, deploys })
         };
-        self.fetch(cx, fut, |this, res, cx| {
+        self.fetch_scoped(cx, fut, |this, res, cx| {
             this.overview.data = Some(Load::from_result(res));
             cx.notify();
         });
@@ -358,7 +358,7 @@ fn node_card(snap: &NodeSnapshot, cx: &mut Context<Console>) -> AnyElement {
     };
     let open = btn(id("open-sites", &name), "Open sites", BtnKind::Plain).on_click(cx.listener(
         move |this, _, _, cx| {
-            this.selected = Some(name.clone());
+            this.set_node(Some(name.clone()), cx);
             this.navigate(View::Sites, cx);
         },
     ));

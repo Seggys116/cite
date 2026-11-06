@@ -12,6 +12,7 @@ use crate::archive::{
 use crate::bots::{downloads_dir, fmt_stamp, is_unsupported};
 use crate::demo::now_ms;
 use crate::model::{fmt_bytes, fmt_int};
+use crate::scope::{Sequence, foreign_notice};
 use crate::theme::{DIM, Tone, c};
 use crate::ui::input::TextInput;
 use crate::ui::widgets::{
@@ -21,6 +22,7 @@ use crate::ui::widgets::{
 
 pub struct State {
     pub list: Load<ArchiveList>,
+    pub list_seq: Sequence,
     pub unsupported: bool,
     pub busy: Busy,
     pub note: Option<(String, Tone)>,
@@ -37,6 +39,7 @@ impl State {
     pub fn new(cx: &mut Context<Console>) -> Self {
         Self {
             list: Load::Idle,
+            list_seq: Sequence::default(),
             unsupported: false,
             busy: Busy::Idle,
             note: None,
@@ -69,18 +72,26 @@ impl Console {
         if !matches!(self.archives.list, Load::Ready(_)) {
             self.archives.list = Load::Loading;
         }
-        self.fetch(cx, async move { h.archives().await }, |this, res, cx| {
-            this.archives.unsupported = false;
-            this.archives.list = match res {
-                Ok(list) => Load::Ready(list),
-                Err(e) if is_unsupported(&e) => {
-                    this.archives.unsupported = true;
-                    Load::Idle
+        let seq = self.archives.list_seq.issue();
+        self.fetch_scoped(
+            cx,
+            async move { h.archives().await },
+            move |this, res, cx| {
+                if !this.archives.list_seq.accept(seq) {
+                    return;
                 }
-                Err(e) => Load::Failed(e.to_string()),
-            };
-            cx.notify();
-        });
+                this.archives.unsupported = false;
+                this.archives.list = match res {
+                    Ok(list) => Load::Ready(list),
+                    Err(e) if is_unsupported(&e) => {
+                        this.archives.unsupported = true;
+                        Load::Idle
+                    }
+                    Err(e) => Load::Failed(e.to_string()),
+                };
+                cx.notify();
+            },
+        );
     }
 
     // One operation at a time: a second click while one runs is ignored.
@@ -99,8 +110,20 @@ impl Console {
         }
         self.archives.busy = busy;
         self.archives.note = None;
-        self.fetch(cx, fut, move |this, res, cx| {
+        self.fetch_origin(cx, fut, move |this, res, here, origin, cx| {
             this.archives.busy = Busy::Idle;
+            if !here {
+                let (text, tone) = match res {
+                    Ok(_) => ("done".to_string(), Tone::Ok),
+                    Err(e) => (op_error(&e), Tone::Bad),
+                };
+                this.say(
+                    foreign_notice("Backup or archive task", origin, &text),
+                    tone,
+                );
+                cx.notify();
+                return;
+            }
             match res {
                 Ok(v) => done(this, v, cx),
                 Err(e) => this.archives.note = Some((op_error(&e), Tone::Bad)),

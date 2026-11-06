@@ -29,7 +29,7 @@ fn normalize_ip(ip: IpAddr) -> IpAddr {
     }
 }
 
-fn normalize_net(net: IpNet) -> IpNet {
+pub(crate) fn normalize_net(net: IpNet) -> IpNet {
     // A v4-mapped v6 network keeps 96 bits of fixed prefix before the embedded v4 address.
     if let IpNet::V6(v6) = net
         && v6.prefix_len() >= 96

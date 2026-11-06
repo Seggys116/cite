@@ -149,7 +149,7 @@ impl Console {
             .await;
             Ok(merge_bot_summaries(&gather(results)?))
         };
-        self.fetch(cx, fut, |this, res, cx| {
+        self.fetch_scoped(cx, fut, |this, res, cx| {
             this.bots.bots = settle(res);
             cx.notify();
         });
@@ -171,7 +171,7 @@ impl Console {
             let parts = gather(results)?;
             Ok(merge_top(parts.iter().collect(), TOP_LIMIT))
         };
-        self.fetch(cx, fut, |this, res, cx| {
+        self.fetch_scoped(cx, fut, |this, res, cx| {
             this.bots.top = settle(res);
             cx.notify();
         });
@@ -201,7 +201,7 @@ impl Console {
             .await;
             Ok::<_, ClientError>(results.into_iter().flatten().collect::<Vec<_>>())
         };
-        self.fetch(cx, fut, |this, res, cx| {
+        self.fetch_scoped(cx, fut, |this, res, cx| {
             this.bots.storage = settle(res);
             cx.notify();
         });

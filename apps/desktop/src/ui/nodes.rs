@@ -160,7 +160,7 @@ impl Console {
             self.say(format!("Could not save the config: {e}"), Tone::Bad);
         }
         if self.selected.as_deref() == Some(name) {
-            self.selected = None;
+            self.set_node(None, cx);
         }
         self.connect();
         self.load_overview(cx);

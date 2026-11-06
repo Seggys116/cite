@@ -39,6 +39,7 @@ fn manager_spec() -> (String, Value) {
             secret: None,
         }),
         history: Vec::new(),
+        access: Default::default(),
     };
     let env = StackEnv {
         registry: common::REGISTRY,

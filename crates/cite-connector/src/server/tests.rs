@@ -11,6 +11,8 @@ use super::*;
 use crate::store::testing::test_config;
 
 mod archive_api;
+mod certificates_api;
+mod zone_api;
 
 const SECRET: &str = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
 fn password() -> &'static str {
@@ -52,6 +54,7 @@ struct Harness {
     http: Client,
     state: AppState,
     task: tokio::task::JoinHandle<()>,
+    fake: FakeHaproxy,
 }
 
 impl Drop for Harness {
@@ -67,6 +70,10 @@ async fn start() -> Harness {
 async fn start_with(tweak: impl FnOnce(&mut ConnectorConfig)) -> Harness {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut cfg = test_config(dir.path());
+    // A healthy fake HAProxy by default, because protection changes are refused when none is running; a test can point the config elsewhere.
+    let fake = fake_haproxy(false).await;
+    cfg.master_addr = fake.master.clone();
+    cfg.runtime_addr = fake.runtime.clone();
     tweak(&mut cfg);
     let store = Store::open(&cfg).await.expect("open");
     store.set_credentials(creds()).await.expect("credentials");
@@ -100,7 +107,17 @@ async fn start_with(tweak: impl FnOnce(&mut ConnectorConfig)) -> Harness {
         http,
         state,
         task,
+        fake,
     }
+}
+
+// The same harness with nothing listening where HAProxy would be.
+async fn start_absent() -> Harness {
+    start_with(|cfg| {
+        cfg.master_addr = "127.0.0.1:1".into();
+        cfg.runtime_addr = "127.0.0.1:1".into();
+    })
+    .await
 }
 
 impl Harness {
@@ -1650,6 +1667,10 @@ struct FakeHaproxy {
     master: String,
     runtime: String,
     attempts: Arc<std::sync::atomic::AtomicU64>,
+    // While set, every reload is refused.
+    refuse: Arc<std::sync::atomic::AtomicBool>,
+    // The next reloads to refuse, one per count, after which they succeed again.
+    refuse_next: Arc<std::sync::atomic::AtomicU64>,
 }
 
 async fn fake_haproxy(refuse_first: bool) -> FakeHaproxy {
@@ -1663,13 +1684,23 @@ async fn fake_haproxy(refuse_first: bool) -> FakeHaproxy {
         master.local_addr().expect("addr").to_string(),
         runtime.local_addr().expect("addr").to_string(),
     );
-    let (count, ok) = (attempts.clone(), loaded.clone());
+    let refuse = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let refuse_next = Arc::new(AtomicU64::new(0));
+    let (count, ok, refusing, skipping) = (
+        attempts.clone(),
+        loaded.clone(),
+        refuse.clone(),
+        refuse_next.clone(),
+    );
     tokio::spawn(async move {
         while let Ok((mut stream, _)) = master.accept().await {
             let mut line = String::new();
             let _ = BufReader::new(&mut stream).read_line(&mut line).await;
             let n = count.fetch_add(1, Ordering::SeqCst) + 1;
-            let reply = if refuse_first && n == 1 {
+            let skip = skipping
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_sub(1))
+                .is_ok();
+            let reply = if refusing.load(Ordering::SeqCst) || skip || (refuse_first && n == 1) {
                 "Success=0\n--\n[ALERT] refused\n"
             } else {
                 ok.fetch_add(1, Ordering::SeqCst);
@@ -1692,6 +1723,8 @@ async fn fake_haproxy(refuse_first: bool) -> FakeHaproxy {
         master: addrs.0,
         runtime: addrs.1,
         attempts,
+        refuse,
+        refuse_next,
     }
 }
 
@@ -1716,7 +1749,7 @@ async fn every_reload_request_reaches_haproxy_even_for_an_unchanged_config() {
 
 #[tokio::test]
 async fn a_reload_of_an_absent_haproxy_is_reported_as_unavailable() {
-    let h = start().await;
+    let h = start_absent().await;
     let t = h.token().await;
     let (status, body) = h.post(&t, "/haproxy/reload", json!({})).await;
     assert_eq!(status, 503, "{body}");

@@ -10,14 +10,21 @@ use cite_client::{
 use cite_edge::analytics::{Point, SizeBucket, Summary, Timeseries, TopItem, window_from_str};
 use cite_edge::bot::BotSummary;
 use cite_edge::model::{
-    DeployAction, Deployment, EdgeSettings, FirewallAction, FirewallRule, HealthCheck, LogEvent,
-    Maintenance, MaintenancePage, Matchers, Site, SiteKind, Slot, Source, Target, Upstream,
+    BotPolicy, Cors, DeployAction, Deployment, EdgeSettings, FirewallAction, FirewallRule,
+    HeaderMatch, HeaderOp, HeaderOpKind, HeaderTarget, HealthCheck, LogEvent, Maintenance,
+    MaintenancePage, Matchers, Redirect, Site, SiteAccess, SiteKind, Slot, Source, Target, TlsMode,
+    Upstream,
 };
 use cite_edge::presets::presets;
 use serde_json::{Map, Value, json};
 
 use crate::archive::{CutSpec, DAY_MS};
+use crate::certs::{
+    CertItem, CertListing, RangesListing, UploadOutcome, UploadRequest, check_certificate_pem,
+    check_key_pem, covered_hosts, is_read_only, valid_cert_id, validate_cert_name,
+};
 use crate::config::{DesktopConfig, DesktopNode};
+use crate::zone::{ZONE_HEADER, ZoneReveal, ZoneStatus};
 
 type Res<T> = Result<T, ClientError>;
 
@@ -716,6 +723,16 @@ fn seed_sites(node: i64, now: i64) -> Vec<Site> {
                 secret: None,
             }),
             history,
+            access: SiteAccess {
+                cloudflare_only: id == "api",
+                tls: TlsMode::Full,
+                bots: if id == "shop" {
+                    BotPolicy::BlockBad
+                } else {
+                    BotPolicy::Allow
+                },
+                zone_lock: id == "api",
+            },
         };
     use DeployAction::{Failed, Promote, Rollback, Switch};
     vec![
@@ -774,16 +791,30 @@ fn seed_sites(node: i64, now: i64) -> Vec<Site> {
     ]
 }
 
+// Built from parts so the demo data holds no literal that looks like a credential.
+fn demo_beta_key() -> String {
+    ["beta", "-preview-", "2026"].concat()
+}
+
 fn seed_rules() -> Vec<FirewallRule> {
     let rule = |id: &str, name: &str, enabled, action, matchers: Matchers, site: Option<&str>| {
         FirewallRule {
             id: id.into(),
             name: name.into(),
             enabled,
-            action,
+            action: Some(action),
             matchers,
             site: site.map(str::to_string),
+            ..FirewallRule::default()
         }
+    };
+    let effect = |id: &str, name: &str, site: &str, matchers: Matchers| FirewallRule {
+        id: id.into(),
+        name: name.into(),
+        enabled: true,
+        matchers,
+        site: (!site.is_empty()).then(|| site.to_string()),
+        ..FirewallRule::default()
     };
     let m = Matchers::default;
     vec![
@@ -853,10 +884,59 @@ fn seed_rules() -> Vec<FirewallRule> {
             },
             Some("shop"),
         ),
+        rule(
+            "r-beta-gate",
+            "Beta preview gate",
+            true,
+            FirewallAction::Deny,
+            Matchers {
+                header: Some(HeaderMatch {
+                    name: "X-Beta-Key".into(),
+                    equals: Some(demo_beta_key()),
+                    negate: true,
+                    secret: true,
+                    ..HeaderMatch::default()
+                }),
+                path_prefix: Some("/beta".into()),
+                ..m()
+            },
+            Some("docs"),
+        ),
+        FirewallRule {
+            redirect: Some(Redirect {
+                to: "{scheme}://{www_host}{path}{query}".into(),
+                status: 301,
+            }),
+            label: Some("add-www".into()),
+            ..effect("r-add-www", "Add www", "shop", m())
+        },
+        FirewallRule {
+            cors: Some(Cors {
+                origins: vec!["https://app.example.com".into()],
+                methods: vec!["GET".into(), "POST".into()],
+                allow_headers: vec!["Authorization".into(), "Content-Type".into()],
+                expose_headers: Vec::new(),
+                credentials: true,
+                max_age_secs: 600,
+            }),
+            headers: vec![HeaderOp {
+                target: HeaderTarget::Response,
+                op: HeaderOpKind::Set,
+                name: "X-Content-Type-Options".into(),
+                value: Some("nosniff".into()),
+            }],
+            ..effect("r-api-cors", "API CORS and headers", "api", m())
+        },
     ]
 }
 
+struct DemoZone {
+    secret: String,
+    created_at: String,
+}
+
 struct DemoState {
+    zones: BTreeMap<String, DemoZone>,
     sites: Vec<Site>,
     rules: Vec<FirewallRule>,
     pages: Vec<MaintenancePage>,
@@ -866,6 +946,92 @@ struct DemoState {
     rows: u64,
     oldest_ms: i64,
     archives: Vec<ArchiveEntry>,
+    certs: Vec<CertItem>,
+    builtin_stamp: String,
+    ranges_stamp: String,
+}
+
+const DEMO_CERT_DAYS: i64 = 90;
+const DEMO_SHOP_CERT: &str = "01JC9ZQ7M3X8V4N2B6T5R0WHYA";
+const DEMO_API_CERT: &str = "01JC9ZQ7M3X8V4N2B6T5R0WHYB";
+const DEMO_MANUAL_CERT: &str = "file:legacy-wildcard.pem";
+
+// Cloudflare's published ranges, so the built-in list looks like the real one.
+const DEMO_BUILTIN_RANGES: [&str; 22] = [
+    "173.245.48.0/20",
+    "103.21.244.0/22",
+    "103.22.200.0/22",
+    "103.31.4.0/22",
+    "141.101.64.0/18",
+    "108.162.192.0/18",
+    "190.93.240.0/20",
+    "188.114.96.0/20",
+    "197.234.240.0/22",
+    "198.41.128.0/17",
+    "162.158.0.0/15",
+    "104.16.0.0/13",
+    "104.24.0.0/14",
+    "172.64.0.0/13",
+    "131.0.72.0/22",
+    "2400:cb00::/32",
+    "2606:4700::/32",
+    "2803:f800::/32",
+    "2405:b500::/32",
+    "2405:8100::/32",
+    "2a06:98c0::/29",
+    "2c0f:f248::/32",
+];
+
+// One certificate is close to expiry and docs.example.com has none, so both notes show.
+fn seed_certs(now: i64) -> Vec<CertItem> {
+    let cert =
+        |id: &str, name: &str, host: &str, sans: &[&str], issued: i64, days_left: i64| CertItem {
+            id: id.into(),
+            name: name.into(),
+            subject: format!("CN={host}"),
+            sans: sans.iter().map(|s| (*s).to_string()).collect(),
+            issuer: "Example Trust CA R3".into(),
+            not_before: iso(now - issued * DAY_MS),
+            not_after: iso(now + days_left * DAY_MS),
+            days_left,
+            fingerprint: demo_sha(issued as u64 + 11),
+            key_type: "ECDSA P-256".into(),
+            created_at: iso(now - issued * DAY_MS),
+            covers: Vec::new(),
+            source: "api".into(),
+            warning: None,
+        };
+    vec![
+        CertItem {
+            id: DEMO_MANUAL_CERT.into(),
+            source: "manual".into(),
+            warning: Some("No private key file sits next to this certificate.".into()),
+            ..cert(
+                DEMO_MANUAL_CERT,
+                "legacy-wildcard",
+                "legacy.example.net",
+                &["legacy.example.net", "*.legacy.example.net"],
+                200,
+                40,
+            )
+        },
+        cert(
+            DEMO_SHOP_CERT,
+            "storefront",
+            "shop.example.com",
+            &["shop.example.com", "www.example.com"],
+            24,
+            DEMO_CERT_DAYS - 24,
+        ),
+        cert(
+            DEMO_API_CERT,
+            "public-api",
+            "api.example.com",
+            &["api.example.com"],
+            85,
+            5,
+        ),
+    ]
 }
 
 // Short stable hex digest stand-in so demo archives show a plausible checksum column.
@@ -954,6 +1120,13 @@ impl DemoNode {
             index,
             started: Instant::now(),
             state: Mutex::new(DemoState {
+                zones: BTreeMap::from([(
+                    "api".to_string(),
+                    DemoZone {
+                        secret: demo_zone_secret(0, "api"),
+                        created_at: iso(now - 9 * DAY_MS),
+                    },
+                )]),
                 sites: seed_sites(index, now),
                 rules: seed_rules(),
                 pages: vec![
@@ -979,6 +1152,9 @@ impl DemoNode {
                 rows: DEMO_ROWS,
                 oldest_ms: now - DEMO_SPAN_DAYS * DAY_MS,
                 archives: seed_archives(now),
+                certs: seed_certs(now),
+                builtin_stamp: iso(now - 12 * DAY_MS),
+                ranges_stamp: iso(now - 12 * DAY_MS),
             }),
         }
     }
@@ -1036,18 +1212,22 @@ impl DemoNode {
     }
 
     pub fn create_site(&self, site: &Site) -> Res<Site> {
+        check_access(site)?;
         let mut st = self.st();
         if st.sites.iter().any(|s| s.id == site.id) {
             return Err(status_err(409, format!("site {} already exists", site.id)));
         }
         st.sites.push(site.clone());
+        sync_zone(&mut st, site);
         Ok(site.clone())
     }
 
     pub fn update_site(&self, id: &str, site: &Site) -> Res<Site> {
+        check_access(site)?;
         let mut st = self.st();
         let slot = find_mut(&mut st.sites, id)?;
         *slot = site.clone();
+        sync_zone(&mut st, site);
         Ok(site.clone())
     }
 
@@ -1055,7 +1235,59 @@ impl DemoNode {
         let mut st = self.st();
         find(&st.sites, id)?;
         st.sites.retain(|s| s.id != id);
+        st.zones.remove(id);
         Ok(())
+    }
+
+    pub fn zone_secret(&self, site_id: &str) -> Res<ZoneStatus> {
+        self.require_zone()?;
+        let st = self.st();
+        find(&st.sites, site_id)?;
+        let zone = st.zones.get(site_id);
+        Ok(ZoneStatus {
+            configured: zone.is_some(),
+            readable: true,
+            header: ZONE_HEADER.to_string(),
+            created_at: zone.map(|z| z.created_at.clone()),
+            fingerprint: zone.map(|z| zone_fingerprint(&z.secret)),
+        })
+    }
+
+    // Like the node, a rotation needs the lock to be on and returns the new secret exactly once.
+    pub fn rotate_zone_secret(&self, node: &str, site_id: &str) -> Res<ZoneReveal> {
+        self.require_zone()?;
+        let mut st = self.st();
+        if !find(&st.sites, site_id)?.access.zone_lock {
+            return Err(status_err(409, "zone lock is not enabled for this site"));
+        }
+        st.counter += 1;
+        let secret = demo_zone_secret(st.counter, site_id);
+        let created_at = iso(now_ms());
+        let print = zone_fingerprint(&secret);
+        st.zones.insert(
+            site_id.to_string(),
+            DemoZone {
+                secret: secret.clone(),
+                created_at: created_at.clone(),
+            },
+        );
+        Ok(ZoneReveal::new(
+            node,
+            site_id,
+            secret,
+            ZONE_HEADER,
+            Some(created_at),
+            Some(print),
+        ))
+    }
+
+    // The second node plays a release from before the zone lock.
+    fn require_zone(&self) -> Res<()> {
+        if self.index == 0 {
+            Ok(())
+        } else {
+            Err(status_err(404, "not found"))
+        }
     }
 
     // Every mutation appends a deployment entry just as the real connector does.
@@ -1158,11 +1390,13 @@ impl DemoNode {
     }
 
     pub fn create_rule(&self, rule: &FirewallRule) -> Res<FirewallRule> {
+        cite_edge::validate::validate_rule(rule).map_err(|e| status_err(400, e.to_string()))?;
         self.st().rules.push(rule.clone());
         Ok(rule.clone())
     }
 
     pub fn update_rule(&self, id: &str, rule: &FirewallRule) -> Res<FirewallRule> {
+        cite_edge::validate::validate_rule(rule).map_err(|e| status_err(400, e.to_string()))?;
         let mut st = self.st();
         match st.rules.iter_mut().find(|r| r.id == id) {
             Some(slot) => {
@@ -1375,9 +1609,173 @@ impl DemoNode {
         Ok(self.st().settings.clone())
     }
 
+    // The ranges stamp moves only when the list changes, and returns to the built-in date when it is cleared.
     pub fn put_settings(&self, settings: &EdgeSettings) -> Res<EdgeSettings> {
-        self.st().settings = settings.clone();
+        let mut st = self.st();
+        if settings.cloudflare_ranges.is_empty() {
+            st.ranges_stamp = st.builtin_stamp.clone();
+        } else if settings.cloudflare_ranges != st.settings.cloudflare_ranges {
+            st.ranges_stamp = iso(now_ms());
+        }
+        st.settings = settings.clone();
         Ok(settings.clone())
+    }
+
+    fn require_certs(&self) -> Res<()> {
+        if self.index == 0 {
+            Ok(())
+        } else {
+            Err(status_err(404, "not found"))
+        }
+    }
+
+    pub fn certificates(&self) -> Res<CertListing> {
+        self.require_certs()?;
+        let st = self.st();
+        let hosts = site_hosts(&st.sites, true);
+        let items: Vec<CertItem> = st
+            .certs
+            .iter()
+            .map(|c| CertItem {
+                covers: covered_hosts(&hosts, &c.sans),
+                ..c.clone()
+            })
+            .collect();
+        let uncovered_hosts = site_hosts(&st.sites, false)
+            .into_iter()
+            .filter(|h| !items.iter().any(|c| c.covers.contains(h)))
+            .collect();
+        Ok(CertListing {
+            items,
+            https_port: st.settings.https_port,
+            dir_ready: true,
+            uncovered_hosts,
+        })
+    }
+
+    // The demo checks the same PEM rules as the app and derives the names from the certificate name.
+    fn check_upload(&self, st: &DemoState, req: &UploadRequest, own: Option<&str>) -> Res<()> {
+        let name = validate_cert_name(&req.name).map_err(|m| status_err(400, m))?;
+        check_certificate_pem(&req.certificate).map_err(|m| status_err(400, m))?;
+        check_key_pem(&req.private_key).map_err(|m| status_err(400, m))?;
+        if st
+            .certs
+            .iter()
+            .any(|c| c.name == name && Some(c.id.as_str()) != own)
+        {
+            return Err(status_err(
+                409,
+                format!("a certificate named {name} already exists"),
+            ));
+        }
+        Ok(())
+    }
+
+    fn fresh_validity(item: &mut CertItem, fingerprint: String) {
+        let now = now_ms();
+        item.not_before = iso(now);
+        item.not_after = iso(now + DEMO_CERT_DAYS * DAY_MS);
+        item.days_left = DEMO_CERT_DAYS;
+        item.fingerprint = fingerprint;
+    }
+
+    fn outcome(st: &DemoState, item: CertItem) -> UploadOutcome {
+        let hosts = site_hosts(&st.sites, true);
+        let covers = covered_hosts(&hosts, &item.sans);
+        let warning = covers
+            .is_empty()
+            .then(|| "This certificate does not cover any site host on this node.".to_string());
+        UploadOutcome {
+            cert: CertItem { covers, ..item },
+            warning,
+        }
+    }
+
+    pub fn certificate_upload(&self, req: &UploadRequest) -> Res<UploadOutcome> {
+        self.require_certs()?;
+        let mut st = self.st();
+        self.check_upload(&st, req, None)?;
+        st.counter += 1;
+        let name = req.name.trim().to_string();
+        let host = if name.contains('.') {
+            name.to_lowercase()
+        } else {
+            format!("{}.example.com", name.to_lowercase().replace(' ', "-"))
+        };
+        let mut item = CertItem {
+            id: format!("01JD{:022}", st.counter),
+            name,
+            subject: format!("CN={host}"),
+            sans: vec![host],
+            issuer: "Example Trust CA R3".into(),
+            not_before: String::new(),
+            not_after: String::new(),
+            days_left: 0,
+            fingerprint: String::new(),
+            key_type: "ECDSA P-256".into(),
+            created_at: iso(now_ms()),
+            covers: Vec::new(),
+            source: "api".into(),
+            warning: None,
+        };
+        let print = demo_sha(st.counter ^ req.certificate.len() as u64);
+        Self::fresh_validity(&mut item, print);
+        st.certs.push(item.clone());
+        Ok(Self::outcome(&st, item))
+    }
+
+    pub fn certificate_replace(&self, id: &str, req: &UploadRequest) -> Res<UploadOutcome> {
+        self.require_certs()?;
+        check_managed_id(id)?;
+        let mut st = self.st();
+        if !st.certs.iter().any(|c| c.id == id) {
+            return Err(status_err(404, format!("certificate {id} not found")));
+        }
+        self.check_upload(&st, req, Some(id))?;
+        st.counter += 1;
+        let print = demo_sha(st.counter ^ req.certificate.len() as u64);
+        let name = req.name.trim().to_string();
+        let Some(slot) = st.certs.iter_mut().find(|c| c.id == id) else {
+            return Err(status_err(404, format!("certificate {id} not found")));
+        };
+        slot.name = name;
+        Self::fresh_validity(slot, print);
+        let item = slot.clone();
+        Ok(Self::outcome(&st, item))
+    }
+
+    pub fn certificate_delete(&self, id: &str) -> Res<()> {
+        self.require_certs()?;
+        check_managed_id(id)?;
+        let mut st = self.st();
+        let before = st.certs.len();
+        st.certs.retain(|c| c.id != id);
+        if st.certs.len() == before {
+            return Err(status_err(404, format!("certificate {id} not found")));
+        }
+        Ok(())
+    }
+
+    pub fn cloudflare_ranges(&self) -> Res<RangesListing> {
+        self.require_certs()?;
+        let st = self.st();
+        let custom = &st.settings.cloudflare_ranges;
+        Ok(if custom.is_empty() {
+            RangesListing {
+                source: "builtin".into(),
+                updated: st.ranges_stamp.clone(),
+                ranges: DEMO_BUILTIN_RANGES
+                    .iter()
+                    .map(|r| (*r).to_string())
+                    .collect(),
+            }
+        } else {
+            RangesListing {
+                source: "custom".into(),
+                updated: st.ranges_stamp.clone(),
+                ranges: custom.clone(),
+            }
+        })
     }
 
     pub fn list_tokens(&self) -> Res<Vec<TokenMeta>> {
@@ -1405,6 +1803,77 @@ impl DemoNode {
         self.st().tokens.retain(|t| t.id != id);
         Ok(())
     }
+}
+
+// Hand-placed files are listed but not addressable: the node answers 404 for them.
+fn check_managed_id(id: &str) -> Res<()> {
+    if is_read_only("", id) {
+        return Err(status_err(404, format!("certificate {id} not found")));
+    }
+    check_id(id)
+}
+
+fn check_id(id: &str) -> Res<()> {
+    if valid_cert_id(id) {
+        Ok(())
+    } else {
+        Err(status_err(
+            400,
+            "certificate id must be 26 characters of 0-9 and A-Z",
+        ))
+    }
+}
+
+fn check_access(site: &Site) -> Res<()> {
+    if site.access.zone_lock && !site.access.cloudflare_only {
+        return Err(status_err(400, "zone_lock requires cloudflare_only"));
+    }
+    Ok(())
+}
+
+// The node generates a secret when the lock is switched on and drops it when the lock goes off.
+fn sync_zone(st: &mut DemoState, site: &Site) {
+    if !site.access.zone_lock {
+        st.zones.remove(&site.id);
+    } else if !st.zones.contains_key(&site.id) {
+        st.counter += 1;
+        let secret = demo_zone_secret(st.counter, &site.id);
+        st.zones.insert(
+            site.id.clone(),
+            DemoZone {
+                secret,
+                created_at: iso(now_ms()),
+            },
+        );
+    }
+}
+
+fn demo_zone_secret(counter: u64, site_id: &str) -> String {
+    let mix = site_id.bytes().fold(counter, |a, b| {
+        a.wrapping_mul(31).wrapping_add(u64::from(b))
+    });
+    demo_sha(mix)[..40].to_string()
+}
+
+fn zone_fingerprint(secret: &str) -> String {
+    demo_sha(
+        secret
+            .bytes()
+            .fold(7u64, |a, b| a.wrapping_mul(131).wrapping_add(u64::from(b))),
+    )[..16]
+        .to_string()
+}
+
+// Hosts that need a certificate leave out sites whose origin speaks plain HTTP behind Cloudflare.
+fn site_hosts(sites: &[Site], all: bool) -> Vec<String> {
+    let mut hosts: Vec<String> = sites
+        .iter()
+        .filter(|s| all || s.access.tls != TlsMode::Flexible)
+        .flat_map(|s| s.hosts.iter().cloned())
+        .collect();
+    hosts.sort();
+    hosts.dedup();
+    hosts
 }
 
 fn find<'a>(sites: &'a [Site], id: &str) -> Res<&'a Site> {
@@ -1680,6 +2149,359 @@ mod tests {
         let first = node.apply_preset(&name).expect("apply");
         assert!(!first.is_empty());
         assert!(node.apply_preset(&name).expect("again").is_empty());
+    }
+
+    fn upload(name: &str) -> UploadRequest {
+        UploadRequest {
+            name: name.into(),
+            certificate: crate::testkit::cert(),
+            private_key: crate::testkit::key(),
+        }
+    }
+
+    #[test]
+    fn older_demo_node_has_no_certificate_routes() {
+        let nodes = demo_nodes();
+        let old = &nodes[1].1;
+        let code = |e: ClientError| e.status_code();
+        assert_eq!(code(old.certificates().expect_err("old")), Some(404));
+        assert_eq!(code(old.cloudflare_ranges().expect_err("old")), Some(404));
+        assert_eq!(
+            code(old.certificate_upload(&upload("x")).expect_err("old")),
+            Some(404)
+        );
+        assert_eq!(
+            code(
+                old.certificate_replace(DEMO_SHOP_CERT, &upload("x"))
+                    .expect_err("old")
+            ),
+            Some(404)
+        );
+        assert_eq!(
+            code(old.certificate_delete(DEMO_SHOP_CERT).expect_err("old")),
+            Some(404)
+        );
+    }
+
+    #[test]
+    fn demo_certificates_show_an_expiring_one_and_an_uncovered_host() {
+        let node = &demo_nodes()[0].1;
+        let list = node.certificates().expect("list");
+        assert_eq!(list.items.len(), 3);
+        assert_eq!(list.https_port, Some(443));
+        assert!(list.dir_ready);
+        assert_eq!(list.uncovered_hosts, vec!["docs.example.com".to_string()]);
+        let levels: Vec<_> = list
+            .items
+            .iter()
+            .map(|c| crate::certs::classify_expiry(c.days_left))
+            .collect();
+        assert!(levels.contains(&crate::certs::Expiry::Urgent));
+        assert!(levels.contains(&crate::certs::Expiry::Fine));
+        let shop = list
+            .items
+            .iter()
+            .find(|c| c.id == DEMO_SHOP_CERT)
+            .expect("shop");
+        assert!(
+            list.items
+                .iter()
+                .filter(|c| !c.read_only())
+                .all(|c| crate::certs::valid_cert_id(&c.id))
+        );
+        assert_eq!(shop.covers, vec!["shop.example.com", "www.example.com"]);
+    }
+
+    #[test]
+    fn a_hand_placed_certificate_is_listed_but_cannot_be_changed() {
+        let node = &demo_nodes()[0].1;
+        let list = node.certificates().expect("list");
+        let manual = list
+            .items
+            .iter()
+            .find(|c| c.id == DEMO_MANUAL_CERT)
+            .expect("manual");
+        assert!(manual.read_only() && manual.source == "manual");
+        assert!(manual.warning.is_some());
+        let managed = list.items.iter().filter(|c| !c.read_only()).count();
+        assert_eq!(managed, 2);
+        let code = |e: ClientError| e.status_code();
+        assert_eq!(
+            code(
+                node.certificate_replace(DEMO_MANUAL_CERT, &upload("legacy"))
+                    .expect_err("read-only")
+            ),
+            Some(404)
+        );
+        assert_eq!(
+            code(
+                node.certificate_delete(DEMO_MANUAL_CERT)
+                    .expect_err("read-only")
+            ),
+            Some(404)
+        );
+        assert_eq!(node.certificates().expect("list").items.len(), 3);
+    }
+
+    #[test]
+    fn demo_certificates_upload_replace_and_delete() {
+        let node = &demo_nodes()[0].1;
+        let done = node
+            .certificate_upload(&upload("docs.example.com"))
+            .expect("upload");
+        assert!(done.warning.is_none());
+        assert_eq!(done.cert.covers, vec!["docs.example.com"]);
+        let list = node.certificates().expect("list");
+        assert_eq!(list.items.len(), 4);
+        assert!(list.uncovered_hosts.is_empty());
+
+        let before = done.cert.fingerprint.clone();
+        let replaced = node
+            .certificate_replace(&done.cert.id, &upload("docs.example.com"))
+            .expect("replace");
+        assert_eq!(replaced.cert.id, done.cert.id);
+        assert_ne!(replaced.cert.fingerprint, before);
+        assert_eq!(node.certificates().expect("list").items.len(), 4);
+
+        node.certificate_delete(&done.cert.id).expect("delete");
+        let list = node.certificates().expect("list");
+        assert_eq!(list.items.len(), 3);
+        assert_eq!(list.uncovered_hosts, vec!["docs.example.com".to_string()]);
+        let gone = node.certificate_delete(&done.cert.id).expect_err("gone");
+        assert_eq!(gone.status_code(), Some(404));
+        let missing = node
+            .certificate_replace("01JC9ZQ7M3X8V4N2B6T5R0WHZZ", &upload("x"))
+            .expect_err("unknown");
+        assert_eq!(missing.status_code(), Some(404));
+        let malformed = node
+            .certificate_replace("nope", &upload("x"))
+            .expect_err("malformed");
+        assert_eq!(malformed.status_code(), Some(400));
+        assert_eq!(
+            node.certificate_delete("c-1")
+                .expect_err("malformed")
+                .status_code(),
+            Some(400)
+        );
+    }
+
+    #[test]
+    fn demo_uploads_warn_about_uncovered_names_and_refuse_bad_input() {
+        let node = &demo_nodes()[0].1;
+        let done = node.certificate_upload(&upload("blog")).expect("upload");
+        assert!(done.warning.expect("warning").contains("does not cover"));
+        let dup = node
+            .certificate_upload(&upload("blog"))
+            .expect_err("duplicate");
+        assert_eq!(dup.status_code(), Some(409));
+        let mut swapped = upload("other");
+        std::mem::swap(&mut swapped.certificate, &mut swapped.private_key);
+        let bad = node.certificate_upload(&swapped).expect_err("swapped");
+        assert_eq!(bad.status_code(), Some(400));
+        let unnamed = node.certificate_upload(&upload(" ")).expect_err("name");
+        assert_eq!(unnamed.status_code(), Some(400));
+        let taken = node
+            .certificate_replace(DEMO_SHOP_CERT, &upload("public-api"))
+            .expect_err("taken name");
+        assert_eq!(taken.status_code(), Some(409));
+    }
+
+    #[test]
+    fn demo_https_port_follows_the_settings() {
+        let node = &demo_nodes()[0].1;
+        let mut settings = node.get_settings().expect("settings");
+        settings.https_port = None;
+        node.put_settings(&settings).expect("put");
+        assert_eq!(node.certificates().expect("list").https_port, None);
+    }
+
+    #[test]
+    fn demo_cloudflare_ranges_switch_between_builtin_and_custom() {
+        let node = &demo_nodes()[0].1;
+        let builtin = node.cloudflare_ranges().expect("ranges");
+        assert_eq!(builtin.source, "builtin");
+        assert!(builtin.ranges.len() > 10);
+        assert_eq!(
+            crate::certs::parse_range_list(&crate::certs::ranges_text(&builtin.ranges))
+                .expect("valid"),
+            builtin.ranges
+        );
+
+        let mut settings = node.get_settings().expect("settings");
+        settings.cloudflare_ranges = vec!["203.0.113.0/24".into()];
+        node.put_settings(&settings).expect("put");
+        let custom = node.cloudflare_ranges().expect("ranges");
+        assert_eq!(custom.source, "custom");
+        assert_eq!(custom.ranges, vec!["203.0.113.0/24"]);
+        assert_ne!(custom.updated, builtin.updated);
+
+        settings.cloudflare_ranges.clear();
+        node.put_settings(&settings).expect("put");
+        let back = node.cloudflare_ranges().expect("ranges");
+        assert_eq!(back.source, "builtin");
+        assert_eq!(back.updated, builtin.updated);
+    }
+
+    #[test]
+    fn demo_sites_carry_access_and_pass_validation() {
+        let node = &demo_nodes()[0].1;
+        let sites = node.list_sites().expect("sites");
+        let api = sites.iter().find(|s| s.id == "api").expect("api");
+        assert!(api.access.cloudflare_only);
+        assert_eq!(api.access.tls, TlsMode::Full);
+        for site in &sites {
+            validate_site(site).unwrap_or_else(|e| panic!("{}: {e}", site.id));
+        }
+    }
+
+    #[test]
+    fn flexible_sites_need_no_certificate() {
+        let node = &demo_nodes()[0].1;
+        let mut docs = node.get_site("docs").expect("docs").site;
+        docs.access = SiteAccess {
+            cloudflare_only: true,
+            tls: TlsMode::Flexible,
+            ..SiteAccess::default()
+        };
+        node.update_site("docs", &docs).expect("update");
+        assert!(
+            node.certificates()
+                .expect("list")
+                .uncovered_hosts
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn demo_rules_include_block_redirect_and_effect_shapes() {
+        let node = &demo_nodes()[0].1;
+        let rules = node.list_rules().expect("rules");
+        let kind =
+            |id: &str| crate::rules::rule_kind(rules.iter().find(|r| r.id == id).expect("rule"));
+        assert_eq!(kind("r-wp-login"), crate::rules::RuleKind::Block);
+        assert_eq!(kind("r-add-www"), crate::rules::RuleKind::Redirect);
+        assert_eq!(kind("r-api-cors"), crate::rules::RuleKind::Effects);
+        let gate = rules.iter().find(|r| r.id == "r-beta-gate").expect("gate");
+        assert!(gate.matchers.header.as_ref().is_some_and(|h| h.secret));
+        let listed = crate::model::matcher_summary(&gate.matchers).join(" ");
+        assert!(!listed.contains(demo_beta_key().as_str()), "{listed}");
+    }
+
+    #[test]
+    fn demo_presets_include_the_redirect_presets_and_apply_once() {
+        let node = &demo_nodes()[0].1;
+        let names: Vec<String> = node
+            .list_presets()
+            .expect("presets")
+            .into_iter()
+            .map(|p| p.name)
+            .collect();
+        for wanted in ["redirect-to-www", "redirect-to-apex", "force-https"] {
+            assert!(names.iter().any(|n| n == wanted), "{wanted}");
+        }
+        let first = node.apply_preset("force-https").expect("apply");
+        assert_eq!(first.len(), 1);
+        assert!(first[0].redirect.is_some() && first[0].action.is_none());
+        assert!(node.apply_preset("force-https").expect("again").is_empty());
+    }
+
+    #[test]
+    fn demo_refuses_rules_the_connector_would_refuse() {
+        let node = &demo_nodes()[0].1;
+        let bad = FirewallRule {
+            id: "bad".into(),
+            name: "Bad".into(),
+            enabled: true,
+            cors: Some(Cors {
+                origins: vec!["*".into()],
+                credentials: true,
+                ..Cors::default()
+            }),
+            ..FirewallRule::default()
+        };
+        assert_eq!(
+            node.create_rule(&bad).expect_err("bad").status_code(),
+            Some(400)
+        );
+        assert_eq!(
+            node.update_rule("r-api-cors", &bad)
+                .expect_err("bad")
+                .status_code(),
+            Some(400)
+        );
+    }
+
+    #[test]
+    fn demo_zone_status_reports_a_secret_without_revealing_it() {
+        let node = &demo_nodes()[0].1;
+        let status = node.zone_secret("api").expect("status");
+        assert!(status.configured && status.header == "X-Cite-Origin-Secret");
+        assert!(status.created_at.is_some() && status.fingerprint.is_some());
+        assert!(!format!("{status:?}").contains(demo_zone_secret(0, "api").as_str()));
+        assert!(status.readable);
+        let none = node.zone_secret("docs").expect("status");
+        assert!(!none.configured && none.fingerprint.is_none());
+        assert_eq!(
+            node.zone_secret("nope").expect_err("site").status_code(),
+            Some(404)
+        );
+    }
+
+    #[test]
+    fn demo_rotation_returns_a_new_secret_once() {
+        let node = &demo_nodes()[0].1;
+        let before = node.zone_secret("api").expect("status").fingerprint;
+        let first = node.rotate_zone_secret("edge-fra", "api").expect("rotate");
+        assert_eq!(first.secret().len(), 40);
+        assert!(first.is_for("edge-fra", "api"));
+        assert!(crate::zone::reveal_meta(&first).contains("edge-fra"));
+        let after = node.zone_secret("api").expect("status").fingerprint;
+        assert_ne!(before, after);
+        assert_eq!(first.fingerprint, after);
+        let second = node.rotate_zone_secret("edge-fra", "api").expect("rotate");
+        assert!(first.secret() != second.secret(), "values match");
+        assert!(!format!("{first:?}").contains(first.secret()));
+    }
+
+    #[test]
+    fn demo_zone_locks_follow_the_site_access() {
+        let node = &demo_nodes()[0].1;
+        assert_eq!(
+            node.rotate_zone_secret("n", "shop")
+                .expect_err("no lock")
+                .status_code(),
+            Some(409)
+        );
+        let mut shop = node.get_site("shop").expect("shop").site;
+        shop.access.zone_lock = true;
+        assert_eq!(
+            node.update_site("shop", &shop)
+                .expect_err("needs cloudflare")
+                .status_code(),
+            Some(400)
+        );
+        shop.access.cloudflare_only = true;
+        node.update_site("shop", &shop).expect("update");
+        assert!(node.zone_secret("shop").expect("status").configured);
+        assert!(node.rotate_zone_secret("n", "shop").is_ok());
+        shop.access.zone_lock = false;
+        node.update_site("shop", &shop).expect("update");
+        assert!(!node.zone_secret("shop").expect("status").configured);
+    }
+
+    #[test]
+    fn older_demo_node_has_no_zone_secret_routes() {
+        let old = &demo_nodes()[1].1;
+        assert_eq!(
+            old.zone_secret("api").expect_err("old").status_code(),
+            Some(404)
+        );
+        assert_eq!(
+            old.rotate_zone_secret("n", "api")
+                .expect_err("old")
+                .status_code(),
+            Some(404)
+        );
     }
 
     #[test]

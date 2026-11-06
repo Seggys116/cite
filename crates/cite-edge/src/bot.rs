@@ -382,6 +382,93 @@ fn ua_match(ua: &[u8]) -> Option<(&'static str, BotClass, u32)> {
     None
 }
 
+// Scanner names live here, next to the classifier lists, so the scanners preset and the bot policy share one source.
+pub const SCANNER_TOKENS: &[&str] = &[
+    "sqlmap",
+    "nikto",
+    "nmap",
+    "masscan",
+    "zgrab",
+    "gobuster",
+    "dirbuster",
+    "wpscan",
+    "nuclei",
+    "acunetix",
+    "havij",
+];
+
+pub fn tool_tokens() -> Vec<&'static str> {
+    TOOL_TOKENS.iter().map(|(token, _)| *token).collect()
+}
+
+pub fn crawler_tokens() -> Vec<&'static str> {
+    CRAWLER_TOKENS
+        .iter()
+        .chain(GENERIC_CRAWLER_TOKENS)
+        .map(|(token, _)| *token)
+        .collect()
+}
+
+// Brackets keep the token literal without a backslash, which HAProxy would also treat as an escape in a config word.
+fn regex_literal(token: &str) -> String {
+    let mut out = String::with_capacity(token.len() + 4);
+    for c in token.chars() {
+        if ".+*?()|${}".contains(c) {
+            out.push('[');
+            out.push(c);
+            out.push(']');
+        } else if "[]^\\".contains(c) {
+            out.push('\\');
+            out.push(c);
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn alternation(groups: &[Vec<&str>]) -> String {
+    let mut seen: Vec<&str> = Vec::new();
+    for token in groups.iter().flatten() {
+        if !seen.contains(token) {
+            seen.push(*token);
+        }
+    }
+    let body: Vec<String> = seen.iter().map(|t| regex_literal(t)).collect();
+    format!("(?i)({})", body.join("|"))
+}
+
+pub fn scanner_regex() -> String {
+    alternation(&[SCANNER_TOKENS.to_vec()])
+}
+
+// Tools and scanners; an empty or missing User-Agent never matches a token list, so it is left to the scanners preset.
+pub fn bad_bot_regex() -> String {
+    alternation(&[tool_tokens(), SCANNER_TOKENS.to_vec()])
+}
+
+pub fn automation_tokens() -> Vec<&'static str> {
+    AUTOMATION_TOKENS.iter().map(|(token, _)| *token).collect()
+}
+
+pub fn scraper_tokens() -> Vec<&'static str> {
+    GENERIC_SCRAPER_TOKENS
+        .iter()
+        .map(|(token, _)| *token)
+        .collect()
+}
+
+// Every token class the classifier treats as a bot: tools and scanners, crawlers, automation and scrapers, built from the same lists.
+pub fn all_bot_regex() -> String {
+    alternation(&[
+        tool_tokens(),
+        SCANNER_TOKENS.to_vec(),
+        crawler_tokens(),
+        automation_tokens(),
+        scraper_tokens(),
+    ])
+}
+
 // Header signals are scored first and carry the most weight; the User-Agent only adds a named signal and may pin the class afterwards.
 pub fn classify(i: &BotInputs<'_>) -> BotVerdict {
     let ua = cap(i.user_agent, MAX_FIELD);
@@ -929,6 +1016,121 @@ mod tests {
             serde_json::from_str::<BotSummary>(&json).expect("parses"),
             s
         );
+    }
+
+    fn compiled(re: &str) -> regex::Regex {
+        regex::Regex::new(re).expect("block regex compiles")
+    }
+
+    #[test]
+    fn every_listed_token_matches_the_regex_of_its_class_in_any_case() {
+        let bad = compiled(&bad_bot_regex());
+        let all = compiled(&all_bot_regex());
+        let scanners = compiled(&scanner_regex());
+        for (i, word) in tool_tokens().into_iter().enumerate() {
+            assert!(bad.is_match(word) && all.is_match(word), "tool entry {i}");
+            assert!(
+                bad.is_match(&word.to_uppercase()),
+                "tool entry {i} in upper case"
+            );
+        }
+        for (i, word) in SCANNER_TOKENS.iter().enumerate() {
+            assert!(
+                bad.is_match(word) && all.is_match(word),
+                "scanner entry {i}"
+            );
+            assert!(
+                scanners.is_match(&word.to_uppercase()),
+                "scanner entry {i} in upper case"
+            );
+        }
+        for (i, word) in crawler_tokens().into_iter().enumerate() {
+            assert!(all.is_match(word), "crawler entry {i}");
+            assert!(
+                all.is_match(&word.to_uppercase()),
+                "crawler entry {i} in upper case"
+            );
+        }
+    }
+
+    #[test]
+    fn block_all_covers_every_token_the_classifier_labels_a_bot() {
+        let all = compiled(&all_bot_regex());
+        let bad = compiled(&bad_bot_regex());
+        for (i, (word, _)) in CRAWLER_TOKENS
+            .iter()
+            .chain(GENERIC_CRAWLER_TOKENS)
+            .chain(AUTOMATION_TOKENS)
+            .chain(GENERIC_SCRAPER_TOKENS)
+            .chain(TOOL_TOKENS)
+            .enumerate()
+        {
+            assert!(all.is_match(word), "entry {i}");
+            assert!(
+                all.is_match(&word.to_uppercase()),
+                "entry {i} in upper case"
+            );
+        }
+        for (i, word) in automation_tokens()
+            .into_iter()
+            .chain(scraper_tokens())
+            .enumerate()
+        {
+            assert!(!bad.is_match(word), "entry {i} belongs to block_all only");
+        }
+        let headless = "Mozilla/5.0 HeadlessChrome/124.0.0.0 Safari/537.36";
+        assert!(all.is_match(headless) && !bad.is_match(headless));
+    }
+
+    #[test]
+    fn the_blocker_lists_are_the_classifier_lists() {
+        for (i, word) in tool_tokens().into_iter().enumerate() {
+            let v = classify(&BotInputs {
+                user_agent: word,
+                ..BotInputs::default()
+            });
+            assert_eq!(v.class, BotClass::Tool, "tool entry {i}");
+        }
+        for (i, word) in crawler_tokens().into_iter().enumerate() {
+            let v = classify(&BotInputs {
+                user_agent: word,
+                ..BotInputs::default()
+            });
+            assert_eq!(v.class, BotClass::Crawler, "crawler entry {i}");
+        }
+    }
+
+    #[test]
+    fn bad_policy_spares_crawlers_browsers_and_empty_agents() {
+        let bad = compiled(&bad_bot_regex());
+        let all = compiled(&all_bot_regex());
+        let googlebot = "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)";
+        assert!(!bad.is_match(googlebot) && all.is_match(googlebot));
+        for ua in [CHROME_UA, FIREFOX_UA, SAFARI_UA] {
+            assert!(!bad.is_match(ua) && !all.is_match(ua), "{ua}");
+        }
+        assert!(!bad.is_match("") && !all.is_match(""));
+        for ua in [
+            "curl/8.5.0",
+            "python-requests/2.31.0",
+            "sqlmap/1.7.2#stable",
+        ] {
+            assert!(bad.is_match(ua), "{ua}");
+        }
+    }
+
+    #[test]
+    fn block_regexes_are_one_safe_config_word_that_fits_a_config_line() {
+        for re in [bad_bot_regex(), all_bot_regex(), scanner_regex()] {
+            assert!(re.starts_with("(?i)(") && re.ends_with(')'));
+            assert!(re.len() < 1500, "{}", re.len());
+            assert!(
+                re.chars()
+                    .all(|c| c.is_ascii_graphic() && !matches!(c, '"' | '\'' | '#' | '\\' | '$'))
+            );
+        }
+        assert_eq!(regex_literal("+http"), "[+]http");
+        assert_eq!(regex_literal("archive.org_bot"), "archive[.]org_bot");
     }
 
     proptest! {

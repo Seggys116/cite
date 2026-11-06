@@ -8,13 +8,15 @@ use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use cite_client::{
     ClientError, NodeClient, archive_download_name, archive_kind_from_name, export_file_name,
-    validate_archive_name,
+    validate_archive_name, validate_certificate_id, validate_site_id,
 };
 
 use crate::error::ApiError;
 use crate::state::AppState;
 
 pub const MAX_REQUEST_BODY: usize = 1024 * 1024;
+// The connector caps the JSON at 128 KiB; escaped newlines make a 100 KiB PEM pair somewhat larger on the wire.
+pub const MAX_CERTIFICATE_BODY: usize = 144 * 1024;
 
 const PREFIX: &str = "/api/v1/nodes/";
 const PROXY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -34,7 +36,7 @@ const ANALYTICS_ROUTES: [&str; 7] = [
 ];
 const ANALYTICS_WRITE_ROUTES: [&str; 3] = ["backup", "cut", "restore"];
 const ARCHIVE_PREFIX: &str = "analytics/archives/";
-const ALLOWED_PREFIXES: [&str; 9] = [
+const ALLOWED_PREFIXES: [&str; 11] = [
     "node",
     "settings",
     "audit",
@@ -44,6 +46,8 @@ const ALLOWED_PREFIXES: [&str; 9] = [
     "analytics",
     "haproxy",
     "tokens",
+    "certificates",
+    "cloudflare",
 ];
 
 // Segments are limited to unreserved characters, which rules out traversal and encoded separators.
@@ -96,6 +100,59 @@ fn analytics_route_ok(method: &Method, rest: &str) -> bool {
         (Some(route), None) if method == Method::GET => ANALYTICS_ROUTES.contains(&route),
         (Some(route), None) => method == Method::POST && ANALYTICS_WRITE_ROUTES.contains(&route),
         _ => false,
+    }
+}
+
+// Certificates and the Cloudflare list are also limited to the exact (method, route) pairs the console uses.
+fn certificate_route_ok(method: &Method, rest: &str) -> bool {
+    let mut segments = rest.split('/');
+    let first = segments.next();
+    if !matches!(first, Some("certificates" | "cloudflare")) {
+        return true;
+    }
+    let second = segments.next();
+    // Anything beyond the exact shapes below is refused, but only for these two prefixes.
+    if segments.next().is_some() {
+        return false;
+    }
+    match (first, second) {
+        (Some("certificates"), None) => method == Method::GET || method == Method::POST,
+        (Some("certificates"), Some(id)) => {
+            (method == Method::GET || method == Method::PUT || method == Method::DELETE)
+                && validate_certificate_id(id).is_ok()
+        }
+        (Some("cloudflare"), Some("ranges")) => method == Method::GET,
+        _ => false,
+    }
+}
+
+fn is_zone_secret_route(rest: &str) -> bool {
+    let mut segments = rest.split('/');
+    segments.next() == Some("sites") && segments.nth(1) == Some("zone-secret")
+}
+
+// Only the exact status and rotate pair is open here; the other site routes keep their prefix-level access.
+fn zone_secret_route_ok(method: &Method, rest: &str) -> bool {
+    if !is_zone_secret_route(rest) {
+        return true;
+    }
+    let segments: Vec<&str> = rest.split('/').collect();
+    matches!(segments.as_slice(), [_, id, _] if validate_site_id(id).is_ok())
+        && (method == Method::GET || method == Method::POST)
+}
+
+fn route_ok(method: &Method, rest: &str) -> bool {
+    analytics_route_ok(method, rest)
+        && certificate_route_ok(method, rest)
+        && zone_secret_route_ok(method, rest)
+}
+
+fn body_limit_for(method: &Method, rest: &str) -> usize {
+    let write = matches!(*method, Method::POST | Method::PUT);
+    if write && rest.split('/').next() == Some("certificates") {
+        MAX_CERTIFICATE_BODY
+    } else {
+        MAX_REQUEST_BODY
     }
 }
 
@@ -226,7 +283,7 @@ async fn forward(state: &AppState, req: Request) -> Result<Response, ApiError> {
         .ok_or_else(not_found)?;
     let (node, rest) = tail.split_once('/').ok_or_else(not_found)?;
     let rest = clean_rest(rest).ok_or_else(not_found)?;
-    if !allowed(rest) || !analytics_route_ok(&parts.method, rest) {
+    if !allowed(rest) || !route_ok(&parts.method, rest) {
         return Err(not_found());
     }
     if !matches!(
@@ -251,9 +308,11 @@ async fn forward(state: &AppState, req: Request) -> Result<Response, ApiError> {
         return stream_archive(&client, name).await;
     }
     let payload = if matches!(parts.method, Method::POST | Method::PUT) {
-        to_bytes(body, MAX_REQUEST_BODY).await.map_err(|_| {
-            ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "request body is too large")
-        })?
+        to_bytes(body, body_limit_for(&parts.method, rest))
+            .await
+            .map_err(|_| {
+                ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "request body is too large")
+            })?
     } else {
         Bytes::new()
     };
@@ -283,12 +342,15 @@ async fn forward(state: &AppState, req: Request) -> Result<Response, ApiError> {
             "node sent an unexpected redirect",
         ));
     }
-    Response::builder()
-        .status(status)
-        .header(
-            header::CONTENT_TYPE,
-            response_content_type(forwarded.content_type.as_deref()),
-        )
+    let mut builder = Response::builder().status(status).header(
+        header::CONTENT_TYPE,
+        response_content_type(forwarded.content_type.as_deref()),
+    );
+    // A rotated secret is shown once, so no cache may keep it
+    if is_zone_secret_route(rest) {
+        builder = builder.header(header::CACHE_CONTROL, "no-store");
+    }
+    builder
         .body(Body::from(forwarded.body))
         .map_err(ApiError::internal)
 }
@@ -403,6 +465,99 @@ mod tests {
     }
 
     #[test]
+    fn certificate_and_cloudflare_routes_use_exact_method_pairs() {
+        let id = "01JC9ZQ7M3X8V4N2B6T5R0WHYA";
+        let item = format!("certificates/{id}");
+        let yes = [
+            (Method::GET, "certificates"),
+            (Method::POST, "certificates"),
+            (Method::GET, item.as_str()),
+            (Method::PUT, item.as_str()),
+            (Method::DELETE, item.as_str()),
+            (Method::GET, "cloudflare/ranges"),
+        ];
+        for (method, rest) in yes {
+            assert!(allowed(rest), "{rest}");
+            assert!(route_ok(&method, rest), "{method} {rest}");
+        }
+        let no = [
+            (Method::PUT, "certificates"),
+            (Method::DELETE, "certificates"),
+            (Method::POST, item.as_str()),
+            (Method::PATCH, item.as_str()),
+            (Method::POST, "cloudflare/ranges"),
+            (Method::PUT, "cloudflare/ranges"),
+            (Method::GET, "cloudflare"),
+            (Method::GET, "cloudflare/other"),
+            (Method::GET, "certificates/x"),
+            (Method::GET, "certificates/01jc9zq7m3x8v4n2b6t5r0whya"),
+            (Method::GET, "certificates/0123456789abcdef0123456789abcdef"),
+            (Method::PUT, "certificates/0123456789abcdef0123456789abcdef"),
+            (
+                Method::DELETE,
+                "certificates/0123456789abcdef0123456789abcdef",
+            ),
+            (Method::GET, "certificates/01JC9ZQ7M3X8V4N2B6T5R0WHY"),
+            (Method::DELETE, "certificates/.."),
+            (Method::GET, "certificates/01JC9ZQ7M3X8V4N2B6T5R0WHYA/extra"),
+            (Method::GET, "cloudflare/ranges/extra"),
+        ];
+        for (method, rest) in no {
+            assert!(!route_ok(&method, rest), "{method} {rest}");
+        }
+        assert!(route_ok(&Method::POST, "sites"));
+        assert!(route_ok(&Method::GET, "analytics/archives"));
+    }
+
+    #[test]
+    fn zone_secret_routes_are_exact_pairs_with_valid_site_ids() {
+        for method in [Method::GET, Method::POST] {
+            assert!(route_ok(&method, "sites/shop/zone-secret"), "{method}");
+        }
+        for method in [Method::PUT, Method::DELETE, Method::PATCH] {
+            assert!(!route_ok(&method, "sites/shop/zone-secret"), "{method}");
+        }
+        for rest in [
+            "sites/shop/zone-secret/extra",
+            "sites/Shop/zone-secret",
+            "sites/-x/zone-secret",
+            "sites/a_b/zone-secret",
+        ] {
+            assert!(!route_ok(&Method::GET, rest), "{rest}");
+            assert!(!route_ok(&Method::POST, rest), "{rest}");
+        }
+        assert!(is_zone_secret_route("sites/shop/zone-secret"));
+        assert!(!is_zone_secret_route("sites/zone-secret"));
+        assert!(!is_zone_secret_route("sites/shop/deploy"));
+        assert!(route_ok(&Method::POST, "sites/shop/deploy"));
+        assert!(route_ok(&Method::PUT, "sites/shop"));
+        assert_eq!(
+            timeout_for(&Method::POST, "sites/shop/zone-secret"),
+            PROXY_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn only_certificate_writes_get_the_small_body_limit() {
+        for (method, rest) in [
+            (Method::POST, "certificates"),
+            (Method::PUT, "certificates/01JC9ZQ7M3X8V4N2B6T5R0WHYA"),
+        ] {
+            assert_eq!(body_limit_for(&method, rest), MAX_CERTIFICATE_BODY);
+        }
+        for (method, rest) in [
+            (Method::POST, "sites"),
+            (Method::PUT, "settings"),
+            (Method::GET, "certificates"),
+            (Method::POST, "cloudflare/ranges"),
+        ] {
+            assert_eq!(body_limit_for(&method, rest), MAX_REQUEST_BODY);
+        }
+        assert_eq!(MAX_CERTIFICATE_BODY, 144 * 1024);
+        assert_eq!(timeout_for(&Method::POST, "certificates"), PROXY_TIMEOUT);
+    }
+
+    #[test]
     fn archive_downloads_get_rebuilt_headers() {
         assert_eq!(
             archive_download_target("analytics/archives/a.db"),
@@ -507,5 +662,21 @@ mod tests {
         let html = response_content_type(Some("text/html"));
         assert_eq!(html, "application/octet-stream");
         assert_eq!(response_content_type(None), "application/octet-stream");
+    }
+
+    #[test]
+    fn the_combined_route_check_keeps_archive_and_other_routes_reachable() {
+        assert!(route_ok(&Method::GET, "analytics/archives"));
+        assert!(route_ok(
+            &Method::GET,
+            "analytics/archives/requests-2026-11-05.ndjson.gz"
+        ));
+        assert!(route_ok(&Method::GET, "certificates"));
+        assert!(route_ok(&Method::GET, "cloudflare/ranges"));
+        assert!(!route_ok(
+            &Method::GET,
+            "certificates/0123456789abcdef/extra"
+        ));
+        assert!(!route_ok(&Method::GET, "cloudflare/other"));
     }
 }

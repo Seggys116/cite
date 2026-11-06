@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod archive;
+pub mod certificate;
 pub mod client;
 pub mod config;
 pub mod error;
@@ -8,11 +9,16 @@ pub mod export;
 pub mod fleet;
 pub mod fsio;
 pub mod tokens;
+pub mod zone;
 
 pub use archive::{
     ARCHIVE_EXTENSIONS, ArchiveEntry, ArchiveKind, ArchiveList, CutReport, CutRequest,
     MAX_ARCHIVE_NAME_CHARS, MAX_CUT_DAYS, RestoreReport, archive_download_name,
     archive_kind_from_name, validate_archive_name,
+};
+pub use certificate::{
+    CertificateInfo, CertificateList, CertificateSaved, CertificateUpload, CloudflareRanges,
+    MAX_CERT_NAME_CHARS, MAX_PEM_BYTES, validate_certificate_id, validate_certificate_name,
 };
 pub use client::{
     AuditEntry, CreatedToken, DeployRequest, Forwarded, LoginResponse, NodeClient, NodeInfo,
@@ -33,3 +39,4 @@ pub use fleet::{
     apply_site_to_nodes, fan_out,
 };
 pub use tokens::{JsonTokenStore, MemoryTokenStore, TokenStore};
+pub use zone::{ZoneSecret, ZoneSecretStatus, validate_site_id};
