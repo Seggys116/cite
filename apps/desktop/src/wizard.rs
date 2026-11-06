@@ -1,7 +1,7 @@
 use crate::certs::{AccessDraft, bots_label};
 use crate::model::{
-    SiteDraft, SourceKind, clean_list, github_problem, normalize_repo, parse_hosts, parse_targets,
-    paths_problem,
+    SiteDraft, SourceKind, branch_problem, clean_list, github_problem, health_problem,
+    normalize_repo, parse_hosts, parse_targets, paths_problem, poll_problem, repo_problem,
 };
 
 // The create-site wizard shows one decision per step and nothing from the branch not taken.
@@ -111,7 +111,7 @@ pub fn effective_token(view: &TokenView, typed: &str) -> String {
 
 fn id_problem(id: &str) -> Option<String> {
     let ok = !id.is_empty()
-        && id.len() <= 63
+        && id.len() <= 40
         && !id.starts_with('-')
         && id
             .chars()
@@ -178,8 +178,76 @@ fn servers_problem(d: &SiteDraft) -> Option<String> {
     if let Err(e) = parse_targets(&d.green) {
         return Some(e);
     }
-    (!d.health_path.trim().starts_with('/'))
-        .then(|| "The health check path must start with /.".into())
+    health_problem(d)
+}
+
+// Problems per field, so both the wizard and the edit form can show them next to the field they belong to.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct FieldProblems {
+    pub name: Option<String>,
+    pub id: Option<String>,
+    pub hosts: Option<String>,
+    pub paths: Option<String>,
+    pub repo: Option<String>,
+    pub branch: Option<String>,
+    pub poll: Option<String>,
+    pub health: Option<String>,
+}
+
+impl FieldProblems {
+    pub fn first(&self) -> Option<&String> {
+        [
+            &self.name,
+            &self.id,
+            &self.hosts,
+            &self.paths,
+            &self.repo,
+            &self.branch,
+            &self.poll,
+            &self.health,
+        ]
+        .into_iter()
+        .find_map(Option::as_ref)
+    }
+}
+
+// The source fields are only checked for sites built from GitHub; the id only when it can still be chosen.
+pub fn field_problems(d: &SiteDraft, check_id: bool) -> FieldProblems {
+    let github = d.source == SourceKind::Github;
+    let hosts = parse_hosts(&d.hosts);
+    let prefixes = clean_list(d.path_prefixes.iter().cloned());
+    let regexes = clean_list(d.path_regexes.iter().cloned());
+    FieldProblems {
+        name: d
+            .name
+            .trim()
+            .is_empty()
+            .then(|| "Give the site a name.".into()),
+        id: if check_id {
+            id_problem(d.id.trim())
+        } else {
+            None
+        },
+        hosts: if hosts.is_empty() {
+            Some("Add at least one host name.".into())
+        } else {
+            hosts.iter().find_map(|h| host_problem(h))
+        },
+        paths: paths_problem(&prefixes, &regexes)
+            .map(|p| format!("The routing paths are not valid: {p}")),
+        repo: if github { repo_problem(&d.repo) } else { None },
+        branch: if github {
+            branch_problem(&d.branch)
+        } else {
+            None
+        },
+        poll: if github {
+            poll_problem(&d.poll_interval)
+        } else {
+            None
+        },
+        health: health_problem(d),
+    }
 }
 
 // The first step from the start that is not valid, used to stop a jump to the end with a bad earlier answer.
@@ -448,6 +516,43 @@ mod tests {
         let (step, _) = first_blocked(&d, 1, &quiet()).expect("blocked");
         assert_eq!(step, Step::Setup);
         assert!(first_blocked(&github(), 1, &quiet()).is_none());
+    }
+
+    #[test]
+    fn field_problems_sit_next_to_their_fields() {
+        let none = field_problems(&github(), true);
+        assert_eq!(none, FieldProblems::default());
+        assert!(none.first().is_none());
+        let mut d = github();
+        d.name.clear();
+        d.id = "Bad".into();
+        d.hosts = "bad host!".into();
+        d.repo = "nope".into();
+        d.branch = "-x".into();
+        d.poll_interval = "5s".into();
+        d.path_prefixes = vec!["nope".into()];
+        let p = field_problems(&d, true);
+        assert!(p.name.is_some() && p.id.is_some() && p.hosts.is_some());
+        assert!(p.repo.is_some() && p.branch.is_some() && p.poll.is_some() && p.paths.is_some());
+        assert_eq!(p.first(), p.name.as_ref());
+        assert!(field_problems(&d, false).id.is_none());
+        let mut s = servers();
+        s.repo = "nope".into();
+        s.poll_interval = "5s".into();
+        let p = field_problems(&s, true);
+        assert!(p.repo.is_none() && p.poll.is_none() && p.branch.is_none());
+        s.health_interval = "10".into();
+        assert!(
+            field_problems(&s, true)
+                .health
+                .unwrap()
+                .contains("interval")
+        );
+        let mut long = github();
+        long.id = "a".repeat(41);
+        assert!(field_problems(&long, true).id.is_some());
+        long.id = "a".repeat(40);
+        assert!(field_problems(&long, true).id.is_none());
     }
 
     #[test]

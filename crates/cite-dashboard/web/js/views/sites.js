@@ -1,4 +1,5 @@
-import { h, icon, clear } from '../dom.js';
+import { h, icon, clear, debounce } from '../dom.js';
+import { failureNote } from '../historylib.js';
 import { nodeApi } from '../api.js';
 import { state } from '../state.js';
 import {
@@ -28,12 +29,23 @@ function hostChips(hosts) {
 function render({ rows, failed }) {
   const showNode = state.node === 'all';
   const healthCells = new Map();
+  const noteCells = new Map();
+  const stateCells = new Map();
+  // Details are fetched once per site; typing in the filter redraws from this cache instead of asking every node again
+  const details = new Map();
   const needle = h('input', { class: 'input search', type: 'search', placeholder: 'Filter sites by name or host', 'aria-label': 'Filter sites' });
   const tableHost = h('div', {});
   const key = (r) => r.node + '/' + r.id;
 
   const columns = [
-    { label: 'Site', render: (r) => h('div', { class: 'cell-stack' }, h('b', { class: 'cell-strong' }, r.name), h('span', { class: 'mono muted' }, r.id)) },
+    {
+      label: 'Site',
+      render: (r) => {
+        const note = h('span', { class: 'error-text fail-note', hidden: true });
+        noteCells.set(key(r), note);
+        return h('div', { class: 'cell-stack' }, h('b', { class: 'cell-strong' }, r.name), h('span', { class: 'mono muted' }, r.id), note);
+      },
+    },
     showNode ? { label: 'Node', render: (r) => h('span', { class: 'mono' }, r.node) } : null,
     { label: 'Kind', render: (r) => pill(r.kind === 'api' ? 'API' : 'Site', 'muted') },
     { label: 'Hosts', render: (r) => hostChips(r.hosts || []) },
@@ -46,13 +58,45 @@ function render({ rows, failed }) {
         return cell;
       },
     },
-    { label: 'State', render: (r) => (r.maintenance && r.maintenance.enabled ? pill('Maintenance', 'warn', 'wrench') : pill('Serving', 'ok')) },
+    {
+      label: 'State',
+      render: (r) => {
+        const cell = h('span', {}, r.maintenance && r.maintenance.enabled ? pill('Maintenance', 'warn', 'wrench') : pill('Serving', 'ok'));
+        stateCells.set(key(r), { cell, maintenance: Boolean(r.maintenance && r.maintenance.enabled) });
+        return cell;
+      },
+    },
   ].filter(Boolean);
+
+  // Puts what the detail call showed into the row: the health dots, and the reason when the site is failing
+  const fill = (r, detail) => {
+    const cell = healthCells.get(key(r));
+    if (cell && cell.isConnected) {
+      const live = (detail.live && detail.live[detail.active]) || [];
+      clear(cell);
+      cell.appendChild(healthDots(live));
+    }
+    const text = failureNote(detail);
+    const note = noteCells.get(key(r));
+    if (note) {
+      note.textContent = text;
+      note.title = text;
+      note.hidden = !text;
+    }
+    const state = stateCells.get(key(r));
+    if (state && text && !state.maintenance) {
+      clear(state.cell);
+      state.cell.appendChild(pill('Needs attention', 'bad', 'alert'));
+      state.cell.title = text;
+    }
+  };
 
   const draw = () => {
     const q = needle.value.trim().toLowerCase();
     const shown = rows.filter((r) => !q || r.name.toLowerCase().includes(q) || r.id.includes(q) || (r.hosts || []).some((x) => x.toLowerCase().includes(q)));
     healthCells.clear();
+    noteCells.clear();
+    stateCells.clear();
     clear(tableHost);
     tableHost.appendChild(dataTable({
       columns,
@@ -70,22 +114,32 @@ function render({ rows, failed }) {
     }));
     // Health lives on the per-site detail call, so the dots fill in after the table is on screen
     for (const r of shown) {
-      nodeApi(r.node).get('/sites/' + encodeURIComponent(r.id)).then((detail) => {
-        const cell = healthCells.get(key(r));
-        if (!cell || !cell.isConnected) return;
-        const live = (detail.live && detail.live[detail.active]) || [];
-        clear(cell);
-        cell.appendChild(healthDots(live));
-      }, () => {
+      const cached = details.get(key(r));
+      if (cached && cached.detail) {
+        fill(r, cached.detail);
+      } else if (cached && cached.failed) {
         const cell = healthCells.get(key(r));
         if (cell) {
           clear(cell);
           cell.appendChild(dot('bad', 'unavailable'));
         }
-      });
+      } else if (!cached) {
+        details.set(key(r), {});
+        nodeApi(r.node).get('/sites/' + encodeURIComponent(r.id)).then((detail) => {
+          details.set(key(r), { detail });
+          fill(r, detail);
+        }, () => {
+          details.set(key(r), { failed: true });
+          const cell = healthCells.get(key(r));
+          if (cell) {
+            clear(cell);
+            cell.appendChild(dot('bad', 'unavailable'));
+          }
+        });
+      }
     }
   };
-  needle.addEventListener('input', draw);
+  needle.addEventListener('input', debounce(draw, 120));
   draw();
 
   return h('div', { class: 'stack' },

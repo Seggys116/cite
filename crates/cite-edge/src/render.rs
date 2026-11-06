@@ -34,6 +34,7 @@ const DEFAULT_PAGE_STATUS: u16 = 503;
 const CF_PEER: &str = "cf_peer";
 // Shown as the rule label in logs and the Traffic blocked-by-rule table.
 const CF_RULE: &str = "cloudflare-only";
+const RATE_RULE: &str = "rate-limit";
 const CF_CLIENT_HEADERS: [&str; 5] = [
     "CF-Connecting-IP",
     "True-Client-IP",
@@ -216,6 +217,9 @@ fn cloudflare_sites(cfg: &EdgeConfig) -> CloudflareSites {
 // The peer test uses fc_src, the TCP peer, because a client cannot forge it the way it can a header.
 fn cloudflare_acls(cf: &CloudflareSites, file: &str, out: &mut String) {
     push_in(out, &format!("acl {CF_PEER} fc_src -f {file}"));
+    if cf.aware.is_empty() {
+        return;
+    }
     for (name, ids) in [
         ("cf_only", &cf.only),
         ("cf_flex", &cf.flexible),
@@ -273,15 +277,12 @@ fn cloudflare_forwarded_proto(cf: &CloudflareSites, out: &mut String) {
     );
 }
 
-// Needs a header that is present once and is a single IP, otherwise src stays the Cloudflare edge address.
-fn cloudflare_real_client(cf: &CloudflareSites, out: &mut String) {
-    if cf.only.is_empty() {
-        return;
-    }
+// Applies to every site so the per-IP rate limit counts visitors, not the shared Cloudflare edge address; needs a header that is present once and is a single IP, otherwise src stays the edge address.
+fn cloudflare_real_client(out: &mut String) {
     push_in(
         out,
         &format!(
-            "http-request set-src req.fhdr(cf-connecting-ip) if cf_only {CF_PEER} {{ req.hdr_cnt(cf-connecting-ip) eq 1 }} {{ req.fhdr(cf-connecting-ip) -m ip 0.0.0.0/0 ::/0 }}"
+            "http-request set-src req.fhdr(cf-connecting-ip) if {CF_PEER} {{ req.hdr_cnt(cf-connecting-ip) eq 1 }} {{ req.fhdr(cf-connecting-ip) -m ip 0.0.0.0/0 ::/0 }}"
         ),
     );
 }
@@ -382,8 +383,7 @@ fn host_inline(host: &str) -> String {
     }
 }
 
-// A site matched by its own ACLs; plain sites in a long run are matched through the host map instead.
-// A site with prefixes and regexes gets one condition for each, and each becomes its own set-var line, which makes them alternatives.
+// A site with prefixes and regexes gets one condition each, and each becomes its own set-var line, which makes them alternatives.
 fn site_conds(site: &Site) -> Vec<String> {
     let id = &site.id;
     let mut conds = Vec::new();
@@ -973,12 +973,28 @@ fn cors_headers(rule: &FirewallRule, c: &Cors, preflight: bool) -> Vec<(&'static
     h
 }
 
-// A redirect to the node's own HTTPS listener is dropped where there is none, and for Flexible sites Cloudflare already owns the scheme.
-fn redirect_wanted(rule: &FirewallRule, https_ok: bool) -> bool {
-    let Some(r) = &rule.redirect else {
-        return true;
-    };
-    https_ok || !parse_template(&r.to).is_ok_and(|t| t.is_own_https())
+// Where the node's own HTTPS listener on 443 comes from: the owner's setting, or the automatic one added for Cloudflare-aware sites.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Listener {
+    Missing,
+    Explicit,
+    Automatic,
+}
+
+// A redirect to the node's own HTTPS listener is dropped where there is none; Some(true) limits the rule to Cloudflare-aware sites.
+fn redirect_wanted(rule: &FirewallRule, listener: Listener, cf: &CloudflareSites) -> Option<bool> {
+    let own = rule
+        .redirect
+        .as_ref()
+        .is_some_and(|r| parse_template(&r.to).is_ok_and(|t| t.is_own_https()));
+    match (own, listener) {
+        (false, _) | (true, Listener::Explicit) => Some(false),
+        (true, Listener::Missing) => None,
+        (true, Listener::Automatic) => match &rule.site {
+            Some(site) => cf.aware.contains(site).then_some(true),
+            None => Some(true),
+        },
+    }
 }
 
 // The www and apex guards make those helper redirects fire only when they change the host, so they cannot loop.
@@ -988,8 +1004,12 @@ fn redirect_line(
     cf: &CloudflareSites,
     t: &Template,
     status: u16,
+    aware_only: bool,
 ) -> String {
     let mut cond = request_cond(rule, cfg);
+    if aware_only {
+        cond.push_str(" cf_aware");
+    }
     if t.uses_www() {
         cond.push_str(" !{ var(txn.host) -m beg www. }");
     }
@@ -1006,13 +1026,16 @@ fn redirect_line(
 }
 
 // Request-phase effects run after every blocking rule, in this order: redirects, request header changes, CORS preflight. Response-phase effects follow.
-fn render_effects(cfg: &EdgeConfig, cf: &CloudflareSites, https_ok: bool, out: &mut String) {
-    let rules: Vec<&FirewallRule> = cfg
+fn render_effects(cfg: &EdgeConfig, cf: &CloudflareSites, listener: Listener, out: &mut String) {
+    let wanted: Vec<(&FirewallRule, bool)> = cfg
         .firewall
         .iter()
-        .filter(|r| r.enabled && r.action.is_none() && redirect_wanted(r, https_ok))
+        .filter(|r| r.enabled && r.action.is_none())
+        .filter_map(|r| redirect_wanted(r, listener, cf).map(|aware_only| (r, aware_only)))
         .collect();
-    for rule in &rules {
+    // a rule whose redirect exists only for the automatic listener keeps nothing but that redirect
+    let rules: Vec<&FirewallRule> = wanted.iter().filter(|w| !w.1).map(|w| w.0).collect();
+    for rule in wanted.iter().map(|w| w.0) {
         for line in rule_acl_lines(rule) {
             push_in(out, &line);
         }
@@ -1022,7 +1045,13 @@ fn render_effects(cfg: &EdgeConfig, cf: &CloudflareSites, https_ok: bool, out: &
             }
         }
     }
-    for rule in rules.iter().filter(|r| needs_match_var(r, cfg)) {
+    for (rule, _) in wanted.iter().filter(|(r, aware_only)| {
+        if *aware_only {
+            heavy_cond(r, cfg)
+        } else {
+            needs_match_var(r, cfg)
+        }
+    }) {
         push_in(
             out,
             &format!(
@@ -1032,11 +1061,14 @@ fn render_effects(cfg: &EdgeConfig, cf: &CloudflareSites, https_ok: bool, out: &
             ),
         );
     }
-    for rule in &rules {
+    for (rule, aware_only) in &wanted {
         if let Some(r) = &rule.redirect
             && let Ok(t) = parse_template(&r.to)
         {
-            push_in(out, &redirect_line(rule, cfg, cf, &t, r.status));
+            push_in(
+                out,
+                &redirect_line(rule, cfg, cf, &t, r.status, *aware_only),
+            );
         }
     }
     for rule in &rules {
@@ -1183,6 +1215,7 @@ fn render_frontend(
     segs: &[Segment<'_>],
     opts: &RenderOptions,
     tls: bool,
+    auto_https: bool,
     out: &mut String,
 ) {
     let s = &cfg.settings;
@@ -1300,9 +1333,11 @@ fn render_frontend(
     }
     let cf = cloudflare_sites(cfg);
     // the peer is judged before set-src runs, so the later rules never see a rewritten address
-    if let (false, Some(file)) = (cf.aware.is_empty(), &opts.cloudflare_file) {
+    if let Some(file) = &opts.cloudflare_file {
         cloudflare_acls(&cf, file, out);
-        cloudflare_gate(&cf, out);
+        if !cf.aware.is_empty() {
+            cloudflare_gate(&cf, out);
+        }
     }
     push_in(
         out,
@@ -1312,9 +1347,9 @@ fn render_frontend(
         out,
         "http-request set-header X-Forwarded-Proto http unless { ssl_fc }",
     );
-    if !cf.aware.is_empty() && opts.cloudflare_file.is_some() {
+    if opts.cloudflare_file.is_some() {
         cloudflare_forwarded_proto(&cf, out);
-        cloudflare_real_client(&cf, out);
+        cloudflare_real_client(out);
     }
     if let Some(limit) = s.per_ip_rate_limit {
         push_in(
@@ -1324,7 +1359,15 @@ fn render_frontend(
         push_in(out, "http-request track-sc0 src");
         push_in(
             out,
-            &format!("http-request deny deny_status 429 if {{ sc_http_req_rate(0) gt {limit} }}"),
+            &format!(
+                "http-request set-var(txn.blocked) str({RATE_RULE}) if {{ sc_http_req_rate(0) gt {limit} }}"
+            ),
+        );
+        push_in(
+            out,
+            &format!(
+                "http-request deny deny_status 429 if {{ var(txn.blocked) -m str {RATE_RULE} }}"
+            ),
         );
     }
     if let Some(max) = s.max_body_bytes {
@@ -1346,8 +1389,12 @@ fn render_frontend(
     bot_policy_lines(cfg, out);
     zone_strip_lines(cfg, out);
     // an HTTPS redirect needs the node's own listener on the default port, or the Location would point nowhere
-    let https_ok = tls && s.https_port == Some(443);
-    render_effects(cfg, &cf, https_ok, out);
+    let listener = match (tls && s.https_port == Some(443), auto_https) {
+        (false, _) => Listener::Missing,
+        (true, false) => Listener::Explicit,
+        (true, true) => Listener::Automatic,
+    };
+    render_effects(cfg, &cf, listener, out);
     // maintenance rules are always emitted; the maint map toggles them at runtime without a reload
     let mut pages: Vec<(PageRef, Vec<String>)> = Vec::new();
     for site in &cfg.sites {
@@ -1427,6 +1474,22 @@ fn render_notfound(out: &mut String) {
 }
 
 pub fn render(cfg: &EdgeConfig, opts: &RenderOptions) -> Result<Rendered, ValidationError> {
+    render_with(cfg, opts, false)
+}
+
+/// Like `render`, for a config whose `https_port` the node filled in itself for Cloudflare-aware sites; redirects to the node's own HTTPS then apply to those sites only.
+pub fn render_automatic_https(
+    cfg: &EdgeConfig,
+    opts: &RenderOptions,
+) -> Result<Rendered, ValidationError> {
+    render_with(cfg, opts, true)
+}
+
+fn render_with(
+    cfg: &EdgeConfig,
+    opts: &RenderOptions,
+    auto_https: bool,
+) -> Result<Rendered, ValidationError> {
     validate_config(cfg)?;
     validate_options(opts)?;
     check_zone_locks(cfg)?;
@@ -1437,7 +1500,7 @@ pub fn render(cfg: &EdgeConfig, opts: &RenderOptions) -> Result<Rendered, Valida
     render_defaults(cfg, &mut config);
     render_resolvers(&mut config);
     let segs = segments(&cfg.sites);
-    render_frontend(cfg, &segs, opts, tls, &mut config);
+    render_frontend(cfg, &segs, opts, tls, auto_https, &mut config);
     for site in &cfg.sites {
         render_backend(site, Slot::Blue, &mut config);
         render_backend(site, Slot::Green, &mut config);
@@ -1488,7 +1551,8 @@ pub fn render(cfg: &EdgeConfig, opts: &RenderOptions) -> Result<Rendered, Valida
     pages.push((DEFAULT_PAGE_FILE.to_string(), DEFAULT_PAGE_HTML.to_string()));
     pages.sort();
 
-    let cloudflare_list: String = if cloudflare_sites(cfg).aware.is_empty() {
+    // every site needs the list because the real client address is restored for all Cloudflare peers
+    let cloudflare_list: String = if opts.cloudflare_file.is_none() {
         String::new()
     } else {
         effective_ranges(&cfg.settings)
@@ -2055,7 +2119,7 @@ mod tests {
             "acl host_a",
             "set-var(txn.site)",
             "acl rb_r1",
-            "set-var(txn.blocked)",
+            "set-var(txn.blocked) str(r1)",
             "use_backend",
         ];
         let at: Vec<usize> = order.iter().map(|n| position(&r, n)).collect();
@@ -2304,10 +2368,12 @@ mod tests {
                 .contains("log 127.0.0.1:514 len 8192 format rfc5424 local0")
         );
         assert!(r.config.contains("timeout client 30000ms"));
-        assert!(
-            r.config
-                .contains("http-request deny deny_status 429 if { sc_http_req_rate(0) gt 77 }")
-        );
+        assert!(r.config.contains(
+            "http-request set-var(txn.blocked) str(rate-limit) if { sc_http_req_rate(0) gt 77 }"
+        ));
+        assert!(r.config.contains(
+            "http-request deny deny_status 429 if { var(txn.blocked) -m str rate-limit }"
+        ));
         assert!(r.config.contains(
             "http-request deny deny_status 413 if { req.hdr_val(content-length) gt 1000000 }"
         ));
@@ -2488,31 +2554,33 @@ mod tests {
             .sum::<usize>();
         assert_eq!(
             lines_with(&r, "set-var(txn.blocked)").len(),
-            blocking + oversize
+            blocking + oversize + usize::from(cfg.settings.per_ip_rate_limit.is_some())
         );
         // no HTTPS listener, so force-https is skipped; the two www presets are rendered
         assert_eq!(lines_with(&r, "http-request redirect").len(), 2);
     }
 
     #[test]
-    fn sites_without_access_settings_render_no_cloudflare_lines() {
+    fn sites_without_access_settings_only_restore_the_client_address_for_cloudflare_peers() {
         let cfg = config(vec![site("a", "a.com"), site("b", "b.com")]);
         let with_file = render(&cfg, &opts()).unwrap();
-        let mut o = opts();
-        o.cloudflare_file = None;
-        let without_file = render(&cfg, &o).unwrap();
-        assert_eq!(with_file, without_file);
         for needle in [
-            "cf_",
-            "fc_src",
-            "CF-Connecting-IP",
-            "True-Client-IP",
-            "set-src",
-            "cloudflare",
+            "cf_only",
+            "cf_flex",
+            "cf_aware",
+            "del-header",
+            "cloudflare-only",
         ] {
             assert!(!with_file.config.contains(needle), "{needle}");
         }
-        assert!(with_file.cloudflare_list.is_empty());
+        assert_eq!(
+            lines_with(&with_file, "cf_peer"),
+            [
+                "    acl cf_peer fc_src -f /run/cite/maps/cloudflare.lst",
+                "    http-request set-src req.fhdr(cf-connecting-ip) if cf_peer { req.hdr_cnt(cf-connecting-ip) eq 1 } { req.fhdr(cf-connecting-ip) -m ip 0.0.0.0/0 ::/0 }",
+            ]
+        );
+        assert!(!with_file.cloudflare_list.is_empty());
         assert_eq!(
             lines_with(&with_file, "X-Forwarded-Proto"),
             [
@@ -2520,12 +2588,49 @@ mod tests {
                 "    http-request set-header X-Forwarded-Proto http unless { ssl_fc }",
             ]
         );
+        let mut o = opts();
+        o.cloudflare_file = None;
+        let without_file = render(&cfg, &o).unwrap();
+        for needle in ["cf_", "fc_src", "CF-Connecting-IP", "set-src", "cloudflare"] {
+            assert!(!without_file.config.contains(needle), "{needle}");
+        }
+        assert!(without_file.cloudflare_list.is_empty());
+    }
+
+    #[test]
+    fn rate_limit_tracks_the_restored_client_address_for_sites_that_are_not_cloudflare_only() {
+        let mut cfg = config(vec![
+            site("open", "open.com"),
+            cf_site("flex", "flex.com", false, TlsMode::Flexible),
+        ]);
+        cfg.settings.per_ip_rate_limit = Some(600);
+        let r = render(&cfg, &opts()).unwrap();
+        assert!(lines_with(&r, "acl cf_only").is_empty());
+        let order = [
+            "acl cf_peer fc_src -f /run/cite/maps/cloudflare.lst",
+            "http-request del-header CF-Connecting-IP if cf_aware !cf_peer",
+            "http-request set-src req.fhdr(cf-connecting-ip) if cf_peer",
+            "track-sc0 src",
+            "str(rate-limit)",
+            "deny_status 429",
+        ];
+        let at: Vec<usize> = order.iter().map(|n| position(&r, n)).collect();
+        assert!(at.windows(2).all(|w| w[0] < w[1]), "{at:?}");
+        let set_src = lines_with(&r, "set-src");
+        assert_eq!(set_src.len(), 1);
+        for guard in [
+            "if cf_peer ",
+            "req.hdr_cnt(cf-connecting-ip) eq 1",
+            "req.fhdr(cf-connecting-ip) -m ip 0.0.0.0/0 ::/0",
+        ] {
+            assert!(set_src[0].contains(guard), "{guard}");
+        }
+        assert!(!set_src[0].contains("cf_only"));
     }
 
     #[test]
     fn hash_covers_the_range_list() {
         let plain = render(&config(vec![site("a", "a.com")]), &opts()).unwrap();
-        assert!(plain.cloudflare_list.is_empty());
         let mut changed = plain.clone();
         changed.cloudflare_list = "198.51.100.0/24\n".into();
         assert_ne!(config_hash(&plain), config_hash(&changed));
@@ -2609,7 +2714,7 @@ mod tests {
         assert_eq!(
             lines_with(&r, "set-src"),
             [
-                "    http-request set-src req.fhdr(cf-connecting-ip) if cf_only cf_peer { req.hdr_cnt(cf-connecting-ip) eq 1 } { req.fhdr(cf-connecting-ip) -m ip 0.0.0.0/0 ::/0 }"
+                "    http-request set-src req.fhdr(cf-connecting-ip) if cf_peer { req.hdr_cnt(cf-connecting-ip) eq 1 } { req.fhdr(cf-connecting-ip) -m ip 0.0.0.0/0 ::/0 }"
             ]
         );
         assert_eq!(
@@ -2638,7 +2743,7 @@ mod tests {
         );
         assert!(lines_with(&r, "acl cf_only").is_empty());
         assert!(lines_with(&r, "str(cloudflare-only)").is_empty());
-        assert!(lines_with(&r, "set-src").is_empty());
+        assert_eq!(lines_with(&r, "set-src").len(), 1);
         assert_eq!(
             lines_with(&r, "X-Forwarded-Proto"),
             [
@@ -2667,7 +2772,7 @@ mod tests {
     }
 
     #[test]
-    fn range_list_follows_settings_and_is_empty_without_cloudflare_sites() {
+    fn range_list_follows_settings_and_is_empty_only_without_a_range_file() {
         let mut cfg = config(vec![cf_site("cf", "cf.com", true, TlsMode::Full)]);
         let r = render(&cfg, &opts()).unwrap();
         assert!(r.cloudflare_list.starts_with("173.245.48.0/20\n"));
@@ -2682,7 +2787,13 @@ mod tests {
             "198.51.100.0/24\n"
         );
         cfg.sites[0].access = Default::default();
-        assert!(render(&cfg, &opts()).unwrap().cloudflare_list.is_empty());
+        assert_eq!(
+            render(&cfg, &opts()).unwrap().cloudflare_list,
+            "198.51.100.0/24\n"
+        );
+        let mut o = opts();
+        o.cloudflare_file = None;
+        assert!(render(&cfg, &o).unwrap().cloudflare_list.is_empty());
     }
 
     #[test]
@@ -2786,7 +2897,8 @@ mod tests {
         assert_eq!(
             tail,
             [
-                "    http-request deny deny_status 429 if { sc_http_req_rate(0) gt 600 }",
+                "    http-request set-var(txn.blocked) str(rate-limit) if { sc_http_req_rate(0) gt 600 }",
+                "    http-request deny deny_status 429 if { var(txn.blocked) -m str rate-limit }",
                 "    acl rb_r1 path_beg /x",
                 "    acl rb_r1 var(txn.cpath) -m beg /x",
                 "    http-request set-var(txn.blocked) str(r1) if rb_r1",
@@ -3014,6 +3126,50 @@ mod tests {
         let r = render(&cfg, &o).unwrap();
         assert!(lines_with(&r, "redirect")[0].ends_with("!cf_flex"));
         assert!(lines_with(&r, "redirect")[0].contains("-m str flex"));
+    }
+
+    fn backend_block(r: &Rendered, name: &str) -> String {
+        let head = format!("backend {name}\n");
+        let start = r.config.find(&head).expect("backend");
+        let rest = &r.config[start..];
+        let end = rest[head.len()..]
+            .find("\nbackend ")
+            .map_or(rest.len(), |i| i + head.len());
+        rest[..end].to_string()
+    }
+
+    #[test]
+    fn the_automatic_listener_redirects_only_cloudflare_aware_sites() {
+        let before_cfg = {
+            let mut cfg = config(vec![site("a", "a.com")]);
+            cfg.firewall.push(preset_rule("force-https"));
+            cfg
+        };
+        let before = render(&before_cfg, &opts()).unwrap();
+        assert!(lines_with(&before, "redirect").is_empty());
+
+        let mut cfg = before_cfg.clone();
+        cfg.sites.push(cf_site("cf", "cf.com", true, TlsMode::Full));
+        let o = tls_opts(&mut cfg, 443);
+        let after = render_automatic_https(&cfg, &o).unwrap();
+        let redirects = lines_with(&after, "redirect");
+        assert_eq!(redirects.len(), 1, "{redirects:?}");
+        assert!(redirects[0].ends_with(" cf_aware"), "{redirects:?}");
+        assert!(position(&after, "acl cf_aware") < position(&after, "http-request redirect"));
+        assert_eq!(
+            backend_block(&before, "be_a_blue"),
+            backend_block(&after, "be_a_blue")
+        );
+
+        let explicit = render(&cfg, &o).unwrap();
+        assert!(!lines_with(&explicit, "redirect")[0].contains("cf_aware"));
+
+        cfg.firewall = vec![scoped_to(preset_rule("force-https"), "a")];
+        let scoped_plain = render_automatic_https(&cfg, &o).unwrap();
+        assert!(lines_with(&scoped_plain, "redirect").is_empty());
+        cfg.firewall = vec![scoped_to(preset_rule("force-https"), "cf")];
+        let scoped_cf = render_automatic_https(&cfg, &o).unwrap();
+        assert_eq!(lines_with(&scoped_cf, "redirect").len(), 1);
     }
 
     #[test]
@@ -3789,14 +3945,9 @@ mod tests {
             let rendered = render(&cfg, &opts());
             prop_assert!(rendered.is_ok(), "{:?}", rendered.err());
             if let Ok(r) = rendered {
-                let any_aware = cfg.sites.iter().any(|s| {
-                    s.access.cloudflare_only || s.access.tls == TlsMode::Flexible
-                });
-                if any_aware {
-                    prop_assert!(!r.cloudflare_list.is_empty());
-                    if !ranges.is_empty() {
-                        prop_assert!(r.cloudflare_list.lines().count() <= ranges.len());
-                    }
+                prop_assert!(!r.cloudflare_list.is_empty());
+                if !ranges.is_empty() {
+                    prop_assert!(r.cloudflare_list.lines().count() <= ranges.len());
                 }
                 for line in r.config.lines() {
                     let ok = line.is_empty()
@@ -3811,7 +3962,7 @@ mod tests {
                     prop_assert!(parse_cidr(entry).is_some(), "bad entry {:?}", entry);
                 }
                 let any_only = cfg.sites.iter().any(|s| s.access.cloudflare_only);
-                prop_assert_eq!(r.config.contains("set-src"), any_only);
+                prop_assert!(r.config.contains("set-src"));
                 prop_assert_eq!(r.config.contains("str(cloudflare-only)"), any_only);
             }
         }

@@ -338,9 +338,127 @@ fn routes_declare_their_bodies_and_checks() {
         allowed("GET", "/containers/cite-shop-blue-manager/json").check(),
         None
     );
+    let logs = allowed(
+        "GET",
+        "/containers/cite-shop-blue-manager/logs?stdout=1&tail=10",
+    );
+    assert_eq!(logs.body(), BodyKind::None);
+    assert_eq!(
+        logs.check(),
+        Some(Check::Container("cite-shop-blue-manager".to_string()))
+    );
     assert_eq!(
         allowed("POST", "/containers/create?name=cite-shop-blue-manager").check(),
         None
+    );
+}
+
+#[test]
+fn logs_are_a_bounded_read_of_stack_containers() {
+    let base = "containers/cite-shop-blue-manager/logs";
+    for target in [
+        format!("/{base}?stdout=1&tail=100"),
+        format!("/v1.45/{base}?stdout=1&tail=100"),
+        format!("/v1.99/{base}?stderr=true&tail=1"),
+        format!("/v1.45/{base}?stdout=true&stderr=true&tail=1000"),
+        format!(
+            "/v1.45/{base}?stdout=1&stderr=1&tail=50&timestamps=true&since=1700000000.123456789"
+        ),
+        format!("/v1.45/{base}?stdout=1&tail=5&since=12345678901234567890"),
+        format!("/v1.45/{base}?stdout=1&tail=5&since=0"),
+        format!("/v1.45/{base}?stdout=1&tail=5&timestamps=0"),
+        format!("/v1.45/{base}?stdout=1&tail=5&timestamps=false"),
+        format!("/v1.45/{base}?stdout=1&tail=5&timestamps=1"),
+    ] {
+        assert_eq!(
+            allowed("GET", &target),
+            Route::ContainerLogs("cite-shop-blue-manager".to_string()),
+            "{target}"
+        );
+    }
+    for name in ["cite-shop-green-executor", "cite-shop-blue-init"] {
+        allowed(
+            "GET",
+            &format!("/v1.45/containers/{name}/logs?stdout=1&tail=5"),
+        );
+    }
+}
+
+#[test]
+fn log_requests_outside_the_allowlist_are_refused() {
+    let base = "/v1.45/containers/cite-shop-blue-manager/logs";
+    for query in [
+        "",
+        "stdout=1",
+        "stderr=1",
+        "tail=10",
+        "stdout=1&tail=all",
+        "stdout=1&tail=0",
+        "stdout=1&tail=1001",
+        "stdout=1&tail=99999",
+        "stdout=1&tail=-1",
+        "stdout=1&tail=1.5",
+        "stdout=1&tail=1e2",
+        "stdout=1&tail=",
+        "stdout=1&tail=%20",
+        "stdout=1&tail=00001",
+        "stdout=0&tail=10",
+        "stdout=false&tail=10",
+        "stdout=yes&tail=10",
+        "stdout=1&stderr=0&tail=10",
+        "stdout=&tail=10",
+        "stdout=1&tail=10&follow=1",
+        "stdout=1&tail=10&follow=true",
+        "stdout=1&tail=10&follow=0",
+        "stdout=1&tail=10&until=1700000000",
+        "stdout=1&tail=10&details=true",
+        "stdout=1&tail=10&details=1",
+        "stdout=1&tail=10&unknown=1",
+        "stdout=1&tail=10&Stdout=1",
+        "stdout=1&tail=10&since=abc",
+        "stdout=1&tail=10&since=",
+        "stdout=1&tail=10&since=.",
+        "stdout=1&tail=10&since=.5",
+        "stdout=1&tail=10&since=5.",
+        "stdout=1&tail=10&since=1.2.3",
+        "stdout=1&tail=10&since=-5",
+        "stdout=1&tail=10&since=1e9",
+        "stdout=1&tail=10&since=2024-01-01T00:00:00Z",
+        "stdout=1&tail=10&since=123456789012345678901",
+        "stdout=1&tail=10&timestamps=2",
+        "stdout=1&tail=10&timestamps=yes",
+        "stdout=1&tail=10&timestamps=",
+        "stdout=1&tail=10&stdout=1",
+    ] {
+        refused("GET", &format!("{base}?{query}"));
+    }
+}
+
+#[test]
+fn log_requests_need_a_stack_name_and_the_get_method() {
+    let query = "stdout=1&tail=10";
+    for name in [
+        "cite-node-haproxy",
+        "redis",
+        "cite-shop-blue-manager-2",
+        "cite-SHOP-blue-manager",
+        "cite-shop-red-manager",
+    ] {
+        refused("GET", &format!("/v1.45/containers/{name}/logs?{query}"));
+    }
+    for method in ["POST", "PUT", "DELETE", "HEAD", "OPTIONS", "PATCH"] {
+        refused(
+            method,
+            &format!("/v1.45/containers/cite-shop-blue-manager/logs?{query}"),
+        );
+    }
+    refused(
+        "GET",
+        &format!("/v1.45/containers/cite-shop-blue-manager/logs/extra?{query}"),
+    );
+    refused(
+        "GET",
+        &format!("/v1.45/containers/cite-shop-blue-manager/../cite-node-haproxy/logs?{query}"),
     );
 }
 

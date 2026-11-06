@@ -298,8 +298,48 @@ pub struct ManagerState {
     pub paused: bool,
     #[serde(default)]
     pub token_invalid: bool,
+    /// Fingerprint of the token GitHub rejected; an invalid flag only applies while the configured token still matches it.
+    #[serde(default)]
+    pub token_invalid_fingerprint: Option<String>,
     #[serde(default)]
     pub token_expires_at: Option<String>,
+    /// The last CITE_DEPLOY_ID whose forced attempt finished, so a restart never repeats it.
+    #[serde(default)]
+    pub deploy_id_handled: Option<String>,
+    #[serde(default)]
+    pub last_outcome: Option<DeployOutcome>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeployResult {
+    Live,
+    Failed,
+}
+
+/// How the attempt for one deploy id ended; `reason` is redacted before it is stored.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeployOutcome {
+    pub deploy_id: String,
+    pub result: DeployResult,
+    #[serde(default)]
+    pub sha: Option<String>,
+    #[serde(default)]
+    pub reason: String,
+    pub started_at: String,
+    pub finished_at: String,
+}
+
+/// Longest failure reason kept in the state file.
+pub const MAX_OUTCOME_REASON: usize = 8192;
+
+/// A deploy id is a 26-character upper-case ULID.
+pub fn is_deploy_id(value: &str) -> bool {
+    value.len() == 26
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || b.is_ascii_uppercase())
 }
 
 impl Default for ManagerState {
@@ -317,7 +357,10 @@ impl Default for ManagerState {
             generation: 0,
             paused: false,
             token_invalid: false,
+            token_invalid_fingerprint: None,
             token_expires_at: None,
+            deploy_id_handled: None,
+            last_outcome: None,
         }
     }
 }
@@ -523,6 +566,13 @@ impl SlotStatus {
     }
 }
 
+/// A one-way fingerprint that identifies a token without storing it.
+pub fn token_fingerprint(token: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(format!("cite-token-fingerprint:{token}").as_bytes());
+    digest[..8].iter().map(|b| format!("{b:02x}")).collect()
+}
+
 impl ManagerState {
     fn validate(&self) -> Result<()> {
         check_version(self.v)?;
@@ -540,6 +590,26 @@ impl ManagerState {
         }
         if let Some(at) = &self.token_expires_at {
             check_time(at)?;
+        }
+        if let Some(id) = &self.deploy_id_handled
+            && !is_deploy_id(id)
+        {
+            return Err(Error::msg("deploy_id_handled is not a deploy id"));
+        }
+        if let Some(outcome) = &self.last_outcome {
+            if !is_deploy_id(&outcome.deploy_id) {
+                return Err(Error::msg("last_outcome.deploy_id is not a deploy id"));
+            }
+            if let Some(sha) = &outcome.sha {
+                check_sha(sha)?;
+            }
+            check_time(&outcome.started_at)?;
+            check_time(&outcome.finished_at)?;
+            check_text(
+                "last_outcome.reason",
+                &outcome.reason,
+                MAX_OUTCOME_REASON * 2,
+            )?;
         }
         for record in &self.history {
             check_sha(&record.sha)?;
@@ -691,6 +761,56 @@ mod tests {
         assert_eq!(Slot::Blue.loopback_port(3001).unwrap(), 3001);
         assert_eq!(Slot::Green.loopback_port(3001).unwrap(), 3002);
         assert!(Slot::Green.loopback_port(u16::MAX).is_err());
+    }
+
+    #[test]
+    fn token_fingerprint_is_stable_short_and_hides_the_token() {
+        let a = token_fingerprint("ghp_secret");
+        assert_eq!(a, token_fingerprint("ghp_secret"));
+        assert_ne!(a, token_fingerprint("ghp_other"));
+        assert_eq!(a.len(), 16);
+        assert!(!a.contains("secret"));
+    }
+
+    #[test]
+    fn invalid_fingerprint_round_trips_and_old_files_decode_without_it() {
+        let old = decode_state(br#"{"v":1,"generation":1,"token_invalid":true}"#).unwrap();
+        assert!(old.token_invalid && old.token_invalid_fingerprint.is_none());
+        let state = ManagerState {
+            token_invalid: true,
+            token_invalid_fingerprint: Some(token_fingerprint("t")),
+            ..ManagerState::default()
+        };
+        let back = decode_state(&serde_json::to_vec(&state).unwrap()).unwrap();
+        assert_eq!(back, state);
+    }
+
+    #[test]
+    fn state_without_deploy_fields_still_decodes_and_outcome_round_trips() {
+        let old = br#"{"v":1,"generation":3}"#;
+        let state = decode_state(old).unwrap();
+        assert!(state.deploy_id_handled.is_none() && state.last_outcome.is_none());
+
+        let id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let mut state = ManagerState {
+            deploy_id_handled: Some(id.into()),
+            last_outcome: Some(DeployOutcome {
+                deploy_id: id.into(),
+                result: DeployResult::Failed,
+                sha: Some("a".repeat(40)),
+                reason: "install failed".into(),
+                started_at: "2026-01-01T00:00:00Z".into(),
+                finished_at: "2026-01-01T00:01:00Z".into(),
+            }),
+            ..ManagerState::default()
+        };
+        let bytes = serde_json::to_vec(&state).unwrap();
+        assert!(String::from_utf8_lossy(&bytes).contains("\"result\":\"failed\""));
+        assert_eq!(decode_state(&bytes).unwrap(), state);
+
+        state.deploy_id_handled = Some("not-a-ulid".into());
+        assert!(decode_state(&serde_json::to_vec(&state).unwrap()).is_err());
+        assert!(is_deploy_id(id) && !is_deploy_id("01arz3ndektsv4rrffq69g5fav"));
     }
 
     fn sample_release() -> ReleaseManifest {

@@ -37,10 +37,37 @@ JSON bodies are parsed strictly: a duplicate object key at any depth, or two key
 | `POST /containers/create?name=` | The name must be `cite-<id>-<slot>-(manager\|executor\|init)`. The body is compared structurally with the exact specification the orchestrator builds for that role. See below. |
 | `POST /containers/{name}/start`, `stop`, `restart`, `wait` | Name pattern, `cite.managed=true` on the container, and only the query parameters the orchestrator uses. |
 | `GET /containers/{name}/json` | Name pattern. |
+| `GET /containers/{name}/logs` | Name pattern and `cite.managed=true` on the container. Query keys are limited to `stdout`, `stderr` (at least one, value `1` or `true`), `tail` (required, a whole number from 1 to 1000, never `all`), `since` (digits with an optional fraction, at most 20 characters) and `timestamps` (`0`, `1`, `true` or `false`). `follow`, `until`, `details` and any other key are refused. The response is passed through but cut off at 4 MiB. |
 | `DELETE /containers/{name}` | Name pattern, `cite.managed=true`, optional `force`. |
 | `GET /containers/json` | The `filters` parameter must pin `cite.managed=true`. |
 
 A container create body is rebuilt by the proxy from the site id, slot and role in the name, and the request must equal it. Only a few values are free, and each is checked: the image (registry, image name for the role, tag form), the environment (a fixed list of keys, fixed values for paths, validated values for repo, branch, poll interval, node major and token, and the GitHub API URL only when it equals the proxy's own setting), the memory, CPU and pids limits (positive and under a per-role cap), and the network (`none` for init, the stack's own egress network for the manager, the stack's own network or the configured edge network for the executor). Any other key or value is rejected, which covers `Privileged`, `Binds`, `Devices`, `PidMode`, `IpcMode`, `UsernsMode`, `CapAdd` beyond the fixed sets, other users, other mounts, `Sysctls`, `VolumesFrom`, port bindings and the rest. Mounts are volumes only, named after the same stack, with the exact subpaths and read-only flags.
+
+The manager environment is a closed list of at most 32 entries, each key at most once. Besides the fixed values (`CITE_DATA_DIR`, `CITE_RELEASES_DIR`, `CITE_CONTROL_DIR`, `CITE_STATUS_DIR`, `CITE_STATE_DIR`, `CITE_WORK_DIR`, `CITE_CACHE_DIR`, `CITE_SOCKET`, `RUST_LOG`) these keys carry validated values:
+
+| Key | Accepted value |
+|---|---|
+| `CITE_REPO` | `owner/name`, each part letters, digits, `.`, `_`, `-`, at most 100 characters. |
+| `CITE_BRANCH` | Letters, digits, `.`, `_`, `-`, `/`, at most 100 characters, no leading `-`, no `..`. |
+| `CITE_POLL_INTERVAL` | Letters and digits, at most 16 characters. |
+| `CITE_NODE` | `22` or `24`. |
+| `CITE_GITHUB_TOKEN` | 1 to 512 printable ASCII characters without spaces. |
+| `CITE_GITHUB_API_URL` | Exactly the proxy's `CITE_PROXY_GITHUB_API_URL`. |
+| `CITE_ROOT_DIR`, `CITE_OUTPUT_DIR`, `CITE_SPA_FALLBACK` | A relative path of at most 255 bytes from `A-Za-z0-9._/-`, with no `..` segment and no leading `/`. |
+| `CITE_PACKAGE_MANAGER` | `npm`, `pnpm`, `yarn` or `bun`. |
+| `CITE_RENDERING` | `static` or `ssr`. |
+| `CITE_FRAMEWORK` | 1 to 32 characters from `a-z0-9-`. |
+| `CITE_PRUNE` | `true` or `false`. |
+| `CITE_INSTALL_COMMAND`, `CITE_BUILD_COMMAND` | 1 to 1024 bytes with no control characters (so no newline or NUL). The manager runs them with `sh -c` inside the sandboxed build helper, so shell syntax is allowed here by design. |
+| `CITE_START_COMMAND` | 1 to 1024 bytes with no control characters. It is split with shell-like quoting and must not contain a semicolon, pipe, ampersand, angle bracket, backtick or dollar sign anywhere, or a parenthesis, brace, `*`, `?`, `~`, `!`, `#` or backslash outside quotes. The first word must not be a package manager or shell (`npm`, `npx`, `pnpm`, `yarn`, `corepack`, `cargo`, `rustc`, `sh`, `bash`, `env`), also when given as a path. |
+| `CITE_FORGE` | Exactly the proxy's `CITE_STACK_FORGE`. |
+| `CITE_FORGE_API_URL` | Exactly the proxy's `CITE_STACK_FORGE_API_URL`. |
+| `CITE_DEPLOY_ID` | Exactly 26 characters from `0-9A-Z`. |
+| `CITE_BUILD_ENV_JSON` | A JSON object of at most 12 KiB and 64 keys, with no duplicate keys. Keys match `[A-Z_][A-Z0-9_]{0,63}`, do not start with `CITE_`, and are not `LD_PRELOAD`, `LD_LIBRARY_PATH`, `LD_AUDIT`, `NODE_OPTIONS`, `NODE_EXTRA_CA_CERTS`, `HOME`, `PATH`, `TMPDIR`, `SSL_CERT_FILE`, `SSL_CERT_DIR`, `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, `ALL_PROXY`, `PNPM_HOME`, or start with `XDG_`, `GIT_` or `npm_config_` (compared without regard to case). Values are strings of at most 4096 bytes without control characters. |
+
+The executor environment is likewise closed: its fixed values, `CITE_NODE`, and `CITE_RUNTIME_ENV_JSON`, which follows the same rules as `CITE_BUILD_ENV_JSON` and also refuses `PORT`, `NODE_ENV`, `HOST`, `HOSTNAME` and `NITRO_HOST`, the names the executor sets itself.
+
+Anything else is refused, including `CITE_BUILD_UID`, `CITE_BUILD_GID`, `CITE_DEV_SAME_USER`, `CITE_BUILD_ENV_FILE`, the `CITE_MAX_*` limits, `CITE_BUILD_TIMEOUT`, any other directory key and per-site API URLs. With every key at its longest value and a 12 KiB build environment escaped twice, a create body stays well under the 64 KiB body cap.
 
 The proxy also refuses, before any matching: request targets that are not origin-form, percent-encoding in paths, `.` and `..` segments, empty segments, backslashes and NUL bytes, API versions outside 1.45 to 1.99, duplicate query keys, any `Upgrade` or `Connection: upgrade` (so no attach, exec or hijack), any `Transfer-Encoding`, a body on a request that should have none, a body over 64 KiB, and a body without `Content-Type: application/json`. Client headers are not forwarded; the proxy builds its own request to the engine, so request smuggling toward Docker is not possible. Responses are streamed back (image pull progress) with a per-route deadline. Connections are capped (`CITE_PROXY_MAX_CONNS`, default 64) and request headers must arrive within 10 seconds.
 
@@ -55,6 +82,10 @@ Proxy settings, all on the `dockerproxy` service:
 | `CITE_PROXY_EDGE_NETWORK` | `cite_edge` | Shared network executors may join when per-stack networks are off. |
 | `CITE_PROXY_MAX_CONNS` | `64` | Concurrent connections. |
 | `CITE_PROXY_GITHUB_API_URL` | unset | The one GitHub API URL a manager may be given. Unset means a manager create body must not carry `CITE_GITHUB_API_URL` at all. |
+| `CITE_STACK_FORGE` | unset | `github`, `gitlab` or `gitea`: the kind of forge the one `CITE_STACK_FORGE_API_URL` belongs to. Must be set together with the URL. Unset means a manager create body must not carry `CITE_FORGE` or `CITE_FORGE_API_URL`. |
+| `CITE_STACK_FORGE_API_URL` | unset | The one forge API URL a manager may be given as `CITE_FORGE_API_URL`. `https` only, with the same shape rules as the GitHub API URL. |
+| `CITE_STACK_MAX_MEM` | `16g` | Largest `Memory` a manager or executor create body may ask for. A whole number with an optional `k`, `m`, `g` or `t` suffix (powers of 1024, optionally followed by `b` or `ib`). Between `256m` and `1t`. |
+| `CITE_STACK_MAX_CPUS` | `8` | Largest `NanoCpus` (as a CPU count such as `4` or `0.5`, at most nine decimals) a manager or executor create body may ask for. Between `0.25` and `1024`. |
 
 Because the stack version becomes an image tag, `CITE_STACK_VERSION` must be a plain `x.y.z` version. The overlay passes it from `.env` to the connector; when it is unset the connector uses its own version. The connector uses Docker Engine API v1.45, which is why Docker Engine 26 or newer is required.
 
@@ -154,6 +185,8 @@ The managers sit on a per-stack bridge network, so the mock is published on the 
 The script needs these local images, tagged as the orchestrator asks for them (version `0.0.1` in CI): `cite-connector`, `cite-dockerproxy`, `cite-manager:<version>-node22`, `cite-executor-node:<version>-node22` and `cite-executor-static:<version>`, all under `ghcr.io/seggys116`, and `cite-mock-github:e2e` (override with `MOCK_IMAGE`). The mock cannot delete a file or rewind a branch, so the second version of the site is a push to a new `release` branch, deployed through `git_ref`.
 
 ## Resource planning
+
+The proxy accepts any manager or executor `Memory` from 256 MiB up to `CITE_STACK_MAX_MEM` (default 16 GiB) and any `NanoCpus` from 0.25 up to `CITE_STACK_MAX_CPUS` (default 8 CPUs); `MemorySwap` must equal `Memory`. Values outside the range, or an unparsable setting, are refused (a bad setting stops the proxy at start). Init containers keep their fixed 256 MiB cap, and pid limits are unchanged.
 
 Each active stack holds up to 3 GiB of memory limit and a data, work and cache volume. Sizing for those volumes is the same as in [Install](install.md#disk-sizing). A stopped standby stack frees its memory but keeps its volumes.
 

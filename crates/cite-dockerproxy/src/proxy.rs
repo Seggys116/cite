@@ -26,7 +26,7 @@ use tokio::sync::Semaphore;
 use tokio::time::Instant;
 
 use crate::config::Config;
-use crate::policy::{BodyKind, Check, MAX_BODY, Policy, Route};
+use crate::policy::{BodyKind, Check, MAX_BODY, MAX_LOG_RESPONSE, Policy, Route};
 use crate::strict;
 use crate::target::normalise;
 
@@ -109,6 +109,68 @@ where
 
     fn size_hint(&self) -> SizeHint {
         self.inner.size_hint()
+    }
+}
+
+// Passes at most `left` bytes through and then drops the engine connection, so a huge log is never buffered or fully read.
+struct Capped<B> {
+    inner: Option<B>,
+    left: usize,
+}
+
+impl<B: Body<Data = Bytes> + Unpin> Body for Capped<B>
+where
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
+    type Data = Bytes;
+    type Error = io::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, io::Error>>> {
+        let Some(inner) = self.inner.as_mut() else {
+            return Poll::Ready(None);
+        };
+        let frame = match Pin::new(inner).poll_frame(cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(None) => {
+                self.inner = None;
+                return Poll::Ready(None);
+            }
+            Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(io::Error::other(e)))),
+            Poll::Ready(Some(Ok(frame))) => frame,
+        };
+        let mut data = match frame.into_data() {
+            Ok(data) => data,
+            Err(other) => return Poll::Ready(Some(Ok(other))),
+        };
+        if data.len() <= self.left {
+            self.left -= data.len();
+            return Poll::Ready(Some(Ok(Frame::data(data))));
+        }
+        tracing::warn!(
+            limit = MAX_LOG_RESPONSE,
+            "log response truncated at the size cap"
+        );
+        data.truncate(self.left);
+        self.left = 0;
+        self.inner = None;
+        if data.is_empty() {
+            Poll::Ready(None)
+        } else {
+            Poll::Ready(Some(Ok(Frame::data(data))))
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.as_ref().is_none_or(|b| b.is_end_stream())
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        let mut hint = SizeHint::new();
+        hint.set_upper(self.left as u64);
+        hint
     }
 }
 
@@ -242,11 +304,23 @@ impl State {
         let resp = self.call(parts.method, raw, payload, deadline).await?;
         let (mut head, body) = resp.into_parts();
         strip_hop_by_hop(&mut head.headers);
-        let guarded = Deadline {
-            inner: body,
-            sleep: Box::pin(tokio::time::sleep_until(deadline)),
+        let sleep = Box::pin(tokio::time::sleep_until(deadline));
+        let body: Out = if matches!(route, Route::ContainerLogs(_)) {
+            // The cut-off body is shorter than any length the engine declared, so the client is told to expect a chunked stream.
+            head.headers.remove(header::CONTENT_LENGTH);
+            let capped = Capped {
+                inner: Some(body),
+                left: MAX_LOG_RESPONSE,
+            };
+            Deadline {
+                inner: capped,
+                sleep,
+            }
+            .boxed_unsync()
+        } else {
+            Deadline { inner: body, sleep }.boxed_unsync()
         };
-        Ok(Response::from_parts(head, guarded.boxed_unsync()))
+        Ok(Response::from_parts(head, body))
     }
 
     async fn call(

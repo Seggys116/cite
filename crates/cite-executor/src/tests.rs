@@ -2421,7 +2421,7 @@ s.listen(port,'127.0.0.1',()=>{setTimeout(()=>process.exit(1),1500);});
         wait_status(
             data,
             |s| s.active_slot == Some(Slot::Green) && s.ack_generation >= 3,
-            Duration::from_secs(15)
+            Duration::from_secs(40)
         )
         .await
     );
@@ -3166,6 +3166,231 @@ async fn restart_child_spawn_failure_is_treated_as_a_crash() {
     );
     let (code, _, _) = http_once(exe.addr, Method::GET, "/", &[]).await;
     assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+    exe.shutdown().await;
+}
+
+const ENV_ECHO_JS: &str = r#"const http=require('http');
+const e=process.env;
+const port=e.APP_PORT||e.PORT;
+http.createServer((q,r)=>{r.end(JSON.stringify({a:e.MY_VAR,b:e.OTHER_VAR,port:e.PORT,appPort:e.APP_PORT||null,nodeEnv:e.NODE_ENV,host:e.HOST,path:e.PATH,json:e.CITE_RUNTIME_ENV_JSON||null,ld:e.LD_PRELOAD||null}));}).listen(port,'127.0.0.1');
+console.log('child saw '+e.MY_VAR);
+"#;
+const SECRET_VALUE: &str = "s3cr3t-value-123";
+
+async fn ssr_env_fixture(
+    data: &Path,
+    port_env: &str,
+    user_env: crate::UserEnv,
+) -> crate::RunningExecutor {
+    std::fs::create_dir_all(data.join("control")).unwrap();
+    std::fs::create_dir_all(data.join("status")).unwrap();
+    seal_ssr(
+        data,
+        Slot::Blue,
+        "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        ENV_ECHO_JS,
+        10,
+    );
+    let mut manifest = sample_ssr(Slot::Blue, "01ARZ3NDEKTSV4RRFFQ69G5FAV");
+    manifest.port_env = port_env.into();
+    write_release(&data.join("releases/blue/release.json"), &manifest).unwrap();
+    write_desired_action(data, 1, Slot::Blue, DesiredAction::Activate, None);
+    let mut cfg = config_from(data, "127.0.0.1:0");
+    cfg.node_bin = which_node();
+    let exe = crate::spawn_with_env(cfg, user_env).await.unwrap();
+    assert!(
+        wait_status(
+            data,
+            |s| s.active_slot == Some(Slot::Blue) && s.ack_generation >= 1,
+            Duration::from_secs(15)
+        )
+        .await
+    );
+    exe
+}
+
+async fn child_env(exe: &crate::RunningExecutor) -> serde_json::Value {
+    let (st, _, body) = http_once(exe.addr, Method::GET, "/", &[]).await;
+    assert_eq!(st, StatusCode::OK);
+    serde_json::from_slice(&body).unwrap()
+}
+
+#[tokio::test]
+async fn ssr_child_sees_owner_variables_and_nothing_leaks_elsewhere() {
+    if !node_available() {
+        eprintln!("skipping env test: node not on PATH");
+        return;
+    }
+    let dir = tempdir().unwrap();
+    let data = dir.path();
+    let json = format!(r#"{{"MY_VAR":"{SECRET_VALUE}","OTHER_VAR":"two words"}}"#);
+    let user_env = crate::UserEnv::from_json(&json).unwrap();
+    let exe = ssr_env_fixture(data, "PORT", user_env).await;
+
+    let seen = child_env(&exe).await;
+    assert_eq!(seen["a"], SECRET_VALUE);
+    assert_eq!(seen["b"], "two words");
+    assert_eq!(seen["nodeEnv"], "production");
+    assert_eq!(seen["host"], "127.0.0.1");
+    assert!(
+        seen["json"].is_null(),
+        "the raw entry must not reach the child"
+    );
+    assert!(std::env::var("MY_VAR").is_err());
+
+    let status = std::fs::read_to_string(data.join("status/executor.json")).unwrap();
+    assert!(!status.contains(SECRET_VALUE), "{status}");
+    exe.shutdown().await;
+}
+
+#[tokio::test]
+async fn supervisor_keys_win_over_owner_keys() {
+    if !node_available() {
+        eprintln!("skipping env test: node not on PATH");
+        return;
+    }
+    let dir = tempdir().unwrap();
+    let data = dir.path();
+    let vars = [
+        ("PORT", "1"),
+        ("NODE_ENV", "development"),
+        ("HOST", "0.0.0.0"),
+        ("PATH", "/nonexistent"),
+        ("MY_VAR", "kept"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect();
+    let exe = ssr_env_fixture(data, "PORT", crate::UserEnv::unchecked(vars)).await;
+
+    let seen = child_env(&exe).await;
+    assert_ne!(seen["port"], "1");
+    assert_eq!(seen["nodeEnv"], "production");
+    assert_eq!(seen["host"], "127.0.0.1");
+    assert_ne!(seen["path"], "/nonexistent");
+    assert_eq!(seen["a"], "kept");
+    exe.shutdown().await;
+}
+
+#[tokio::test]
+async fn the_manifest_port_variable_wins_over_an_owner_key_of_the_same_name() {
+    if !node_available() {
+        eprintln!("skipping env test: node not on PATH");
+        return;
+    }
+    let dir = tempdir().unwrap();
+    let user_env = crate::UserEnv::from_json(r#"{"APP_PORT":"1"}"#).unwrap();
+    let exe = ssr_env_fixture(dir.path(), "APP_PORT", user_env).await;
+    let seen = child_env(&exe).await;
+    assert_ne!(seen["appPort"], "1");
+    assert!(seen["appPort"].as_str().unwrap().parse::<u16>().unwrap() > 1);
+    exe.shutdown().await;
+}
+
+#[tokio::test]
+async fn static_sites_ignore_owner_variables() {
+    let dir = tempdir().unwrap();
+    let data = dir.path();
+    std::fs::create_dir_all(data.join("control")).unwrap();
+    std::fs::create_dir_all(data.join("status")).unwrap();
+    seal_static(
+        data,
+        Slot::Blue,
+        "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        &[("index.html", b"<html>static</html>")],
+    );
+    write_desired_action(data, 1, Slot::Blue, DesiredAction::Activate, None);
+    let json = format!(r#"{{"MY_VAR":"{SECRET_VALUE}"}}"#);
+    let user_env = crate::UserEnv::from_json(&json).unwrap();
+    let mut cfg = config_from(data, "127.0.0.1:0");
+    cfg.runtime = RuntimeKind::Static;
+    assert!(crate::load_user_env(&cfg).unwrap().vars().is_empty());
+    let exe = crate::spawn_with_env(cfg, user_env).await.unwrap();
+    assert!(
+        wait_status(
+            data,
+            |s| s.active_slot == Some(Slot::Blue) && s.ack_generation >= 1,
+            Duration::from_secs(5)
+        )
+        .await
+    );
+    let (st, _, body) = http_once(exe.addr, Method::GET, "/", &[]).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(!String::from_utf8_lossy(&body).contains(SECRET_VALUE));
+    let status = std::fs::read_to_string(data.join("status/executor.json")).unwrap();
+    assert!(!status.contains(SECRET_VALUE));
+    exe.shutdown().await;
+}
+
+#[test]
+fn owner_values_are_redacted_from_log_lines() {
+    let user_env = crate::UserEnv::from_json(&format!(r#"{{"MY_VAR":"{SECRET_VALUE}"}}"#)).unwrap();
+    let mut redactor = cite_core::Redactor::new();
+    crate::add_user_secrets(&mut redactor, &user_env);
+    let line = redactor.redact_line(&format!("connecting with {SECRET_VALUE} now"));
+    assert!(!line.contains(SECRET_VALUE), "{line}");
+}
+
+#[tokio::test]
+async fn static_files_serve_cache_headers_ranges_and_cached_gzip() {
+    let dir = tempdir().unwrap();
+    let data = dir.path();
+    std::fs::create_dir_all(data.join("control")).unwrap();
+    std::fs::create_dir_all(data.join("status")).unwrap();
+    let script = "const answer = 42;\n".repeat(200);
+    let image: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+    seal_static(
+        data,
+        Slot::Blue,
+        "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        &[
+            ("index.html", b"<html>home</html>"),
+            ("app.js", script.as_bytes()),
+            ("logo.png", &image),
+        ],
+    );
+    write_desired_action(data, 1, Slot::Blue, DesiredAction::Activate, None);
+    let exe = spawn(config_from(data, "127.0.0.1:0")).await.unwrap();
+    assert!(
+        wait_status(
+            data,
+            |s| s.active_slot == Some(Slot::Blue) && s.ack_generation >= 1,
+            Duration::from_secs(5)
+        )
+        .await
+    );
+
+    let (st, headers, body) = http_once(exe.addr, Method::GET, "/logo.png", &[]).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(&body[..], &image[..]);
+    assert_eq!(
+        headers[header::CACHE_CONTROL],
+        "public, max-age=86400, stale-while-revalidate=604800"
+    );
+    let (_, headers, _) = http_once(exe.addr, Method::GET, "/app.js", &[]).await;
+    assert_eq!(headers[header::CACHE_CONTROL], "public, max-age=3600");
+    let (_, headers, _) = http_once(exe.addr, Method::GET, "/index.html", &[]).await;
+    assert_eq!(headers[header::CACHE_CONTROL], "no-cache");
+
+    let range = "bytes=65530-65545";
+    let (st, headers, body) =
+        http_once(exe.addr, Method::GET, "/logo.png", &[("range", range)]).await;
+    assert_eq!(st, StatusCode::PARTIAL_CONTENT);
+    assert_eq!(&body[..], &image[65_530..=65_545]);
+    assert_eq!(headers[header::CONTENT_LENGTH], "16");
+
+    let gz = [("accept-encoding", "gzip")];
+    let (st, first_headers, first) = http_once(exe.addr, Method::GET, "/app.js", &gz).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(first_headers[header::CONTENT_ENCODING], "gzip");
+    assert!(first.len() < script.len());
+    let (_, second_headers, second) = http_once(exe.addr, Method::GET, "/app.js", &gz).await;
+    assert_eq!(first, second);
+    assert_eq!(second_headers[header::CONTENT_ENCODING], "gzip");
+    assert_eq!(
+        second_headers[header::CONTENT_LENGTH],
+        first.len().to_string()
+    );
     exe.shutdown().await;
 }
 

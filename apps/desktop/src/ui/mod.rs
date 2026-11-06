@@ -1,6 +1,9 @@
 // Each view lives in its own module and extends Console with loaders and a render method.
+pub mod alertspanel;
+pub mod analytics;
 pub mod bots;
 pub mod certs;
+pub mod certtools;
 pub mod chart;
 pub mod create;
 pub mod detail;
@@ -8,9 +11,11 @@ pub mod firewall;
 pub mod input;
 pub mod maintenance;
 pub mod nodes;
+pub mod ops;
 pub mod overview;
 pub mod paths;
 pub mod settings;
+pub mod siteform;
 pub mod sites;
 pub mod storage;
 pub mod traffic;

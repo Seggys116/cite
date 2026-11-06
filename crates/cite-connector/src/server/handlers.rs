@@ -1,21 +1,22 @@
 use std::collections::HashMap;
 use std::fmt::Display;
-use std::net::IpAddr;
 
 use axum::extract::{Path, Request, State};
 use axum::http::header;
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
-use cite_edge::analytics::{RequestFilter, window_from_str};
 use cite_edge::cloudflare::{CLOUDFLARE_RANGES_UPDATED, effective_ranges};
 use cite_edge::model::{EdgeSettings, FirewallRule, MaintenancePage, Site, Slot, Target};
 use cite_edge::presets::{preset, presets};
 use cite_edge::ratelimit::client_key;
-use cite_edge::validate::{is_valid_id, validate_page, validate_rule, validate_site};
+use cite_edge::validate::{
+    is_valid_id, validate_page, validate_rule, validate_site, validate_site_strict,
+};
 use cite_store::TopKind;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use super::site_ops;
 use super::{
     ApiError, ApiResult, AppState, JsonBody, MaybeJson, Params, Peer, Principal, lock_std,
     parse_json, read_body_limited,
@@ -31,7 +32,7 @@ const MAX_GIT_REF_CHARS: usize = 128;
 const MAX_GITHUB_TOKEN_BYTES: usize = 512;
 const ORCHESTRATOR_PING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
-fn json_ok<T: Serialize + ?Sized>(value: &T) -> ApiResult<Response> {
+pub(super) fn json_ok<T: Serialize + ?Sized>(value: &T) -> ApiResult<Response> {
     let body = serde_json::to_vec(value)?;
     Ok(([(header::CONTENT_TYPE, "application/json")], body).into_response())
 }
@@ -50,6 +51,12 @@ pub(super) fn check_id(id: &str) -> ApiResult<()> {
     } else {
         Err(ApiError::bad("invalid id"))
     }
+}
+
+pub(super) fn valid_github_token(token: &str) -> bool {
+    !token.is_empty()
+        && token.len() <= MAX_GITHUB_TOKEN_BYTES
+        && token.bytes().all(|b| b.is_ascii_graphic())
 }
 
 fn clean_text(what: &str, raw: &str, max_chars: usize) -> ApiResult<String> {
@@ -244,7 +251,9 @@ pub(super) async fn node(State(st): State<AppState>) -> ApiResult<Response> {
         "github": {
             "token_configured": st.cfg.github_token.is_some(),
             "source": st.cfg.github_token.as_ref().map_or("none", |t| t.source().as_str()),
+            "api_host": site_ops::github_api_host(st.cfg.github_api_url.as_deref()),
         },
+        "capabilities": site_ops::capabilities(st.orchestrator.is_some()),
         "analytics": analytics,
     }))
     .into_response())
@@ -400,7 +409,7 @@ pub(super) async fn audit_log(
     json_ok(&st.store.audit_tail(limit).await)
 }
 
-fn find_site(st: &AppState, id: &str) -> ApiResult<Site> {
+pub(super) fn find_site(st: &AppState, id: &str) -> ApiResult<Site> {
     let cfg = st.store.config();
     cfg.sites
         .iter()
@@ -425,19 +434,13 @@ pub(super) async fn create_site(
     // The token rides along with the site payload but is never stored inside the Site.
     let token = match obj.remove("github_token") {
         None | Some(Value::Null) => None,
-        Some(Value::String(s))
-            if !s.is_empty()
-                && s.len() <= MAX_GITHUB_TOKEN_BYTES
-                && s.bytes().all(|b| b.is_ascii_graphic()) =>
-        {
-            Some(s)
-        }
+        Some(Value::String(s)) if valid_github_token(&s) => Some(s),
         Some(_) => return Err(ApiError::bad("github_token must be a non-empty string")),
     };
     obj.remove("history");
     let site: Site =
         serde_json::from_value(body).map_err(|e| ApiError::bad(format!("invalid site: {e}")))?;
-    validate_site(&site)?;
+    validate_site_strict(&site)?;
     if st.store.config().sites.iter().any(|s| s.id == site.id) {
         return Err(ConnectorError::Conflict(format!("site {} already exists", site.id)).into());
     }
@@ -476,7 +479,7 @@ pub(super) async fn put_site(
     if site.id != id {
         return Err(ApiError::bad("site id in the body must match the path"));
     }
-    validate_site(&site)?;
+    validate_site_strict(&site)?;
     find_site(&st, &id)?;
     let updated = st.deployer.update_site(&p.actor(), site).await?;
     json_ok(&updated)
@@ -499,6 +502,8 @@ pub(super) struct DeployReq {
     targets: Option<Vec<Target>>,
     note: Option<String>,
     git_ref: Option<String>,
+    // Absent keeps the blocking behaviour; false answers 202 once the deploy is accepted.
+    wait: Option<bool>,
 }
 
 fn valid_git_ref(s: &str) -> bool {
@@ -536,11 +541,16 @@ pub(super) async fn deploy_site(
     {
         return Err(ApiError::bad("git_ref contains unsupported characters"));
     }
-    let deployment = st
+    let wait = req.wait.unwrap_or(true);
+    let outcome = st
         .deployer
-        .deploy(&p.actor(), &id, req.targets, note, req.git_ref)
+        .deploy(&p.actor(), &id, req.targets, note, req.git_ref, wait)
         .await?;
-    json_ok(&deployment)
+    let mut res = json_ok(&outcome)?;
+    if !wait {
+        *res.status_mut() = axum::http::StatusCode::ACCEPTED;
+    }
+    Ok(res)
 }
 
 #[derive(Deserialize)]
@@ -1019,20 +1029,6 @@ pub(super) fn now_ms() -> i64 {
         .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
-fn window_and_site(q: &HashMap<String, String>) -> ApiResult<(u64, Option<String>)> {
-    let window = q.get("window").map_or("1h", String::as_str);
-    let secs = window_from_str(window)
-        .ok_or_else(|| ApiError::bad("window must be one of 15m, 1h, 24h, 7d, 30d"))?;
-    let site = match q.get("site").filter(|s| !s.is_empty()) {
-        Some(s) => {
-            check_id(s)?;
-            Some(s.clone())
-        }
-        None => None,
-    };
-    Ok((secs, site))
-}
-
 fn join_failure(e: tokio::task::JoinError) -> ApiError {
     ConnectorError::Internal(format!("analytics task failed: {e}")).into()
 }
@@ -1065,33 +1061,6 @@ pub(super) async fn with_store<T: Send + 'static>(
         .map_err(store_failure)
 }
 
-pub(super) async fn analytics_summary(
-    State(st): State<AppState>,
-    Params(q): Params,
-) -> ApiResult<Response> {
-    let (secs, site) = window_and_site(&q)?;
-    let summary = with_store(&st, move |s| s.summary(secs, site.as_deref(), now_ms())).await?;
-    json_ok(&summary)
-}
-
-pub(super) async fn analytics_timeseries(
-    State(st): State<AppState>,
-    Params(q): Params,
-) -> ApiResult<Response> {
-    let (secs, site) = window_and_site(&q)?;
-    let series = with_store(&st, move |s| s.timeseries(secs, site.as_deref(), now_ms())).await?;
-    json_ok(&series)
-}
-
-pub(super) async fn analytics_bots(
-    State(st): State<AppState>,
-    Params(q): Params,
-) -> ApiResult<Response> {
-    let (secs, site) = window_and_site(&q)?;
-    let bots = with_store(&st, move |s| s.bots(secs, site.as_deref(), now_ms())).await?;
-    json_ok(&bots)
-}
-
 pub(super) fn parse_top_kind(raw: &str) -> ApiResult<TopKind> {
     Ok(match raw {
         "paths" => TopKind::Paths,
@@ -1108,23 +1077,6 @@ pub(super) fn parse_top_kind(raw: &str) -> ApiResult<TopKind> {
             ));
         }
     })
-}
-
-pub(super) async fn analytics_top(
-    State(st): State<AppState>,
-    Params(q): Params,
-) -> ApiResult<Response> {
-    let (secs, site) = window_and_site(&q)?;
-    let kind = match q.get("kind") {
-        Some(raw) => parse_top_kind(raw)?,
-        None => return Err(ApiError::bad("kind is required")),
-    };
-    let limit = parse_limit(&q)?;
-    let items = with_store(&st, move |s| {
-        s.top(kind, secs, site.as_deref(), now_ms(), limit)
-    })
-    .await?;
-    json_ok(&json!({ "items": items }))
 }
 
 // Store counters plus the settings that shape them; fields only ever get added.
@@ -1169,53 +1121,4 @@ pub(super) fn parse_method(raw: &str) -> ApiResult<String> {
     } else {
         Err(ApiError::bad("method must be an HTTP method token"))
     }
-}
-
-fn request_filter(q: &HashMap<String, String>) -> ApiResult<RequestFilter> {
-    let mut filter = RequestFilter::default();
-    if let Some(raw) = q.get("status") {
-        let status = raw
-            .parse::<u16>()
-            .ok()
-            .filter(|v| (100..=599).contains(v))
-            .ok_or_else(|| ApiError::bad("status must be an HTTP status code"))?;
-        filter.status = Some(status);
-    }
-    if let Some(raw) = q.get("method").filter(|s| !s.is_empty()) {
-        filter.method = Some(parse_method(raw)?);
-    }
-    if let Some(raw) = q.get("path").filter(|s| !s.is_empty()) {
-        if raw.len() > 256 || raw.chars().any(char::is_control) {
-            return Err(ApiError::bad(
-                "path filter is too long or has control characters",
-            ));
-        }
-        filter.path_contains = Some(raw.clone());
-    }
-    if let Some(raw) = q.get("site").filter(|s| !s.is_empty()) {
-        check_id(raw)?;
-        filter.site = Some(raw.clone());
-    }
-    if let Some(raw) = q.get("ip").filter(|s| !s.is_empty()) {
-        let ip: IpAddr = raw
-            .parse()
-            .map_err(|_| ApiError::bad("ip must be an IP address"))?;
-        filter.ip = Some(ip.to_string());
-    }
-    filter.blocked_only = match q.get("blocked").map(String::as_str) {
-        None | Some("" | "false" | "0") => false,
-        Some("true" | "1") => true,
-        Some(_) => return Err(ApiError::bad("blocked must be true or false")),
-    };
-    Ok(filter)
-}
-
-pub(super) async fn analytics_requests(
-    State(st): State<AppState>,
-    Params(q): Params,
-) -> ApiResult<Response> {
-    let limit = parse_limit(&q)?;
-    let filter = request_filter(&q)?;
-    let events = with_store(&st, move |s| s.requests(&filter, limit)).await?;
-    json_ok(&events)
 }

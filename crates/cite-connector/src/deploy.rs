@@ -1,19 +1,21 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use cite_edge::model::{
     DeployAction, Deployment, EdgeConfig, Maintenance, Site, Slot, Target, Upstream,
 };
-use cite_edge::validate::validate_site;
+use cite_edge::validate::validate_site_strict;
+use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 use tokio::time::sleep;
 
 use crate::error::{ConnectorError, Result};
 use crate::haproxy::Haproxy;
-use crate::orchestrator::Orchestrator;
+use crate::orchestrator::{Orchestrator, StackOpts};
+use crate::siteops::{EnvKind, OpGuard, RESTART_LOOP, SiteOps, SlotProbe, repo_record};
 use crate::store::{Store, now_rfc3339};
 
 const HISTORY_CAP: usize = 50;
@@ -22,24 +24,54 @@ const DEPLOY_HEALTH: Duration = Duration::from_secs(60);
 // A repo-built site has to clone, install and compile before its executor answers.
 const BUILD_HEALTH: Duration = Duration::from_secs(600);
 const DRAIN_DELAY: Duration = Duration::from_secs(30);
+// The manager's own build timeout (15 minutes) plus room to fetch and promote.
+const RELEASE_WAIT: Duration = Duration::from_secs(20 * 60);
+const RELEASE_MARGIN: Duration = Duration::from_secs(5 * 60);
+const RELEASE_POLL: Duration = Duration::from_secs(2);
+const TOKEN_WAIT: Duration = Duration::from_secs(60);
+const SILENT_HEALTHY_PROBES: u32 = 3;
 
 #[derive(Debug, Clone, Copy)]
-struct Timing {
+pub(crate) struct Timing {
     create_health: Duration,
     deploy_health: Duration,
     build_health: Duration,
     drain: Duration,
+    pub(crate) release_wait: Duration,
+    pub(crate) poll: Duration,
+    pub(crate) token_wait: Duration,
 }
 
 pub struct Deployer {
-    store: Arc<Store>,
-    haproxy: Arc<Haproxy>,
-    orchestrator: Option<Arc<Orchestrator>>,
+    pub(crate) store: Arc<Store>,
+    pub(crate) haproxy: Arc<Haproxy>,
+    pub(crate) orchestrator: Option<Arc<Orchestrator>>,
+    pub(crate) probe: Option<Arc<dyn SlotProbe>>,
     locks: StdMutex<HashMap<String, Arc<Mutex<()>>>>,
     // Bumped by every drain schedule so an older timer can tell a later switch happened.
     drain_gen: Arc<StdMutex<HashMap<String, u64>>>,
     config_lock: Mutex<()>,
-    timing: Timing,
+    pub(crate) timing: Timing,
+    pub(crate) site_ops: SiteOps,
+}
+
+/// Answer of a deploy that was not waited for; poll the site status for its outcome.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DeployStarted {
+    pub deployment_id: String,
+}
+
+/// A waited deploy serialises as its history entry, an accepted one as `{"deployment_id": ...}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum DeployReply {
+    Finished(Deployment),
+    Started(DeployStarted),
+}
+
+enum Release {
+    Live { sha: Option<String> },
+    Failed { reason: String, sha: Option<String> },
 }
 
 // Runs to completion even when the caller is dropped, so a disconnect or the request timeout cannot stop a deploy midway.
@@ -54,7 +86,7 @@ pub(crate) async fn detach<T: Send + 'static>(
     }
 }
 
-fn upstream(site: &Site, slot: Slot) -> &Upstream {
+pub(crate) fn upstream(site: &Site, slot: Slot) -> &Upstream {
     match slot {
         Slot::Blue => &site.blue,
         Slot::Green => &site.green,
@@ -72,24 +104,53 @@ fn not_found(id: &str) -> ConnectorError {
     ConnectorError::NotFound(format!("site {id} not found"))
 }
 
-fn site_mut<'a>(cfg: &'a mut EdgeConfig, id: &str) -> Result<&'a mut Site> {
+pub(crate) fn site_mut<'a>(cfg: &'a mut EdgeConfig, id: &str) -> Result<&'a mut Site> {
     cfg.sites
         .iter_mut()
         .find(|s| s.id == id)
         .ok_or_else(|| not_found(id))
 }
 
-fn secret_name(site_id: &str) -> String {
+pub(crate) fn secret_name(site_id: &str) -> String {
     format!("site-{site_id}")
 }
 
-fn deployment(slot: Slot, action: DeployAction, note: String) -> Deployment {
+fn new_deploy_id() -> String {
+    ulid::Ulid::generate().to_string()
+}
+
+fn deployment(id: Option<&str>, slot: Slot, action: DeployAction, note: String) -> Deployment {
     Deployment {
-        id: ulid::Ulid::generate().to_string(),
+        id: id.map_or_else(new_deploy_id, str::to_string),
         at: now_rfc3339(),
         slot,
         action,
         note,
+    }
+}
+
+fn sha_text(sha: Option<&str>) -> String {
+    format!("sha {}", sha.filter(|s| !s.is_empty()).unwrap_or("unknown"))
+}
+
+// Repo-built deploys always name the commit, so the history says what went live or failed.
+fn failure_note(reason: &str, note: &str, sha: Option<Option<&str>>) -> String {
+    let mut text = if note.is_empty() {
+        reason.to_string()
+    } else {
+        format!("{reason} ({note})")
+    };
+    if let Some(sha) = sha {
+        text = format!("{text}; {}", sha_text(sha));
+    }
+    text
+}
+
+fn success_note(note: &str, sha: Option<Option<&str>>) -> String {
+    match sha {
+        None => note.to_string(),
+        Some(sha) if note.is_empty() => format!("live; {}", sha_text(sha)),
+        Some(sha) => format!("{note}; {}", sha_text(sha)),
     }
 }
 
@@ -116,10 +177,12 @@ impl Deployer {
         haproxy: Arc<Haproxy>,
         orchestrator: Option<Arc<Orchestrator>>,
     ) -> Deployer {
+        let probe = orchestrator.clone().map(|o| o as Arc<dyn SlotProbe>);
         Deployer {
             store,
             haproxy,
             orchestrator,
+            probe,
             locks: StdMutex::new(HashMap::new()),
             drain_gen: Arc::default(),
             config_lock: Mutex::new(()),
@@ -128,7 +191,11 @@ impl Deployer {
                 deploy_health: DEPLOY_HEALTH,
                 build_health: BUILD_HEALTH,
                 drain: DRAIN_DELAY,
+                release_wait: RELEASE_WAIT,
+                poll: RELEASE_POLL,
+                token_wait: TOKEN_WAIT,
             },
+            site_ops: SiteOps::default(),
         }
     }
 
@@ -143,13 +210,38 @@ impl Deployer {
             deploy_health,
             build_health: deploy_health,
             drain,
+            ..self.timing
         };
         self
     }
 
     pub fn with_build_wait(mut self, wait: Duration) -> Deployer {
         self.timing.build_health = wait;
+        self.timing.release_wait = RELEASE_WAIT.max(wait.saturating_add(RELEASE_MARGIN));
         self
+    }
+
+    /// How long a deploy waits for the manager's verdict, how often it asks, and how long a token change waits to be verified.
+    pub fn with_release_timing(
+        mut self,
+        release_wait: Duration,
+        poll: Duration,
+        token_wait: Duration,
+    ) -> Deployer {
+        self.timing.release_wait = release_wait;
+        self.timing.poll = poll;
+        self.timing.token_wait = token_wait;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_probe(mut self, probe: Arc<dyn SlotProbe>) -> Deployer {
+        self.probe = Some(probe);
+        self
+    }
+
+    pub fn sites(&self) -> Vec<Site> {
+        self.store.config().sites.clone()
     }
 
     // A repo-built slot gets the long build wait, an upstream slot only the short health wait.
@@ -166,18 +258,18 @@ impl Deployer {
         &self.config_lock
     }
 
-    fn site_lock(&self, id: &str) -> Arc<Mutex<()>> {
+    pub(crate) fn site_lock(&self, id: &str) -> Arc<Mutex<()>> {
         let mut locks = self.locks.lock().unwrap_or_else(|p| p.into_inner());
         locks.entry(id.to_string()).or_default().clone()
     }
 
-    fn orchestrator(&self) -> Result<&Arc<Orchestrator>> {
+    pub(crate) fn orchestrator(&self) -> Result<&Arc<Orchestrator>> {
         self.orchestrator.as_ref().ok_or_else(|| {
             ConnectorError::BadRequest("orchestration is not enabled on this node".into())
         })
     }
 
-    fn get_site(&self, id: &str) -> Result<Site> {
+    pub(crate) fn get_site(&self, id: &str) -> Result<Site> {
         self.store
             .config()
             .sites
@@ -188,7 +280,7 @@ impl Deployer {
     }
 
     // A site's own stored token wins; a site without one uses the node token, read afresh so a restart with a rotated variable reaches the next container plan.
-    async fn token_for(&self, site: &Site) -> String {
+    pub(crate) async fn token_for(&self, site: &Site) -> String {
         match site.source.as_ref().and_then(|s| s.secret.as_deref()) {
             Some(name) => self.store.get_secret(name).await.unwrap_or_default(),
             None => self
@@ -227,20 +319,143 @@ impl Deployer {
         }
     }
 
-    async fn record_failure(&self, actor: &str, id: &str, slot: Slot, note: &str, reason: &str) {
-        let text = if note.is_empty() {
-            reason.to_string()
-        } else {
-            format!("{reason} ({note})")
-        };
-        self.record(actor, id, deployment(slot, DeployAction::Failed, text))
-            .await;
+    async fn record_failure(
+        &self,
+        actor: &str,
+        id: &str,
+        slot: Slot,
+        deploy_id: Option<&str>,
+        text: String,
+    ) {
+        self.site_ops.invalidate(id);
+        self.record(
+            actor,
+            id,
+            deployment(deploy_id, slot, DeployAction::Failed, text),
+        )
+        .await;
     }
 
     async fn drop_secret(&self, name: Option<&str>) {
         if let Some(name) = name {
             self.store.delete_secret(name).await;
         }
+    }
+
+    // Polls the slot's manager until it reports this deploy id as live or failed; an older live release never counts.
+    async fn await_release(
+        &self,
+        site: &Site,
+        slot: Slot,
+        deploy_id: &str,
+        op: &OpGuard,
+    ) -> Release {
+        let probe = match self.probe() {
+            Ok(probe) => probe,
+            Err(err) => {
+                return Release::Failed {
+                    reason: err.to_string(),
+                    sha: None,
+                };
+            }
+        };
+        let id = site.id.as_str();
+        let deadline = Instant::now() + self.timing.release_wait;
+        let mut silent = 0u32;
+        loop {
+            match probe.inspect(id, slot).await {
+                Ok(seen) => {
+                    // A healthy 0.4.0 manager always prints a report, so a silent healthy one is an older image.
+                    if seen.health == "healthy" && seen.manager_report.is_none() {
+                        silent += 1;
+                        if silent >= SILENT_HEALTHY_PROBES {
+                            return Release::Failed {
+                                reason: format!(
+                                    "the build manager reported no result for deploy {deploy_id}: it is healthy \
+                                     but prints no status report, so its image is likely older than 0.4.0; \
+                                     check CITE_STACK_VERSION on the node"
+                                ),
+                                sha: None,
+                            };
+                        }
+                    } else {
+                        silent = 0;
+                    }
+                    if let Some(report) = &seen.manager_report {
+                        if let Some(outcome) = report.deploy.as_ref().filter(|d| d.id == deploy_id)
+                        {
+                            match outcome.result.as_str() {
+                                "live" => {
+                                    return Release::Live {
+                                        sha: outcome
+                                            .sha
+                                            .clone()
+                                            .or_else(|| report.live_sha.clone()),
+                                    };
+                                }
+                                "failed" => {
+                                    let reason = outcome
+                                        .reason
+                                        .clone()
+                                        .or_else(|| report.last_error.clone())
+                                        .filter(|r| !r.is_empty())
+                                        .unwrap_or_else(|| "the build failed".to_string());
+                                    return Release::Failed {
+                                        reason,
+                                        sha: outcome
+                                            .sha
+                                            .clone()
+                                            .or_else(|| report.last_failed_sha.clone()),
+                                    };
+                                }
+                                _ => {}
+                            }
+                        }
+                        if !report.phase.is_empty() {
+                            op.step(&report.phase);
+                        }
+                    }
+                    if seen.restart_count >= RESTART_LOOP {
+                        return Release::Failed {
+                            reason: self.restart_reason(site, slot, &seen).await,
+                            sha: None,
+                        };
+                    }
+                }
+                Err(err) => tracing::warn!("slot {id}/{} unreadable: {err}", slot.as_str()),
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Release::Failed {
+                    reason: format!(
+                        "the build manager reported no result for deploy {deploy_id} within {}s",
+                        self.timing.release_wait.as_secs()
+                    ),
+                    sha: None,
+                };
+            }
+            sleep(self.timing.poll.min(deadline - now)).await;
+        }
+    }
+
+    // A repo change drops the slot's old checkout and cache first, then the stack starts with this deploy id.
+    async fn start_release(
+        &self,
+        site: &Site,
+        slot: Slot,
+        git_ref: Option<&str>,
+        deploy_id: &str,
+    ) -> Result<Vec<Target>> {
+        let orch = self.orchestrator()?;
+        self.prepare_repo_volumes(orch, site, slot).await?;
+        let token = self.token_for(site).await;
+        let opts = StackOpts {
+            deploy_id: Some(deploy_id.to_string()),
+            build_env: self.env_opt(&site.id, EnvKind::Build).await?,
+            runtime_env: self.env_opt(&site.id, EnvKind::Runtime).await?,
+        };
+        orch.ensure_stack_with(site, slot, git_ref, &token, &opts)
+            .await
     }
 
     async fn stop_stack_quietly(&self, id: &str, slot: Slot) {
@@ -359,7 +574,7 @@ impl Deployer {
         github_token: Option<String>,
     ) -> Result<Site> {
         site.history.clear();
-        validate_site(&site)?;
+        validate_site_strict(&site)?;
         let id = site.id.clone();
         let lock = self.site_lock(&id);
         let _guard = lock.lock().await;
@@ -370,8 +585,9 @@ impl Deployer {
         }
         let active = site.active;
         let mut stored_secret: Option<String> = None;
-        if site.source.is_some() {
+        if let Some(source) = &site.source {
             let orch = self.orchestrator()?;
+            orch.limits().check_source(source)?;
             let token = github_token.filter(|t| !t.is_empty());
             // The secret name is assigned here; a client-supplied one could read another site's token.
             if let Some(source) = site.source.as_mut() {
@@ -394,7 +610,10 @@ impl Deployer {
                     ));
                 }
             };
-            let started = orch.ensure_stack(&site, active, None, token_text).await;
+            let started = match self.prepare_repo_volumes(orch, &site, active).await {
+                Ok(_) => orch.ensure_stack(&site, active, None, token_text).await,
+                Err(err) => Err(err),
+            };
             match started {
                 Ok(targets) => upstream_mut(&mut site, active).targets = targets,
                 Err(err) => {
@@ -459,30 +678,46 @@ impl Deployer {
 
     // Slots, the active choice and maintenance move only through their own endpoints, so a stale client copy cannot undo a deploy.
     async fn update_site_inner(&self, actor: &str, mut site: Site) -> Result<Site> {
-        validate_site(&site)?;
+        validate_site_strict(&site)?;
         let id = site.id.clone();
         let lock = self.site_lock(&id);
         let _guard = lock.lock().await;
         let existing = self.get_site(&id)?;
-        if site.source.is_some() && self.orchestrator.is_none() {
-            return Err(ConnectorError::BadRequest(
-                "orchestration is not enabled on this node".into(),
-            ));
+        if let Some(source) = &site.source {
+            self.orchestrator()?.limits().check_source(source)?;
         }
-        site.history = existing.history;
+        site.history = existing.history.clone();
         site.active = existing.active;
-        site.blue = existing.blue;
-        site.green = existing.green;
-        site.maintenance = existing.maintenance;
+        site.blue = existing.blue.clone();
+        site.green = existing.green.clone();
+        site.maintenance = existing.maintenance.clone();
         if let Some(source) = site.source.as_mut() {
-            source.secret = existing.source.and_then(|s| s.secret);
+            source.secret = existing.source.as_ref().and_then(|s| s.secret.clone());
         }
+        if site == existing {
+            return Ok(existing);
+        }
+        // Build settings are not part of the HAProxy config, so changing only them is a store write that waits for the next deploy.
+        let mut routing = site.clone();
+        routing.source = existing.source.clone();
+        let source_only = routing == existing && site.source.is_some() && existing.source.is_some();
         let sid = id.clone();
-        self.mutate_apply(actor, "site.update", move |cfg| {
-            *site_mut(cfg, &sid)? = site;
-            Ok(())
-        })
-        .await?;
+        if source_only {
+            let _gate = self.config_lock.lock().await;
+            self.store
+                .update(actor, "site.update", move |cfg| {
+                    *site_mut(cfg, &sid)? = site;
+                    Ok(())
+                })
+                .await?;
+        } else {
+            self.mutate_apply(actor, "site.update", move |cfg| {
+                *site_mut(cfg, &sid)? = site;
+                Ok(())
+            })
+            .await?;
+        }
+        self.site_ops.invalidate(&id);
         self.get_site(&id)
     }
 
@@ -521,6 +756,11 @@ impl Deployer {
         }
         self.drop_secret(site.source.as_ref().and_then(|s| s.secret.as_deref()))
             .await;
+        for kind in [EnvKind::Build, EnvKind::Runtime] {
+            self.store.delete_secret(&kind.secret(id)).await;
+        }
+        self.store.delete_secret(&repo_record(id)).await;
+        self.site_ops.forget(id);
         drop(guard);
         self.locks
             .lock()
@@ -536,11 +776,67 @@ impl Deployer {
         targets: Option<Vec<Target>>,
         note: Option<String>,
         git_ref: Option<String>,
-    ) -> Result<Deployment> {
-        let (this, actor, id) = (Arc::clone(self), actor.to_string(), id.to_string());
-        detach(async move { this.deploy_inner(&actor, &id, targets, note, git_ref).await }).await
+        wait: bool,
+    ) -> Result<DeployReply> {
+        if wait {
+            return self
+                .deploy_and_wait(actor, id, targets, note, git_ref)
+                .await
+                .map(DeployReply::Finished);
+        }
+        // The cheap refusals happen before the 202, so an accepted deploy only fails on its way.
+        self.refuse_early(id, targets.as_deref())?;
+        let deploy_id = new_deploy_id();
+        let (this, actor, sid, did) = (
+            Arc::clone(self),
+            actor.to_string(),
+            id.to_string(),
+            deploy_id.clone(),
+        );
+        tokio::spawn(async move {
+            if let Err(err) = this
+                .deploy_inner(&actor, &sid, targets, note, git_ref, did.clone())
+                .await
+            {
+                tracing::warn!("deploy {did} of {sid} did not go live: {err}");
+            }
+        });
+        Ok(DeployReply::Started(DeployStarted {
+            deployment_id: deploy_id,
+        }))
     }
 
+    pub async fn deploy_and_wait(
+        self: &Arc<Self>,
+        actor: &str,
+        id: &str,
+        targets: Option<Vec<Target>>,
+        note: Option<String>,
+        git_ref: Option<String>,
+    ) -> Result<Deployment> {
+        self.refuse_early(id, targets.as_deref())?;
+        let (this, actor, id) = (Arc::clone(self), actor.to_string(), id.to_string());
+        let deploy_id = new_deploy_id();
+        detach(async move {
+            this.deploy_inner(&actor, &id, targets, note, git_ref, deploy_id)
+                .await
+        })
+        .await
+    }
+
+    fn refuse_early(&self, id: &str, targets: Option<&[Target]>) -> Result<()> {
+        let site = self.get_site(id)?;
+        if site.source.is_some() {
+            self.orchestrator()?;
+        } else if targets.is_none_or(|t| t.is_empty()) {
+            return Err(ConnectorError::BadRequest(
+                "a deploy needs at least one target".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    // The deploy id is the history entry id and, for a repo-built site, the CITE_DEPLOY_ID that forces the manager to build.
     async fn deploy_inner(
         &self,
         actor: &str,
@@ -548,6 +844,7 @@ impl Deployer {
         targets: Option<Vec<Target>>,
         note: Option<String>,
         git_ref: Option<String>,
+        deploy_id: String,
     ) -> Result<Deployment> {
         let lock = self.site_lock(id);
         let _guard = lock.lock().await;
@@ -555,24 +852,35 @@ impl Deployer {
         let (old, idle) = (site.active, site.active.other());
         let orchestrated = site.source.is_some();
         let note = note.unwrap_or_default();
+        let did = Some(deploy_id.as_str());
+        let op = self
+            .site_ops
+            .ops
+            .begin(id, "deploy", Some(idle), did, "starting");
         let new_targets = if orchestrated {
-            let orch = self.orchestrator()?;
-            let token = self.token_for(&site).await;
-            match orch
-                .ensure_stack(&site, idle, git_ref.as_deref(), &token)
+            op.step("starting the build manager");
+            match self
+                .start_release(&site, idle, git_ref.as_deref(), &deploy_id)
                 .await
             {
                 Ok(started) => started,
                 Err(err) => {
                     let reason = format!("stack could not be started: {err}");
-                    self.record_failure(actor, id, idle, &note, &reason).await;
+                    let text = failure_note(&reason, &note, Some(None));
+                    self.record_failure(actor, id, idle, did, text).await;
                     return Err(err);
                 }
             }
         } else {
-            targets.filter(|t| !t.is_empty()).ok_or_else(|| {
-                ConnectorError::BadRequest("a deploy needs at least one target".into())
-            })?
+            match targets.filter(|t| !t.is_empty()) {
+                Some(targets) => targets,
+                None => {
+                    let reason = "a deploy needs at least one target";
+                    let text = failure_note(reason, &note, None);
+                    self.record_failure(actor, id, idle, did, text).await;
+                    return Err(ConnectorError::BadRequest(reason.into()));
+                }
+            }
         };
         let sid = id.to_string();
         let staged = self
@@ -582,10 +890,34 @@ impl Deployer {
             })
             .await;
         if let Err(err) = staged {
+            // An accepted deploy has already answered with its id, so the failure must reach the history.
+            let reason = format!("the new targets could not be applied: {err}");
+            let sha = orchestrated.then_some(None);
+            let text = failure_note(&reason, &note, sha);
+            self.record_failure(actor, id, idle, did, text).await;
             self.stop_stack_quietly(id, idle).await;
             return Err(err);
         }
-        let wait = self.health_wait(site.source.is_some());
+        // A previously used idle slot still serves its old release, so health alone would promote it before the new build.
+        let mut live_sha: Option<Option<String>> = None;
+        if orchestrated {
+            op.step("building");
+            match self.await_release(&site, idle, &deploy_id, &op).await {
+                Release::Live { sha } => live_sha = Some(sha),
+                Release::Failed { reason, sha } => {
+                    let text = failure_note(&reason, &note, Some(sha.as_deref()));
+                    self.record_failure(actor, id, idle, did, text).await;
+                    self.stop_stack_quietly(id, idle).await;
+                    return Err(ConnectorError::Conflict(format!(
+                        "deploy {deploy_id} of {id} failed: {reason}; the {} slot still serves",
+                        old.as_str()
+                    )));
+                }
+            }
+        }
+        let sha = live_sha.as_ref().map(Option::as_deref);
+        op.step("checking health");
+        let wait = self.health_wait(orchestrated);
         let healthy = self
             .haproxy
             .wait_healthy(id, idle, wait)
@@ -598,15 +930,25 @@ impl Deployer {
                 idle.as_str(),
                 wait.as_secs()
             );
-            self.record_failure(actor, id, idle, &note, &reason).await;
+            let text = failure_note(&reason, &note, sha);
+            self.record_failure(actor, id, idle, did, text).await;
             self.stop_stack_quietly(id, idle).await;
             return Err(ConnectorError::Conflict(format!(
                 "deploy failed health checks: the {} slot of {id} never came up, active slot unchanged",
                 idle.as_str()
             )));
         }
+        op.step("switching traffic");
         let promoted = self
-            .promote(actor, id, old, idle, DeployAction::Promote, note)
+            .promote(
+                actor,
+                id,
+                old,
+                idle,
+                DeployAction::Promote,
+                success_note(&note, sha),
+                did,
+            )
             .await?;
         if orchestrated {
             self.schedule_drain(id, old, idle);
@@ -615,6 +957,7 @@ impl Deployer {
     }
 
     // The runtime map flips before the store is updated, so a failed flip leaves the stored slot alone.
+    #[allow(clippy::too_many_arguments)]
     async fn promote(
         &self,
         actor: &str,
@@ -623,17 +966,20 @@ impl Deployer {
         slot: Slot,
         action: DeployAction,
         note: String,
+        deploy_id: Option<&str>,
     ) -> Result<Deployment> {
+        self.site_ops.invalidate(id);
         let gate = self.config_lock.lock().await;
         if let Err(err) = self.haproxy.set_active(id, slot).await {
             // Put the map file back so a later reload cannot route to the slot that never went live.
             let _ = self.haproxy.set_active(id, old).await;
             drop(gate);
             let reason = format!("switching traffic failed: {err}");
-            self.record_failure(actor, id, slot, &note, &reason).await;
+            let text = failure_note(&reason, &note, None);
+            self.record_failure(actor, id, slot, deploy_id, text).await;
             return Err(err);
         }
-        let entry = deployment(slot, action, note);
+        let entry = deployment(deploy_id, slot, action, note);
         let saved = entry.clone();
         let sid = id.to_string();
         self.store
@@ -685,7 +1031,7 @@ impl Deployer {
             )));
         }
         let moved = self
-            .promote(actor, id, site.active, slot, action, note)
+            .promote(actor, id, site.active, slot, action, note, None)
             .await?;
         if orchestrated {
             self.schedule_drain(id, site.active, slot);
@@ -701,8 +1047,15 @@ impl Deployer {
         let token = self.token_for(site).await;
         // The slot comes back on the ref it last ran, not on the site's current branch.
         let git_ref = orch.slot_ref(&site.id, slot).await?;
+        // The kept deploy id and the stored env keep a restart from rebuilding or dropping variables.
+        let opts = self.kept_opts(site, slot).await?;
+        let git_ref = if self.prepare_repo_volumes(orch, site, slot).await? {
+            None
+        } else {
+            git_ref
+        };
         let started = orch
-            .ensure_stack(site, slot, git_ref.as_deref(), &token)
+            .ensure_stack_with(site, slot, git_ref.as_deref(), &token, &opts)
             .await?;
         if started != upstream(site, slot).targets {
             let sid = site.id.clone();
@@ -873,8 +1226,13 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
-    use cite_edge::model::{HealthCheck, MaintenancePage, SiteKind, Source};
+    use cite_edge::model::{HealthCheck, MaintenancePage, SiteKind};
+    use cite_edge::status::{BuildEnvPatch, LogLine};
     use tempfile::TempDir;
+
+    use crate::orchestrator::SlotInspect;
+    use crate::orchestrator::tests::container_env;
+    use crate::siteops::{LogQuery, LogSource};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::TcpListener;
 
@@ -948,17 +1306,150 @@ mod tests {
         cfg: crate::config::ConnectorConfig,
     }
 
+    type Docker = Arc<StdMutex<crate::orchestrator::tests::Fake>>;
+
+    const SHA: &str = "1111111111111111111111111111111111111111";
+    const OLD_SHA: &str = "0000000000000000000000000000000000000000";
+    const OLD_ID: &str = "01HZX3K9M2N4P5Q6R7S8T9V0WX";
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Mode {
+        // Reports whatever CITE_DEPLOY_ID the manager was started with as live.
+        Auto,
+        Stale,
+        Fail(String),
+        Silent,
+    }
+
+    #[derive(Default)]
+    struct Sim {
+        modes: HashMap<Slot, Mode>,
+        restarts: HashMap<Slot, u32>,
+        tokens: HashMap<Slot, String>,
+        logs: Vec<cite_edge::status::LogLine>,
+        redactions: Vec<Vec<String>>,
+    }
+
+    // Stands in for the manager's health report, reading the env the fake Docker engine holds.
+    struct SimProbe {
+        orch: Arc<Orchestrator>,
+        docker: Docker,
+        sim: StdMutex<Sim>,
+    }
+
+    impl SimProbe {
+        fn set_mode(&self, slot: Slot, mode: Mode) {
+            self.sim.lock().unwrap().modes.insert(slot, mode);
+        }
+
+        fn set_token(&self, slot: Slot, token: &str) {
+            self.sim.lock().unwrap().tokens.insert(slot, token.into());
+        }
+
+        fn last_redactions(&self) -> Vec<String> {
+            self.sim
+                .lock()
+                .unwrap()
+                .redactions
+                .last()
+                .cloned()
+                .unwrap_or_default()
+        }
+
+        async fn read(&self, site_id: &str, slot: Slot) -> Result<SlotInspect> {
+            let limits = *self.orch.limits();
+            let mut seen = SlotInspect {
+                state: "missing".into(),
+                health: "none".into(),
+                restart_count: 0,
+                exit_code: None,
+                oom_killed: false,
+                env: Vec::new(),
+                manager_report: None,
+                manager_memory: limits.manager_memory,
+                manager_nano_cpus: limits.manager_nano_cpus,
+                executor_memory: limits.executor_memory,
+                executor_nano_cpus: limits.executor_nano_cpus,
+            };
+            if self.orch.slot_ref(site_id, slot).await?.is_none() {
+                return Ok(seen);
+            }
+            let name = format!("cite-{site_id}-{}-manager", slot.as_str());
+            let env: Vec<String> = serde_json::from_str(
+                &crate::orchestrator::tests::container_env(&self.docker, &name),
+            )
+            .unwrap_or_default();
+            let deploy_id = crate::siteops::env_value(&env, "CITE_DEPLOY_ID=");
+            let sim = self.sim.lock().unwrap();
+            let token = sim
+                .tokens
+                .get(&slot)
+                .cloned()
+                .unwrap_or_else(|| "ok".into());
+            let report = match sim.modes.get(&slot).cloned().unwrap_or(Mode::Auto) {
+                Mode::Auto => Some(match deploy_id {
+                    Some(id) => json!({"v": 1, "phase": "idle", "token": token, "live_sha": SHA,
+                        "deploy": {"id": id, "result": "live", "sha": SHA}}),
+                    None => json!({"v": 1, "phase": "idle", "token": token, "live_sha": OLD_SHA}),
+                }),
+                Mode::Stale => Some(json!({"v": 1, "phase": "building", "token": token,
+                    "live_sha": OLD_SHA, "deploy": {"id": OLD_ID, "result": "live"}})),
+                Mode::Fail(reason) => Some(json!({"v": 1, "phase": "failed", "token": token,
+                    "last_error": reason, "last_failed_sha": SHA,
+                    "deploy": {"id": deploy_id.unwrap_or_default(), "result": "failed"}})),
+                Mode::Silent => None,
+            };
+            seen.state = "running".into();
+            seen.health = "healthy".into();
+            seen.restart_count = sim.restarts.get(&slot).copied().unwrap_or(0);
+            seen.env = env
+                .into_iter()
+                .filter(|e| !e.starts_with("CITE_GITHUB_TOKEN=") && !e.contains("_ENV_JSON="))
+                .collect();
+            seen.manager_report = report.map(|v| serde_json::from_value(v).unwrap());
+            Ok(seen)
+        }
+    }
+
+    impl SlotProbe for SimProbe {
+        fn inspect<'a>(
+            &'a self,
+            site_id: &'a str,
+            slot: Slot,
+        ) -> futures_util::future::BoxFuture<'a, Result<SlotInspect>> {
+            Box::pin(self.read(site_id, slot))
+        }
+
+        fn logs<'a>(
+            &'a self,
+            req: crate::siteops::LogRequest<'a>,
+        ) -> futures_util::future::BoxFuture<'a, Result<crate::orchestrator::LogsBatch>> {
+            let mut sim = self.sim.lock().unwrap();
+            sim.redactions.push(req.redact.to_vec());
+            let lines = sim.logs.clone();
+            let last_ts = lines.last().and_then(|l| l.ts.clone());
+            Box::pin(async move {
+                Ok(crate::orchestrator::LogsBatch {
+                    lines,
+                    truncated: false,
+                    last_ts,
+                })
+            })
+        }
+    }
+
     async fn env_with(
         tweak: impl FnOnce(&mut crate::config::ConnectorConfig),
         orchestrator: Option<Arc<Orchestrator>>,
     ) -> Env {
-        env_full(tweak, orchestrator, Duration::from_millis(50)).await
+        env_full(tweak, orchestrator, Duration::from_millis(50), None).await
     }
 
     async fn env_full(
         tweak: impl FnOnce(&mut crate::config::ConnectorConfig),
         orchestrator: Option<Arc<Orchestrator>>,
         drain: Duration,
+        probe: Option<Arc<SimProbe>>,
     ) -> Env {
         let dir = tempfile::tempdir().unwrap();
         let (addr, fake) = start_fake().await;
@@ -968,20 +1459,50 @@ mod tests {
         let store = Store::open(&cfg).await.unwrap();
         let haproxy = Arc::new(Haproxy::new(&cfg));
         let short = Duration::from_millis(600);
-        let deployer = Arc::new(
-            Deployer::new(store.clone(), haproxy, orchestrator).with_timing(
-                Duration::from_millis(300),
-                short,
-                drain,
-            ),
-        );
+        let mut deployer = Deployer::new(store.clone(), haproxy, orchestrator)
+            .with_timing(Duration::from_millis(300), short, drain)
+            .with_release_timing(
+                Duration::from_secs(3),
+                Duration::from_millis(20),
+                Duration::from_millis(400),
+            );
+        if let Some(probe) = probe {
+            deployer = deployer.with_probe(probe);
+        }
         Env {
             _dir: dir,
-            deployer,
+            deployer: Arc::new(deployer),
             store,
             fake,
             cfg,
         }
+    }
+
+    // A fake Docker engine with a simulated manager report; the node token is optional.
+    async fn docker_env(
+        drain: Duration,
+        node_token: Option<&str>,
+        release_wait: Option<Duration>,
+    ) -> (Env, Arc<Orchestrator>, Docker, Arc<SimProbe>) {
+        let (orch, docker) = crate::orchestrator::tests::start_fake().await;
+        let token = node_token
+            .map(|t| crate::config::NodeToken::new(t, crate::config::TokenSource::Env).unwrap());
+        let orch = Arc::new(orch.with_default_token(token));
+        let sim = Arc::new(SimProbe {
+            orch: orch.clone(),
+            docker: docker.clone(),
+            sim: StdMutex::default(),
+        });
+        let mut e = env_full(|_| {}, Some(orch.clone()), drain, Some(sim.clone())).await;
+        if let Some(wait) = release_wait {
+            let deployer = Arc::try_unwrap(e.deployer).ok().unwrap();
+            e.deployer = Arc::new(deployer.with_release_timing(
+                wait,
+                Duration::from_millis(20),
+                Duration::from_millis(400),
+            ));
+        }
+        (e, orch, docker, sim)
     }
 
     async fn env() -> Env {
@@ -1048,14 +1569,7 @@ mod tests {
 
     fn orchestrated_site(id: &str) -> Site {
         let mut site = new_site(id);
-        site.source = Some(Source {
-            repo: "owner/repo".into(),
-            branch: None,
-            runtime: None,
-            node_major: None,
-            poll_interval: None,
-            secret: None,
-        });
+        site.source = Some(serde_json::from_value(json!({ "repo": "owner/repo" })).unwrap());
         site
     }
 
@@ -1150,22 +1664,14 @@ mod tests {
         assert_eq!(e.store.get_secret("site-shop").await, None);
     }
 
-    async fn node_token_env() -> (
-        Env,
-        Arc<Orchestrator>,
-        Arc<StdMutex<crate::orchestrator::tests::Fake>>,
-    ) {
-        let (orch, fake) = crate::orchestrator::tests::start_fake().await;
-        let token =
-            crate::config::NodeToken::new("ghp_nodewide", crate::config::TokenSource::Env).unwrap();
-        let orch = Arc::new(orch.with_default_token(Some(token)));
-        let e = env_with(|_| {}, Some(orch.clone())).await;
+    async fn node_token_env() -> (Env, Arc<Orchestrator>, Docker) {
+        let (e, orch, fake, _sim) =
+            docker_env(Duration::from_millis(50), Some("ghp_nodewide"), None).await;
         (e, orch, fake)
     }
 
     #[tokio::test]
     async fn a_site_without_a_token_uses_the_node_token_and_never_stores_it() {
-        use crate::orchestrator::tests::container_env;
         let (e, _orch, fake) = node_token_env().await;
         let made = e
             .deployer
@@ -1181,7 +1687,7 @@ mod tests {
 
         // the next deploy plans the idle slot afresh and resolves the same fallback
         e.deployer
-            .deploy("t", "shop", None, None, None)
+            .deploy_and_wait("t", "shop", None, None, None)
             .await
             .unwrap();
         assert!(
@@ -1202,7 +1708,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_site_token_overrides_the_node_token() {
-        use crate::orchestrator::tests::container_env;
         let (e, _orch, fake) = node_token_env().await;
         e.deployer
             .create_site("t", orchestrated_site("shop"), Some("ghp_sitewide".into()))
@@ -1320,6 +1825,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_accepted_deploy_whose_targets_are_refused_is_recorded_as_failed() {
+        let tools = tempfile::tempdir().unwrap();
+        let (bin, armed) = one_shot_rejecting_haproxy(tools.path());
+        let e = env_with(
+            move |cfg| {
+                cfg.validate_with_haproxy = true;
+                cfg.haproxy_bin = bin;
+            },
+            None,
+        )
+        .await;
+        created(&e).await;
+        std::fs::write(&armed, b"").unwrap();
+        let reply = e
+            .deployer
+            .deploy("t", "shop", Some(green_targets()), None, None, false)
+            .await
+            .unwrap();
+        let DeployReply::Started(started) = reply else {
+            panic!("expected an accepted deploy, got {reply:?}");
+        };
+        for _ in 0..100 {
+            let site = current(&e, "shop");
+            if let Some(entry) = site.history.iter().find(|d| d.id == started.deployment_id) {
+                assert_eq!(entry.action, DeployAction::Failed);
+                assert_eq!(entry.slot, Slot::Green);
+                assert!(
+                    entry.note.contains("could not be applied"),
+                    "{}",
+                    entry.note
+                );
+                assert_eq!(site.active, Slot::Blue);
+                assert!(site.green.targets.is_empty());
+                return;
+            }
+            sleep(Duration::from_millis(30)).await;
+        }
+        panic!("the refused deploy left no history entry");
+    }
+
+    #[tokio::test]
     async fn the_config_lock_is_shared_with_callers() {
         let e = env().await;
         let held = e.deployer.config_lock().lock().await;
@@ -1359,7 +1905,7 @@ mod tests {
         created(&e).await;
         let done = e
             .deployer
-            .deploy("t", "shop", Some(green_targets()), Some("v2".into()), None)
+            .deploy_and_wait("t", "shop", Some(green_targets()), Some("v2".into()), None)
             .await
             .unwrap();
         assert_eq!(done.action, DeployAction::Promote);
@@ -1385,13 +1931,16 @@ mod tests {
         let e = env().await;
         created(&e).await;
         for bad in [None, Some(vec![])] {
-            let err = e.deployer.deploy("t", "shop", bad, None, None).await;
+            let err = e
+                .deployer
+                .deploy_and_wait("t", "shop", bad, None, None)
+                .await;
             assert!(matches!(err, Err(ConnectorError::BadRequest(_))));
         }
         assert!(current(&e, "shop").history.is_empty());
         let missing = e
             .deployer
-            .deploy("t", "ghost", Some(green_targets()), None, None)
+            .deploy_and_wait("t", "ghost", Some(green_targets()), None, None)
             .await;
         assert!(matches!(missing, Err(ConnectorError::NotFound(_))));
     }
@@ -1403,7 +1952,7 @@ mod tests {
         set_down(&e, "be_shop_green");
         let err = e
             .deployer
-            .deploy(
+            .deploy_and_wait(
                 "t",
                 "shop",
                 Some(green_targets()),
@@ -1431,12 +1980,12 @@ mod tests {
         created(&e).await;
         let first = e
             .deployer
-            .deploy("t", "shop", Some(green_targets()), None, None)
+            .deploy_and_wait("t", "shop", Some(green_targets()), None, None)
             .await;
         let blue = vec![target("10.0.2.1:8080")];
         let second = e
             .deployer
-            .deploy("t", "shop", Some(blue.clone()), None, None)
+            .deploy_and_wait("t", "shop", Some(blue.clone()), None, None)
             .await;
         assert_eq!(first.unwrap().slot, Slot::Green);
         assert_eq!(second.unwrap().slot, Slot::Blue);
@@ -1451,10 +2000,14 @@ mod tests {
         created(&e).await;
         let one = e
             .deployer
-            .deploy("t", "shop", Some(green_targets()), None, None);
-        let two = e
-            .deployer
-            .deploy("t", "shop", Some(vec![target("10.0.3.1:8080")]), None, None);
+            .deploy_and_wait("t", "shop", Some(green_targets()), None, None);
+        let two = e.deployer.deploy_and_wait(
+            "t",
+            "shop",
+            Some(vec![target("10.0.3.1:8080")]),
+            None,
+            None,
+        );
         let (a, b) = tokio::join!(one, two);
         assert!(a.is_ok() && b.is_ok());
         let slots: Vec<Slot> = current(&e, "shop").history.iter().map(|d| d.slot).collect();
@@ -1469,7 +2022,7 @@ mod tests {
         for n in 0..(HISTORY_CAP + 4) {
             let t = vec![target(&format!("10.1.0.{}:8080", n % 200 + 1))];
             e.deployer
-                .deploy("t", "shop", Some(t), Some(format!("n{n}")), None)
+                .deploy_and_wait("t", "shop", Some(t), Some(format!("n{n}")), None)
                 .await
                 .unwrap();
         }
@@ -1487,7 +2040,7 @@ mod tests {
         let e = env().await;
         created(&e).await;
         e.deployer
-            .deploy("t", "shop", Some(green_targets()), None, None)
+            .deploy_and_wait("t", "shop", Some(green_targets()), None, None)
             .await
             .unwrap();
         let moved = e.deployer.switch("t", "shop", Slot::Blue).await.unwrap();
@@ -1505,7 +2058,7 @@ mod tests {
         let empty = e.deployer.switch("t", "shop", Slot::Green).await;
         assert!(matches!(empty, Err(ConnectorError::BadRequest(_))));
         e.deployer
-            .deploy("t", "shop", Some(green_targets()), None, None)
+            .deploy_and_wait("t", "shop", Some(green_targets()), None, None)
             .await
             .unwrap();
         set_down(&e, "be_shop_blue");
@@ -1521,7 +2074,7 @@ mod tests {
         let none = e.deployer.rollback("t", "shop").await;
         assert!(matches!(none, Err(ConnectorError::BadRequest(_))));
         e.deployer
-            .deploy("t", "shop", Some(green_targets()), None, None)
+            .deploy_and_wait("t", "shop", Some(green_targets()), None, None)
             .await
             .unwrap();
         let back = e.deployer.rollback("t", "shop").await.unwrap();
@@ -1604,7 +2157,7 @@ mod tests {
         let e = env().await;
         created(&e).await;
         e.deployer
-            .deploy("t", "shop", Some(green_targets()), None, None)
+            .deploy_and_wait("t", "shop", Some(green_targets()), None, None)
             .await
             .unwrap();
         let mut edit = new_site("shop");
@@ -1625,7 +2178,7 @@ mod tests {
         let e = env().await;
         created(&e).await;
         e.deployer
-            .deploy("t", "shop", Some(green_targets()), None, None)
+            .deploy_and_wait("t", "shop", Some(green_targets()), None, None)
             .await
             .unwrap();
         let mut stale = new_site("shop");
@@ -1677,7 +2230,7 @@ mod tests {
         let abandoned = tokio::time::timeout(
             Duration::from_millis(100),
             e.deployer
-                .deploy("t", "shop", Some(green_targets()), None, None),
+                .deploy_and_wait("t", "shop", Some(green_targets()), None, None),
         )
         .await;
         assert!(abandoned.is_err());
@@ -1727,19 +2280,17 @@ mod tests {
 
     #[tokio::test]
     async fn rollback_restarts_a_drained_slot_on_the_ref_it_ran() {
-        let (orch, _fake) = crate::orchestrator::tests::start_fake().await;
-        let orch = Arc::new(orch);
-        let e = env_with(|_| {}, Some(orch.clone())).await;
+        let (e, orch, _fake, _sim) = docker_env(Duration::from_millis(50), None, None).await;
         e.deployer
             .create_site("t", orchestrated_site("shop"), Some("ghp_testtoken".into()))
             .await
             .unwrap();
         e.deployer
-            .deploy("t", "shop", None, None, Some("v1".into()))
+            .deploy_and_wait("t", "shop", None, None, Some("v1".into()))
             .await
             .unwrap();
         e.deployer
-            .deploy("t", "shop", None, None, Some("v2".into()))
+            .deploy_and_wait("t", "shop", None, None, Some("v2".into()))
             .await
             .unwrap();
         for _ in 0..60 {
@@ -1757,17 +2308,130 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_site_override_above_the_node_maximum_is_refused_at_update() {
+        let (e, _orch, _docker, _sim) = docker_env(Duration::from_millis(50), None, None).await;
+        built(&e, "ghp_testtoken").await;
+        let mut edit = current(&e, "shop");
+        edit.source.as_mut().unwrap().memory_mb = Some(64 * 1024);
+        let err = e.deployer.update_site("t", edit).await.unwrap_err();
+        assert!(
+            matches!(&err, ConnectorError::BadRequest(m) if m.contains("CITE_STACK_MAX_MEM")),
+            "{err:?}"
+        );
+        assert_eq!(current(&e, "shop").source.unwrap().memory_mb, None);
+        let mut big = orchestrated_site("big");
+        big.source.as_mut().unwrap().cpus = Some(cite_edge::model::Cpus(64.0));
+        let err = e
+            .deployer
+            .create_site("t", big, Some("ghp_testtoken".into()))
+            .await
+            .unwrap_err();
+        assert!(matches!(&err, ConnectorError::BadRequest(m) if m.contains("CITE_STACK_MAX_CPUS")));
+    }
+
+    async fn move_repo(e: &Env, repo: &str) {
+        let mut edit = current(e, "shop");
+        edit.source.as_mut().unwrap().repo = repo.to_string();
+        e.deployer.update_site("t", edit).await.unwrap();
+    }
+
+    fn work_resets(docker: &Docker, slot: Slot) -> usize {
+        crate::orchestrator::tests::count(
+            docker,
+            &format!("DELETE /volumes/cite-shop-{}-work", slot.as_str()),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_token_change_after_a_repo_change_resets_the_build_volumes_once() {
+        let (e, _orch, docker, _sim) = docker_env(Duration::from_millis(50), None, None).await;
+        built(&e, "ghp_testtoken").await;
+        assert_eq!(work_resets(&docker, Slot::Blue), 0);
+        move_repo(&e, "owner/other").await;
+        e.deployer
+            .set_site_token(
+                "t",
+                "shop",
+                zeroize::Zeroizing::new("ghp_secondtoken".into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(work_resets(&docker, Slot::Blue), 1);
+        assert_eq!(
+            crate::orchestrator::tests::count(&docker, "DELETE /volumes/cite-shop-blue-cache"),
+            1
+        );
+        assert!(container_env(&docker, "cite-shop-blue-manager").contains("CITE_REPO=owner/other"));
+        assert_eq!(
+            crate::orchestrator::tests::count(&docker, "CREATE cite-shop-blue-executor"),
+            1,
+            "the live executor is never recreated"
+        );
+        e.deployer
+            .set_site_token(
+                "t",
+                "shop",
+                zeroize::Zeroizing::new("ghp_thirdtoken".into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(work_resets(&docker, Slot::Blue), 1);
+    }
+
+    #[tokio::test]
+    async fn a_rollback_after_a_repo_change_starts_the_slot_on_fresh_build_volumes() {
+        let (e, orch, docker, _sim) = docker_env(Duration::from_millis(50), None, None).await;
+        built(&e, "ghp_testtoken").await;
+        e.deployer
+            .deploy_and_wait("t", "shop", None, None, Some("v1".into()))
+            .await
+            .unwrap();
+        for _ in 0..60 {
+            if !orch.stack_running("shop", Slot::Blue).await.unwrap() {
+                break;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+        assert!(!orch.stack_running("shop", Slot::Blue).await.unwrap());
+        move_repo(&e, "owner/other").await;
+        e.deployer.rollback("t", "shop").await.unwrap();
+        assert_eq!(current(&e, "shop").active, Slot::Blue);
+        assert_eq!(work_resets(&docker, Slot::Blue), 1);
+        assert_eq!(work_resets(&docker, Slot::Green), 0);
+        let env = container_env(&docker, "cite-shop-blue-manager");
+        assert!(env.contains("CITE_REPO=owner/other"), "{env}");
+    }
+
+    #[tokio::test]
+    async fn build_volumes_without_a_record_are_reset_even_when_the_manager_is_gone() {
+        let (e, _orch, docker, _sim) = docker_env(Duration::from_millis(50), None, None).await;
+        built(&e, "ghp_testtoken").await;
+        e.deployer
+            .deploy_and_wait("t", "shop", None, None, None)
+            .await
+            .unwrap();
+        e.store.delete_secret(&repo_record("shop")).await;
+        crate::orchestrator::tests::drop_container(&docker, "cite-shop-blue-manager");
+        e.deployer
+            .deploy_and_wait("t", "shop", None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(work_resets(&docker, Slot::Blue), 1);
+        let recorded = e.store.get_secret(&repo_record("shop")).await.unwrap();
+        assert_eq!(recorded, r#"{"blue":"owner/repo"}"#);
+        e.deployer.delete_site("t", "shop").await.unwrap();
+        assert!(e.store.get_secret(&repo_record("shop")).await.is_none());
+    }
+
+    #[tokio::test]
     async fn an_older_drain_timer_does_not_stop_a_slot_that_went_idle_later() {
-        let (orch, _fake) = crate::orchestrator::tests::start_fake().await;
-        let orch = Arc::new(orch);
-        let drain = Duration::from_millis(600);
-        let e = env_full(|_| {}, Some(orch.clone()), drain).await;
+        let (e, orch, _fake, _sim) = docker_env(Duration::from_millis(600), None, None).await;
         e.deployer
             .create_site("t", orchestrated_site("shop"), Some("ghp_testtoken".into()))
             .await
             .unwrap();
         e.deployer
-            .deploy("t", "shop", None, None, None)
+            .deploy_and_wait("t", "shop", None, None, None)
             .await
             .unwrap();
         sleep(Duration::from_millis(200)).await;
@@ -1783,15 +2447,13 @@ mod tests {
 
     #[tokio::test]
     async fn startup_reconcile_stops_idle_stacks_once_the_active_slot_is_healthy() {
-        let (orch, _fake) = crate::orchestrator::tests::start_fake().await;
-        let orch = Arc::new(orch);
-        let e = env_full(|_| {}, Some(orch.clone()), Duration::from_secs(600)).await;
+        let (e, orch, _fake, _sim) = docker_env(Duration::from_secs(600), None, None).await;
         e.deployer
             .create_site("t", orchestrated_site("shop"), Some("ghp_testtoken".into()))
             .await
             .unwrap();
         e.deployer
-            .deploy("t", "shop", None, None, None)
+            .deploy_and_wait("t", "shop", None, None, None)
             .await
             .unwrap();
         assert!(orch.stack_running("shop", Slot::Blue).await.unwrap());
@@ -1807,9 +2469,7 @@ mod tests {
     #[tokio::test]
     async fn startup_reconcile_reattaches_haproxy_even_when_the_site_is_unhealthy() {
         use crate::orchestrator::tests::{HAPROXY, members, recreate_haproxy};
-        let (orch, fake) = crate::orchestrator::tests::start_fake().await;
-        let orch = Arc::new(orch);
-        let e = env_full(|_| {}, Some(orch.clone()), Duration::from_secs(600)).await;
+        let (e, orch, fake, _sim) = docker_env(Duration::from_secs(600), None, None).await;
         e.deployer
             .create_site("t", orchestrated_site("shop"), Some("ghp_testtoken".into()))
             .await
@@ -1849,7 +2509,7 @@ mod tests {
             .unwrap();
         let err = e
             .deployer
-            .deploy("t", "shop", None, Some("try".into()), Some("main".into()))
+            .deploy_and_wait("t", "shop", None, Some("try".into()), Some("main".into()))
             .await;
         assert!(err.is_err());
         let site = current(&e, "shop");
@@ -1864,7 +2524,7 @@ mod tests {
         let e = env().await;
         created(&e).await;
         e.deployer
-            .deploy("t", "shop", Some(green_targets()), None, None)
+            .deploy_and_wait("t", "shop", Some(green_targets()), None, None)
             .await
             .unwrap();
         set_down(&e, "be_shop_green");
@@ -1893,5 +2553,524 @@ mod tests {
         assert_eq!(live["blue"][0]["status"], "UNKNOWN");
         assert_eq!(live["blue"][1]["status"], "UNKNOWN");
         assert_eq!(live["green"], json!([]));
+    }
+
+    async fn built(e: &Env, token: &str) {
+        e.deployer
+            .create_site("t", orchestrated_site("shop"), Some(token.into()))
+            .await
+            .unwrap();
+    }
+
+    fn patch(key: &str, value: &str) -> BuildEnvPatch {
+        BuildEnvPatch {
+            set: [(key.to_string(), value.to_string())].into(),
+            unset: Vec::new(),
+        }
+    }
+
+    fn green_promoted(e: &Env) -> bool {
+        commands(e)
+            .iter()
+            .any(|c| c.starts_with("set map") && c.contains("be_shop_green"))
+    }
+
+    fn error_line(text: &str) -> LogLine {
+        LogLine {
+            ts: Some("2026-01-01T00:00:00Z".into()),
+            stream: "stderr".into(),
+            level: Some("error".into()),
+            phase: None,
+            text: text.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stale_release_is_not_promoted_before_the_manager_reports_the_new_deploy() {
+        let (e, _orch, _docker, sim) = docker_env(Duration::from_millis(50), None, None).await;
+        built(&e, "ghp_testtoken").await;
+        sim.set_mode(Slot::Green, Mode::Stale);
+        let deployer = e.deployer.clone();
+        let running = tokio::spawn(async move {
+            deployer
+                .deploy_and_wait("t", "shop", None, Some("v2".into()), None)
+                .await
+        });
+        sleep(Duration::from_millis(400)).await;
+        assert_eq!(current(&e, "shop").active, Slot::Blue);
+        assert!(!green_promoted(&e), "the old release went live");
+        let during = e.deployer.site_status("shop").await.unwrap();
+        let op = during.operation.expect("a running deploy is visible");
+        assert_eq!((op.kind.as_str(), op.step.as_str()), ("deploy", "building"));
+        assert_eq!(op.slot, Some(Slot::Green));
+        assert_eq!(during.phase, "building");
+
+        sim.set_mode(Slot::Green, Mode::Auto);
+        let done = running.await.unwrap().unwrap();
+        assert_eq!(done.slot, Slot::Green);
+        assert_eq!(op.deploy_id.as_deref(), Some(done.id.as_str()));
+        assert!(
+            done.note.contains("v2") && done.note.contains(SHA),
+            "{}",
+            done.note
+        );
+        assert_eq!(current(&e, "shop").active, Slot::Green);
+        assert!(green_promoted(&e));
+        assert!(
+            e.deployer
+                .site_status("shop")
+                .await
+                .unwrap()
+                .operation
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_build_is_recorded_with_its_reason_and_the_active_slot_is_untouched() {
+        let (e, orch, _docker, sim) = docker_env(Duration::from_millis(50), None, None).await;
+        built(&e, "ghp_testtoken").await;
+        sim.set_mode(Slot::Green, Mode::Fail("npm ci exited with 1".into()));
+        let err = e
+            .deployer
+            .deploy_and_wait("t", "shop", None, Some("v2".into()), None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ConnectorError::Conflict(_)), "{err:?}");
+        assert!(err.to_string().contains("npm ci exited with 1"));
+        let site = current(&e, "shop");
+        assert_eq!(site.active, Slot::Blue);
+        let last = site.history.last().unwrap();
+        assert_eq!(
+            (last.action, last.slot),
+            (DeployAction::Failed, Slot::Green)
+        );
+        for part in ["npm ci exited with 1", "v2", SHA] {
+            assert!(last.note.contains(part), "{} lacks {part}", last.note);
+        }
+        assert!(!green_promoted(&e));
+        let map = std::fs::read_to_string(e.cfg.maps_dir.join("active.map")).unwrap();
+        assert_eq!(map, "shop be_shop_blue\n");
+        assert!(!orch.stack_running("shop", Slot::Green).await.unwrap());
+        assert!(orch.stack_running("shop", Slot::Blue).await.unwrap());
+        let status = e.deployer.site_status("shop").await.unwrap();
+        assert_eq!(status.last_failure.unwrap().note, last.note);
+        assert!(status.error.unwrap().contains("npm ci exited with 1"));
+    }
+
+    #[tokio::test]
+    async fn a_build_that_never_reports_times_out_without_promoting() {
+        let (e, _orch, _docker, sim) = docker_env(
+            Duration::from_millis(50),
+            None,
+            Some(Duration::from_millis(300)),
+        )
+        .await;
+        built(&e, "ghp_testtoken").await;
+        sim.set_mode(Slot::Green, Mode::Silent);
+        let err = e
+            .deployer
+            .deploy_and_wait("t", "shop", None, None, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("reported no result"), "{err}");
+        let site = current(&e, "shop");
+        assert_eq!(site.active, Slot::Blue);
+        let last = site.history.last().unwrap();
+        assert_eq!(last.action, DeployAction::Failed);
+        assert!(last.note.contains("sha unknown"), "{}", last.note);
+        assert!(!green_promoted(&e));
+    }
+
+    #[tokio::test]
+    async fn a_healthy_manager_without_a_report_fails_fast_naming_the_stack_version() {
+        let (e, _orch, _docker, sim) = docker_env(
+            Duration::from_millis(50),
+            None,
+            Some(Duration::from_secs(60)),
+        )
+        .await;
+        built(&e, "ghp_testtoken").await;
+        sim.set_mode(Slot::Green, Mode::Silent);
+        let started = Instant::now();
+        let err = e
+            .deployer
+            .deploy_and_wait("t", "shop", None, None, None)
+            .await
+            .unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(10));
+        let text = err.to_string();
+        assert!(text.contains("older than 0.4.0"), "{text}");
+        assert!(text.contains("CITE_STACK_VERSION"), "{text}");
+        let site = current(&e, "shop");
+        assert_eq!(site.active, Slot::Blue);
+        assert_eq!(site.history.last().unwrap().action, DeployAction::Failed);
+        assert!(!green_promoted(&e));
+    }
+
+    #[tokio::test]
+    async fn a_restart_loop_fails_the_deploy_with_the_last_error_lines() {
+        let (e, _orch, _docker, sim) = docker_env(Duration::from_millis(50), None, None).await;
+        built(&e, "ghp_testtoken").await;
+        sim.set_mode(Slot::Green, Mode::Silent);
+        {
+            let mut state = sim.sim.lock().unwrap();
+            state.restarts.insert(Slot::Green, 3);
+            state.logs = vec![
+                error_line("Error: Cannot find module 'next'"),
+                LogLine {
+                    level: Some("info".into()),
+                    ..error_line("starting up")
+                },
+            ];
+        }
+        let err = e
+            .deployer
+            .deploy_and_wait("t", "shop", None, None, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("keeps restarting"), "{err}");
+        let note = current(&e, "shop").history.last().unwrap().note.clone();
+        assert!(note.contains("Cannot find module 'next'"), "{note}");
+        assert!(!note.contains("starting up"), "{note}");
+        assert_eq!(current(&e, "shop").active, Slot::Blue);
+    }
+
+    #[tokio::test]
+    async fn an_unwaited_deploy_returns_its_id_and_finishes_in_the_background() {
+        let (e, _orch, _docker, _sim) = docker_env(Duration::from_millis(50), None, None).await;
+        built(&e, "ghp_testtoken").await;
+        let reply = e
+            .deployer
+            .deploy("t", "shop", None, None, None, false)
+            .await
+            .unwrap();
+        let DeployReply::Started(started) = reply else {
+            panic!("expected an accepted deploy, got {reply:?}");
+        };
+        assert_eq!(started.deployment_id.len(), 26);
+        assert_eq!(
+            serde_json::to_value(DeployReply::Started(started.clone())).unwrap(),
+            json!({ "deployment_id": started.deployment_id })
+        );
+        for _ in 0..100 {
+            if current(&e, "shop")
+                .history
+                .iter()
+                .any(|d| d.id == started.deployment_id && d.action == DeployAction::Promote)
+            {
+                return;
+            }
+            sleep(Duration::from_millis(30)).await;
+        }
+        panic!("the background deploy never promoted");
+    }
+
+    #[tokio::test]
+    async fn an_unwaited_deploy_refuses_bad_requests_before_accepting() {
+        let e = env().await;
+        created(&e).await;
+        let empty = e
+            .deployer
+            .deploy("t", "shop", None, None, None, false)
+            .await;
+        assert!(matches!(empty, Err(ConnectorError::BadRequest(_))));
+        let ghost = e
+            .deployer
+            .deploy("t", "ghost", Some(green_targets()), None, None, false)
+            .await;
+        assert!(matches!(ghost, Err(ConnectorError::NotFound(_))));
+        let waited = e
+            .deployer
+            .deploy("t", "shop", Some(green_targets()), None, None, true)
+            .await
+            .unwrap();
+        assert!(matches!(waited, DeployReply::Finished(d) if d.slot == Slot::Green));
+    }
+
+    #[tokio::test]
+    async fn a_new_token_is_stored_restarts_the_manager_and_is_verified() {
+        let (e, _orch, docker, _sim) =
+            docker_env(Duration::from_millis(50), Some("ghp_nodewide"), None).await;
+        built(&e, "ghp_firsttoken").await;
+        let status = e
+            .deployer
+            .set_site_token(
+                "t",
+                "shop",
+                zeroize::Zeroizing::new("ghp_secondtoken".into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(status.source, "site");
+        assert!(status.site_token_set && status.node_token_configured);
+        assert_eq!(status.verified, Some(true));
+        assert_eq!(status.status.as_deref(), Some("ok"));
+        assert_eq!(
+            e.store.get_secret("site-shop").await.as_deref(),
+            Some("ghp_secondtoken")
+        );
+        assert!(container_env(&docker, "cite-shop-blue-manager").contains("ghp_secondtoken"));
+        let audit = format!("{:?}", e.store.audit_tail(100).await);
+        let edge = std::fs::read_to_string(e.cfg.data_dir.join("edge.json")).unwrap();
+        for leak in ["ghp_secondtoken", "ghp_firsttoken"] {
+            assert!(!audit.contains(leak) && !edge.contains(leak));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refused_token_is_replaced_by_the_previous_one() {
+        let (e, _orch, docker, sim) =
+            docker_env(Duration::from_millis(50), Some("ghp_nodewide"), None).await;
+        built(&e, "ghp_firsttoken").await;
+        sim.set_token(Slot::Blue, "invalid");
+        let err = e
+            .deployer
+            .set_site_token("t", "shop", zeroize::Zeroizing::new("ghp_badtoken".into()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ConnectorError::BadRequest(_)), "{err:?}");
+        assert!(!err.to_string().contains("ghp_badtoken"));
+        assert_eq!(
+            e.store.get_secret("site-shop").await.as_deref(),
+            Some("ghp_firsttoken")
+        );
+        let env = container_env(&docker, "cite-shop-blue-manager");
+        assert!(env.contains("ghp_firsttoken") && !env.contains("ghp_badtoken"));
+        let audit = e.store.audit_tail(100).await;
+        assert!(
+            audit
+                .iter()
+                .any(|a| a.action == "site.github_token.restore")
+        );
+        assert!(!format!("{audit:?}").contains("ghp_"));
+        assert!(
+            e.deployer
+                .site_status("shop")
+                .await
+                .unwrap()
+                .operation
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unverified_token_is_kept_and_marked_unverified() {
+        let (e, _orch, _docker, sim) = docker_env(Duration::from_millis(50), None, None).await;
+        built(&e, "ghp_firsttoken").await;
+        sim.set_token(Slot::Blue, "unknown");
+        let status = e
+            .deployer
+            .set_site_token(
+                "t",
+                "shop",
+                zeroize::Zeroizing::new("ghp_secondtoken".into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(status.verified, Some(false));
+        assert_eq!(
+            e.store.get_secret("site-shop").await.as_deref(),
+            Some("ghp_secondtoken")
+        );
+    }
+
+    #[tokio::test]
+    async fn clearing_the_site_token_needs_a_node_token() {
+        let (e, _orch, _docker, _sim) = docker_env(Duration::from_millis(50), None, None).await;
+        built(&e, "ghp_firsttoken").await;
+        let err = e.deployer.clear_site_token("t", "shop").await.unwrap_err();
+        assert!(matches!(err, ConnectorError::Conflict(_)), "{err:?}");
+        assert_eq!(
+            e.store.get_secret("site-shop").await.as_deref(),
+            Some("ghp_firsttoken")
+        );
+        assert!(current(&e, "shop").source.unwrap().secret.is_some());
+    }
+
+    #[tokio::test]
+    async fn clearing_the_site_token_falls_back_to_the_node_token() {
+        let (e, _orch, docker, _sim) =
+            docker_env(Duration::from_millis(50), Some("ghp_nodewide"), None).await;
+        built(&e, "ghp_firsttoken").await;
+        let status = e.deployer.clear_site_token("t", "shop").await.unwrap();
+        assert_eq!(status.source, "node");
+        assert!(!status.site_token_set);
+        assert_eq!(e.store.get_secret("site-shop").await, None);
+        assert_eq!(current(&e, "shop").source.unwrap().secret, None);
+        assert!(container_env(&docker, "cite-shop-blue-manager").contains("ghp_nodewide"));
+        let read = e.deployer.token_status("shop").await.unwrap();
+        assert_eq!((read.source.as_str(), read.verified), ("node", Some(true)));
+    }
+
+    #[tokio::test]
+    async fn build_and_runtime_env_are_stored_as_secrets_and_reach_the_next_deploy() {
+        let (e, _orch, docker, _sim) = docker_env(Duration::from_millis(50), None, None).await;
+        built(&e, "ghp_testtoken").await;
+        let names = e
+            .deployer
+            .patch_build_env("t", "shop", patch("API_KEY", "build-value-0451"))
+            .await
+            .unwrap();
+        assert_eq!(names.names, vec!["API_KEY".to_string()]);
+        e.deployer
+            .patch_runtime_env("t", "shop", patch("DB_PASSWORD", "runtime-value-0452"))
+            .await
+            .unwrap();
+        assert_eq!(
+            e.deployer.runtime_env_names("shop").await.unwrap().names,
+            vec!["DB_PASSWORD".to_string()]
+        );
+        let bad = e
+            .deployer
+            .patch_build_env("t", "shop", patch("lower", "x"))
+            .await;
+        assert!(matches!(bad, Err(ConnectorError::BadRequest(_))));
+        for owned in ["NODE_ENV", "PORT", "HOST", "HOSTNAME", "NITRO_HOST"] {
+            let refused = e
+                .deployer
+                .patch_runtime_env("t", "shop", patch(owned, "production"))
+                .await;
+            assert!(
+                matches!(&refused, Err(ConnectorError::BadRequest(m)) if m.contains(owned)),
+                "{refused:?}"
+            );
+        }
+        assert_eq!(
+            e.deployer.runtime_env_names("shop").await.unwrap().names,
+            vec!["DB_PASSWORD".to_string()]
+        );
+        let shell = e
+            .deployer
+            .patch_build_env("t", "shop", patch("SHELL", "/bin/bash"))
+            .await;
+        assert!(
+            matches!(shell, Err(ConnectorError::BadRequest(_))),
+            "{shell:?}"
+        );
+        assert!(!container_env(&docker, "cite-shop-blue-manager").contains("build-value-0451"));
+
+        e.deployer
+            .deploy_and_wait("t", "shop", None, None, None)
+            .await
+            .unwrap();
+        assert!(container_env(&docker, "cite-shop-green-manager").contains("build-value-0451"));
+        assert!(container_env(&docker, "cite-shop-green-executor").contains("runtime-value-0452"));
+        let audit = format!("{:?}", e.store.audit_tail(200).await);
+        for file in ["edge.json", "audit.jsonl"] {
+            let text = std::fs::read_to_string(e.cfg.data_dir.join(file)).unwrap_or_default();
+            for value in ["build-value-0451", "runtime-value-0452"] {
+                assert!(
+                    !text.contains(value) && !audit.contains(value),
+                    "{file} holds {value}"
+                );
+            }
+        }
+
+        let cleared = BuildEnvPatch {
+            set: Default::default(),
+            unset: vec!["API_KEY".into()],
+        };
+        let names = e
+            .deployer
+            .patch_build_env("t", "shop", cleared)
+            .await
+            .unwrap();
+        assert!(names.names.is_empty());
+        assert_eq!(e.store.get_secret("site-shop.build-env").await, None);
+        e.deployer.delete_site("t", "shop").await.unwrap();
+        assert_eq!(e.store.get_secret("site-shop.runtime-env").await, None);
+        assert_eq!(e.store.get_secret("site-shop").await, None);
+    }
+
+    #[tokio::test]
+    async fn status_never_waits_for_the_site_lock() {
+        let (e, _orch, _docker, _sim) = docker_env(Duration::from_millis(50), None, None).await;
+        built(&e, "ghp_testtoken").await;
+        let lock = e.deployer.site_lock("shop");
+        let _held = lock.lock().await;
+        let status = tokio::time::timeout(Duration::from_secs(2), e.deployer.site_status("shop"))
+            .await
+            .expect("status waited for the site lock")
+            .unwrap();
+        assert_eq!(status.active, Slot::Blue);
+        assert_eq!(status.phase, "idle");
+        assert_eq!(status.error, None);
+        assert!(status.settings_current);
+        assert_eq!(status.slots.len(), 2);
+        let blue = status.slots.iter().find(|s| s.slot == Slot::Blue).unwrap();
+        assert_eq!(blue.container, "running");
+        assert_eq!(blue.haproxy.as_deref(), Some("UP"));
+        assert!(blue.report.is_some());
+        let green = status.slots.iter().find(|s| s.slot == Slot::Green).unwrap();
+        assert_eq!(green.container, "missing");
+        assert_eq!(green.haproxy, None);
+    }
+
+    #[tokio::test]
+    async fn a_source_only_edit_is_stored_without_a_redeploy_and_shows_as_pending() {
+        let (e, _orch, _docker, _sim) = docker_env(Duration::from_millis(50), None, None).await;
+        built(&e, "ghp_testtoken").await;
+        let site = current(&e, "shop");
+        assert!(!e.deployer.pending_redeploy(&site).await);
+        let mut edit = site.clone();
+        edit.history.clear();
+        if let Some(source) = edit.source.as_mut() {
+            source.build_command = Some("npm run build".into());
+            source.secret = None;
+        }
+        let saved = e.deployer.update_site("t", edit).await.unwrap();
+        let source = saved.source.clone().unwrap();
+        assert_eq!(source.build_command.as_deref(), Some("npm run build"));
+        assert_eq!(source.secret.as_deref(), Some("site-shop"));
+        assert_eq!(saved.history, site.history);
+        assert_eq!(saved.active, Slot::Blue);
+        assert!(e.deployer.pending_redeploy(&saved).await);
+        assert!(
+            !e.deployer
+                .site_status("shop")
+                .await
+                .unwrap()
+                .settings_current
+        );
+    }
+
+    #[tokio::test]
+    async fn logs_are_redacted_with_every_secret_of_the_site() {
+        let (e, _orch, _docker, sim) =
+            docker_env(Duration::from_millis(50), Some("ghp_nodewide"), None).await;
+        built(&e, "ghp_sitetoken").await;
+        e.deployer
+            .patch_build_env("t", "shop", patch("API_KEY", "build-value-0451"))
+            .await
+            .unwrap();
+        e.deployer
+            .patch_runtime_env("t", "shop", patch("DB_PASSWORD", "runtime-value-0452"))
+            .await
+            .unwrap();
+        let zone = e.deployer.haproxy.zones().rotate("shop").unwrap().secret;
+        sim.sim.lock().unwrap().logs = vec![error_line("boom")];
+        let query = LogQuery {
+            source: LogSource::Manager,
+            slot: None,
+            tail: 50,
+            since: Some("2026-01-01T00:00:00Z".into()),
+        };
+        let out = e.deployer.site_logs("shop", query).await.unwrap();
+        assert_eq!(out.lines.len(), 1);
+        assert_eq!(out.cursor.as_deref(), Some("1767225600.000000001"));
+        let redact = sim.last_redactions();
+        for secret in [
+            "ghp_sitetoken",
+            "ghp_nodewide",
+            "build-value-0451",
+            "runtime-value-0452",
+            zone.as_str(),
+        ] {
+            assert!(
+                redact.iter().any(|r| r == secret),
+                "{secret} is not redacted"
+            );
+        }
     }
 }

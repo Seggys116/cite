@@ -26,6 +26,7 @@ fn site(id: &str, runtime: &str) -> Site {
             node_major: None,
             poll_interval: None,
             secret: None,
+            ..Default::default()
         }),
         history: Vec::new(),
         access: Default::default(),

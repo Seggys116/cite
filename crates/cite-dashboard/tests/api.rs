@@ -269,6 +269,8 @@ async fn spawn_fake(fake: Shared) -> String {
         .route("/api/v1/analytics/summary", get(summary))
         .route("/api/v1/analytics/bots", get(summary))
         .route("/api/v1/analytics/top", get(summary))
+        .route("/api/v1/analytics/facets", get(echo))
+        .route("/api/v1/analytics/compare", get(echo))
         .route("/api/v1/analytics/stats", get(summary))
         .route("/api/v1/analytics/export", get(export))
         .route("/api/v1/analytics/archives", get(echo))
@@ -285,6 +287,17 @@ async fn spawn_fake(fake: Shared) -> String {
         .route("/api/v1/cloudflare/ranges", any(echo))
         .route("/api/v1/sites/{id}/zone-secret", any(echo))
         .route("/api/v1/firewall/bulk", any(echo))
+        .route("/api/v1/sites/{id}/status", any(echo))
+        .route("/api/v1/sites/{id}/logs", any(echo))
+        .route("/api/v1/sites/{id}/github-token", any(echo))
+        .route("/api/v1/sites/{id}/build-env", any(echo))
+        .route("/api/v1/sites/{id}/runtime-env", any(echo))
+        .route("/api/v1/certificates/generate", any(echo))
+        .route("/api/v1/certificates/origin-ca", any(echo))
+        .route("/api/v1/certificates/acme", any(echo))
+        .route("/api/v1/certificates/acme/{job}", any(echo))
+        .route("/api/v1/alerts", any(echo))
+        .route("/api/v1/alerts/test", any(echo))
         .route("/api/v1/haproxy/stats", get(big))
         .route("/api/v1/sites", get(list_sites).post(create_site))
         .route("/api/v1/sites/{id}", get(get_site).put(put_site))
@@ -1338,6 +1351,50 @@ async fn new_analytics_reads_are_proxied_and_other_analytics_routes_are_not() {
 }
 
 #[tokio::test]
+async fn analytics_facets_and_compare_relay_the_whole_query_and_refuse_writes() {
+    let fake = new_fake(NODE_TOKEN);
+    let url = spawn_fake(fake).await;
+    let h = harness_with_nodes(&[("edge-1", url.as_str(), NODE_TOKEN)]);
+    let s = login(&h).await;
+    // A long filter list: a path prefix near its 2048 byte limit plus several user agent and site values.
+    let long_prefix = "a".repeat(2000);
+    let sites = (0..20)
+        .map(|i| format!("site-{i}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let query = format!(
+        "from=1000&to=2000&site={sites}&path_prefix=%2F{long_prefix}&user_agent=cur%20l&client_ip=10.0.0.0%2F8&status_class=4xx,5xx&blocked=rule%3Ax"
+    );
+    for route in ["facets", "compare"] {
+        let uri = format!("/api/v1/nodes/edge-1/analytics/{route}?{query}");
+        let reply = get_path(&h.app, &uri, &s.headers()).await;
+        assert_eq!(reply.status, StatusCode::OK, "{route}");
+        assert_eq!(reply.json()["query"], query.as_str(), "{route}");
+        assert_eq!(reply.json()["method"], "GET", "{route}");
+    }
+    let against = get_path(
+        &h.app,
+        "/api/v1/nodes/edge-1/analytics/compare?window=24h&against=previous",
+        &s.headers(),
+    )
+    .await;
+    assert_eq!(against.json()["query"], "window=24h&against=previous");
+    for route in ["facets", "compare"] {
+        let write = send_json(
+            &h.app,
+            Method::POST,
+            &format!("/api/v1/nodes/edge-1/analytics/{route}"),
+            &s.headers(),
+            json!({}),
+        )
+        .await;
+        assert_eq!(write.status, StatusCode::NOT_FOUND, "{route}");
+    }
+    let anonymous = get_path(&h.app, "/api/v1/nodes/edge-1/analytics/facets", &[]).await;
+    assert_eq!(anonymous.status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
 async fn archive_downloads_stream_with_rebuilt_headers() {
     let url = spawn_fake(new_fake(NODE_TOKEN)).await;
     let h = harness_with_nodes(&[("edge-1", url.as_str(), NODE_TOKEN)]);
@@ -1572,6 +1629,152 @@ async fn firewall_bulk_is_one_csrf_protected_post_with_a_512_kib_limit() {
 }
 
 #[tokio::test]
+async fn site_token_env_and_status_routes_need_csrf_and_are_never_cached() {
+    let url = spawn_fake(new_fake(NODE_TOKEN)).await;
+    let h = harness_with_nodes(&[("edge-1", url.as_str(), NODE_TOKEN)]);
+    let s = login(&h).await;
+    let cookie_only = [("cookie", s.cookie.as_str())];
+    let base = "/api/v1/nodes/edge-1/sites/shop";
+    let token_uri = format!("{base}/github-token");
+    let env_uri = format!("{base}/build-env");
+    let token = ["gh", "p_", "x"].concat();
+    let body = json!({ "token": token });
+
+    let no_csrf = send_json(&h.app, Method::PUT, &token_uri, &cookie_only, body.clone()).await;
+    assert_eq!(no_csrf.status, StatusCode::FORBIDDEN);
+    let no_csrf = send_json(&h.app, Method::PATCH, &env_uri, &cookie_only, json!({})).await;
+    assert_eq!(no_csrf.status, StatusCode::FORBIDDEN);
+
+    let set = send_json(&h.app, Method::PUT, &token_uri, &s.headers(), body).await;
+    assert_eq!(set.status, StatusCode::OK);
+    assert_eq!(set.header("cache-control"), "no-store");
+    let patched = send_json(
+        &h.app,
+        Method::PATCH,
+        &env_uri,
+        &s.headers(),
+        json!({ "unset": ["A"] }),
+    )
+    .await;
+    assert_eq!(patched.status, StatusCode::OK);
+    for uri in [
+        token_uri.clone(),
+        env_uri.clone(),
+        format!("{base}/status"),
+        format!("{base}/logs?source=manager"),
+        format!("{base}/runtime-env"),
+    ] {
+        let reply = get_path(&h.app, &uri, &s.headers()).await;
+        assert_eq!(reply.status, StatusCode::OK, "GET {uri}");
+        assert_eq!(reply.header("cache-control"), "no-store", "GET {uri}");
+    }
+
+    for (method, uri) in [
+        (Method::POST, token_uri.clone()),
+        (Method::PATCH, token_uri.clone()),
+        (Method::PUT, env_uri.clone()),
+        (Method::POST, format!("{base}/status")),
+        (Method::PATCH, format!("{base}/deploy")),
+        (Method::PATCH, base.to_string()),
+        (Method::GET, format!("{base}/status/extra")),
+    ] {
+        let reply = send_json(&h.app, method.clone(), &uri, &s.headers(), json!({})).await;
+        assert!(
+            reply.status == StatusCode::NOT_FOUND || reply.status == StatusCode::METHOD_NOT_ALLOWED,
+            "{method} {uri}"
+        );
+    }
+
+    let big_token = json!({ "token": "x".repeat(2048) });
+    let refused = send_json(&h.app, Method::PUT, &token_uri, &s.headers(), big_token).await;
+    assert_eq!(refused.status, StatusCode::PAYLOAD_TOO_LARGE);
+    let big_env = json!({ "set": { "A": "x".repeat(70 * 1024) } });
+    let refused = send_json(&h.app, Method::PATCH, &env_uri, &s.headers(), big_env).await;
+    assert_eq!(refused.status, StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
+async fn certificate_issue_and_alert_routes_are_exact_and_capped() {
+    let url = spawn_fake(new_fake(NODE_TOKEN)).await;
+    let h = harness_with_nodes(&[("edge-1", url.as_str(), NODE_TOKEN)]);
+    let s = login(&h).await;
+    let cookie_only = [("cookie", s.cookie.as_str())];
+    let base = "/api/v1/nodes/edge-1";
+    for path in [
+        "certificates/generate",
+        "certificates/origin-ca",
+        "certificates/acme",
+        "alerts/test",
+    ] {
+        let uri = format!("{base}/{path}");
+        let no_csrf = send_json(&h.app, Method::POST, &uri, &cookie_only, json!({})).await;
+        assert_eq!(no_csrf.status, StatusCode::FORBIDDEN, "{path}");
+        let ok = send_json(
+            &h.app,
+            Method::POST,
+            &uri,
+            &s.headers(),
+            json!({ "hosts": ["a.example.com"] }),
+        )
+        .await;
+        assert_eq!(ok.status, StatusCode::OK, "{path}");
+        assert_eq!(ok.header("cache-control"), "no-store", "{path}");
+    }
+    for path in ["certificates/acme", "certificates/acme/job-1", "alerts"] {
+        let reply = get_path(&h.app, &format!("{base}/{path}"), &s.headers()).await;
+        assert_eq!(reply.status, StatusCode::OK, "{path}");
+        assert_eq!(reply.header("cache-control"), "no-store", "{path}");
+    }
+    let put = send_json(
+        &h.app,
+        Method::PUT,
+        &format!("{base}/alerts"),
+        &s.headers(),
+        json!({ "enabled": true }),
+    )
+    .await;
+    assert_eq!(put.status, StatusCode::OK);
+    for (method, path) in [
+        (Method::GET, "certificates/generate"),
+        (Method::PUT, "certificates/acme"),
+        (Method::POST, "certificates/acme/job-1"),
+        (Method::POST, "alerts"),
+        (Method::DELETE, "alerts"),
+        (Method::GET, "alerts/test"),
+    ] {
+        let reply = send_json(
+            &h.app,
+            method.clone(),
+            &format!("{base}/{path}"),
+            &s.headers(),
+            json!({}),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::NOT_FOUND, "{method} {path}");
+    }
+    let big = json!({ "pad": "x".repeat(20 * 1024) });
+    let refused = send_json(
+        &h.app,
+        Method::POST,
+        &format!("{base}/certificates/generate"),
+        &s.headers(),
+        big,
+    )
+    .await;
+    assert_eq!(refused.status, StatusCode::PAYLOAD_TOO_LARGE);
+    let big = json!({ "pad": "x".repeat(70 * 1024) });
+    let refused = send_json(
+        &h.app,
+        Method::PUT,
+        &format!("{base}/alerts"),
+        &s.headers(),
+        big,
+    )
+    .await;
+    assert_eq!(refused.status, StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
 async fn zone_secret_routes_are_exact_pairs_and_never_cached() {
     let url = spawn_fake(new_fake(NODE_TOKEN)).await;
     let h = harness_with_nodes(&[("edge-1", url.as_str(), NODE_TOKEN)]);
@@ -1753,6 +1956,7 @@ async fn a_github_token_is_sent_beside_the_site_and_not_echoed() {
         node_major: None,
         poll_interval: None,
         secret: None,
+        ..Default::default()
     });
     let body = json!({
         "nodes": ["edge-1"],
@@ -1791,8 +1995,9 @@ async fn a_source_site_is_forwarded_whole_with_the_token_at_top_level() {
         branch: Some("release".into()),
         runtime: Some("bun".into()),
         node_major: Some(24),
-        poll_interval: Some("30s".into()),
+        poll_interval: Some("2m".into()),
         secret: None,
+        ..Default::default()
     });
     let body = json!({
         "nodes": ["edge-1"],
@@ -1815,7 +2020,7 @@ async fn a_source_site_is_forwarded_whole_with_the_token_at_top_level() {
     assert_eq!(sent["source"]["branch"], "release");
     assert_eq!(sent["source"]["runtime"], "bun");
     assert_eq!(sent["source"]["node_major"], 24);
-    assert_eq!(sent["source"]["poll_interval"], "30s");
+    assert_eq!(sent["source"]["poll_interval"], "2m");
     assert!(sent["source"]["secret"].is_null());
     assert!(!reply.text().contains("ghp_private"));
 }

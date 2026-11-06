@@ -1,31 +1,41 @@
 use std::future::Future;
 
 use cite_client::{ClientError, DeployRequest};
-use cite_edge::model::{MaintenancePage, Site, SiteKind, Slot, TlsMode};
-use gpui::{AnyElement, Context, Div, Entity, div, prelude::*, px};
+use cite_edge::model::{Deployment, MaintenancePage, Site, SiteKind, Slot, TlsMode};
+use gpui::{AnyElement, ClipboardItem, Context, Div, Entity, div, prelude::*, px};
 use serde_json::Value;
 
 use crate::app::{Confirm, Console, Load, View, new_input};
-use crate::certs::{AccessDraft, zone_newly_enabled};
+use crate::certs::zone_newly_enabled;
 use crate::demo::now_ms;
+use crate::diagnose::{Banner, NO_REASON_NOTE, banner, deploy_outcome, failure_text, save_outcome};
 use crate::model::{
-    clean_list, fmt_targets, parse_rfc3339_ms, parse_targets, paths_problem, rel_time,
+    draft_from_site, edit_site, fmt_targets, parse_rfc3339_ms, parse_targets, rel_time,
+    site_change, source_deploy_request,
 };
 use crate::scope::{error_survives, foreign_notice};
-use crate::theme::{DIM, Tone, c};
+use crate::theme::{CARD_RADIUS, DIM, Tone, c, tint};
 use crate::ui::certs::{access_body, access_controls};
 use crate::ui::input::TextInput;
 use crate::ui::overview::{action_pill, slot_pill};
-use crate::ui::paths::{PathRow, path_editor, read_paths, rows_from};
+use crate::ui::paths::PathRow;
+use crate::ui::siteform::{Home, SiteFields, basics, domains, health_fields, source_fields};
 use crate::ui::sites::health_tone;
 use crate::ui::widgets::{
     BtnKind, Col, btn, btn_off, card, dot, empty_state, field, id, mono, notice, page_header, pill,
     seg_item, seg_row, skeleton, strong, table, text_dim, toggle,
 };
+use crate::wizard::field_problems;
 use crate::zone::{
     CLOUDFLARE_STEPS, NOT_SHOWN_AGAIN, ROTATE_WARNING, ZoneReveal, ZoneStatus, reveal_meta,
     reveal_nodes_elsewhere, reveals_for, rotation_failed, status_text,
 };
+
+// A new zone secret (or why none came) and the outcome of a redeploy, when one was asked for.
+type SaveDone = (
+    Option<Result<ZoneReveal, String>>,
+    Option<Result<Deployment, String>>,
+);
 
 pub struct Data {
     pub site: Site,
@@ -44,10 +54,28 @@ pub struct State {
     pub error: Option<String>,
     pub maint_enabled: bool,
     pub maint_page: Option<String>,
-    pub access: AccessDraft,
-    pub paths: Vec<PathRow>,
+    // The edit form, built from the same fields as the create wizard.
+    pub edit: SiteFields,
+    // The site the form was last filled from, to tell a reload apart from unsaved edits.
+    pub edit_base: Option<Site>,
+    // The node and site id the form belongs to, so edits never carry over to another site.
+    pub edit_for: (String, String),
     pub reveals: Vec<ZoneReveal>,
 }
+
+fn edit_fields(c: &mut Console) -> &mut SiteFields {
+    &mut c.detail.edit
+}
+
+fn edit_paths(c: &mut Console) -> &mut Vec<PathRow> {
+    &mut c.detail.edit.paths
+}
+
+const HOME: Home = Home {
+    key: "edit-form",
+    fields: edit_fields,
+    paths: edit_paths,
+};
 
 impl State {
     pub fn new(cx: &mut Context<Console>) -> Self {
@@ -61,8 +89,9 @@ impl State {
             error: None,
             maint_enabled: false,
             maint_page: None,
-            access: AccessDraft::default(),
-            paths: Vec::new(),
+            edit: SiteFields::new(cx),
+            edit_base: None,
+            edit_for: (String::new(), String::new()),
             reveals: Vec::new(),
         }
     }
@@ -82,24 +111,28 @@ impl Console {
             self.detail.data = Load::Failed(format!("Node {node} is not connected."));
             return;
         };
+        let (ops_node, ops_site) = (node.clone(), site_id.clone());
+        // The three reads do not depend on each other, so they run together.
         let fut = async move {
-            let detail = h.get_site(&site_id).await?;
-            let pages = h.list_pages().await.unwrap_or_default();
-            let zone = h.zone_secret(&site_id).await.ok();
+            let (detail, pages, zone) = tokio::join!(
+                h.get_site(&site_id),
+                h.list_pages(),
+                h.zone_secret(&site_id)
+            );
+            let detail = detail?;
             Ok(Data {
                 site: detail.site,
                 live: detail.live,
-                pages,
-                zone,
+                pages: pages.unwrap_or_default(),
+                zone: zone.ok(),
             })
         };
-        self.fetch_scoped(cx, fut, |this, res, cx| {
+        self.fetch_scoped(cx, fut, move |this, res, cx| {
             if let Ok(data) = &res {
                 this.detail.maint_enabled = data.site.maintenance.enabled;
                 this.detail.maint_page = data.site.maintenance.page_id.clone();
-                this.detail.access = AccessDraft::from_access(&data.site.access);
-                this.detail.paths =
-                    rows_from(cx, &data.site.path_prefixes, &data.site.path_regexes);
+                this.refill_edit(&data.site, cx);
+                this.load_ops(ops_node, ops_site, data.site.source.is_some(), cx);
             }
             this.detail.data = Load::from_result(res);
             cx.notify();
@@ -167,154 +200,268 @@ impl Console {
     }
 
     // Deploy waits on health checks, so the busy notice stays up until the node answers.
-    fn do_deploy(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn do_deploy(&mut self, cx: &mut Context<Self>) {
         let Some((h, site)) = self.site_handle() else {
             return;
         };
-        let targets = match parse_targets(self.detail.targets.read(cx).text()) {
-            Ok(t) if !t.is_empty() => t,
-            Ok(_) => {
-                self.detail.error = Some("Add at least one target to deploy.".into());
-                return;
+        let note =
+            Some(self.detail.note.read(cx).text().trim().to_string()).filter(|n| !n.is_empty());
+        // A site built from GitHub takes no targets: the node builds the idle slot itself.
+        let req = if site.source.is_some() {
+            source_deploy_request(note)
+        } else {
+            match parse_targets(self.detail.targets.read(cx).text()) {
+                Ok(t) if !t.is_empty() => DeployRequest { targets: t, note },
+                Ok(_) => {
+                    self.detail.error = Some("Add at least one target to deploy.".into());
+                    return;
+                }
+                Err(e) => {
+                    self.detail.error = Some(e);
+                    return;
+                }
             }
+        };
+        let fut = async move { h.deploy(&site.id, &req).await };
+        self.site_action(cx, "Deploy", fut, deploy_outcome);
+    }
+
+    // The form follows the node: it is refilled after every load unless the owner has unsaved edits in it.
+    fn refill_edit(&mut self, site: &Site, cx: &mut Context<Self>) {
+        let draft = self.detail.edit.draft(cx);
+        // The form reads as a site when it produces exactly that site.
+        let reads_as = |s: &Site| edit_site(s, &draft).is_ok_and(|e| e == *s);
+        let here = (self.detail.node.clone(), site.id.clone());
+        let edited = self.detail.edit_for == here
+            && self
+                .detail
+                .edit_base
+                .as_ref()
+                .is_some_and(|base| !reads_as(site) && !reads_as(base));
+        if !edited {
+            self.detail.edit.load(&draft_from_site(site), cx);
+            self.detail.edit_base = Some(site.clone());
+            self.detail.edit_for = here;
+        }
+    }
+
+    // Puts the stored values back into the form.
+    fn discard_edits(&mut self, cx: &mut Context<Self>) {
+        if let Some(site) = self.detail.data.ready().map(|d| d.site.clone()) {
+            self.detail.edit.load(&draft_from_site(&site), cx);
+            self.detail.edit_base = Some(site);
+        }
+        self.detail.error = None;
+    }
+
+    // Saves the whole form through the normal site update; with redeploy it then starts a deploy so a source change takes effect.
+    // Turning the zone lock on rotates in a secret right after the save, because the node only shows it when asked.
+    // The stored GitHub token is never sent: the node keeps it.
+    fn do_save(&mut self, redeploy: bool, cx: &mut Context<Self>) {
+        let Some((h, existing)) = self.site_handle() else {
+            return;
+        };
+        let draft = self.detail.edit.draft(cx);
+        let edited = match edit_site(&existing, &draft) {
+            Ok(s) => s,
             Err(e) => {
                 self.detail.error = Some(e);
                 return;
             }
         };
-        let note = self.detail.note.read(cx).text().trim().to_string();
-        let idle = site.active.other();
-        let req = DeployRequest {
-            targets,
-            note: Some(note).filter(|n| !n.is_empty()),
-        };
-        let fut = async move { h.deploy(&site.id, &req).await };
-        self.site_action(cx, "Deploy", fut, move |dep| {
-            if dep.action == cite_edge::model::DeployAction::Failed {
-                Err("Health checks did not pass. The active slot was left untouched.".into())
-            } else {
-                Ok(format!("Deployed. {} is now active.", idle.as_str()))
-            }
-        });
-    }
-
-    // The whole site goes back through the normal update, so an older node rejecting the access field shows its own error.
-    // Turning the zone lock on rotates in a secret right after the save, because the node only shows it when asked.
-    // Saves the routing paths through the normal site update after the node's own checks have run here.
-    fn do_paths(&mut self, cx: &mut Context<Self>) {
-        let Some((h, mut site)) = self.site_handle() else {
-            return;
-        };
-        let (prefixes, regexes) = read_paths(&self.detail.paths, cx);
-        let (prefixes, regexes) = (clean_list(prefixes), clean_list(regexes));
-        if let Some(problem) = paths_problem(&prefixes, &regexes) {
-            self.detail.error = Some(format!("The routing paths are not valid: {problem}"));
-            return;
-        }
-        site.path_prefixes = prefixes;
-        site.path_regexes = regexes;
-        self.site_action(
-            cx,
-            "Routing paths",
-            async move { h.update_site(&site.id, &site).await.map(|_| ()) },
-            |_| Ok("Routing paths saved".to_string()),
+        let rotate = zone_newly_enabled(&existing.access, &edited.access);
+        // A saved source change is not in the running build, so the owner is asked about a rebuild afterwards.
+        let ask_rebuild = !redeploy
+            && existing.source.is_some()
+            && site_change(&existing, &edited).needs_redeploy;
+        let req = source_deploy_request(
+            Some(self.detail.note.read(cx).text().trim().to_string()).filter(|n| !n.is_empty()),
         );
-    }
-
-    fn paths_card(&self, cx: &mut Context<Self>) -> AnyElement {
-        let editor = path_editor(
-            &self.detail.paths,
-            "detail-path",
-            None,
-            |c| &mut c.detail.paths,
-            cx,
-        );
-        let save = if self.detail.busy {
-            btn_off("Save paths").into_any_element()
-        } else {
-            btn(id("detail", "save-paths"), "Save paths", BtnKind::Primary)
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.do_paths(cx);
-                    cx.notify();
-                }))
-                .into_any_element()
-        };
-        card(
-            Some("Routing paths"),
-            Some("Which requests for this site's hosts it serves"),
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(12.))
-                .child(editor)
-                .child(div().flex().child(save)),
-        )
-        .into_any_element()
-    }
-
-    fn do_access(&mut self, cx: &mut Context<Self>) {
-        let Some((h, mut site)) = self.site_handle() else {
-            return;
-        };
-        let next = self.detail.access.to_access();
-        let rotate = zone_newly_enabled(&site.access, &next);
-        site.access = next;
         self.detail.busy = true;
         self.detail.error = None;
         let fut = async move {
-            h.update_site(&site.id, &site).await?;
+            h.update_site(&edited.id, &edited).await?;
             let reveal = if rotate {
                 Some(
-                    h.rotate_zone_secret(&site.id)
+                    h.rotate_zone_secret(&edited.id)
                         .await
                         .map_err(|e| e.to_string()),
                 )
             } else {
                 None
             };
-            Ok(reveal)
+            let deploy = if redeploy {
+                Some(h.deploy(&edited.id, &req).await.map_err(|e| e.to_string()))
+            } else {
+                None
+            };
+            Ok((reveal, deploy))
         };
         self.fetch_origin(
             cx,
             fut,
-            |this,
-             res: Result<Option<Result<ZoneReveal, String>>, ClientError>,
-             here,
-             origin,
-             cx| {
-                const WHAT: &str = "Access settings";
+            move |this, res: Result<SaveDone, ClientError>, here, origin, cx| {
+                const WHAT: &str = "Save site";
+                let saved = res.is_ok();
+                let (reveal, outcome) = match res {
+                    Ok((reveal, deploy)) => (reveal, save_outcome(deploy.as_ref())),
+                    Err(e) => (None, Err(e.to_string())),
+                };
+                if here && saved && ask_rebuild {
+                    this.ops.rebuild_prompt = true;
+                }
+                let mut warn = None;
+                match reveal {
+                    Some(Ok(r)) => this.keep_reveal(r),
+                    Some(Err(e)) => warn = Some(rotation_failed(&e)),
+                    None => {}
+                }
                 if !here {
                     // A secret for another place is kept under its own node and site and shown only there.
-                    let (text, tone) = match res {
-                        Ok(Some(Ok(reveal))) => {
-                            this.keep_reveal(reveal);
-                            (
-                                "saved; open the site to copy its new zone secret".to_string(),
-                                Tone::Ok,
-                            )
-                        }
-                        Ok(Some(Err(e))) => (rotation_failed(&e), Tone::Warn),
-                        Ok(None) => ("saved".to_string(), Tone::Ok),
-                        Err(e) => (e.to_string(), Tone::Bad),
+                    let (mut text, tone) = match outcome {
+                        Ok(t) => (t, Tone::Ok),
+                        Err(t) => (t, Tone::Bad),
                     };
+                    if let Some(w) = warn {
+                        text = format!("{text} {w}");
+                    }
                     this.say(foreign_notice(WHAT, origin, &text), tone);
                     cx.notify();
                     return;
                 }
                 this.detail.busy = false;
-                match res {
-                    Ok(Some(Err(e))) => this.detail.error = Some(rotation_failed(&e)),
-                    Ok(Some(Ok(reveal))) => {
-                        this.keep_reveal(reveal);
-                        this.say("Access settings saved", Tone::Ok);
+                match (outcome, warn) {
+                    (Ok(t), None) => this.say(t, Tone::Ok),
+                    (Ok(t), Some(w)) => this.detail.error = Some(format!("{t} {w}")),
+                    (Err(t), w) => {
+                        this.detail.error = Some(match w {
+                            Some(w) => format!("{t} {w}"),
+                            None => t,
+                        })
                     }
-                    Ok(None) => this.say("Access settings saved", Tone::Ok),
-                    Err(e) => this.detail.error = Some(e.to_string()),
                 }
                 this.reload_detail(cx);
                 cx.notify();
             },
         );
+    }
+
+    // Everything the node accepts on a site, from the same fields the create wizard uses.
+    fn edit_cards(&self, data: &Data, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let f = &self.detail.edit;
+        let draft = f.draft(cx);
+        let problems = field_problems(&draft, false);
+        let mut cards = vec![
+            card(
+                Some("General"),
+                Some("Name, kind and the domains and paths this site answers for"),
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(16.))
+                    .child(basics(f, HOME, &problems, true, cx))
+                    .child(domains(f, HOME, &problems, true, cx)),
+            )
+            .into_any_element(),
+        ];
+        if data.site.source.is_some() {
+            cards.push(
+                card(
+                    Some("Source"),
+                    Some("Where the node builds this site from. Changes take effect on the next deploy."),
+                    source_fields(f, HOME, &problems, cx),
+                )
+                .into_any_element(),
+            );
+            cards.extend(self.build_card(data, cx));
+        }
+        cards.push(
+            card(
+                Some("Health check"),
+                Some("How the node decides a target is ready"),
+                health_fields(f, &problems),
+            )
+            .into_any_element(),
+        );
+        cards.push(self.access_card(data, cx));
+        cards.push(self.save_bar(data, &draft, &problems, cx));
+        cards
+    }
+
+    // One Save for the whole form, with what it will do spelled out under the buttons.
+    fn save_bar(
+        &self,
+        data: &Data,
+        draft: &crate::model::SiteDraft,
+        problems: &crate::wizard::FieldProblems,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let edited = edit_site(&data.site, draft);
+        let change = edited
+            .as_ref()
+            .map(|e| site_change(&data.site, e))
+            .unwrap_or(crate::model::SiteChange {
+                dirty: true,
+                needs_redeploy: false,
+            });
+        let blocker = problems
+            .first()
+            .cloned()
+            .or_else(|| edited.as_ref().err().cloned());
+        let busy = self.detail.busy;
+        let can_save = !busy && change.dirty && blocker.is_none();
+        let save = if can_save {
+            btn(id("detail", "save"), "Save", BtnKind::Primary)
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.do_save(false, cx);
+                    cx.notify();
+                }))
+                .into_any_element()
+        } else {
+            btn_off("Save").into_any_element()
+        };
+        let mut row = div().flex().items_center().gap(px(8.)).child(save);
+        let redeploy = data.site.source.is_some() && change.needs_redeploy;
+        if redeploy {
+            row = row.child(if can_save {
+                btn(
+                    id("detail", "save-redeploy"),
+                    "Save and redeploy",
+                    BtnKind::Primary,
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.do_save(true, cx);
+                    cx.notify();
+                }))
+                .into_any_element()
+            } else {
+                btn_off("Save and redeploy").into_any_element()
+            });
+        }
+        if change.dirty && !busy {
+            row = row.child(pill("Unsaved changes", Tone::Warn)).child(
+                btn(id("detail", "discard"), "Discard changes", BtnKind::Plain).on_click(
+                    cx.listener(|this, _, _, cx| {
+                        this.discard_edits(cx);
+                        cx.notify();
+                    }),
+                ),
+            );
+        }
+        let explain = if data.site.source.is_some() {
+            "Save stores the settings on the node. Routing, health check and access apply at once; a change to the repository, branch, runtime, Node version, poll interval, build settings or resources only takes effect on the next deploy. Save and redeploy stores everything and then builds the branch again. The stored GitHub token is kept."
+        } else {
+            "Save stores the settings on the node and they apply to routing at once. To change the targets, deploy new ones below."
+        };
+        let mut col = div().flex().flex_col().gap(px(8.)).child(row);
+        if let Some(b) = blocker.filter(|_| change.dirty) {
+            col = col.child(
+                text_dim(b)
+                    .text_size(px(12.))
+                    .text_color(c(Tone::Bad.color())),
+            );
+        }
+        card(None, None, col.child(text_dim(explain).text_size(px(12.)))).into_any_element()
     }
 
     // A newer secret for the same node and site replaces the older one, so only the valid value is ever on screen.
@@ -325,7 +472,7 @@ impl Console {
         self.detail.reveals.push(reveal);
     }
 
-    fn reload_detail(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn reload_detail(&mut self, cx: &mut Context<Self>) {
         if let View::SiteDetail { node, id } = self.view.clone() {
             self.load_detail(node, id, cx);
         }
@@ -532,6 +679,11 @@ impl Console {
         if let Some(err) = &self.detail.error {
             col = col.child(notice(err, Tone::Bad));
         }
+        if let Some(found) = banner(site, data.live.as_ref()) {
+            col = col.child(self.failure_banner(&found, cx));
+        }
+        col = col.children(self.status_card(data, cx));
+        col = col.children(self.rebuild_prompt_card(cx));
         col = col.children(self.reveal_panels(&site.id, cx));
         col = col
             .child(
@@ -542,8 +694,8 @@ impl Console {
                     .child(self.slot_card(data, Slot::Green)),
             )
             .child(self.deploy_card(site, cx))
-            .child(self.paths_card(cx))
-            .child(self.access_card(data, cx))
+            .children(self.edit_cards(data, cx))
+            .children(self.ops_cards(data, cx))
             .child(self.maintenance_card(data, cx))
             .child(self.history_card(site, cx))
             .child(self.danger_card(site, cx));
@@ -643,12 +795,37 @@ impl Console {
             Slot::Blue => fmt_targets(&site.blue.targets),
             Slot::Green => fmt_targets(&site.green.targets),
         };
-        let deploy = btn(id("detail", "deploy"), "Deploy", BtnKind::Primary).on_click(cx.listener(
+        let source = site.source.as_ref();
+        let label = if source.is_some() {
+            "Redeploy"
+        } else {
+            "Deploy"
+        };
+        let deploy = btn(id("detail", "deploy"), label, BtnKind::Primary).on_click(cx.listener(
             |this, _, _, cx| {
                 this.do_deploy(cx);
                 cx.notify();
             },
         ));
+        if let Some(src) = source {
+            let branch = src.branch.clone().unwrap_or_else(|| "main".into());
+            return card(
+                Some("Redeploy from GitHub"),
+                Some(&format!(
+                    "The node fetches {} of {} again, builds it in the idle {} slot, health checks it, then flips traffic over.",
+                    branch,
+                    src.repo,
+                    idle.as_str()
+                )),
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(12.))
+                    .child(field("Note", None, self.detail.note.clone()))
+                    .child(div().flex().child(deploy)),
+            )
+            .into_any_element();
+        }
         let body = div()
             .flex()
             .flex_col()
@@ -671,27 +848,140 @@ impl Console {
         .into_any_element()
     }
 
+    // A Copy button that puts the given text on the clipboard.
+    fn copy_button(
+        &self,
+        key: String,
+        label: &str,
+        text: String,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        btn(id("banner-copy", key), label, BtnKind::Plain)
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+                this.say("Copied", Tone::Ok);
+                cx.notify();
+            }))
+            .into_any_element()
+    }
+
+    // Shown first whenever the last deploy failed or the live slot is unhealthy; the node's note is kept whole and copyable.
+    fn failure_banner(&self, b: &Banner, cx: &mut Context<Self>) -> AnyElement {
+        let red = Tone::Bad.color();
+        let mut col = div()
+            .flex()
+            .flex_col()
+            .gap(px(10.))
+            .p(px(14.))
+            .rounded(px(CARD_RADIUS))
+            .border_1()
+            .border_color(tint(red, 0.6))
+            .bg(tint(red, 0.08))
+            .child(
+                strong(b.headline.clone())
+                    .text_size(px(15.))
+                    .text_color(c(red)),
+            );
+        if let Some(f) = &b.failure {
+            let when = rel_time(now_ms(), parse_rfc3339_ms(&f.at).unwrap_or(0));
+            col = col.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.))
+                    .child(
+                        text_dim(format!("{when} - the {} slot", f.slot.as_str()))
+                            .text_size(px(12.)),
+                    )
+                    .child(mono(f.note.clone()))
+                    .child(div().flex().child(self.copy_button(
+                        "note".into(),
+                        "Copy the node's note",
+                        failure_text(f),
+                        cx,
+                    ))),
+            );
+        }
+        let mut slots = div().flex().flex_col().gap(px(6.));
+        for line in &b.slots {
+            let mut row = div()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap(px(8.))
+                .child(slot_pill(line.slot))
+                .child(text_dim(format!(
+                    "{}: {}",
+                    if line.active { "active" } else { "idle" },
+                    line.state.label()
+                )));
+            for t in &line.targets {
+                row = row.child(pill(
+                    &format!("{} {}", t.addr, t.status),
+                    health_tone(&t.status),
+                ));
+            }
+            slots = slots.child(row);
+        }
+        col = col
+            .child(slots)
+            .child(text_dim(NO_REASON_NOTE).text_size(px(12.)));
+        if !b.checks.is_empty() {
+            let mut list = div().flex().flex_col().gap(px(4.));
+            for (i, check) in b.checks.iter().enumerate() {
+                list = list.child(text_dim(format!("{}. {check}", i + 1)).text_size(px(12.)));
+            }
+            col = col
+                .child(strong("What to check").text_size(px(13.)))
+                .child(list);
+        }
+        for (i, cmd) in b.commands.iter().enumerate() {
+            col = col.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(strong(format!(
+                                "{} ({} slot)",
+                                cmd.label,
+                                cmd.slot.as_str()
+                            )))
+                            .child(text_dim(cmd.explains).text_size(px(12.))),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(div().flex_1().child(mono(cmd.command.clone())))
+                            .child(self.copy_button(
+                                format!("cmd-{i}"),
+                                "Copy",
+                                cmd.command.clone(),
+                                cx,
+                            )),
+                    ),
+            );
+        }
+        col.into_any_element()
+    }
+
     // Both choices are staged locally and only sent by Save.
     fn access_card(&self, data: &Data, cx: &mut Context<Self>) -> AnyElement {
-        let draft = self.detail.access;
+        let draft = self.detail.edit.access;
         let mut body = access_body(
-            access_controls(cx, "access", draft, |c| &mut c.detail.access),
+            access_controls(cx, "access", draft, |c| &mut c.detail.edit.access),
             draft,
         );
         if data.site.access.zone_lock {
             body = body.child(self.zone_status_line(data.zone.as_ref()));
         }
         let busy = self.detail.busy;
-        let save = if busy {
-            btn_off("Save access").into_any_element()
-        } else {
-            btn(id("detail", "save-access"), "Save access", BtnKind::Primary)
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.do_access(cx);
-                    cx.notify();
-                }))
-                .into_any_element()
-        };
         let rotate = if data.site.access.zone_lock && !busy {
             btn(
                 id("detail", "rotate-zone"),
@@ -712,10 +1002,11 @@ impl Console {
         } else {
             btn_off("Rotate zone secret").into_any_element()
         };
-        body = body.child(div().flex().gap(px(8.)).child(save).child(rotate));
+        body = body.child(div().flex().gap(px(8.)).child(rotate));
+        body = body.children(self.bot_trust_block(data));
         card(
             Some("Access"),
-            Some("Older nodes reject these fields: if saving fails, update the node."),
+            Some("Saved with the rest of the form. Older nodes reject these fields: if saving fails, update the node."),
             body,
         )
         .into_any_element()

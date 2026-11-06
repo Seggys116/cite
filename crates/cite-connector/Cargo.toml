@@ -48,6 +48,9 @@ getrandom = "0.3"
 x509-parser.workspace = true
 pem.workspace = true
 zeroize.workspace = true
+base64.workspace = true
+ring.workspace = true
+webpki-roots = "1"
 
 [dev-dependencies]
 tempfile.workspace = true

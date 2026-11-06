@@ -3,6 +3,8 @@ import { ApiError } from './js/api.js';
 import {
   corsProblem, hasMatcher, headerOpProblem, listsOf, redirectProblem,
 } from './js/rulelib.js';
+import { firstSourceProblem, sourceToForm } from './js/buildlib.js';
+import { healthProblems } from './js/sitelib.js';
 
 const query = new URLSearchParams(location.search);
 const state = {
@@ -15,6 +17,31 @@ const state = {
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const clone = (v) => (v === undefined ? undefined : JSON.parse(JSON.stringify(v)));
 const iso = (ms) => new Date(ms).toISOString();
+
+// Extra route modules add handlers here; one that is missing or fails to load is skipped so the rest of the mock keeps working.
+const extraRoutes = [];
+const registerRoute = (handler) => {
+  if (typeof handler === 'function') extraRoutes.push(handler);
+};
+const ready = (async () => {
+  const helpers = { ApiError, clone, iso, sleep, state, registerRoute };
+  for (const path of ['./mock-sites.js', './mock-certs.js']) {
+    try {
+      const mod = await import(path);
+      if (typeof mod.install === 'function') mod.install(registerRoute, helpers);
+    } catch (err) {
+      // Optional module: leave its routes out
+    }
+  }
+})();
+
+function runExtraRoutes(ctx) {
+  for (const handler of extraRoutes) {
+    const out = handler(ctx);
+    if (out !== undefined) return out;
+  }
+  return undefined;
+}
 
 function mulberry32(seed) {
   let a = seed >>> 0;
@@ -62,7 +89,9 @@ function seedSites(nodeIdx, now) {
       id: 'shop', name: 'Storefront', hosts: ['shop.example.com', 'www.example.com'], path_prefixes: [], path_regexes: [], kind: 'site',
       blue: { targets: [target(1, 11, 8080), target(1, 12, 8080)], label: 'v2.14.0' },
       green: { targets: [target(1, 21, 8080), target(1, 22, 8080)], label: 'v2.13.4' },
-      active: 'blue', maintenance: { enabled: false, page_id: null }, health, source: null,
+      active: 'blue', maintenance: { enabled: false, page_id: null }, health,
+      // On the second node the storefront is built from its repository, and its live slot is unhealthy with a rejected token
+      source: nodeIdx === 1 ? { repo: 'acme/storefront', branch: 'main', runtime: 'node', node_major: 22, poll_interval: '5m', build_command: 'pnpm build' } : null,
       history: hist([[170, 'green', 'promote', 'Release 2.13.4'], [52, 'blue', 'promote', 'Release 2.14.0-rc1'], [51, 'green', 'rollback', 'Checkout regression'], [6, 'blue', 'promote', 'Release 2.14.0']]),
     },
     {
@@ -604,6 +633,16 @@ function checkSiteShape(site) {
     }
   }
   if ((site.path_prefixes || []).some((p) => typeof p !== 'string' || !p.startsWith('/'))) throw new ApiError(400, 'path prefixes start with /');
+  if (site.source) {
+    if (typeof site.source.forge === 'string' && site.source.forge !== '') throw new ApiError(400, `site ${site.id} source: the forge is set for the whole node by the operator (CITE_STACK_FORGE); a per-site forge is not supported`);
+    const bad = firstSourceProblem(sourceToForm(site.source));
+    if (bad) throw new ApiError(400, `site ${site.id} source ${bad.field}: ${bad.message}`);
+  }
+  if (site.health) {
+    const trouble = healthProblems(site.health);
+    const first = Object.values(trouble)[0];
+    if (first) throw new ApiError(400, `site ${site.id}: health: ${first}`);
+  }
   if (site.access && (!['full', 'flexible'].includes(site.access.tls || 'full') || typeof (site.access.cloudflare_only ?? false) !== 'boolean')) throw new ApiError(400, 'invalid access settings');
   if (site.access && !['allow', 'block_bad', 'block_all'].includes(site.access.bots || 'allow')) throw new ApiError(400, 'bots must be allow, block_bad or block_all');
   if (site.access && site.access.zone_lock && !site.access.cloudflare_only) throw new ApiError(400, 'zone_lock needs cloudflare_only');
@@ -662,7 +701,11 @@ function nodeInfo(node) {
     haproxy: { running: true, config_hash: node.hap.configHash, last_reload_at: iso(node.hap.lastReload), last_reload_ok: node.hap.ok, last_error: node.hap.error || null },
     sites: node.sites.length, firewall_rules: node.rules.length,
     // The first node holds a GitHub token of its own, the second does not, so both token flows can be tried
-    github: { token_configured: node.idx === 0, source: node.idx === 0 ? 'env' : 'none' },
+    github: { token_configured: node.idx === 0, source: node.idx === 0 ? 'env' : 'none', api_host: 'api.github.com' },
+    // The second node is an older connector, so controls for features it lacks stay hidden there
+    capabilities: node.idx === 1
+      ? ['site-status', 'source-build', 'site-github-token', 'site-build-env', 'deploy-async', 'cert-generate']
+      : ['site-status', 'site-logs', 'source-build', 'site-github-token', 'site-build-env', 'site-runtime-env', 'deploy-async', 'cert-generate', 'cert-origin-ca', 'cert-acme', 'alerts', 'forges'],
   };
 }
 
@@ -714,6 +757,10 @@ async function siteRoute(node, method, seg, body) {
     if (method === 'PUT') {
       checkSiteShape(body);
       const { name, hosts, path_prefixes: pathPrefixes, path_regexes: pathRegexes, kind, health, source, access } = clone(body);
+      if (JSON.stringify(site.source || null) !== JSON.stringify(source || null)) {
+        node.pendingBuild = node.pendingBuild || new Set();
+        node.pendingBuild.add(id);
+      }
       Object.assign(site, { name, hosts, path_prefixes: pathPrefixes || [], path_regexes: pathRegexes || [], kind, health, source, access: access || { cloudflare_only: false, tls: 'full' } });
       if (!site.access.zone_lock) delete node.zones[id];
       else if (!node.zones[id]) node.zones[id] = { created_at: iso(Date.now()), fingerprint: fakeSha(id + Date.now()).slice(0, 12) };
@@ -986,6 +1033,8 @@ function exportBody(node, q) {
 async function nodeRoute(node, method, seg, q, body) {
   const [a, b, c] = seg;
   if (a === 'node') return nodeInfo(node);
+  const extra = runExtraRoutes({ node, method, seg, q, body });
+  if (extra !== undefined) return extra;
   if (a === 'sites') return siteRoute(node, method, seg.slice(1), body);
   if (a === 'pages') {
     const inUse = (id) => (node.sites.find((s) => s.maintenance.page_id === id) || {}).name;
@@ -1155,6 +1204,7 @@ export async function mockRequest(method, rawPath, body) {
   if (!state.nodes.length) {
     state.nodes.push(seedNode('edge-fra', 'https://fra.edge.example.com:8443', 0), seedNode('edge-nyc', 'https://nyc.edge.example.com:8443', 1));
   }
+  await ready;
   await sleep(70 + Math.random() * 190);
   const [pathname, search] = rawPath.split('?');
   const seg = pathname.split('/').filter(Boolean).map(decodeURIComponent);

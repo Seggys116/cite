@@ -4,10 +4,12 @@ import {
   SOURCES, STEPS, buildSite, emptySiteForm, firstProblem, reviewLines, stepProblem,
 } from '../../web/js/sitewizard.js';
 import { tokenPlan } from '../../web/js/siteCheck.js';
+import { sourceToForm } from '../../web/js/buildlib.js';
 import { newRow } from '../../web/js/conditionlib.js';
 
-const github = (over = {}) => ({
-  ...emptySiteForm(), source: 'github', repo: 'acme/storefront', name: 'Storefront', id: 'storefront', hosts: ['shop.example.com'], nodes: ['edge-1'], ...over,
+const github = ({ src = {}, ...over } = {}) => ({
+  ...emptySiteForm(), source: 'github', name: 'Storefront', id: 'storefront', hosts: ['shop.example.com'], nodes: ['edge-1'], ...over,
+  src: { ...sourceToForm({ repo: 'acme/storefront' }), ...src },
 });
 const servers = (over = {}) => ({
   ...emptySiteForm(), source: 'servers', blue: [{ addr: '10.0.0.12:8080', weight: 100 }], name: 'Api', id: 'api', hosts: ['api.example.com'], nodes: ['edge-1'], ...over,
@@ -30,10 +32,12 @@ test('step one needs a source', () => {
 
 test('GitHub details are checked field by field', () => {
   assert.equal(stepProblem(github(), 1), null);
-  assert.match(stepProblem(github({ repo: 'nope' }), 1), /owner\/name/);
-  assert.match(stepProblem(github({ branch: 'a..b' }), 1), /branch/);
-  assert.match(stepProblem(github({ runtime: 'ruby' }), 1), /node, bun, static or rust/);
-  assert.match(stepProblem(github({ poll: 'often' }), 1), /poll interval/);
+  assert.match(stepProblem(github({ src: { repo: 'nope' } }), 1), /owner\/name/);
+  assert.match(stepProblem(github({ src: { branch: 'a..b' } }), 1), /branch/);
+  assert.match(stepProblem(github({ src: { runtime: 'ruby' } }), 1), /node, bun, static or rust/);
+  assert.match(stepProblem(github({ src: { poll_interval: 'often' } }), 1), /unit such as 5m/);
+  assert.match(stepProblem(github({ src: { build_command: 'a\nb' } }), 1), /one line/);
+  assert.equal(stepProblem(github({ src: { repo: 'https://github.com/acme/storefront.git' } }), 1), null);
 });
 
 test('the token is required only when a selected node has none', () => {
@@ -74,7 +78,7 @@ test('protection never blocks and the last step needs a node', () => {
 test('create sends the user back to the first step with a problem', () => {
   assert.equal(firstProblem(github(), { tokenPlan: have, token: '' }), null);
   assert.equal(firstProblem(github({ id: '' }), { tokenPlan: have }).step, 2);
-  assert.equal(firstProblem(github({ repo: '' }), {}).step, 1);
+  assert.equal(firstProblem(github({ src: { repo: '' } }), {}).step, 1);
   assert.equal(firstProblem(emptySiteForm(), {}).step, 0);
 });
 
@@ -89,7 +93,9 @@ test('a GitHub site is sent with empty slots and its source', () => {
   assert.equal('path_regex' in site, false);
   assert.equal(site.health.path, '/');
   assert.equal('access' in site, false);
-  assert.equal(buildSite(github({ runtime: 'rust' })).source.node_major, null);
+  assert.equal(buildSite(github({ src: { runtime: 'rust', node_major: '' } })).source.node_major, null);
+  assert.equal(buildSite(github({ src: { repo: 'https://github.com/acme/storefront.git', build_command: 'make' } })).source.repo, 'acme/storefront');
+  assert.equal(buildSite(github({ src: { build_command: 'make' } })).source.build_command, 'make');
 });
 
 test('a site on your own servers keeps its targets and has no source', () => {

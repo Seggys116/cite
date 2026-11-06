@@ -11,7 +11,7 @@ For each request HAProxy applies these steps in order, and the first that answer
 3. Cloudflare-only check, for sites with `access.cloudflare_only`. A connection whose TCP peer is not in the Cloudflare range list answers 403 and is recorded with the built-in rule label `cloudflare-only`. See [Access: Cloudflare only and Flexible SSL](sites.md#access-cloudflare-only-and-flexible-ssl).
 4. Set `X-Forwarded-Proto` to `http` or `https` (for Flexible SSL sites reached through Cloudflare, from Cloudflare's header).
 5. Real client address: for Cloudflare-only sites reached through Cloudflare, the source address becomes the single valid IP in `CF-Connecting-IP`.
-6. Per-IP rate limit. Over the limit answers 429.
+6. Per-IP rate limit. Over the limit answers 429 and is recorded with the built-in rule label `rate-limit`.
 7. Maximum body size, when set. A larger `Content-Length` answers 413.
 8. Blocking firewall rules (those with an `action`), in list order. This includes a [zone lock](sites.md#zone-lock-prove-the-request-came-through-your-cloudflare-zone) rule.
 9. Bot policy, for sites with `access.bots` other than `allow`. See [Bot policy](#bot-policy).
@@ -154,7 +154,7 @@ A redirect to the node's own HTTPS (`https://` with a host placeholder) is not r
 - Normal responses to a listed origin get `Access-Control-Allow-Origin`, `-Allow-Credentials` (when set) and `-Expose-Headers` (when set). A request with two `Origin` headers is treated as having none, because HAProxy could otherwise echo the unlisted copy.
 - Without `"*"`, every response the rule applies to carries `Vary: Origin`, including requests with no or an unlisted `Origin`, so shared caches keep the variants apart. With `"*"` the value is a literal `*` and no `Vary` is added.
 
-The source address is the one HAProxy sees on the TCP connection. Behind another proxy or load balancer that is the proxy's address, not the visitor's, and `cidrs` and the rate limit act on it. The one exception is a site with `access.cloudflare_only`: for connections from a Cloudflare range the source address is replaced by `CF-Connecting-IP`, so `cidrs` and the rate limit see the visitor.
+The source address is the one HAProxy sees on the TCP connection. Behind another proxy or load balancer that is the proxy's address, not the visitor's, and `cidrs` and the rate limit act on it. The one exception is Cloudflare: for every site, a connection whose TCP peer is in the Cloudflare range list and that carries exactly one valid `CF-Connecting-IP` has its source address replaced by that header, so `cidrs` and the rate limit see the visitor and not the shared Cloudflare edge address. The header is never trusted from any other peer.
 
 ### Limits on what you can write
 
@@ -284,7 +284,7 @@ Each rewritten or disabled rule is reported by id, running the migration again c
 
 ## Rate limit
 
-`settings.per_ip_rate_limit` is the number of requests one source address may make in a 10 second window. The default is 600. Over the limit, HAProxy answers 429. Set it to `null` to turn it off; the valid range is 1 to 1000000.
+`settings.per_ip_rate_limit` is the number of requests one source address may make in a 10 second window. The default is 600. Over the limit, HAProxy answers 429 and logs the block as `rate-limit`. Requests that arrive through Cloudflare are counted per visitor (from `CF-Connecting-IP`), not per Cloudflare edge address; direct connections are counted per TCP source address. Set it to `null` to turn it off; the valid range is 1 to 1000000.
 
 HAProxy tracks sources in an IPv6-keyed stick table (IPv4 addresses are stored in their mapped form, so both families are counted) of 200000 entries that expire after 10 minutes without traffic. `settings.max_body_bytes` (off by default) rejects requests whose `Content-Length` exceeds it with 413.
 

@@ -4,11 +4,13 @@ pub mod build;
 pub mod cli;
 pub mod daemon;
 pub mod deploy;
+pub mod forge;
 pub mod github;
 pub mod helpers;
 pub mod poll;
 pub mod promote;
 pub mod reconcile;
+pub mod report;
 pub mod socket;
 
 pub use cite_core::VERSION;
@@ -124,7 +126,8 @@ pub fn run() -> ExitCode {
     if matches!(
         parsed.command,
         Some(
-            Command::BuildHelper { .. }
+            Command::Healthcheck
+                | Command::BuildHelper { .. }
                 | Command::PackHelper { .. }
                 | Command::CleanHelper { .. }
                 | Command::PtraceProbe

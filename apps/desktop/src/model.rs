@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use cite_client::{NodeInfo, NodeTargets, ReplicationMode, ReplicationPlan};
+use cite_client::{DeployRequest, NodeInfo, NodeTargets, ReplicationMode, ReplicationPlan};
 use cite_edge::analytics::{Point, SizeBucket, Summary, Timeseries, TopItem};
 use cite_edge::model::{
     EdgeSettings, FirewallAction, FirewallRule, HealthCheck, Maintenance, Matchers, Retention,
@@ -8,6 +8,8 @@ use cite_edge::model::{
 };
 use cite_edge::validate::validate_rule;
 use serde_json::Value;
+
+use crate::repo::parse_repo;
 
 pub const WINDOWS: [&str; 5] = ["15m", "1h", "24h", "7d", "30d"];
 pub const OVERVIEW_WINDOW_MINUTES: f64 = 15.0;
@@ -118,15 +120,53 @@ pub fn matcher_problem(matchers: Matchers) -> Option<String> {
     })
 }
 
-// Routing paths are checked as a rule's path matchers, which share the node's list limits and regex subset.
+// The form asks on every repaint, so the last answer is remembered for as long as the lists stay the same.
+type PathsMemo = (Vec<String>, Vec<String>, Option<String>);
+
+thread_local! {
+    static PATHS_MEMO: std::cell::RefCell<Option<PathsMemo>> = const { std::cell::RefCell::new(None) };
+    static REGEX_CACHE: std::cell::RefCell<std::collections::HashMap<String, Option<regex::Regex>>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+const REGEX_CACHE_LIMIT: usize = 128;
+
 pub fn paths_problem(prefixes: &[String], regexes: &[String]) -> Option<String> {
     if prefixes.is_empty() && regexes.is_empty() {
         return None;
     }
-    matcher_problem(Matchers {
+    let hit = PATHS_MEMO.with(|m| {
+        m.borrow()
+            .as_ref()
+            .filter(|(p, r, _)| p == prefixes && r == regexes)
+            .map(|(_, _, answer)| answer.clone())
+    });
+    if let Some(answer) = hit {
+        return answer;
+    }
+    let answer = matcher_problem(Matchers {
         path_prefixes: prefixes.to_vec(),
         path_regexes: regexes.to_vec(),
         ..Matchers::default()
+    });
+    PATHS_MEMO.with(|m| {
+        *m.borrow_mut() = Some((prefixes.to_vec(), regexes.to_vec(), answer.clone()));
+    });
+    answer
+}
+
+// Compiling is the slow part of a sample check, so each pattern is compiled once and kept.
+fn regex_hits(pattern: &str, sample: &str) -> bool {
+    REGEX_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.len() >= REGEX_CACHE_LIMIT && !cache.contains_key(pattern) {
+            cache.clear();
+        }
+        cache
+            .entry(pattern.to_string())
+            .or_insert_with(|| regex::Regex::new(pattern).ok())
+            .as_ref()
+            .is_some_and(|re| re.is_match(sample))
     })
 }
 
@@ -143,12 +183,7 @@ pub fn paths_match(prefixes: &[String], regexes: &[String], sample: &str) -> Opt
     if prefixes.iter().any(|p| sample.starts_with(p.as_str())) {
         return Some(true);
     }
-    Some(
-        regexes
-            .iter()
-            .filter_map(|r| regex::Regex::new(r).ok())
-            .any(|re| re.is_match(sample)),
-    )
+    Some(regexes.iter().any(|r| regex_hits(r, sample)))
 }
 
 pub const PATHS_HINT: &str = "Optional. Leave empty to route every path. A request is routed when its path starts with any prefix or matches any regex.";
@@ -507,10 +542,31 @@ pub enum SourceKind {
     Servers,
 }
 
+// The runtimes and Node majors the node's orchestrator accepts (docs/orchestrator.md, Source settings).
 pub const RUNTIMES: [&str; 4] = ["node", "bun", "static", "rust"];
 pub const NODE_MAJORS: [u8; 2] = [22, 24];
 pub const DEFAULT_RUNTIME: &str = "node";
 pub const DEFAULT_POLL: &str = "5m";
+pub const DEFAULT_BRANCH: &str = "main";
+pub const POLL_HELP: &str = "How often the node checks the branch for new commits: 1m or longer (for example 5m, 1h or 1d), or off to deploy only by hand.";
+pub const NODE_HELP: &str = "The Node.js version the node builds with. If the repository asks for a different version the build fails.";
+pub const BUILD_DETECTION_NOTE: &str = "Package manager and build commands are detected by the node from your lockfile (npm, pnpm, yarn or bun) and package.json scripts.";
+
+// One line for each runtime the node accepts.
+pub fn runtime_help(runtime: &str) -> &'static str {
+    match runtime {
+        "node" => "Install, build and run a Node.js site, server-rendered or static.",
+        "bun" => "Built like a Node.js site, then run by Bun.",
+        "static" => "Serve the built files only; no server process runs.",
+        "rust" => "Build and run a Rust crate. Takes no Node version.",
+        _ => "",
+    }
+}
+
+// Every runtime except rust builds with Node, so only rust takes no version.
+pub fn takes_node_major(runtime: &str) -> bool {
+    runtime.trim() != "rust"
+}
 
 #[derive(Clone, Default)]
 pub struct SiteDraft {
@@ -524,11 +580,17 @@ pub struct SiteDraft {
     pub blue: String,
     pub green: String,
     pub health_path: String,
+    // Empty means the node's default for each of these.
+    pub health_interval: String,
+    pub health_timeout: String,
+    pub health_rise: String,
+    pub health_fall: String,
     pub repo: String,
     pub branch: String,
     pub runtime: String,
     pub node_major: u8,
     pub poll_interval: String,
+    pub build: BuildDraft,
     pub github_token: String,
     pub access: crate::certs::AccessDraft,
 }
@@ -546,63 +608,94 @@ impl std::fmt::Debug for SiteDraft {
             .field("blue", &self.blue)
             .field("green", &self.green)
             .field("health_path", &self.health_path)
+            .field("health_interval", &self.health_interval)
+            .field("health_timeout", &self.health_timeout)
+            .field("health_rise", &self.health_rise)
+            .field("health_fall", &self.health_fall)
             .field("repo", &self.repo)
             .field("branch", &self.branch)
             .field("runtime", &self.runtime)
             .field("node_major", &self.node_major)
             .field("poll_interval", &self.poll_interval)
+            .field("build", &self.build)
             .field("github_token", &"[redacted]")
             .field("access", &self.access)
             .finish()
     }
 }
 
-// Accepts owner/name or a github.com URL and returns owner/name.
+// Accepts owner/name or a repository address and returns owner/name; text that cannot be read is returned as typed.
 pub fn normalize_repo(text: &str) -> String {
-    let t = text.trim().trim_end_matches('/');
-    let t = t.strip_suffix(".git").unwrap_or(t);
-    for prefix in ["https://github.com/", "http://github.com/", "github.com/"] {
-        if let Some(rest) = t.strip_prefix(prefix) {
-            return rest.to_string();
-        }
-    }
-    t.to_string()
+    parse_repo(text)
+        .map(|r| r.name)
+        .unwrap_or_else(|_| text.trim().to_string())
 }
 
 pub fn repo_problem(text: &str) -> Option<String> {
-    let repo = normalize_repo(text);
-    let part_ok = |p: &str| {
-        !p.is_empty()
-            && !p.starts_with('.')
-            && p.chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
-    };
-    let parts: Vec<&str> = repo.split('/').collect();
-    (parts.len() != 2 || !parts.iter().all(|p| part_ok(p)))
-        .then(|| "The repository must look like owner/name.".to_string())
+    parse_repo(text).err()
 }
 
+// Mirrors the node's git ref check: letters, digits, '.', '_', '/', '-', up to 100 characters.
 pub fn branch_problem(text: &str) -> Option<String> {
     let b = text.trim();
     let ok = !b.is_empty()
-        && b.len() <= 256
+        && b.len() <= 100
         && b.chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '-'))
+        && !b.starts_with('-')
         && !b.starts_with('/')
         && !b.ends_with('/')
         && !b.contains("..");
-    (!ok).then(|| "The branch contains characters git refs do not allow here.".to_string())
+    (!ok).then(|| {
+        "The branch may use letters, digits, '.', '_', '/' and '-' (up to 100 characters), cannot start with '-' and cannot contain '..'.".to_string()
+    })
 }
 
+// Mirrors the node: off or 0 disables polling, anything else is a duration of at least 60 seconds.
 pub fn poll_problem(text: &str) -> Option<String> {
     let t = text.trim();
-    let digits = t.strip_suffix(['s', 'm', 'h']).unwrap_or("");
-    let ok = !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit());
-    (!ok).then(|| "The poll interval must be a number with s, m or h, such as 5m.".to_string())
+    if t == "0" || t.eq_ignore_ascii_case("off") {
+        return None;
+    }
+    let bad = || {
+        Some("The poll interval is off, or a number with a unit such as 5m, 1h or 1d.".to_string())
+    };
+    let Some(split) = t.find(|c: char| c.is_ascii_alphabetic()) else {
+        return bad();
+    };
+    let (num, unit) = t.split_at(split);
+    let Ok(n) = num.parse::<u64>() else {
+        return bad();
+    };
+    let unit_secs: u64 = match unit.to_ascii_lowercase().as_str() {
+        "ms" => 0,
+        "s" | "sec" | "secs" => 1,
+        "m" | "min" | "mins" => 60,
+        "h" | "hr" | "hrs" => 3_600,
+        "d" | "day" | "days" => 86_400,
+        _ => return bad(),
+    };
+    let secs = if unit.eq_ignore_ascii_case("ms") {
+        n / 1000
+    } else {
+        n.saturating_mul(unit_secs)
+    };
+    if secs < 60 {
+        return Some("The poll interval must be at least 1m (or off).".into());
+    }
+    if secs > 366 * 86_400 {
+        return Some("The poll interval is too large; use at most 366d.".into());
+    }
+    None
 }
 
 pub fn runtime_problem(text: &str) -> Option<String> {
     (!RUNTIMES.contains(&text.trim())).then(|| "Pick node, bun, static or rust.".to_string())
+}
+
+pub fn node_major_problem(runtime: &str, major: u8) -> Option<String> {
+    (takes_node_major(runtime) && !NODE_MAJORS.contains(&major))
+        .then(|| "Pick Node 22 or 24.".to_string())
 }
 
 // The GitHub fields, in the order the form shows them.
@@ -610,33 +703,242 @@ pub fn github_problem(draft: &SiteDraft) -> Option<String> {
     repo_problem(&draft.repo)
         .or_else(|| branch_problem(&draft.branch))
         .or_else(|| runtime_problem(&draft.runtime))
+        .or_else(|| node_major_problem(&draft.runtime, draft.node_major))
         .or_else(|| poll_problem(&draft.poll_interval))
-        .or_else(|| {
-            (draft.runtime.trim() != "rust" && !NODE_MAJORS.contains(&draft.node_major))
-                .then(|| "Pick Node 22 or 24.".to_string())
-        })
+}
+
+// The health check from its text fields; blank fields keep the node's defaults and the node's own ranges are checked with the site.
+pub fn health_from_draft(d: &SiteDraft) -> Result<HealthCheck, String> {
+    let def = HealthCheck::default();
+    let number = |text: &str, what: &str, default: u32| -> Result<u32, String> {
+        let t = text.trim();
+        if t.is_empty() {
+            return Ok(default);
+        }
+        t.parse::<u32>()
+            .map_err(|_| format!("The health check {what} must be a whole number."))
+    };
+    Ok(HealthCheck {
+        path: d.health_path.trim().to_string(),
+        interval_ms: number(&d.health_interval, "interval", def.interval_ms)?,
+        timeout_ms: number(&d.health_timeout, "timeout", def.timeout_ms)?,
+        rise: number(&d.health_rise, "rise count", def.rise)?,
+        fall: number(&d.health_fall, "fall count", def.fall)?,
+    })
+}
+
+// The health check fields checked the way the node checks a site, so the message matches.
+pub fn health_problem(d: &SiteDraft) -> Option<String> {
+    let health = match health_from_draft(d) {
+        Ok(h) => h,
+        Err(e) => return Some(e),
+    };
+    let empty = || Upstream {
+        targets: Vec::new(),
+        label: None,
+    };
+    let probe = Site {
+        id: "probe".into(),
+        name: "probe".into(),
+        hosts: vec!["probe.example.com".into()],
+        path_prefixes: Vec::new(),
+        path_regexes: Vec::new(),
+        kind: SiteKind::Site,
+        blue: empty(),
+        green: empty(),
+        active: Slot::Blue,
+        maintenance: Maintenance::default(),
+        health,
+        source: None,
+        history: Vec::new(),
+        access: Default::default(),
+    };
+    cite_edge::validate::validate_site(&probe)
+        .err()
+        .map(|e| e.to_string().replacen("site probe: ", "", 1))
+}
+
+// The build settings as text, one field per Source field; a blank field means "let the node detect it".
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BuildDraft {
+    pub root_dir: String,
+    pub install_command: String,
+    pub build_command: String,
+    pub output_dir: String,
+    pub framework: String,
+    pub start_command: String,
+    pub spa_fallback: String,
+    // "" for auto, otherwise npm, pnpm, yarn or bun.
+    pub package_manager: String,
+    // "" for auto, otherwise static or ssr.
+    pub rendering: String,
+    // "" for auto, otherwise yes or no.
+    pub prune: String,
+    pub memory_mb: String,
+    pub cpus: String,
+    pub build_memory_mb: String,
+    pub build_cpus: String,
+}
+
+pub const PACKAGE_MANAGERS: [&str; 4] = ["npm", "pnpm", "yarn", "bun"];
+pub const RENDERINGS: [&str; 2] = ["static", "ssr"];
+// The node's defaults for the two containers, shown as hints because a blank field keeps them.
+pub const BUILD_RESOURCE_HINT: &str = "Build container default: 4 GiB of memory and 2 CPUs.";
+pub const SERVE_RESOURCE_HINT: &str = "Serving container default: 2 GiB of memory and 2 CPUs.";
+pub const RESOURCE_NOTE: &str = "Resource limits apply on the next redeploy.";
+
+fn opt_text(text: &str) -> Option<String> {
+    Some(text.trim().to_string()).filter(|t| !t.is_empty())
+}
+
+fn opt_mb(text: &str, what: &str) -> Result<Option<u32>, String> {
+    let t = text.trim();
+    if t.is_empty() {
+        return Ok(None);
+    }
+    t.parse::<u32>()
+        .map(Some)
+        .map_err(|_| format!("{what} must be a whole number of MiB."))
+}
+
+fn opt_cpus(text: &str, what: &str) -> Result<Option<cite_edge::model::Cpus>, String> {
+    let t = text.trim();
+    if t.is_empty() {
+        return Ok(None);
+    }
+    t.parse::<f32>()
+        .ok()
+        .filter(|c| c.is_finite())
+        .map(|c| Some(cite_edge::model::Cpus(c)))
+        .ok_or_else(|| format!("{what} must be a number such as 2 or 0.5."))
+}
+
+// Copies the build text fields onto a source; the node's own validation (validate_source) judges the values afterwards.
+pub fn apply_build(src: &mut Source, b: &BuildDraft) -> Result<(), String> {
+    use cite_edge::model::{PackageManager, RenderMode};
+    src.root_dir = opt_text(&b.root_dir);
+    src.install_command = opt_text(&b.install_command);
+    src.build_command = opt_text(&b.build_command);
+    src.output_dir = opt_text(&b.output_dir);
+    src.framework = opt_text(&b.framework);
+    src.start_command = opt_text(&b.start_command);
+    src.spa_fallback = opt_text(&b.spa_fallback);
+    src.package_manager = match b.package_manager.trim() {
+        "" => None,
+        "npm" => Some(PackageManager::Npm),
+        "pnpm" => Some(PackageManager::Pnpm),
+        "yarn" => Some(PackageManager::Yarn),
+        "bun" => Some(PackageManager::Bun),
+        _ => return Err("Pick npm, pnpm, yarn or bun, or leave it on auto.".into()),
+    };
+    src.rendering = match b.rendering.trim() {
+        "" => None,
+        "static" => Some(RenderMode::Static),
+        "ssr" => Some(RenderMode::Ssr),
+        _ => return Err("Pick static or ssr, or leave it on auto.".into()),
+    };
+    src.prune = match b.prune.trim() {
+        "" => None,
+        "yes" => Some(true),
+        "no" => Some(false),
+        _ => return Err("Prune is yes, no or auto.".into()),
+    };
+    src.memory_mb = opt_mb(&b.memory_mb, "Serving memory")?;
+    src.cpus = opt_cpus(&b.cpus, "Serving CPUs")?;
+    src.build_memory_mb = opt_mb(&b.build_memory_mb, "Build memory")?;
+    src.build_cpus = opt_cpus(&b.build_cpus, "Build CPUs")?;
+    Ok(())
+}
+
+pub fn build_draft_from(src: &Source) -> BuildDraft {
+    use cite_edge::model::{PackageManager, RenderMode};
+    let text = |v: &Option<String>| v.clone().unwrap_or_default();
+    BuildDraft {
+        root_dir: text(&src.root_dir),
+        install_command: text(&src.install_command),
+        build_command: text(&src.build_command),
+        output_dir: text(&src.output_dir),
+        framework: text(&src.framework),
+        start_command: text(&src.start_command),
+        spa_fallback: text(&src.spa_fallback),
+        package_manager: match src.package_manager {
+            None => "",
+            Some(PackageManager::Npm) => "npm",
+            Some(PackageManager::Pnpm) => "pnpm",
+            Some(PackageManager::Yarn) => "yarn",
+            Some(PackageManager::Bun) => "bun",
+        }
+        .to_string(),
+        rendering: match src.rendering {
+            None => "",
+            Some(RenderMode::Static) => "static",
+            Some(RenderMode::Ssr) => "ssr",
+        }
+        .to_string(),
+        prune: match src.prune {
+            None => "",
+            Some(true) => "yes",
+            Some(false) => "no",
+        }
+        .to_string(),
+        memory_mb: src.memory_mb.map(|m| m.to_string()).unwrap_or_default(),
+        cpus: src.cpus.map(|c| c.0.to_string()).unwrap_or_default(),
+        build_memory_mb: src
+            .build_memory_mb
+            .map(|m| m.to_string())
+            .unwrap_or_default(),
+        build_cpus: src.build_cpus.map(|c| c.0.to_string()).unwrap_or_default(),
+    }
+}
+
+// The source the draft describes. A stored source is the starting point, so the token name and any field the form does not own survive an edit.
+fn source_from_draft(d: &SiteDraft, base: Option<&Source>) -> Result<Source, String> {
+    if let Some(problem) = github_problem(d) {
+        return Err(problem);
+    }
+    let repo = parse_repo(&d.repo)?;
+    let runtime = d.runtime.trim().to_string();
+    let mut src = base.cloned().unwrap_or_default();
+    // The node picks the forge for the whole node and refuses a per-site one.
+    src.forge = None;
+    src.repo = repo.name;
+    src.branch = Some(d.branch.trim().to_string());
+    src.node_major = takes_node_major(&runtime).then_some(d.node_major);
+    src.runtime = Some(runtime);
+    src.poll_interval = Some(d.poll_interval.trim().to_string());
+    apply_build(&mut src, &d.build)?;
+    Ok(src)
+}
+
+// The fields every site has, shared by creating a site and editing one.
+fn fill_site(site: &mut Site, d: &SiteDraft) -> Result<(), String> {
+    if d.name.trim().is_empty() {
+        return Err("Give the site a name.".into());
+    }
+    let prefixes = clean_list(d.path_prefixes.iter().cloned());
+    let regexes = clean_list(d.path_regexes.iter().cloned());
+    if let Some(problem) = paths_problem(&prefixes, &regexes) {
+        return Err(format!("The routing paths are not valid: {problem}"));
+    }
+    site.name = d.name.trim().to_string();
+    site.hosts = parse_hosts(&d.hosts);
+    site.path_prefixes = prefixes;
+    site.path_regexes = regexes;
+    site.kind = if d.api { SiteKind::Api } else { SiteKind::Site };
+    site.health = health_from_draft(d)?;
+    site.access = d.access.to_access();
+    Ok(())
 }
 
 pub fn build_site(draft: &SiteDraft) -> Result<Site, String> {
-    if draft.name.trim().is_empty() {
-        return Err("Give the site a name.".into());
-    }
     let github = draft.source == SourceKind::Github;
     let (blue, green, source) = if github {
-        if let Some(problem) = github_problem(draft) {
-            return Err(problem);
-        }
-        let runtime = draft.runtime.trim().to_string();
         // The node builds the live slot itself, so both slots start empty.
-        let source = Source {
-            repo: normalize_repo(&draft.repo),
-            branch: Some(draft.branch.trim().to_string()),
-            node_major: (runtime != "rust").then_some(draft.node_major),
-            runtime: Some(runtime),
-            poll_interval: Some(draft.poll_interval.trim().to_string()),
-            secret: None,
-        };
-        (Vec::new(), Vec::new(), Some(source))
+        (
+            Vec::new(),
+            Vec::new(),
+            Some(source_from_draft(draft, None)?),
+        )
     } else {
         let blue = parse_targets(&draft.blue)?;
         if blue.is_empty() {
@@ -644,22 +946,13 @@ pub fn build_site(draft: &SiteDraft) -> Result<Site, String> {
         }
         (blue, parse_targets(&draft.green)?, None)
     };
-    let prefixes = clean_list(draft.path_prefixes.iter().cloned());
-    let regexes = clean_list(draft.path_regexes.iter().cloned());
-    if let Some(problem) = paths_problem(&prefixes, &regexes) {
-        return Err(format!("The routing paths are not valid: {problem}"));
-    }
-    let site = Site {
+    let mut site = Site {
         id: draft.id.trim().to_string(),
-        name: draft.name.trim().to_string(),
-        hosts: parse_hosts(&draft.hosts),
-        path_prefixes: prefixes,
-        path_regexes: regexes,
-        kind: if draft.api {
-            SiteKind::Api
-        } else {
-            SiteKind::Site
-        },
+        name: String::new(),
+        hosts: Vec::new(),
+        path_prefixes: Vec::new(),
+        path_regexes: Vec::new(),
+        kind: SiteKind::Site,
         blue: Upstream {
             targets: blue,
             label: None,
@@ -670,16 +963,90 @@ pub fn build_site(draft: &SiteDraft) -> Result<Site, String> {
         },
         active: Slot::Blue,
         maintenance: Maintenance::default(),
-        health: HealthCheck {
-            path: draft.health_path.trim().to_string(),
-            ..HealthCheck::default()
-        },
+        health: HealthCheck::default(),
         source,
         history: Vec::new(),
-        access: draft.access.to_access(),
+        access: Default::default(),
     };
-    cite_edge::validate::validate_site(&site).map_err(|e| e.to_string())?;
+    fill_site(&mut site, draft)?;
+    cite_edge::validate::validate_site_strict(&site).map_err(|e| e.to_string())?;
     Ok(site)
+}
+
+// The site as an edit would send it: everything the form owns is replaced, the slots, history and stored token stay as the node has them.
+pub fn edit_site(existing: &Site, draft: &SiteDraft) -> Result<Site, String> {
+    let mut site = existing.clone();
+    fill_site(&mut site, draft)?;
+    if let Some(old) = &existing.source {
+        site.source = Some(source_from_draft(draft, Some(old))?);
+    }
+    cite_edge::validate::validate_site_strict(&site).map_err(|e| e.to_string())?;
+    Ok(site)
+}
+
+// The node refuses an empty target list but ignores it for a source-built site, so a valid placeholder goes out.
+pub fn source_deploy_request(note: Option<String>) -> DeployRequest {
+    DeployRequest {
+        targets: vec![Target {
+            addr: "192.0.2.1:1".into(),
+            weight: 100,
+        }],
+        note,
+    }
+}
+
+// What saving would change: any difference, and whether it is one a redeploy is needed for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SiteChange {
+    pub dirty: bool,
+    pub needs_redeploy: bool,
+}
+
+pub fn site_change(existing: &Site, edited: &Site) -> SiteChange {
+    SiteChange {
+        dirty: existing != edited,
+        needs_redeploy: existing.source != edited.source,
+    }
+}
+
+// The form's starting point for a stored site.
+pub fn draft_from_site(site: &Site) -> SiteDraft {
+    let src = site.source.as_ref();
+    let runtime = src
+        .and_then(|s| s.runtime.clone())
+        .unwrap_or_else(|| DEFAULT_RUNTIME.to_string());
+    SiteDraft {
+        api: site.kind == SiteKind::Api,
+        source: if src.is_some() {
+            SourceKind::Github
+        } else {
+            SourceKind::Servers
+        },
+        name: site.name.clone(),
+        id: site.id.clone(),
+        hosts: site.hosts.join(", "),
+        path_prefixes: site.path_prefixes.clone(),
+        path_regexes: site.path_regexes.clone(),
+        blue: String::new(),
+        green: String::new(),
+        health_path: site.health.path.clone(),
+        health_interval: site.health.interval_ms.to_string(),
+        health_timeout: site.health.timeout_ms.to_string(),
+        health_rise: site.health.rise.to_string(),
+        health_fall: site.health.fall.to_string(),
+        repo: src.map(|s| s.repo.clone()).unwrap_or_default(),
+        branch: src
+            .and_then(|s| s.branch.clone())
+            .unwrap_or_else(|| DEFAULT_BRANCH.to_string()),
+        runtime,
+        node_major: src.and_then(|s| s.node_major).unwrap_or(NODE_MAJORS[0]),
+        poll_interval: src
+            .and_then(|s| s.poll_interval.clone())
+            .unwrap_or_else(|| DEFAULT_POLL.to_string()),
+        build: src.map(build_draft_from).unwrap_or_default(),
+        github_token: String::new(),
+        access: crate::certs::AccessDraft::from_access(&site.access),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -928,6 +1295,105 @@ mod tests {
     }
 
     #[test]
+    fn build_settings_round_trip_through_a_source() {
+        let mut src = Source {
+            repo: "acme/shop".into(),
+            ..Default::default()
+        };
+        let b = BuildDraft {
+            root_dir: " web ".into(),
+            build_command: "pnpm build".into(),
+            package_manager: "pnpm".into(),
+            rendering: "ssr".into(),
+            prune: "no".into(),
+            start_command: "node server.js".into(),
+            memory_mb: "1024".into(),
+            cpus: "0.5".into(),
+            build_memory_mb: "4096".into(),
+            build_cpus: "2".into(),
+            ..BuildDraft::default()
+        };
+        apply_build(&mut src, &b).expect("valid");
+        assert_eq!(src.root_dir.as_deref(), Some("web"));
+        assert_eq!(src.install_command, None);
+        assert_eq!(
+            src.package_manager,
+            Some(cite_edge::model::PackageManager::Pnpm)
+        );
+        assert_eq!(src.rendering, Some(cite_edge::model::RenderMode::Ssr));
+        assert_eq!(src.prune, Some(false));
+        assert_eq!(src.memory_mb, Some(1024));
+        assert_eq!(src.cpus.map(|c| c.0), Some(0.5));
+        assert_eq!(src.build_cpus.map(|c| c.0), Some(2.0));
+        assert!(cite_edge::validate::validate_source(&src).is_ok());
+        let back = build_draft_from(&src);
+        assert_eq!(back.root_dir, "web");
+        assert_eq!(back.cpus, "0.5");
+        assert_eq!(back.build_cpus, "2");
+        assert_eq!(back.prune, "no");
+        let mut again = src.clone();
+        apply_build(&mut again, &back).expect("valid");
+        assert_eq!(again, src);
+        apply_build(&mut again, &BuildDraft::default()).expect("blank");
+        assert_eq!(again.root_dir, None);
+        assert_eq!(again.cpus, None);
+        assert_eq!(again.repo, "acme/shop");
+    }
+
+    #[test]
+    fn bad_build_choices_and_numbers_are_refused_in_plain_words() {
+        let mut src = Source::default();
+        let bad = |f: fn(&mut BuildDraft)| {
+            let mut b = BuildDraft::default();
+            f(&mut b);
+            apply_build(&mut Source::default(), &b).unwrap_err()
+        };
+        assert!(bad(|b| b.package_manager = "pip".into()).contains("npm"));
+        assert!(bad(|b| b.rendering = "hybrid".into()).contains("static"));
+        assert!(bad(|b| b.prune = "maybe".into()).contains("yes"));
+        assert!(bad(|b| b.memory_mb = "lots".into()).contains("MiB"));
+        assert!(bad(|b| b.build_cpus = "two".into()).contains("CPUs"));
+        assert!(bad(|b| b.cpus = "inf".into()).contains("CPUs"));
+        src.repo = "acme/shop".into();
+        src.memory_mb = Some(64);
+        assert!(cite_edge::validate::validate_source(&src).is_err());
+    }
+
+    #[test]
+    fn an_edit_keeps_what_the_form_does_not_own() {
+        let mut stored = build_site(&github_draft()).expect("valid");
+        let src = stored.source.as_mut().expect("source");
+        src.secret = Some("site-token-name".into());
+        src.forge = Some("github".into());
+        let mut d = draft_from_site(&stored);
+        d.build.install_command = "npm ci".into();
+        let edited = edit_site(&stored, &d).expect("valid");
+        let got = edited.source.expect("source");
+        assert_eq!(got.secret.as_deref(), Some("site-token-name"));
+        assert_eq!(got.install_command.as_deref(), Some("npm ci"));
+        assert_eq!(
+            got.forge, None,
+            "a per-site forge is dropped, the node refuses it"
+        );
+    }
+
+    #[test]
+    fn path_checks_are_remembered_between_calls() {
+        let p = vec!["/api".to_string()];
+        let r = vec!["^/v[0-9]+/".to_string()];
+        assert_eq!(paths_problem(&p, &r), None);
+        assert_eq!(paths_problem(&p, &r), None);
+        let bad = vec!["(".to_string()];
+        assert!(paths_problem(&p, &bad).is_some());
+        assert!(paths_problem(&p, &bad).is_some());
+        assert_eq!(paths_problem(&p, &r), None);
+        for _ in 0..3 {
+            assert_eq!(paths_match(&p, &r, "/v2/x"), Some(true));
+            assert_eq!(paths_match(&p, &r, "/zzz"), Some(false));
+        }
+    }
+
+    #[test]
     fn number_formatting() {
         assert_eq!(fmt_num(950), "950");
         assert_eq!(fmt_num(1_234), "1.2K");
@@ -1152,7 +1618,8 @@ mod tests {
             ("acme/shop", true),
             ("https://github.com/acme/shop", true),
             ("acme", false),
-            ("acme/.hidden", false),
+            ("acme/.github", true),
+            ("git@github.com:acme/shop.git", true),
             ("a/b/c", false),
             ("", false),
         ] {
@@ -1160,6 +1627,9 @@ mod tests {
             x.repo = repo.into();
             assert_eq!(build_site(&x).is_ok(), ok, "{repo}");
         }
+        let mut url = d.clone();
+        url.repo = "https://github.com/acme/shop.git".into();
+        assert_eq!(build_site(&url).unwrap().source.unwrap().repo, "acme/shop");
         let mut x = d.clone();
         x.runtime = "ruby".into();
         assert!(build_site(&x).unwrap_err().contains("Pick node"));
@@ -1175,6 +1645,245 @@ mod tests {
         x.runtime = "rust".into();
         let site = build_site(&x).expect("rust needs no node version");
         assert_eq!(site.source.expect("source").node_major, None);
+    }
+
+    #[test]
+    fn poll_intervals_follow_the_nodes_rules() {
+        for ok in [
+            "5m", "60s", "1m", "2h", "1d", "off", "OFF", "0", " 10m ", "120sec", "3days", "60000ms",
+        ] {
+            assert!(poll_problem(ok).is_none(), "{ok}");
+        }
+        for (bad, word) in [
+            ("10s", "at least"),
+            ("59s", "at least"),
+            ("0m", "at least"),
+            ("500ms", "at least"),
+            ("5", "off, or a number"),
+            ("m", "off, or a number"),
+            ("", "off, or a number"),
+            ("soon", "off, or a number"),
+            ("5x", "off, or a number"),
+            ("-5m", "off, or a number"),
+            ("1.5h", "off, or a number"),
+            ("999d", "too large"),
+        ] {
+            let got = poll_problem(bad).unwrap_or_else(|| panic!("{bad} should fail"));
+            assert!(got.contains(word), "{bad}: {got}");
+        }
+    }
+
+    #[test]
+    fn branches_follow_the_nodes_ref_rules() {
+        for ok in ["main", "release/1.2", "feature_x-y", "v1.0.0"] {
+            assert!(branch_problem(ok).is_none(), "{ok}");
+        }
+        let long = "a".repeat(101);
+        for bad in [
+            "",
+            " ",
+            "-x",
+            "/x",
+            "x/",
+            "a..b",
+            "a b",
+            "a~b",
+            "a:b",
+            long.as_str(),
+        ] {
+            assert!(branch_problem(bad).is_some(), "{bad:?}");
+        }
+        assert!(branch_problem(&"a".repeat(100)).is_none());
+    }
+
+    #[test]
+    fn every_runtime_has_a_one_line_explanation() {
+        for r in RUNTIMES {
+            assert!(
+                !runtime_help(r).is_empty() && !runtime_help(r).contains('\n'),
+                "{r}"
+            );
+        }
+        assert_eq!(runtime_help("cobol"), "");
+        assert!(takes_node_major("node") && takes_node_major("bun") && takes_node_major("static"));
+        assert!(!takes_node_major("rust"));
+        assert!(node_major_problem("rust", 0).is_none());
+        assert!(node_major_problem("node", 24).is_none());
+        assert!(node_major_problem("bun", 18).is_some());
+        assert!(
+            BUILD_DETECTION_NOTE.contains("lockfile")
+                && BUILD_DETECTION_NOTE.contains("package.json")
+        );
+    }
+
+    #[test]
+    fn health_checks_come_from_text_with_defaults() {
+        let mut d = draft();
+        let h = health_from_draft(&d).expect("defaults");
+        assert_eq!(
+            (h.interval_ms, h.timeout_ms, h.rise, h.fall),
+            (2000, 1500, 2, 3)
+        );
+        d.health_interval = " 5000 ".into();
+        d.health_timeout = "1000".into();
+        d.health_rise = "3".into();
+        d.health_fall = "4".into();
+        let h = health_from_draft(&d).expect("set");
+        assert_eq!(
+            (h.interval_ms, h.timeout_ms, h.rise, h.fall),
+            (5000, 1000, 3, 4)
+        );
+        d.health_rise = "two".into();
+        assert!(health_from_draft(&d).unwrap_err().contains("rise count"));
+        let site = build_site(&draft()).expect("valid");
+        assert_eq!(site.health.path, "/");
+        assert!(health_problem(&draft()).is_none());
+        let mut odd = draft();
+        odd.health_path = "health".into();
+        assert!(health_problem(&odd).unwrap().contains("health path"));
+        odd.health_path = "/".into();
+        odd.health_fall = "11".into();
+        assert!(health_problem(&odd).unwrap().contains("fall"));
+        odd.health_fall = "x".into();
+        assert!(health_problem(&odd).unwrap().contains("whole number"));
+        let mut slow = draft();
+        slow.health_interval = "50".into();
+        assert!(build_site(&slow).unwrap_err().contains("100"));
+        let mut tangled = draft();
+        tangled.health_interval = "1000".into();
+        tangled.health_timeout = "2000".into();
+        assert!(build_site(&tangled).unwrap_err().contains("timeout"));
+        let mut bad_path = draft();
+        bad_path.health_path = "health".into();
+        assert!(build_site(&bad_path).is_err());
+    }
+
+    #[test]
+    fn editing_replaces_form_fields_and_keeps_the_rest() {
+        let mut stored = build_site(&github_draft()).expect("valid");
+        stored.source.as_mut().unwrap().secret = Some("site-token-name".into());
+        stored.history.push(cite_edge::model::Deployment {
+            id: "d1".into(),
+            at: "2025-01-01T00:00:00Z".into(),
+            slot: Slot::Blue,
+            action: cite_edge::model::DeployAction::Promote,
+            note: "first".into(),
+        });
+        stored.blue.targets = vec![Target {
+            addr: "10.0.0.1:3000".into(),
+            weight: 100,
+        }];
+        let unchanged = edit_site(&stored, &draft_from_site(&stored)).expect("round trip");
+        assert_eq!(unchanged, stored);
+        assert_eq!(
+            site_change(&stored, &unchanged),
+            SiteChange {
+                dirty: false,
+                needs_redeploy: false
+            }
+        );
+
+        let mut d = draft_from_site(&stored);
+        d.name = "Renamed".into();
+        d.hosts = "a.example.com, b.example.com".into();
+        d.api = true;
+        d.path_prefixes = vec!["/api".into()];
+        d.health_interval = "3000".into();
+        let renamed = edit_site(&stored, &d).expect("valid");
+        assert_eq!(renamed.name, "Renamed");
+        assert_eq!(renamed.hosts.len(), 2);
+        assert_eq!(renamed.kind, SiteKind::Api);
+        assert_eq!(renamed.id, stored.id);
+        assert_eq!(renamed.history, stored.history);
+        assert_eq!(renamed.blue, stored.blue);
+        assert_eq!(renamed.active, stored.active);
+        assert_eq!(renamed.source, stored.source);
+        assert_eq!(
+            site_change(&stored, &renamed),
+            SiteChange {
+                dirty: true,
+                needs_redeploy: false
+            }
+        );
+
+        let mut d = draft_from_site(&stored);
+        d.repo = "https://github.com/acme/other.git".into();
+        d.branch = "release".into();
+        d.runtime = "bun".into();
+        d.node_major = 24;
+        d.poll_interval = "1h".into();
+        let moved = edit_site(&stored, &d).expect("valid");
+        let src = moved.source.clone().expect("source");
+        assert_eq!(src.repo, "acme/other");
+        assert_eq!(src.branch.as_deref(), Some("release"));
+        assert_eq!(src.runtime.as_deref(), Some("bun"));
+        assert_eq!(src.node_major, Some(24));
+        assert_eq!(src.poll_interval.as_deref(), Some("1h"));
+        assert_eq!(src.secret.as_deref(), Some("site-token-name"));
+        assert_eq!(
+            site_change(&stored, &moved),
+            SiteChange {
+                dirty: true,
+                needs_redeploy: true
+            }
+        );
+
+        d.runtime = "rust".into();
+        assert_eq!(
+            edit_site(&stored, &d).unwrap().source.unwrap().node_major,
+            None
+        );
+        d.poll_interval = "5s".into();
+        assert!(edit_site(&stored, &d).is_err());
+    }
+
+    #[test]
+    fn a_source_redeploy_sends_a_target_the_node_accepts_and_ignores() {
+        let req = source_deploy_request(Some("rebuild".into()));
+        assert_eq!(req.note.as_deref(), Some("rebuild"));
+        assert_eq!(req.targets.len(), 1);
+        let mut site = build_site(&github_draft()).expect("valid");
+        site.blue.targets = req.targets.clone();
+        cite_edge::validate::validate_site(&site).unwrap();
+        assert!(source_deploy_request(None).note.is_none());
+    }
+
+    #[test]
+    fn editing_a_server_site_never_adds_a_source() {
+        let stored = build_site(&draft()).expect("valid");
+        let mut d = draft_from_site(&stored);
+        assert_eq!(d.source, SourceKind::Servers);
+        d.repo = "acme/shop".into();
+        d.name = "Other".into();
+        let edited = edit_site(&stored, &d).expect("valid");
+        assert!(edited.source.is_none());
+        assert_eq!(edited.blue, stored.blue);
+        d.hosts = "".into();
+        assert!(edit_site(&stored, &d).is_err());
+    }
+
+    #[test]
+    fn the_form_starts_from_the_stored_site() {
+        let mut stored = build_site(&github_draft()).expect("valid");
+        stored.source = Some(Source {
+            repo: "acme/shop".into(),
+            secret: Some("name".into()),
+            ..Default::default()
+        });
+        let d = draft_from_site(&stored);
+        assert_eq!(d.source, SourceKind::Github);
+        assert_eq!(
+            (
+                d.branch.as_str(),
+                d.runtime.as_str(),
+                d.node_major,
+                d.poll_interval.as_str()
+            ),
+            ("main", "node", 22, "5m")
+        );
+        assert!(d.github_token.is_empty());
+        assert_eq!(d.health_interval, "2000");
+        assert_eq!(d.hosts, "shop.example.com, www.example.com");
     }
 
     #[test]
@@ -1276,6 +1985,7 @@ mod tests {
         let info = NodeInfo {
             name: "n".into(),
             version: "1".into(),
+            capabilities: Vec::new(),
             github: None,
             extra,
         };
@@ -1291,6 +2001,7 @@ mod tests {
         let bare = NodeInfo {
             name: String::new(),
             version: String::new(),
+            capabilities: Vec::new(),
             github: None,
             extra: Default::default(),
         };
@@ -1300,6 +2011,7 @@ mod tests {
             github: Some(cite_client::GithubInfo {
                 token_configured: true,
                 source: "env".into(),
+                api_host: None,
             }),
             ..bare
         };

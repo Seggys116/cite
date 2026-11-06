@@ -6,13 +6,13 @@ import {
 import {
   BOT_POLICIES, BOT_SPOOF_NOTE, CLOUDFLARE_ONLY_HELP, CLOUDFLARE_ONLY_LABEL, FLEXIBLE_WARNING, TLS_FLEXIBLE_LABEL, TLS_FULL_LABEL,
   ZONE_LOCK_HELP, ZONE_LOCK_LABEL, ZONE_LOCK_NEEDS_CLOUDFLARE, ZONE_LOCK_TOGGLE,
-  accessOf, botWarning, flexibleWithoutCloudflare, rangesLine, tlsHelp, zoneLockOpenByDefault,
+  accessOf, botStatusLine, botWarning, flexibleWithoutCloudflare, rangesLine, tlsHelp, userAgentRulesFor, userAgentRulesLine, zoneLockOpenByDefault,
 } from '../accesslib.js';
 import { rotateAndShow, zoneStatusText } from './zoneSecret.js';
 
 // Who may reach the site and how Cloudflare speaks to the node; shared by the create form and the routing tab.
 // On a saved site (site given) it also reports the zone secret and offers to rotate it.
-export function accessCard({ node, site, onChange }) {
+export function accessCard({ node, site, siteId = site && site.id, onChange }) {
   const value = accessOf(site);
   const only = toggle({
     checked: value.cloudflare_only,
@@ -29,7 +29,7 @@ export function accessCard({ node, site, onChange }) {
   const help = h('span', { class: 'hint', role: 'status', 'aria-live': 'polite' });
   const warn = h('p', { class: 'notice warn', role: 'status', 'aria-live': 'polite', hidden: true }, FLEXIBLE_WARNING);
   const mode = segmented({
-    label: 'SSL mode',
+    label: 'HTTPS mode',
     value: value.tls,
     options: [{ value: 'full', label: TLS_FULL_LABEL }, { value: 'flexible', label: TLS_FLEXIBLE_LABEL }],
     onChange: (next) => {
@@ -54,7 +54,32 @@ export function accessCard({ node, site, onChange }) {
     sync();
   });
 
+  // Allow says plainly that nothing blocks bots, and the rules that could are listed so the owner can judge for themselves
+  const botLine = h('p', { class: 'hint', role: 'status', 'aria-live': 'polite' });
+  const ruleLine = h('p', { class: 'hint' });
+  const ruleList = h('ul', { class: 'plain-list' });
+  let nodeRules = [];
+  const drawRules = () => {
+    const id = typeof siteId === 'function' ? siteId() : siteId;
+    const list = userAgentRulesFor(nodeRules, id);
+    ruleLine.textContent = userAgentRulesLine(list);
+    ruleLine.hidden = !node;
+    ruleList.replaceChildren(...list.map((r) => h('li', {},
+      h('a', { class: 'link', href: '#/firewall' }, r.name),
+      h('span', { class: 'muted' }, ` (${r.scope}${r.enabled ? '' : ', switched off'}${r.action ? `, ${r.action}` : ''}): `),
+      h('code', { class: 'mono' }, r.patterns.join(', ')))));
+  };
+  if (node) {
+    nodeApi(node).get('/firewall/rules').then((rules) => {
+      nodeRules = Array.isArray(rules) ? rules : [];
+      drawRules();
+    }).catch(() => {});
+  }
+
   function sync() {
+    botLine.textContent = botStatusLine(value.bots);
+    botLine.classList.toggle('warn-text', value.bots === 'allow');
+    drawRules();
     help.textContent = tlsHelp(value.tls);
     warn.hidden = !flexibleWithoutCloudflare(value);
     seo.textContent = botWarning(value.bots);
@@ -127,7 +152,7 @@ export function accessCard({ node, site, onChange }) {
       warn,
       h('div', {}, advancedToggle),
       advanced,
-      h('div', { class: 'field' }, h('span', { class: 'field-label' }, 'Bot policy'), bots, h('span', { class: 'hint' }, BOT_SPOOF_NOTE), seo)),
+      h('div', { class: 'field' }, h('span', { class: 'field-label' }, 'Bot policy'), bots, botLine, h('span', { class: 'hint' }, BOT_SPOOF_NOTE), seo, ruleLine, ruleList)),
   });
   return { el, get: () => ({ ...value }) };
 }

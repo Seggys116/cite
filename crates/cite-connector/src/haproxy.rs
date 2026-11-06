@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use cite_core::atomic::{ensure_dir, write_atomic};
 use cite_edge::model::{BotPolicy, EdgeConfig, FirewallRule, SiteAccess, Slot};
 use cite_edge::presets::{ZONE_HEADER, with_zone_locks};
-use cite_edge::render::{RenderOptions, Rendered, config_hash, render};
+use cite_edge::render::{RenderOptions, Rendered, config_hash, render, render_automatic_https};
 use cite_edge::runtime::{
     BackendStat, all_servers_up, cmd_set_active, cmd_set_maintenance, cmd_show_stat, parse_stat_csv,
 };
@@ -116,6 +116,7 @@ struct State {
 
 pub struct Haproxy {
     certs_dir: PathBuf,
+    certs_mode: u32,
     haproxy_dir: PathBuf,
     maps_dir: PathBuf,
     pages_dir: PathBuf,
@@ -154,6 +155,43 @@ pub fn needs_live_haproxy(before: &EdgeConfig, after: &EdgeConfig) -> bool {
             .firewall
             .iter()
             .any(|r| sensitive(r) && !before.firewall.contains(r))
+}
+
+// Only the rendered copy gets the automatic TLS port, so settings in edge.json stay exactly what the owner set; the flag says the port is automatic.
+fn with_auto_https(edge: Cow<'_, EdgeConfig>) -> (Cow<'_, EdgeConfig>, bool) {
+    let port = certs::effective_https_port(&edge);
+    if port == edge.settings.https_port {
+        return (edge, false);
+    }
+    let automatic = edge.settings.https_port.is_none();
+    let mut owned = edge.into_owned();
+    owned.settings.https_port = port;
+    (Cow::Owned(owned), automatic)
+}
+
+fn render_with(
+    edge: &EdgeConfig,
+    options: &RenderOptions,
+    automatic: bool,
+) -> std::result::Result<Rendered, cite_edge::validate::ValidationError> {
+    if automatic {
+        render_automatic_https(edge, options)
+    } else {
+        render(edge, options)
+    }
+}
+
+// HAProxy reports a taken port only as a reload failure, so the cause is named for the owner.
+fn bind_hint(msg: &str, port: Option<u16>) -> String {
+    let lower = msg.to_ascii_lowercase();
+    match port {
+        Some(port) if lower.contains("cannot bind") || lower.contains("address already in use") => {
+            format!(
+                "HAProxy could not bind the HTTPS port {port}; is another service using it? The previous configuration keeps serving. {msg}"
+            )
+        }
+        _ => msg.to_string(),
+    }
 }
 
 // Header secrets reach the rendered text and can be quoted back by HAProxy's own messages, so every text that leaves this module is scrubbed.
@@ -478,6 +516,7 @@ impl Haproxy {
         };
         Haproxy {
             certs_dir: cfg.certs_dir.clone(),
+            certs_mode: cfg.certs_mode,
             haproxy_dir: cfg.haproxy_dir.clone(),
             maps_dir: cfg.maps_dir.clone(),
             pages_dir: cfg.pages_dir.clone(),
@@ -616,7 +655,33 @@ impl Haproxy {
         }
     }
 
+    // The node's own certificates are made first so the digest and the TLS bind see them, and they are put back if this apply fails.
     async fn apply_locked(&self, edge: &EdgeConfig, force: bool) -> Result<ApplyOutcome> {
+        let store = certs::CertStore::new(self.certs_dir.clone(), self.certs_mode);
+        let config = edge.clone();
+        let now = i64::try_from(crate::store::now_unix()).unwrap_or(i64::MAX);
+        let (store, undo) = tokio::task::spawn_blocking(move || {
+            let undo = store.sync_auto(&config, now);
+            (store, undo)
+        })
+        .await
+        .map_err(internal)?;
+        let undo = undo?;
+        match self.apply_synced(edge, force).await {
+            // a reload HAProxy refused is rolled back by the caller, so the certificates made for it go too
+            Ok(out) if out.running && out.reload_error.is_some() => {
+                let _ = tokio::task::spawn_blocking(move || store.rollback_auto(undo)).await;
+                Ok(out)
+            }
+            Ok(out) => Ok(out),
+            Err(err) => {
+                let _ = tokio::task::spawn_blocking(move || store.rollback_auto(undo)).await;
+                Err(err)
+            }
+        }
+    }
+
+    async fn apply_synced(&self, edge: &EdgeConfig, force: bool) -> Result<ApplyOutcome> {
         let locked: Vec<String> = edge
             .sites
             .iter()
@@ -627,14 +692,14 @@ impl Haproxy {
         let plan = self.zones.plan(&locked)?;
         let mut secrets = secret_values(edge, &self.zones);
         secrets.extend(plan.secrets());
-        let effective = self.with_locks(edge, &plan)?;
+        let (effective, automatic) = with_auto_https(self.with_locks(edge, &plan)?);
         let edge: &EdgeConfig = &effective;
         let certs_dir = self.certs_dir.clone();
         let live = tokio::task::spawn_blocking(move || certs::live_set(&certs_dir))
             .await
             .map_err(internal)?;
         let options = self.render_options(&self.maps_dir, &self.pages_dir, &live)?;
-        let rendered = render(edge, &options)?;
+        let rendered = render_with(edge, &options, automatic)?;
         let hash = apply_hash(&rendered, &live);
         let files_current = self.files_current(&hash, &rendered);
         let loaded = self.state().applied.as_deref() == Some(hash.as_str());
@@ -649,7 +714,10 @@ impl Haproxy {
             });
         }
         if !files_current {
-            if let Err(err) = self.validate_and_install(edge, &rendered, &live).await {
+            if let Err(err) = self
+                .validate_and_install(edge, &rendered, &live, automatic)
+                .await
+            {
                 return Err(scrub_error(err, &secrets));
             }
             let mut st = self.state();
@@ -661,7 +729,7 @@ impl Haproxy {
         }
         let mut result = self.reload_master().await;
         if let Some(msg) = result.error.as_mut() {
-            *msg = scrub(msg, &secrets);
+            *msg = bind_hint(&scrub(msg, &secrets), edge.settings.https_port);
             self.state().status.last_error = Some(msg.clone());
         }
         if result.reloaded {
@@ -685,9 +753,10 @@ impl Haproxy {
         edge: &EdgeConfig,
         rendered: &Rendered,
         live: &LiveSet,
+        automatic: bool,
     ) -> Result<()> {
         if self.validate {
-            self.validate_staged(edge, live).await?;
+            self.validate_staged(edge, live, automatic).await?;
         }
         let (maps, pages, cfg) = (
             self.maps_dir.clone(),
@@ -701,13 +770,18 @@ impl Haproxy {
     }
 
     // The staged copy points at its own maps and pages so the check never depends on live files; the certificate directory is the live one, so a bad certificate fails here.
-    async fn validate_staged(&self, edge: &EdgeConfig, live: &LiveSet) -> Result<()> {
+    async fn validate_staged(
+        &self,
+        edge: &EdgeConfig,
+        live: &LiveSet,
+        automatic: bool,
+    ) -> Result<()> {
         let stage = self.haproxy_dir.join(STAGE_DIR);
         let stage_maps = stage.join("maps");
         let stage_pages = stage.join("pages");
         let cfg_path = stage.join("haproxy.cfg");
         let options = self.render_options(&stage_maps, &stage_pages, live)?;
-        let staged = render(edge, &options)?;
+        let staged = render_with(edge, &options, automatic)?;
         let write = {
             let (maps, pages, cfg) = (stage_maps, stage_pages, cfg_path.clone());
             tokio::task::spawn_blocking(move || write_files(&maps, &pages, &cfg, &staged))
@@ -911,6 +985,7 @@ mod tests {
         let root = dir.path();
         Haproxy {
             certs_dir: root.join("data/certs"),
+            certs_mode: 0o600,
             haproxy_dir: root.join("haproxy"),
             maps_dir: root.join("haproxy/maps"),
             pages_dir: root.join("haproxy/pages"),
@@ -1959,6 +2034,113 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&out.stderr)
         );
+    }
+
+    fn behind_cloudflare(id: &str) -> Site {
+        let mut s = site(id);
+        s.access.cloudflare_only = true;
+        s
+    }
+
+    #[tokio::test]
+    async fn a_cloudflare_site_gets_an_automatic_certificate_and_the_tls_bind_without_any_setting()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let tools = tempfile::tempdir().unwrap();
+        let script = tools.path().join("fake-haproxy");
+        fs::write(
+            &script,
+            "#!/bin/sh\ncp \"$3\" \"$(dirname \"$0\")/capture.cfg\"\nexit 0\n",
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut hp = haproxy_in(&dir, "127.0.0.1:9");
+        hp.validate = true;
+        hp.haproxy_bin = script.display().to_string();
+        let cfg = edge(vec![behind_cloudflare("shop")]);
+
+        hp.apply(&cfg).await.unwrap();
+        let file = hp.certs_dir.join("auto-shop.pem");
+        assert!(file.is_file(), "the automatic certificate is on disk");
+        let bind = format!("bind :443 ssl crt {}", hp.certs_dir.display());
+        assert!(hp.current_config_text().unwrap().contains(&bind));
+        let checked = fs::read_to_string(tools.path().join("capture.cfg")).unwrap();
+        assert!(checked.contains(&bind), "haproxy -c saw the TLS bind");
+        assert!(
+            cfg.settings.https_port.is_none(),
+            "edge.json settings are untouched"
+        );
+
+        // a node without such a site keeps today's behaviour
+        let plain = edge(vec![site("shop")]);
+        hp.apply(&plain).await.unwrap();
+        assert!(!file.exists());
+        assert!(!hp.current_config_text().unwrap().contains("ssl crt"));
+    }
+
+    #[tokio::test]
+    async fn an_explicit_https_port_wins_over_the_automatic_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let hp = haproxy_in(&dir, "127.0.0.1:9");
+        let mut cfg = edge(vec![behind_cloudflare("shop")]);
+        cfg.settings.https_port = Some(8443);
+        hp.apply(&cfg).await.unwrap();
+        let text = hp.current_config_text().unwrap();
+        assert!(text.contains("bind :8443 ssl crt") && !text.contains("bind :443"));
+    }
+
+    #[tokio::test]
+    async fn a_failed_check_puts_the_automatic_certificates_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut hp = haproxy_in(&dir, "127.0.0.1:9");
+        hp.validate = true;
+        hp.haproxy_bin = "false".into();
+        let cfg = edge(vec![behind_cloudflare("shop")]);
+        assert!(hp.apply(&cfg).await.is_err());
+        assert!(!hp.certs_dir.join("auto-shop.pem").exists());
+    }
+
+    #[tokio::test]
+    async fn a_refused_reload_puts_the_automatic_certificates_back() {
+        let (hp, _seen, _dir) = reloading_haproxy(REFUSED).await;
+        let out = hp
+            .apply(&edge(vec![behind_cloudflare("shop")]))
+            .await
+            .unwrap();
+        assert!(out.running && out.reload_error.is_some());
+        assert!(!hp.certs_dir.join("auto-shop.pem").exists());
+    }
+
+    #[tokio::test]
+    async fn automatic_certificates_cover_only_cloudflare_aware_sites() {
+        let dir = tempfile::tempdir().unwrap();
+        let hp = haproxy_in(&dir, "127.0.0.1:9");
+        let cfg = edge(vec![site("plain"), behind_cloudflare("shop")]);
+        hp.apply(&cfg).await.unwrap();
+        assert!(hp.certs_dir.join("auto-shop.pem").is_file());
+        assert!(!hp.certs_dir.join("auto-plain.pem").exists());
+    }
+
+    #[tokio::test]
+    async fn https_port_zero_never_binds_the_automatic_listener() {
+        let dir = tempfile::tempdir().unwrap();
+        let hp = haproxy_in(&dir, "127.0.0.1:9");
+        let mut cfg = edge(vec![behind_cloudflare("shop")]);
+        cfg.settings.https_port = Some(0);
+        hp.apply(&cfg).await.unwrap();
+        assert!(!hp.certs_dir.join("auto-shop.pem").exists());
+        assert!(!hp.current_config_text().unwrap().contains("ssl crt"));
+    }
+
+    #[test]
+    fn a_taken_https_port_is_named_in_the_reload_error() {
+        let hint = bind_hint(
+            "[ALERT] cannot bind socket (Address already in use) for [0.0.0.0:443]",
+            Some(443),
+        );
+        assert!(hint.contains("HTTPS port 443") && hint.contains("keeps serving"));
+        assert_eq!(bind_hint("something else", Some(443)), "something else");
+        assert_eq!(bind_hint("cannot bind", None), "cannot bind");
     }
 
     #[tokio::test]

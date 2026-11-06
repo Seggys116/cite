@@ -29,6 +29,8 @@ pub struct State {
     pub data: Load<Data>,
     pub inspect: Option<LogEvent>,
     pub auto_inspect: bool,
+    // Set while a recent-list refresh is on the wire, so slow nodes are not asked again on every timer tick.
+    pub refreshing: bool,
 }
 
 impl Default for State {
@@ -38,6 +40,7 @@ impl Default for State {
             data: Load::Idle,
             inspect: None,
             auto_inspect: false,
+            refreshing: false,
         }
     }
 }
@@ -50,10 +53,12 @@ impl Console {
         let window = WINDOWS[self.traffic.window];
         let fut = async move {
             let one = |h: crate::api::NodeHandle| async move {
-                let summary = h.summary(window).await?;
-                let series = h.series(window).await?;
-                let recent = h.requests(window, RECENT_LIMIT).await?;
-                Ok::<_, cite_client::ClientError>((summary, series, recent))
+                let (summary, series, recent) = tokio::join!(
+                    h.summary(window),
+                    h.series(window),
+                    h.requests(window, RECENT_LIMIT)
+                );
+                Ok::<_, cite_client::ClientError>((summary?, series?, recent?))
             };
             let results = join_all(handles.into_iter().map(one).collect()).await;
             let mut parts = Vec::new();
@@ -100,9 +105,10 @@ impl Console {
 
     // Only the recent list refreshes on the timer; the aggregates stay put.
     pub fn refresh_recent(&mut self, cx: &mut Context<Self>) {
-        if !matches!(self.traffic.data, Load::Ready(_)) {
+        if !matches!(self.traffic.data, Load::Ready(_)) || self.traffic.refreshing {
             return;
         }
+        self.traffic.refreshing = true;
         let handles = self.selected_handles();
         let window = WINDOWS[self.traffic.window];
         let fut = async move {
@@ -123,7 +129,9 @@ impl Console {
             recent.truncate(RECENT_LIMIT);
             Ok(recent)
         };
-        self.fetch_scoped(cx, fut, |this, res, cx| {
+        // Unscoped on purpose: the guard must clear even when the scope moved on while this was running.
+        self.fetch(cx, fut, |this, res, cx| {
+            this.traffic.refreshing = false;
             if let (Ok(recent), Load::Ready(data)) = (res, &mut this.traffic.data) {
                 data.recent = recent;
                 cx.notify();

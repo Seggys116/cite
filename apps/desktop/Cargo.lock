@@ -863,7 +863,7 @@ dependencies = [
 
 [[package]]
 name = "cite-client"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "bytes",
  "cite-edge",
@@ -879,7 +879,7 @@ dependencies = [
 
 [[package]]
 name = "cite-desktop"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "cite-client",
  "cite-edge",
@@ -896,7 +896,7 @@ dependencies = [
 
 [[package]]
 name = "cite-edge"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "argon2",
  "getrandom 0.3.4",

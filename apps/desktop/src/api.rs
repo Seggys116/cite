@@ -4,15 +4,21 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use cite_client::{
+    AnalyticsMeta, AnalyticsQuery, BotReport, Facets, RequestCursor, RequestsPage, SummaryReport,
+    TimeseriesReport, TopReport, TopSort,
+};
+use cite_client::{
     AnalyticsStats, ArchiveEntry, ArchiveList, ClientError, CreatedToken, CutReport, DeployRequest,
-    ExportQuery, ExportReport, NodeClient, NodeConfig, NodeInfo, PresetInfo, RequestQuery,
-    RestoreReport, SiteDetail, TokenMeta,
+    EnvPatch, ExportQuery, ExportReport, GithubTokenBody, LogsQuery, NodeClient, NodeConfig,
+    NodeInfo, PresetInfo, RequestQuery, RestoreReport, SiteDetail, TokenMeta, TokenStatus,
 };
 use cite_edge::analytics::{Summary, Timeseries, TopItem};
 use cite_edge::bot::BotSummary;
 use cite_edge::model::{
     Deployment, EdgeSettings, FirewallRule, LogEvent, MaintenancePage, Site, Slot,
 };
+use cite_edge::status::{LogsResponse, SiteStatus};
+use serde_json::Value;
 
 use crate::archive::CutSpec;
 use crate::certs::{CertItem, CertListing, RangesListing, UploadOutcome, UploadRequest};
@@ -457,6 +463,218 @@ impl NodeHandle {
             Self::Demo(_, d) => d.delete_token(id),
         }
     }
+
+    pub async fn site_status(&self, site: &str) -> Res<SiteStatus> {
+        match self {
+            Self::Live(c) => decode_value(c.site_status(site).await?),
+            Self::Demo(_, d) => d.site_status(site),
+        }
+    }
+
+    pub async fn site_logs(&self, site: &str, query: &LogsQuery) -> Res<LogsResponse> {
+        match self {
+            Self::Live(c) => decode_value(c.site_logs(site, query).await?),
+            Self::Demo(_, d) => d.site_logs(site, query),
+        }
+    }
+
+    pub async fn github_token_status(&self, site: &str) -> Res<TokenStatus> {
+        match self {
+            Self::Live(c) => c.github_token_status(site).await,
+            Self::Demo(_, d) => d.github_token_status(site),
+        }
+    }
+
+    pub async fn github_token_set(&self, site: &str, token: &str) -> Res<TokenStatus> {
+        match self {
+            Self::Live(c) => {
+                let body = GithubTokenBody::new(token)?;
+                c.github_token_set(site, &body).await
+            }
+            Self::Demo(_, d) => d.github_token_set(site, token),
+        }
+    }
+
+    pub async fn github_token_clear(&self, site: &str) -> Res<()> {
+        match self {
+            Self::Live(c) => c.github_token_clear(site).await,
+            Self::Demo(_, d) => d.github_token_clear(site),
+        }
+    }
+
+    // Build and runtime variables share one shape; only the route differs.
+    pub async fn env_names(&self, site: &str, runtime: bool) -> Res<Vec<String>> {
+        match self {
+            Self::Live(c) if runtime => c.runtime_env_names(site).await.map(|n| n.names),
+            Self::Live(c) => c.build_env_names(site).await.map(|n| n.names),
+            Self::Demo(_, d) => d.env_names(site, runtime),
+        }
+    }
+
+    pub async fn env_patch(&self, site: &str, runtime: bool, patch: &EnvPatch) -> Res<Vec<String>> {
+        match self {
+            Self::Live(c) if runtime => c.runtime_env_patch(site, patch).await.map(|n| n.names),
+            Self::Live(c) => c.build_env_patch(site, patch).await.map(|n| n.names),
+            Self::Demo(_, d) => d.env_patch(site, runtime, patch),
+        }
+    }
+
+    // Starts the build and returns at once; the status panel shows how it goes.
+    pub async fn deploy_async(
+        &self,
+        site: &str,
+        git_ref: Option<&str>,
+        note: Option<&str>,
+    ) -> Res<String> {
+        match self {
+            Self::Live(c) => c
+                .deploy_source_async(site, git_ref, note)
+                .await
+                .map(|a| a.deployment_id),
+            Self::Demo(_, d) => d.deploy_async(site, git_ref, note),
+        }
+    }
+
+    // Nodes without the analytics-filters capability only understand a window and one site, so `modern` false asks the old routes.
+    pub async fn an_compare(
+        &self,
+        q: &AnalyticsQuery,
+        modern: bool,
+    ) -> Res<(SummaryReport, Option<SummaryReport>)> {
+        match self {
+            Self::Live(c) if modern => c
+                .analytics_compare(q)
+                .await
+                .map(|x| (x.current, Some(x.previous))),
+            Self::Live(c) => {
+                let (window, site) = legacy_scope(q);
+                let summary = c.analytics_summary(&window, site.as_deref()).await?;
+                Ok((
+                    SummaryReport {
+                        summary,
+                        meta: AnalyticsMeta::default(),
+                    },
+                    None,
+                ))
+            }
+            Self::Demo(_, d) if modern => d.an_compare(q).map(|x| (x.current, Some(x.previous))),
+            Self::Demo(_, d) => d.an_summary(q).map(|s| (s, None)),
+        }
+    }
+
+    pub async fn an_series(&self, q: &AnalyticsQuery, modern: bool) -> Res<TimeseriesReport> {
+        match self {
+            Self::Live(c) if modern => c.analytics_timeseries_q(q).await,
+            Self::Live(c) => {
+                let (window, site) = legacy_scope(q);
+                let series = c.analytics_timeseries(&window, site.as_deref()).await?;
+                Ok(TimeseriesReport {
+                    series,
+                    meta: AnalyticsMeta::default(),
+                })
+            }
+            Self::Demo(_, d) => d.an_series(q),
+        }
+    }
+
+    pub async fn an_bots(&self, q: &AnalyticsQuery, modern: bool) -> Res<BotReport> {
+        match self {
+            Self::Live(c) if modern => c.analytics_bots_q(q).await,
+            Self::Live(c) => {
+                let (window, site) = legacy_scope(q);
+                let bots = c.analytics_bots(&window, site.as_deref()).await?;
+                Ok(BotReport {
+                    bots,
+                    meta: AnalyticsMeta::default(),
+                })
+            }
+            Self::Demo(_, d) => d.an_bots(q),
+        }
+    }
+
+    pub async fn an_top(
+        &self,
+        kind: &str,
+        q: &AnalyticsQuery,
+        limit: usize,
+        modern: bool,
+    ) -> Res<TopReport> {
+        match self {
+            Self::Live(c) if modern => {
+                c.analytics_top_q(kind, q, Some(limit), TopSort::Count)
+                    .await
+            }
+            Self::Live(c) => {
+                let (window, site) = legacy_scope(q);
+                let items = c
+                    .analytics_top(kind, &window, site.as_deref(), Some(limit))
+                    .await?;
+                Ok(TopReport {
+                    items,
+                    meta: AnalyticsMeta::default(),
+                })
+            }
+            Self::Demo(_, d) => d.an_top(kind, q, Some(limit), TopSort::Count),
+        }
+    }
+
+    pub async fn an_requests(
+        &self,
+        q: &AnalyticsQuery,
+        limit: usize,
+        cursor: Option<RequestCursor>,
+        modern: bool,
+    ) -> Res<RequestsPage> {
+        match self {
+            Self::Live(c) if modern => {
+                c.analytics_requests_q(q, Some(limit), cursor.as_ref())
+                    .await
+            }
+            Self::Live(c) => {
+                let (window, site) = legacy_scope(q);
+                let filter = RequestQuery {
+                    limit: Some(limit),
+                    ..RequestQuery::default()
+                };
+                let items = c
+                    .analytics_requests(&window, site.as_deref(), &filter)
+                    .await?;
+                Ok(RequestsPage {
+                    items,
+                    next_cursor: None,
+                    meta: AnalyticsMeta::default(),
+                })
+            }
+            Self::Demo(_, d) => d.an_requests(q, Some(limit), cursor.as_ref()),
+        }
+    }
+
+    pub async fn an_facets(&self, q: &AnalyticsQuery) -> Res<Facets> {
+        match self {
+            Self::Live(c) => c.analytics_facets(q).await,
+            Self::Demo(_, d) => d.an_facets(q),
+        }
+    }
+
+    pub async fn haproxy_stats(&self) -> Res<Value> {
+        match self {
+            Self::Live(c) => c.haproxy_stats().await,
+            Self::Demo(_, d) => d.haproxy_stats(),
+        }
+    }
+}
+
+// The only parts of a query an older node reads.
+fn legacy_scope(q: &AnalyticsQuery) -> (String, Option<String>) {
+    (
+        q.window.clone().unwrap_or_else(|| "1h".to_string()),
+        q.sites.first().cloned(),
+    )
+}
+
+fn decode_value<T: serde::de::DeserializeOwned>(v: Value) -> Res<T> {
+    serde_json::from_value(v)
+        .map_err(|_| ClientError::Decode("unexpected reply from the node".into()))
 }
 
 // The only place that reads the client's certificate types, so a signature change stays local.

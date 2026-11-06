@@ -1,13 +1,14 @@
 #![forbid(unsafe_code)]
 
+use std::collections::{BTreeMap, HashMap};
 use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use cap_std::ambient_authority;
-use cap_std::fs::Dir;
+use cap_std::fs::{Dir, MetadataExt as _};
 use cite_core::{ContainedOpen, Error, open_contained, request_path};
 use flate2::Compression;
 use flate2::write::GzEncoder;
@@ -16,6 +17,7 @@ use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode, header
 use http_body::Frame;
 use http_body_util::{BodyExt, StreamBody};
 use std::sync::LazyLock;
+use tokio::io::AsyncReadExt as _;
 use tokio::sync::Semaphore;
 
 use time::OffsetDateTime;
@@ -23,15 +25,105 @@ use time::format_description;
 
 use crate::error_page::{self, BoxBody, apply_security_headers, full_body, page_404};
 
-const STREAM_CHUNK: u64 = 64 * 1024;
+/// Large reads keep the blocking-pool round trips per file low on a single CPU.
+const STREAM_CHUNK: u64 = 512 * 1024;
 const GZIP_MAX_BYTES: u64 = 8 * 1024 * 1024;
 const GZIP_CONCURRENCY: usize = 4;
+const GZIP_CACHE_DEFAULT_BYTES: u64 = 64 * 1024 * 1024;
+const GZIP_CACHE_ENV: &str = "CITE_GZIP_CACHE_BYTES";
+const CACHE_ASSET: &str = "public, max-age=86400, stale-while-revalidate=604800";
+const ASSET_EXTENSIONS: [&str; 26] = [
+    "png", "jpg", "jpeg", "gif", "webp", "avif", "ico", "bmp", "svg", "woff", "woff2", "ttf",
+    "otf", "eot", "mp4", "webm", "mp3", "ogg", "wav", "m4a", "mov", "mkv", "flac", "aac", "opus",
+    "apng",
+];
 
 static GZIP_JOBS: LazyLock<Arc<Semaphore>> =
     LazyLock::new(|| Arc::new(Semaphore::new(GZIP_CONCURRENCY)));
 
+/// Compressed bodies are kept per file version so repeat requests skip the gzip work.
+static GZIP_CACHE: LazyLock<GzipCache> = LazyLock::new(|| {
+    let budget = std::env::var(GZIP_CACHE_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(GZIP_CACHE_DEFAULT_BYTES);
+    GzipCache::new(budget)
+});
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct GzipKey {
+    dev: u64,
+    ino: u64,
+    rel: PathBuf,
+    etag: String,
+    encoding: &'static str,
+}
+
+#[derive(Default)]
+struct GzipInner {
+    entries: HashMap<GzipKey, (Bytes, u64)>,
+    order: BTreeMap<u64, GzipKey>,
+    bytes: u64,
+    tick: u64,
+}
+
+/// Byte-budgeted LRU: the sum of cached body lengths never exceeds `budget`.
+struct GzipCache {
+    budget: u64,
+    inner: Mutex<GzipInner>,
+}
+
+impl GzipCache {
+    fn new(budget: u64) -> Self {
+        Self {
+            budget,
+            inner: Mutex::new(GzipInner::default()),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, GzipInner> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn get(&self, key: &GzipKey) -> Option<Bytes> {
+        let mut inner = self.lock();
+        let inner = &mut *inner;
+        let (body, old_tick) = inner.entries.get_mut(key)?;
+        inner.tick += 1;
+        inner.order.remove(old_tick);
+        inner.order.insert(inner.tick, key.clone());
+        *old_tick = inner.tick;
+        Some(body.clone())
+    }
+
+    fn insert(&self, key: GzipKey, body: Bytes) {
+        let size = body.len() as u64;
+        if size > self.budget {
+            return;
+        }
+        let mut inner = self.lock();
+        if let Some((old, tick)) = inner.entries.remove(&key) {
+            inner.bytes -= old.len() as u64;
+            inner.order.remove(&tick);
+        }
+        while inner.bytes + size > self.budget {
+            let Some((_, oldest)) = inner.order.pop_first() else {
+                break;
+            };
+            if let Some((evicted, _)) = inner.entries.remove(&oldest) {
+                inner.bytes -= evicted.len() as u64;
+            }
+        }
+        inner.tick += 1;
+        let tick = inner.tick;
+        inner.order.insert(tick, key.clone());
+        inner.entries.insert(key, (body, tick));
+        inner.bytes += size;
+    }
+}
+
 enum Payload {
-    Memory(Vec<u8>),
+    Memory(Bytes),
     File { file: std::fs::File, len: u64 },
 }
 
@@ -290,13 +382,33 @@ async fn serve_file_open(
         && len <= GZIP_MAX_BYTES
         && *method != Method::HEAD;
     if gzip_wanted {
-        if let Ok(permit) = GZIP_JOBS.clone().try_acquire_owned() {
-            let compressed = tokio::task::spawn_blocking(move || {
-                let _permit = permit;
-                gzip_file(file, len)
-            })
-            .await;
-            let body = compressed.map_err(|err| Error::msg(err.to_string()))??;
+        let key = GzipKey {
+            dev: meta.dev(),
+            ino: meta.ino(),
+            rel: rel.clone(),
+            etag: etag.clone(),
+            encoding: "gzip",
+        };
+        let cached = GZIP_CACHE.get(&key);
+        let permit = if cached.is_some() {
+            None
+        } else {
+            GZIP_JOBS.clone().try_acquire_owned().ok()
+        };
+        if cached.is_some() || permit.is_some() {
+            let body = match cached {
+                Some(body) => body,
+                None => {
+                    let compressed = tokio::task::spawn_blocking(move || {
+                        let _permit = permit;
+                        gzip_file(file, len)
+                    })
+                    .await;
+                    let body = Bytes::from(compressed.map_err(|err| Error::msg(err.to_string()))??);
+                    GZIP_CACHE.insert(key, body.clone());
+                    body
+                }
+            };
             return finish_body(
                 method,
                 Payload::Memory(body),
@@ -338,39 +450,32 @@ fn gzip_file(mut file: std::fs::File, len: u64) -> cite_core::Result<Vec<u8>> {
 }
 
 fn file_body(file: std::fs::File, len: u64) -> BoxBody {
+    let file = tokio::fs::File::from_std(file);
     let frames = stream::unfold((Some(file), len), |(file, remaining)| async move {
         if remaining == 0 {
             return None;
         }
         let mut file = file?;
-        let want = usize::try_from(remaining.min(STREAM_CHUNK)).unwrap_or(0);
-        let read = tokio::task::spawn_blocking(move || {
-            let mut buf = vec![0u8; want];
-            let result = file.read(&mut buf).map(|n| {
-                buf.truncate(n);
-                buf
-            });
-            (file, result)
-        })
-        .await;
-        let failure = |message: &str| {
-            let err: Box<dyn std::error::Error + Send + Sync> =
-                std::io::Error::new(std::io::ErrorKind::UnexpectedEof, message.to_string()).into();
-            Some((Err(err), (None, 0)))
-        };
+        let want = remaining.min(STREAM_CHUNK);
+        // Spare capacity is handed to the read as is, so the buffer is never zero-filled.
+        let mut buf = BytesMut::with_capacity(usize::try_from(want).unwrap_or(0));
+        let read = (&mut file).take(want).read_buf(&mut buf).await;
         match read {
-            Ok((file, Ok(buf))) if !buf.is_empty() => {
-                let left = remaining - buf.len() as u64;
-                Some((
-                    Ok::<Frame<Bytes>, Box<dyn std::error::Error + Send + Sync>>(Frame::data(
-                        Bytes::from(buf),
-                    )),
-                    (Some(file), left),
-                ))
+            Ok(n) if n > 0 => Some((
+                Ok::<Frame<Bytes>, Box<dyn std::error::Error + Send + Sync>>(Frame::data(
+                    buf.freeze(),
+                )),
+                (Some(file), remaining - n as u64),
+            )),
+            Ok(_) => {
+                let err: Box<dyn std::error::Error + Send + Sync> = std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "file shrank while being served",
+                )
+                .into();
+                Some((Err(err), (None, 0)))
             }
-            Ok((_, Ok(_))) => failure("file shrank while being served"),
-            Ok((_, Err(err))) => Some((Err(err.into()), (None, 0))),
-            Err(_) => failure("file read task failed"),
+            Err(err) => Some((Err(err.into()), (None, 0))),
         }
     });
     StreamBody::new(frames).boxed_unsync()
@@ -391,7 +496,7 @@ fn finish_body(
     content_range: Option<String>,
 ) -> cite_core::Result<Response<BoxBody>> {
     let (len, body) = match body {
-        Payload::Memory(bytes) => (bytes.len() as u64, full_body(Bytes::from(bytes))),
+        Payload::Memory(bytes) => (bytes.len() as u64, full_body(bytes)),
         Payload::File { file, len } => (len, file_body(file, len)),
     };
     let body = if *method == Method::HEAD {
@@ -449,6 +554,8 @@ fn set_common_headers(
         "no-cache"
     } else if is_fingerprinted(rel) {
         "public, max-age=31536000, immutable"
+    } else if is_media_asset(rel) {
+        CACHE_ASSET
     } else {
         "public, max-age=3600"
     };
@@ -499,6 +606,12 @@ fn is_fingerprinted(rel: &Path) -> bool {
         }
     }
     false
+}
+
+fn is_media_asset(rel: &Path) -> bool {
+    rel.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| ASSET_EXTENSIONS.iter().any(|a| ext.eq_ignore_ascii_case(a)))
 }
 
 fn is_compressible(mime: &str) -> bool {
@@ -575,4 +688,211 @@ pub fn static_health_ok(app_root: &Path, health_path: &str) -> bool {
         open_contained(&root, health_path),
         Ok(ContainedOpen::File { .. }) | Ok(ContainedOpen::Directory { .. })
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write as _;
+
+    fn pattern(i: u64) -> u8 {
+        (i.wrapping_mul(31) ^ (i >> 8)) as u8
+    }
+
+    fn write_pattern(dir: &Path, name: &str, len: u64) -> PathBuf {
+        let path = dir.join(name);
+        let mut out = std::io::BufWriter::new(std::fs::File::create(&path).unwrap());
+        let mut chunk = vec![0u8; 1 << 16];
+        let mut at = 0u64;
+        while at < len {
+            let n = (len - at).min(chunk.len() as u64) as usize;
+            for (k, b) in chunk[..n].iter_mut().enumerate() {
+                *b = pattern(at + k as u64);
+            }
+            out.write_all(&chunk[..n]).unwrap();
+            at += n as u64;
+        }
+        out.flush().unwrap();
+        path
+    }
+
+    async fn collect(body: BoxBody) -> (Vec<u8>, usize) {
+        let mut body = body;
+        let mut out = Vec::new();
+        let mut frames = 0;
+        while let Some(frame) = body.frame().await {
+            let frame = frame.unwrap();
+            if let Ok(data) = frame.into_data() {
+                frames += 1;
+                out.extend_from_slice(&data);
+            }
+        }
+        (out, frames)
+    }
+
+    fn open_at(path: &Path, start: u64) -> std::fs::File {
+        let mut file = std::fs::File::open(path).unwrap();
+        file.seek(SeekFrom::Start(start)).unwrap();
+        file
+    }
+
+    fn check(bytes: &[u8], start: u64) {
+        for (k, b) in bytes.iter().enumerate() {
+            assert_eq!(*b, pattern(start + k as u64), "byte {}", start + k as u64);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_20_mib_file_streams_in_a_bounded_number_of_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let len = 20 * 1024 * 1024;
+        let path = write_pattern(dir.path(), "big.bin", len);
+        let (bytes, frames) = collect(file_body(open_at(&path, 0), len)).await;
+        assert_eq!(bytes.len() as u64, len);
+        check(&bytes, 0);
+        let max_frames = len.div_ceil(STREAM_CHUNK) as usize;
+        assert!(
+            frames <= max_frames,
+            "{frames} frames for {max_frames} chunks"
+        );
+        assert!(frames >= 2);
+    }
+
+    #[tokio::test]
+    async fn ranges_across_chunk_boundaries_return_exact_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let len = 3 * STREAM_CHUNK + 777;
+        let path = write_pattern(dir.path(), "r.bin", len);
+        for (start, end) in [
+            (STREAM_CHUNK - 3, STREAM_CHUNK + 2),
+            (STREAM_CHUNK, 2 * STREAM_CHUNK - 1),
+            (5, 2 * STREAM_CHUNK + 5),
+            (2 * STREAM_CHUNK - 1, len - 1),
+            (len - 1, len - 1),
+            (0, 0),
+        ] {
+            let want = end - start + 1;
+            let (bytes, _) = collect(file_body(open_at(&path, start), want)).await;
+            assert_eq!(bytes.len() as u64, want, "{start}-{end}");
+            check(&bytes, start);
+        }
+        assert_eq!(
+            parse_single_range("bytes=-10", len),
+            Some((len - 10, len - 1))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_file_that_shrinks_mid_stream_fails_instead_of_truncating_silently() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_pattern(dir.path(), "s.bin", 1000);
+        let mut body = file_body(open_at(&path, 0), 5000);
+        let mut saw_error = false;
+        while let Some(frame) = body.frame().await {
+            if frame.is_err() {
+                saw_error = true;
+                break;
+            }
+        }
+        assert!(saw_error);
+    }
+
+    fn key(name: &str, etag: &str) -> GzipKey {
+        GzipKey {
+            dev: 1,
+            ino: 2,
+            rel: PathBuf::from(name),
+            etag: etag.into(),
+            encoding: "gzip",
+        }
+    }
+
+    #[test]
+    fn gzip_cache_hits_misses_and_a_changed_etag_misses() {
+        let cache = GzipCache::new(1024);
+        assert!(cache.get(&key("a.js", "\"1\"")).is_none());
+        cache.insert(key("a.js", "\"1\""), Bytes::from_static(b"zipped"));
+        assert_eq!(&cache.get(&key("a.js", "\"1\"")).unwrap()[..], b"zipped");
+        assert!(cache.get(&key("a.js", "\"2\"")).is_none());
+    }
+
+    #[test]
+    fn gzip_cache_evicts_least_recently_used_within_the_byte_budget() {
+        let cache = GzipCache::new(100);
+        let body = |n: usize| Bytes::from(vec![7u8; n]);
+        cache.insert(key("a", "e"), body(40));
+        cache.insert(key("b", "e"), body(40));
+        assert!(cache.get(&key("a", "e")).is_some());
+        cache.insert(key("c", "e"), body(40));
+        assert!(cache.get(&key("b", "e")).is_none(), "b was least recent");
+        assert!(cache.get(&key("a", "e")).is_some());
+        assert!(cache.get(&key("c", "e")).is_some());
+        assert_eq!(cache.lock().bytes, 80);
+
+        cache.insert(key("huge", "e"), body(101));
+        assert!(cache.get(&key("huge", "e")).is_none());
+        cache.insert(key("a", "e"), body(10));
+        let inner = cache.lock();
+        assert_eq!(inner.bytes, 50);
+        assert_eq!(inner.entries.len(), inner.order.len());
+    }
+
+    #[test]
+    fn gzip_cache_never_exceeds_its_budget_and_zero_disables_it() {
+        let cache = GzipCache::new(1000);
+        for i in 0..200 {
+            cache.insert(
+                key(&format!("f{i}"), "e"),
+                Bytes::from(vec![0u8; 37 + i % 11]),
+            );
+            assert!(cache.lock().bytes <= 1000);
+        }
+        let off = GzipCache::new(0);
+        off.insert(key("a", "e"), Bytes::from_static(b"x"));
+        assert!(off.get(&key("a", "e")).is_none());
+    }
+
+    fn cache_control(name: &str, htmlish: bool) -> String {
+        let mut headers = HeaderMap::new();
+        set_common_headers(
+            &mut headers,
+            Path::new(name),
+            "\"e\"",
+            None,
+            htmlish,
+            &[],
+            None,
+            None,
+        );
+        headers[header::CACHE_CONTROL].to_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn cache_control_depends_on_the_file_type() {
+        let asset = "public, max-age=86400, stale-while-revalidate=604800";
+        for name in [
+            "logo.png",
+            "photo.JPG",
+            "a/b/hero.webp",
+            "font.woff2",
+            "icon.svg",
+            "clip.mp4",
+            "song.mp3",
+            "favicon.ico",
+        ] {
+            assert_eq!(cache_control(name, false), asset, "{name}");
+        }
+        assert_eq!(cache_control("index.html", true), "no-cache");
+        assert_eq!(
+            cache_control("chunk-1a2b3c4d5e.js", false),
+            "public, max-age=31536000, immutable"
+        );
+        assert_eq!(
+            cache_control("hero-0123abcd.png", false),
+            "public, max-age=31536000, immutable"
+        );
+        assert_eq!(cache_control("app.js", false), "public, max-age=3600");
+        assert_eq!(cache_control("data.json", false), "public, max-age=3600");
+        assert_eq!(cache_control("noext", false), "public, max-age=3600");
+    }
 }

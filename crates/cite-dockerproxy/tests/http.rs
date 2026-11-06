@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use cite_connector::orchestrator::{StackEnv, stack_specs};
 use cite_dockerproxy::config::Config;
+use cite_dockerproxy::policy::MAX_LOG_RESPONSE;
 use cite_dockerproxy::proxy::healthcheck;
 use cite_edge::model::{HealthCheck, Maintenance, Site, SiteKind, Slot, Source, Upstream};
 use common::{build, call, call_json, proxy_and_docker, raw, start_proxy};
@@ -38,6 +39,7 @@ fn manager_spec() -> (String, Value) {
             node_major: None,
             poll_interval: None,
             secret: None,
+            ..Default::default()
         }),
         history: Vec::new(),
         access: Default::default(),
@@ -613,6 +615,127 @@ async fn connections_are_capped() {
         .unwrap()
         .unwrap();
     assert!(String::from_utf8_lossy(&buf).contains("HTTP/1.1 200"));
+}
+
+const LOGS_QUERY: &str = "stdout=1&stderr=1&tail=100";
+
+fn logs_target(name: &str) -> String {
+    format!("/v1.45/containers/{name}/logs?{LOGS_QUERY}")
+}
+
+#[tokio::test]
+// The label check is a separate GET to the engine before the logs request is sent.
+async fn managed_container_logs_are_inspected_then_forwarded() {
+    let (addr, docker) = proxy_and_docker().await;
+    {
+        let mut w = docker.world.lock().unwrap();
+        w.add_container(MANAGED, managed_labels());
+        w.logs
+            .insert(MANAGED.to_string(), "line one\nline two\n".to_string());
+    }
+    let r = call(addr, "GET", &logs_target(MANAGED)).await;
+    assert_eq!(
+        (r.status, r.text()),
+        (200, "line one\nline two\n".to_string())
+    );
+    let log = docker.world.lock().unwrap().log();
+    assert_eq!(
+        log,
+        vec![
+            format!("GET /containers/{MANAGED}/json"),
+            format!("GET {}", logs_target(MANAGED)),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn logs_of_foreign_or_missing_containers_are_refused() {
+    let (addr, docker) = proxy_and_docker().await;
+    let r = call(addr, "GET", &logs_target(MANAGED)).await;
+    assert_eq!(r.status, 404);
+    docker
+        .world
+        .lock()
+        .unwrap()
+        .add_container(MANAGED, json!({}));
+    let r = call(addr, "GET", &logs_target(MANAGED)).await;
+    assert!(denied_body(&r));
+    assert!(
+        docker
+            .seen()
+            .iter()
+            .all(|s| s.uri == format!("/containers/{MANAGED}/json"))
+    );
+}
+
+#[tokio::test]
+async fn unbounded_log_requests_are_denied_before_docker() {
+    let (addr, docker) = proxy_and_docker().await;
+    docker
+        .world
+        .lock()
+        .unwrap()
+        .add_container(MANAGED, managed_labels());
+    for query in [
+        "stdout=1&tail=100&follow=1",
+        "stdout=1&tail=all",
+        "stdout=1",
+        "tail=100",
+        "stdout=1&tail=100&until=1",
+        "stdout=1&tail=100&details=1",
+        "stdout=1&tail=100&x=1",
+    ] {
+        let r = call(
+            addr,
+            "GET",
+            &format!("/v1.45/containers/{MANAGED}/logs?{query}"),
+        )
+        .await;
+        assert!(denied_body(&r), "{query}: {} {}", r.status, r.text());
+    }
+    let r = call(addr, "GET", &logs_target("cite-node-haproxy")).await;
+    assert!(denied_body(&r));
+    assert_eq!(docker.seen_count(), 0);
+}
+
+#[tokio::test]
+// The cap applies to what is streamed back, whether the engine sends one big frame or many small ones.
+async fn log_responses_are_cut_at_the_size_cap() {
+    let cap = MAX_LOG_RESPONSE;
+    let (addr, docker) = proxy_and_docker().await;
+    docker
+        .world
+        .lock()
+        .unwrap()
+        .add_container(MANAGED, managed_labels());
+    let one_frame = |n: usize| "a".repeat(n);
+    let many_lines = |n: usize| {
+        let line = format!("{}\n", "b".repeat(999));
+        line.repeat(n.div_ceil(line.len()))[..n].to_string()
+    };
+    let cases = [
+        (one_frame(10), 10),
+        (one_frame(cap - 1), cap - 1),
+        (one_frame(cap), cap),
+        (one_frame(cap + 1), cap),
+        (one_frame(cap + 100_000), cap),
+        (many_lines(cap), cap),
+        (many_lines(cap + 1), cap),
+        (many_lines(cap + 300_000), cap),
+    ];
+    for (text, expected) in cases {
+        docker
+            .world
+            .lock()
+            .unwrap()
+            .logs
+            .insert(MANAGED.to_string(), text.clone());
+        let r = call(addr, "GET", &logs_target(MANAGED)).await;
+        assert_eq!(r.status, 200);
+        assert_eq!(r.body.len(), expected, "sent {} bytes", text.len());
+        assert_eq!(r.body, text.as_bytes()[..expected]);
+        assert!(r.header("content-length").is_none());
+    }
 }
 
 #[tokio::test]

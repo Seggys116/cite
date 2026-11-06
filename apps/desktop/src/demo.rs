@@ -740,12 +740,12 @@ fn seed_sites(node: i64, now: i64) -> Vec<Site> {
             },
             health: health.clone(),
             source: (id == "docs").then(|| Source {
-                repo: "https://git.example.com/docs.git".into(),
+                repo: "acme/docs".into(),
                 branch: Some("main".into()),
-                runtime: None,
-                node_major: None,
-                poll_interval: None,
-                secret: None,
+                runtime: Some("node".into()),
+                node_major: Some(22),
+                poll_interval: Some("5m".into()),
+                ..Default::default()
             }),
             history,
             access: SiteAccess {
@@ -809,7 +809,18 @@ fn seed_sites(node: i64, now: i64) -> Vec<Site> {
                 now,
                 &[
                     (400, Slot::Blue, Promote, "Initial deploy"),
-                    (90, Slot::Green, Failed, "Health check timed out"),
+                    (
+                        120,
+                        Slot::Green,
+                        Failed,
+                        "stack could not be started: image cite-manager:0.3.1-node22 could not be pulled",
+                    ),
+                    (
+                        90,
+                        Slot::Green,
+                        Failed,
+                        "green slot did not pass health checks within 120s (Release 4.2.0)",
+                    ),
                 ],
             ),
         ),
@@ -1006,6 +1017,7 @@ struct DemoState {
     certs: Vec<CertItem>,
     builtin_stamp: String,
     ranges_stamp: String,
+    ops: crate::demo_ops::DemoOps,
 }
 
 const DEMO_CERT_DAYS: i64 = 90;
@@ -1212,6 +1224,7 @@ impl DemoNode {
                 certs: seed_certs(now),
                 builtin_stamp: iso(now - 12 * DAY_MS),
                 ranges_stamp: iso(now - 12 * DAY_MS),
+                ops: crate::demo_ops::DemoOps::seeded(),
             }),
         }
     }
@@ -1242,14 +1255,278 @@ impl DemoNode {
         );
         Ok(NodeInfo {
             name: self.name.clone(),
-            version: "0.2.0".into(),
+            version: if self.index == 0 { "0.4.0" } else { "0.3.1" }.into(),
+            // The second node plays a release from before the capability list, so the new cards stay hidden there.
+            capabilities: if self.index == 0 {
+                cite_edge::status::CAPABILITIES
+                    .iter()
+                    .map(|c| c.to_string())
+                    .collect()
+            } else {
+                Vec::new()
+            },
             // Node 0 has CITE_GITHUB_TOKEN set and node 1 does not, so both token flows can be tried.
             github: Some(cite_client::GithubInfo {
                 token_configured: self.index == 0,
                 source: if self.index == 0 { "env" } else { "none" }.into(),
+                api_host: (self.index == 0).then(|| "api.github.com".to_string()),
             }),
             extra,
         })
+    }
+
+    // The window the generators know, how much of the traffic the filter keeps, and the clock used for the whole call.
+    fn an_parts(&self, q: &cite_client::AnalyticsQuery) -> (&'static str, f64, i64) {
+        let now = now_ms();
+        let (from, to) = crate::analyticsq::export_range(q, now);
+        let window = crate::demo_analytics::preset_for(((to - from) / 1000).max(1) as u64);
+        let sites = self.st().sites.len();
+        (window, crate::demo_analytics::selectivity(q, sites), now)
+    }
+
+    // The second node plays a release from before filtering and reports nothing beyond the numbers.
+    fn an_meta(&self, q: &cite_client::AnalyticsQuery, now: i64) -> cite_client::AnalyticsMeta {
+        if self.index != 0 {
+            return cite_client::AnalyticsMeta::default();
+        }
+        let (from, to) = crate::analyticsq::export_range(q, now);
+        cite_client::AnalyticsMeta {
+            filters: None,
+            partial: to - from > 14 * DAY_MS,
+            scanned: Some(DEMO_ROWS),
+            from_ms: Some(from),
+            to_ms: Some(to),
+            source: Some("demo".into()),
+        }
+    }
+
+    pub fn an_summary(&self, q: &cite_client::AnalyticsQuery) -> Res<cite_client::SummaryReport> {
+        let (window, f, now) = self.an_parts(q);
+        let base = demo_summary(self.seed(), self.scale(), window, now);
+        Ok(cite_client::SummaryReport {
+            summary: crate::demo_analytics::narrow_summary(&base, q, f),
+            meta: self.an_meta(q, now),
+        })
+    }
+
+    pub fn an_series(&self, q: &cite_client::AnalyticsQuery) -> Res<cite_client::TimeseriesReport> {
+        let (window, f, now) = self.an_parts(q);
+        let base = demo_series(self.seed(), self.scale(), window, now);
+        Ok(cite_client::TimeseriesReport {
+            series: crate::demo_analytics::narrow_series(&base, q, f),
+            meta: self.an_meta(q, now),
+        })
+    }
+
+    pub fn an_bots(&self, q: &cite_client::AnalyticsQuery) -> Res<cite_client::BotReport> {
+        let (window, f, now) = self.an_parts(q);
+        let base = demo_bot_summary(self.seed(), self.scale(), window, now);
+        Ok(cite_client::BotReport {
+            bots: crate::demo_analytics::narrow_bots(&base, q, f),
+            meta: self.an_meta(q, now),
+        })
+    }
+
+    pub fn an_top(
+        &self,
+        kind: &str,
+        q: &cite_client::AnalyticsQuery,
+        limit: Option<usize>,
+        sort: cite_client::TopSort,
+    ) -> Res<cite_client::TopReport> {
+        let (window, f, now) = self.an_parts(q);
+        let base = demo_top(kind, self.seed(), self.scale(), window, now);
+        let mut items = crate::demo_analytics::scale_top(&base, f);
+        if sort == cite_client::TopSort::Bytes {
+            items.sort_by_key(|t| std::cmp::Reverse(t.bytes));
+        }
+        items.truncate(limit.unwrap_or(10));
+        Ok(cite_client::TopReport {
+            items,
+            meta: self.an_meta(q, now),
+        })
+    }
+
+    // Paging is by offset into a list that is stable for a minute, which is all a demo needs.
+    pub fn an_requests(
+        &self,
+        q: &cite_client::AnalyticsQuery,
+        limit: Option<usize>,
+        cursor: Option<&cite_client::RequestCursor>,
+    ) -> Res<cite_client::RequestsPage> {
+        let now = now_ms();
+        let (from, to) = crate::analyticsq::export_range(q, now);
+        let events = demo_events(self.seed(), now / 60_000 * 60_000, 900);
+        let matched: Vec<LogEvent> = crate::demo_analytics::spread_events(events, from, to)
+            .into_iter()
+            .filter(|e| crate::analyticsq::event_matches(q, e, now))
+            .collect();
+        let start = cursor.map_or(0, |c| usize::try_from(c.before_id).unwrap_or(0));
+        let items: Vec<LogEvent> = matched
+            .iter()
+            .skip(start)
+            .take(limit.unwrap_or(50).min(1000))
+            .cloned()
+            .collect();
+        let end = start + items.len();
+        let next_cursor = (end < matched.len()).then(|| cite_client::RequestCursor {
+            before_ts: items.last().map_or(0, |e| e.ts_ms),
+            before_id: end as i64,
+        });
+        Ok(cite_client::RequestsPage {
+            items,
+            next_cursor,
+            meta: self.an_meta(q, now),
+        })
+    }
+
+    pub fn an_facets(&self, q: &cite_client::AnalyticsQuery) -> Res<cite_client::Facets> {
+        let (window, f, now) = self.an_parts(q);
+        let total = demo_summary(self.seed(), self.scale(), window, now).requests;
+        let sites: Vec<(String, Vec<String>)> = self
+            .st()
+            .sites
+            .iter()
+            .map(|s| (s.id.clone(), s.hosts.clone()))
+            .collect();
+        let mut facets = crate::demo_analytics::facets_for((total as f64 * f) as u64, &sites);
+        facets.meta = self.an_meta(q, now);
+        Ok(facets)
+    }
+
+    pub fn an_compare(&self, q: &cite_client::AnalyticsQuery) -> Res<cite_client::Compare> {
+        let current = self.an_summary(q)?;
+        let previous = cite_client::SummaryReport {
+            summary: crate::demo_analytics::previous_of(&current.summary),
+            meta: current.meta.clone(),
+        };
+        Ok(cite_client::Compare {
+            against: "previous".into(),
+            delta: crate::demo_analytics::compare_delta(&current.summary, &previous.summary),
+            current,
+            previous,
+        })
+    }
+
+    fn require_ops(&self) -> Res<()> {
+        if self.index == 0 {
+            Ok(())
+        } else {
+            Err(status_err(404, "not found"))
+        }
+    }
+
+    pub fn site_status(&self, id: &str) -> Res<cite_edge::status::SiteStatus> {
+        self.require_ops()?;
+        let st = self.st();
+        Ok(crate::demo_ops::status_for(find(&st.sites, id)?, now_ms()))
+    }
+
+    pub fn site_logs(
+        &self,
+        id: &str,
+        query: &cite_client::LogsQuery,
+    ) -> Res<cite_edge::status::LogsResponse> {
+        self.require_ops()?;
+        let st = self.st();
+        let site = find(&st.sites, id)?;
+        let total = crate::demo_ops::log_total(self.started.elapsed().as_secs());
+        Ok(crate::demo_ops::logs_for(
+            crate::demo_ops::is_failing(site),
+            &query.source,
+            query.tail,
+            query.since.as_deref(),
+            total,
+        ))
+    }
+
+    pub fn github_token_status(&self, id: &str) -> Res<cite_client::TokenStatus> {
+        self.require_ops()?;
+        let st = self.st();
+        find(&st.sites, id)?;
+        Ok(st.ops.token_status(id, self.index == 0))
+    }
+
+    pub fn github_token_set(&self, id: &str, token: &str) -> Res<cite_client::TokenStatus> {
+        self.require_ops()?;
+        if token.trim().is_empty() {
+            return Err(status_err(400, "the GitHub token is empty"));
+        }
+        let mut st = self.st();
+        find(&st.sites, id)?;
+        st.ops.set_token(id);
+        Ok(st.ops.token_status(id, self.index == 0))
+    }
+
+    pub fn github_token_clear(&self, id: &str) -> Res<()> {
+        self.require_ops()?;
+        let mut st = self.st();
+        find(&st.sites, id)?;
+        st.ops.clear_token(id);
+        Ok(())
+    }
+
+    pub fn env_names(&self, id: &str, runtime: bool) -> Res<Vec<String>> {
+        self.require_ops()?;
+        let st = self.st();
+        find(&st.sites, id)?;
+        Ok(st.ops.names(id, runtime))
+    }
+
+    pub fn env_patch(
+        &self,
+        id: &str,
+        runtime: bool,
+        patch: &cite_client::EnvPatch,
+    ) -> Res<Vec<String>> {
+        self.require_ops()?;
+        let mut st = self.st();
+        find(&st.sites, id)?;
+        Ok(st.ops.patch(id, runtime, patch))
+    }
+
+    pub fn deploy_async(&self, id: &str, git_ref: Option<&str>, note: Option<&str>) -> Res<String> {
+        self.require_ops()?;
+        let label = match (git_ref, note) {
+            (Some(r), _) => format!("Deploy of {r}"),
+            (None, Some(n)) => n.to_string(),
+            (None, None) => String::new(),
+        };
+        let req = DeployRequest {
+            targets: Vec::new(),
+            note: Some(label),
+        };
+        self.deploy(id, &req).map(|d| d.id)
+    }
+
+    // The same bodies the node returns: one backend per site and slot, one server per target.
+    pub fn haproxy_stats(&self) -> Res<Value> {
+        let st = self.st();
+        let backends: Vec<Value> = st
+            .sites
+            .iter()
+            .flat_map(|site| {
+                [(Slot::Blue, &site.blue), (Slot::Green, &site.green)].map(|(slot, up)| {
+                    let failing = crate::demo_ops::is_failing(site) && slot != site.active;
+                    let servers: Vec<Value> = up
+                        .targets
+                        .iter()
+                        .enumerate()
+                        .map(|(i, t)| {
+                            let down = failing || (self.index == 1 && t.addr.ends_with(".22:8080"));
+                            json!({"name": format!("t{}", i + 1), "status": if down { "DOWN" } else { "UP" }, "check": "L7OK"})
+                        })
+                        .collect();
+                    json!({
+                        "name": format!("be_{}_{}", site.id, slot.as_str()),
+                        "status": if failing { "DOWN" } else { "UP" },
+                        "sessions": 0, "bytes_in": 0, "bytes_out": 0,
+                        "servers": servers,
+                    })
+                })
+            })
+            .collect();
+        Ok(json!({ "backends": backends }))
     }
 
     pub fn list_sites(&self) -> Res<Vec<Site>> {
@@ -1261,12 +1538,20 @@ impl DemoNode {
         let st = self.st();
         let site = find(&st.sites, id)?.clone();
         let down = |t: &Target| t.addr.ends_with(".22:8080") && self.index == 1;
-        let state = |ts: &[Target]| -> Vec<Value> {
+        let state = |ts: &[Target], failing: bool| -> Vec<Value> {
             ts.iter()
-                .map(|t| json!({"addr": t.addr, "status": if down(t) { "DOWN" } else { "UP" }}))
+                .map(|t| {
+                    let bad = failing || down(t);
+                    json!({"addr": t.addr, "status": if bad { "DOWN" } else { "UP" }})
+                })
                 .collect()
         };
-        let live = json!({"blue": state(&site.blue.targets), "green": state(&site.green.targets)});
+        // The source-built docs site never got its green stack healthy, so the failed-deploy banner has real data.
+        let stuck = site.id == "docs";
+        let live = json!({
+            "blue": state(&site.blue.targets, false),
+            "green": state(&site.green.targets, stuck),
+        });
         Ok(SiteDetail {
             site,
             live: Some(live),
@@ -1305,13 +1590,25 @@ impl DemoNode {
         Ok(site)
     }
 
+    // Like the node: slots, the active choice, maintenance, history and the stored token name move only through their own calls.
     pub fn update_site(&self, id: &str, site: &Site) -> Res<Site> {
         check_access(site)?;
         let mut st = self.st();
-        let slot = find_mut(&mut st.sites, id)?;
-        *slot = site.clone();
-        sync_zone(&mut st, site);
-        Ok(site.clone())
+        let existing = find(&st.sites, id)?.clone();
+        let mut next = site.clone();
+        next.history = existing.history;
+        next.active = existing.active;
+        next.blue = existing.blue;
+        next.green = existing.green;
+        next.maintenance = existing.maintenance;
+        if let Some(source) = next.source.as_mut() {
+            source.secret = existing.source.and_then(|s| s.secret);
+        }
+        cite_edge::validate::validate_site_strict(&next)
+            .map_err(|e| status_err(400, e.to_string()))?;
+        *find_mut(&mut st.sites, id)? = next.clone();
+        sync_zone(&mut st, &next);
+        Ok(next)
     }
 
     pub fn delete_site(&self, id: &str) -> Res<()> {
@@ -1398,9 +1695,19 @@ impl DemoNode {
         let mut st = self.st();
         let idle = find(&st.sites, id)?.active.other();
         let site = find_mut(&mut st.sites, id)?;
-        match idle {
-            Slot::Blue => site.blue.targets = req.targets.clone(),
-            Slot::Green => site.green.targets = req.targets.clone(),
+        // A source-built site ignores the targets and gets a stack in the idle slot, as on the node.
+        let orchestrated = site.source.is_some();
+        let slot = match idle {
+            Slot::Blue => &mut site.blue,
+            Slot::Green => &mut site.green,
+        };
+        if !orchestrated {
+            slot.targets = req.targets.clone();
+        } else if slot.targets.is_empty() {
+            slot.targets.push(Target {
+                addr: "127.0.0.1:3100".into(),
+                weight: 100,
+            });
         }
         site.active = idle;
         let note = req.note.clone().unwrap_or_default();
@@ -1993,6 +2300,7 @@ pub fn demo_config() -> DesktopConfig {
             node("edge-fra", "https://fra.edge.example.com:7443"),
             node("edge-iad", "https://iad.edge.example.com:7443"),
         ],
+        analytics_presets: Vec::new(),
     }
 }
 
@@ -2566,6 +2874,83 @@ mod tests {
         let wp = rules.iter().find(|r| r.id == "r-wp-login").expect("wp");
         assert_eq!(wp.matchers.path_regexes.len(), 2);
         assert!(rules.iter().filter(|r| r.redirect.is_some()).count() >= 3);
+    }
+
+    #[test]
+    fn demo_docs_site_shows_an_unhealthy_source_build_with_a_failed_deploy() {
+        let node = &demo_nodes()[0].1;
+        let detail = node.get_site("docs").expect("docs");
+        let banner = crate::diagnose::banner(&detail.site, detail.live.as_ref()).expect("banner");
+        let failure = banner.failure.expect("failure");
+        assert!(
+            failure
+                .note
+                .contains("did not pass health checks within 120s")
+        );
+        assert_eq!(failure.slot, Slot::Green);
+        assert_eq!(banner.commands.len(), 2);
+        assert!(
+            banner.commands[0]
+                .command
+                .contains("cite-docs-green-manager")
+        );
+        let green = banner
+            .slots
+            .iter()
+            .find(|s| s.slot == Slot::Green)
+            .expect("green");
+        assert_eq!(green.state, crate::diagnose::SlotState::Down);
+        let source = detail.site.source.expect("source");
+        assert_eq!(source.repo, "acme/docs");
+        assert_eq!(source.runtime.as_deref(), Some("node"));
+        let shop = node.get_site("shop").expect("shop");
+        assert!(crate::diagnose::banner(&shop.site, shop.live.as_ref()).is_none());
+    }
+
+    #[test]
+    fn demo_update_keeps_what_the_node_keeps() {
+        let node = &demo_nodes()[0].1;
+        let mut docs = node.get_site("docs").expect("docs").site;
+        let (history, blue, active) = (docs.history.clone(), docs.blue.clone(), docs.active);
+        docs.name = "Docs renamed".into();
+        docs.history.clear();
+        docs.blue.targets.clear();
+        docs.active = docs.active.other();
+        docs.source.as_mut().expect("source").branch = Some("release".into());
+        let saved = node.update_site("docs", &docs).expect("update");
+        assert_eq!(saved.name, "Docs renamed");
+        assert_eq!(saved.history, history);
+        assert_eq!(saved.blue, blue);
+        assert_eq!(saved.active, active);
+        assert_eq!(
+            saved.source.expect("source").branch.as_deref(),
+            Some("release")
+        );
+        let mut bad = node.get_site("docs").expect("docs").site;
+        bad.hosts.clear();
+        assert_eq!(
+            node.update_site("docs", &bad)
+                .expect_err("bad")
+                .status_code(),
+            Some(400)
+        );
+    }
+
+    #[test]
+    fn demo_redeploy_of_a_source_site_ignores_the_targets() {
+        let node = &demo_nodes()[0].1;
+        let before = node.get_site("docs").expect("docs").site;
+        let idle = before.active.other();
+        let req = crate::model::source_deploy_request(Some("rebuild".into()));
+        let done = node.deploy("docs", &req).expect("deploy");
+        assert_eq!(done.slot, idle);
+        let after = node.get_site("docs").expect("docs").site;
+        let slot = |s: &Site| match idle {
+            Slot::Blue => s.blue.clone(),
+            Slot::Green => s.green.clone(),
+        };
+        assert_eq!(slot(&after), slot(&before));
+        assert!(slot(&after).targets.iter().all(|t| t.addr != "192.0.2.1:1"));
     }
 
     #[test]

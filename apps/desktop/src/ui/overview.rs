@@ -42,11 +42,8 @@ async fn collect(h: NodeHandle) -> (NodeSnapshot, Vec<DeployRow>) {
         Err(e) => return (offline(&name, e.to_string()), Vec::new()),
     };
     let view = read_info(&info);
-    let (summary, series, sites) = (
-        h.summary("15m").await.ok(),
-        h.series("1h").await.ok(),
-        h.list_sites().await.unwrap_or_default(),
-    );
+    let (summary, series, sites) = tokio::join!(h.summary("15m"), h.series("1h"), h.list_sites());
+    let (summary, series, sites) = (summary.ok(), series.ok(), sites.unwrap_or_default());
     let deploys = sites
         .iter()
         .flat_map(|s| {

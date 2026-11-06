@@ -120,7 +120,10 @@ async fn dispatch(
         ControlRequest::Healthcheck => ControlResponse {
             ok: true,
             error: None,
-            data: Some(serde_json::json!({"healthy": true})),
+            data: Some(serde_json::json!({
+                "healthy": true,
+                "report": deployer.health_report().await,
+            })),
         },
         ControlRequest::ConfigCheck => ControlResponse {
             ok: true,

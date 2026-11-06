@@ -10,9 +10,11 @@ use serde_json::{Value, json};
 use super::*;
 use crate::store::testing::test_config;
 
+mod analytics_filters;
 mod archive_api;
 mod certificates_api;
 mod firewall_bulk;
+mod site_ops_api;
 mod zone_api;
 
 const SECRET: &str = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
@@ -556,7 +558,7 @@ async fn node_reports_identity_and_counts() {
     );
     assert_eq!(
         node["github"],
-        json!({ "token_configured": false, "source": "none" })
+        json!({ "token_configured": false, "source": "none", "api_host": "api.github.com" })
     );
 }
 
@@ -573,7 +575,7 @@ async fn node_reports_whether_a_github_token_is_configured_but_never_its_value()
     let (_, node) = h.get(&t, "/node").await;
     assert_eq!(
         node["github"],
-        json!({ "token_configured": true, "source": "env" })
+        json!({ "token_configured": true, "source": "env", "api_host": "api.github.com" })
     );
     assert!(!node.to_string().contains("ghp_node_wide_value"));
 }
@@ -1562,6 +1564,7 @@ async fn at_most_two_exports_run_at_once() {
     assert!(body["error"].is_string());
     drop(held);
     assert_eq!(export_rows(&h, &t, "").await.len(), 1);
+    all_export_permits_return(&h).await;
 
     let one = Arc::clone(&h.state.exports)
         .try_acquire_owned()
@@ -1569,8 +1572,14 @@ async fn at_most_two_exports_run_at_once() {
     assert_eq!(export_rows(&h, &t, "").await.len(), 1);
     drop(one);
     for _ in 0..3 {
+        all_export_permits_return(&h).await;
         assert_eq!(export_rows(&h, &t, "").await.len(), 1);
     }
+    all_export_permits_return(&h).await;
+}
+
+// A finished export hands its permit back just after the body is read.
+async fn all_export_permits_return(h: &Harness) {
     for _ in 0..100 {
         if h.state.exports.available_permits() == MAX_EXPORTS {
             return;

@@ -20,6 +20,8 @@ use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
+use crate::userenv::UserEnv;
+
 const LOG_RING: usize = 40;
 const LOG_LINE_MAX: usize = 1024;
 const SHIM_READ_MAX: u64 = 16 * 1024;
@@ -33,6 +35,7 @@ pub struct SlotManager {
     blue: Arc<Mutex<SlotRuntime>>,
     green: Arc<Mutex<SlotRuntime>>,
     shutting_down: Arc<AtomicBool>,
+    user_env: Arc<UserEnv>,
 }
 
 struct SlotRuntime {
@@ -82,7 +85,14 @@ impl SlotManager {
             blue: Arc::new(Mutex::new(SlotRuntime::new())),
             green: Arc::new(Mutex::new(SlotRuntime::new())),
             shutting_down: Arc::new(AtomicBool::new(false)),
+            user_env: Arc::new(UserEnv::default()),
         }
+    }
+
+    /// The variables reach only the child's environment, never this process or its logs.
+    pub fn with_user_env(mut self, user_env: UserEnv) -> Self {
+        self.user_env = Arc::new(user_env);
+        self
     }
 
     fn runtime(&self, slot: Slot) -> Arc<Mutex<SlotRuntime>> {
@@ -187,6 +197,8 @@ impl SlotManager {
             .process_group(0)
             .kill_on_drop(true)
             .env_clear()
+            // Owner variables go in first so every supervisor-set key below overrides them.
+            .envs(self.user_env.vars())
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env(
                 if manifest.port_env.is_empty() {

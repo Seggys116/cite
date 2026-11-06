@@ -33,6 +33,8 @@ use crate::orchestrator::Orchestrator;
 use crate::store::{Store, TokenOutcome, now_unix, unix_to_rfc3339};
 use crate::{ConnectorError, Result, tls};
 
+mod alerts;
+mod analytics_api;
 mod archives;
 mod certificates;
 mod export;
@@ -40,6 +42,7 @@ mod handlers;
 mod health;
 #[cfg(test)]
 mod perf;
+mod site_ops;
 #[cfg(test)]
 mod tests;
 mod zone_secret;
@@ -70,6 +73,7 @@ pub struct Inner {
     ingest: Arc<IngestStats>,
     exports: Arc<Semaphore>,
     certs: Arc<CertStore>,
+    alerts: Arc<crate::alerts::Alerts>,
     limiter: StdMutex<LoginLimiter>,
     token_limiter: StdMutex<LoginLimiter>,
     started: Instant,
@@ -89,6 +93,8 @@ impl Inner {
         ingest: Arc<IngestStats>,
     ) -> AppState {
         let certs = Arc::new(CertStore::new(cfg.certs_dir.clone(), cfg.certs_mode));
+        let alerts = crate::alerts::Alerts::new(&cfg.data_dir);
+        alerts.attach_certs(Arc::clone(&certs));
         Arc::new(Inner {
             cfg,
             store,
@@ -99,6 +105,7 @@ impl Inner {
             ingest,
             exports: Arc::new(Semaphore::new(MAX_EXPORTS)),
             certs,
+            alerts,
             limiter: StdMutex::new(LoginLimiter::new()),
             token_limiter: StdMutex::new(LoginLimiter::new()),
             started: Instant::now(),
@@ -439,6 +446,22 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/sites/{id}/zone-secret",
             get(zone_secret::status).post(zone_secret::rotate),
         )
+        .route("/api/v1/sites/{id}/status", get(site_ops::status))
+        .route("/api/v1/sites/{id}/logs", get(site_ops::logs))
+        .route(
+            "/api/v1/sites/{id}/github-token",
+            get(site_ops::get_token)
+                .put(site_ops::put_token)
+                .delete(site_ops::delete_token),
+        )
+        .route(
+            "/api/v1/sites/{id}/build-env",
+            get(site_ops::get_build_env).patch(site_ops::patch_build_env),
+        )
+        .route(
+            "/api/v1/sites/{id}/runtime-env",
+            get(site_ops::get_runtime_env).patch(site_ops::patch_runtime_env),
+        )
         .route("/api/v1/sites/{id}/deploy", post(h::deploy_site))
         .route("/api/v1/sites/{id}/switch", post(h::switch_site))
         .route("/api/v1/sites/{id}/rollback", post(h::rollback_site))
@@ -462,11 +485,16 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/firewall/presets/{name}/apply",
             post(h::apply_preset),
         )
-        .route("/api/v1/analytics/summary", get(h::analytics_summary))
-        .route("/api/v1/analytics/timeseries", get(h::analytics_timeseries))
-        .route("/api/v1/analytics/requests", get(h::analytics_requests))
-        .route("/api/v1/analytics/bots", get(h::analytics_bots))
-        .route("/api/v1/analytics/top", get(h::analytics_top))
+        .route("/api/v1/analytics/summary", get(analytics_api::summary))
+        .route(
+            "/api/v1/analytics/timeseries",
+            get(analytics_api::timeseries),
+        )
+        .route("/api/v1/analytics/requests", get(analytics_api::requests))
+        .route("/api/v1/analytics/bots", get(analytics_api::bots))
+        .route("/api/v1/analytics/top", get(analytics_api::top))
+        .route("/api/v1/analytics/facets", get(analytics_api::facets))
+        .route("/api/v1/analytics/compare", get(analytics_api::compare))
         .route("/api/v1/analytics/stats", get(h::analytics_stats))
         .route("/api/v1/analytics/export", get(export::analytics_export))
         .route("/api/v1/analytics/archives", get(archives::list_archives))
@@ -488,6 +516,8 @@ pub fn router(state: AppState) -> Router {
                 .delete(certificates::delete),
         )
         .route("/api/v1/cloudflare/ranges", get(h::cloudflare_ranges))
+        .merge(certificates::issue_routes())
+        .merge(alerts::routes())
         .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
     Router::new()
         .merge(public)
@@ -668,6 +698,8 @@ pub async fn run(cfg: ConnectorConfig) -> Result<()> {
         analytics,
         ingest,
     );
+    crate::alerts::spawn_watcher(Arc::clone(&state.alerts), Arc::clone(&state.deployer));
+    certificates::spawn_renewals(Arc::clone(&state));
     tokio::select! {
         () = serve(listener, state, acceptor) => {}
         () = shutdown_signal() => tracing::info!("shutting down"),

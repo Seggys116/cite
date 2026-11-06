@@ -207,6 +207,9 @@ impl Console {
             return col.child(self.no_nodes_block(cx)).into_any_element();
         }
         col = col.children(self.scope_note());
+        let ready = matches!(self.settings.data, Load::Ready(_));
+        let tools = ready.then(|| self.certtools_card(cx));
+        let alerts = ready.then(|| self.alerts_card(cx));
         match &self.settings.data {
             Load::Idle | Load::Loading => col = col.child(skeleton(220.)).child(skeleton(160.)),
             Load::Failed(msg) => {
@@ -217,7 +220,9 @@ impl Console {
                 col = col
                     .child(self.retention_card(cx))
                     .child(self.certs_card(cx))
+                    .children(tools)
                     .child(self.ranges_card(cx))
+                    .children(alerts)
                     .child(self.tokens_card(data, cx));
             }
         }

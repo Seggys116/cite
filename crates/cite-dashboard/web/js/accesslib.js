@@ -1,12 +1,12 @@
 export const TLS_MODES = ['full', 'flexible'];
 
 export const CLOUDFLARE_ONLY_LABEL = 'Only allow traffic through the Cloudflare proxy';
-export const CLOUDFLARE_ONLY_HELP = 'Visitors must come through Cloudflare (orange cloud on). Direct requests to your server address are refused. You do not need to create any Cloudflare rule for this.';
-export const TLS_FULL_LABEL = 'Certificate on the node';
-export const TLS_FLEXIBLE_LABEL = 'Cloudflare handles HTTPS (no certificate on the node)';
-export const FULL_HELP = 'Visitors and Cloudflare connect over HTTPS, so the node needs a certificate that covers the host. Upload one under Settings, Certificates.';
-export const FLEXIBLE_HELP = 'Cloudflare serves the certificate to visitors and talks to your server over plain http. Pick this if you do not want to upload a certificate. Traffic between Cloudflare and your server is not encrypted.';
-export const FLEXIBLE_WARNING = 'Cloudflare handles HTTPS, but traffic is not limited to the Cloudflare proxy. Anyone who reaches your server address directly is served over plain http with no encryption. Turn on Only allow traffic through the Cloudflare proxy.';
+export const CLOUDFLARE_ONLY_HELP = 'When on, requests that do not arrive from Cloudflare\'s network are refused. Turn it on only for sites that are proxied by Cloudflare (orange cloud).';
+export const TLS_FULL_LABEL = 'Full (the node serves its own certificate)';
+export const TLS_FLEXIBLE_LABEL = 'Flexible SSL (Cloudflare serves HTTPS to visitors and talks to your server over plain http)';
+export const FULL_HELP = 'Visitors, or Cloudflare, connect over HTTPS and the node answers with its own certificate. Create or upload one under Settings, Certificates.';
+export const FLEXIBLE_HELP = 'Cloudflare serves HTTPS to visitors and talks to your server over plain http, so no certificate is needed on the node. Traffic between Cloudflare and your server is not encrypted.';
+export const FLEXIBLE_WARNING = 'Without Only allow traffic through the Cloudflare proxy, anyone can reach your server directly over plain http with no encryption. Flexible SSL still works, but turn that option on if the site is proxied by Cloudflare.';
 export const ZONE_LOCK_LABEL = 'Also require that requests come from MY Cloudflare account (advanced)';
 export const ZONE_LOCK_TOGGLE = 'Show the advanced account check';
 
@@ -104,6 +104,35 @@ export function secretCloseNeedsConfirm(copied) {
 
 export function botWarning(bots) {
   return bots === 'block_all' ? SEO_WARNING : '';
+}
+
+export const NO_BOT_BLOCKING = 'No bot blocking is active for this site';
+
+// Allow never reads as protection: it says outright that nothing blocks bots
+export function botStatusLine(bots) {
+  if (bots === 'block_bad') return 'Scraper and tool bots are blocked for this site.';
+  if (bots === 'block_all') return 'All bots are blocked for this site, including search engines.';
+  return NO_BOT_BLOCKING;
+}
+
+// Firewall rules that look at the user agent and reach this site, global or scoped to it, so the owner sees what could block bots
+export function userAgentRulesFor(rules, siteId) {
+  return (Array.isArray(rules) ? rules : [])
+    .filter((r) => r && (!r.site || r.site === siteId))
+    .map((r) => {
+      const m = r.matchers || {};
+      const patterns = [...(m.user_agent_regexes || []), ...(m.user_agent_regex ? [m.user_agent_regex] : [])];
+      return { id: r.id, name: r.name || r.id, enabled: r.enabled !== false, scope: r.site ? 'this site' : 'all sites', action: r.action || '', patterns };
+    })
+    .filter((r) => r.patterns.length > 0);
+}
+
+// The sentence above the list of rules; disabled rules are named as such so they are not counted as protection
+export function userAgentRulesLine(list) {
+  if (!list.length) return 'No firewall rule looks at user agents for this site.';
+  const live = list.filter((r) => r.enabled).length;
+  if (!live) return `${list.length} firewall ${list.length === 1 ? 'rule looks' : 'rules look'} at user agents for this site, but ${list.length === 1 ? 'it is' : 'all are'} switched off.`;
+  return `${live} firewall ${live === 1 ? 'rule' : 'rules'} may block by user agent for this site:`;
 }
 
 export function flexibleWithoutCloudflare(access) {

@@ -8,23 +8,44 @@ import { actionPill, slotPill, healthKind, healthDots, siteHref } from './common
 import { targetEditor } from './siteForm.js';
 import { conditionList } from './conditions.js';
 import {
-  PATH_TYPES, pathFieldsFromRows, pathRowsFromSite, pathsProblem,
+  PATH_TYPES, pathFieldsFromRows, pathRowsFromSite,
 } from '../conditionlib.js';
 import { pagePreview } from './maintenance.js';
 import { gitRefProblem } from '../siteCheck.js';
 import { accessForSave, accessOf, zoneLockTurnedOn } from '../accesslib.js';
 import { accessCard } from './accessCard.js';
 import { rotateAndShow } from './zoneSecret.js';
+import { nodeInfoCached, siteFeatures, showsBuildSettings } from '../caplib.js';
+import { canRollback, deployRefFor, deployFailureText, historyRows } from '../historylib.js';
+import {
+  healthFromFields, healthProblems, hostProblem, nameProblem, routingProblem, siteBody, KINDS,
+} from '../sitelib.js';
+import { makeDirty, dirtyText } from '../dirtylib.js';
+import { statusPanel } from './siteStatus.js';
+import { logsPanel } from './siteLogs.js';
+import { buildSettingsCard, envCard, tokenCard } from './siteBuild.js';
+import { deployWithToasts } from './deployFlow.js';
 
-const TABS = [
+const ALL_TABS = [
   { id: 'overview', label: 'Overview', icon: 'activity' },
   { id: 'deployments', label: 'Deployments', icon: 'rocket' },
-  { id: 'routing', label: 'Routing', icon: 'globe' },
+  { id: 'build', label: 'Build', icon: 'wrench', needs: 'build' },
+  { id: 'logs', label: 'Logs', icon: 'layers', needs: 'logs' },
+  { id: 'routing', label: 'Settings', icon: 'globe' },
   { id: 'maintenance', label: 'Maintenance', icon: 'wrench' },
   { id: 'danger', label: 'Danger zone', icon: 'alert' },
 ];
 
-const HOST_RE = /^(\*\.)?[a-z0-9]([a-z0-9.-]*[a-z0-9])?$/i;
+// Tabs for features the node does not list are left out instead of showing controls that cannot work
+function tabsFor(site, info) {
+  const features = siteFeatures(info);
+  return ALL_TABS.filter((t) => {
+    if (t.needs === 'build') return showsBuildSettings(info, site);
+    if (t.needs === 'logs') return Boolean(site.source) && features.logs;
+    return true;
+  });
+}
+
 const other = (slot) => (slot === 'blue' ? 'green' : 'blue');
 
 // Draws clients, the edge and both slots; only the branch to the active slot is animated
@@ -76,9 +97,10 @@ function flowDiagram(site) {
   return h('div', { class: 'flow-wrap' }, svg);
 }
 
-function overviewPanel(site) {
+function overviewPanel(site, extra = {}) {
   const live = (site.live && site.live[site.active]) || [];
   return h('div', { class: 'stack' },
+    extra.status || null,
     card({ title: 'Traffic flow', subtitle: `All requests currently reach the ${site.active} slot`, body: flowDiagram(site) }),
     h('div', { class: 'two-col' },
       card({ title: 'Routing', body: kvList([
@@ -94,16 +116,20 @@ function overviewPanel(site) {
         ['Rise / fall', `${site.health.rise} / ${site.health.fall}`],
         ['Active targets', healthDots(live)],
       ]) })),
-    site.source ? card({ title: 'Source', body: kvList([
-      ['Repository', h('code', { class: 'mono' }, site.source.repo)],
-      ['Branch', h('code', { class: 'mono' }, site.source.branch || 'main')],
-      ['Runtime', site.source.runtime ? `${site.source.runtime}${site.source.node_major ? ' ' + site.source.node_major : ''}` : 'node'],
-      ['Poll interval', site.source.poll_interval || '5m'],
-    ]) }) : null);
+    site.source ? card({
+      title: 'Source',
+      actions: extra.editSource ? h('a', { class: 'btn btn-sm', href: siteHref(extra.node, site.id, 'build') }, 'Edit build settings') : null,
+      body: kvList([
+        ['Repository', h('code', { class: 'mono' }, site.source.repo)],
+        ['Branch', h('code', { class: 'mono' }, site.source.branch || 'main')],
+        ['Runtime', site.source.runtime ? `${site.source.runtime}${site.source.node_major ? ' ' + site.source.node_major : ''}` : 'node'],
+        ['Poll interval', site.source.poll_interval || '5m'],
+      ]),
+    }) : null);
 }
 
 function deploymentsPanel(ctx, site, reload) {
-  const { node } = ctx;
+  const { node, info } = ctx;
   const idle = other(site.active);
   const fromGit = Boolean(site.source);
   const editor = targetEditor({ targets: (site[idle] && site[idle].targets) || [] });
@@ -116,7 +142,7 @@ function deploymentsPanel(ctx, site, reload) {
   const err = h('p', { class: 'form-error', role: 'alert', hidden: true });
   const deployBtn = button(`Deploy to ${idle}`, { kind: 'primary', iconName: 'rocket' });
 
-  // The deploy call blocks until health checks pass, so show elapsed time while it runs
+  // A node that cannot deploy in the background holds the request until health checks pass, so show elapsed time while it runs
   const showProgress = () => {
     const started = Date.now();
     const elapsed = h('b', { class: 'mono' }, '0s');
@@ -131,7 +157,29 @@ function deploymentsPanel(ctx, site, reload) {
     };
   };
 
-  deployBtn.addEventListener('click', async () => {
+  // A deploy that failed shows the node's whole message here and in a toast; the record is already in the history, so the list is refreshed
+  const run = async (args, button0) => {
+    err.hidden = true;
+    const waits = !siteFeatures(info).deployAsync || !fromGit;
+    const stop = waits ? showProgress() : () => {};
+    const ok = await withBusy(button0, () => deployWithToasts({ node, siteId: site.id, info, ...args }, {
+      onAfter: (res) => {
+        stop();
+        if (res.failed) {
+          err.textContent = deployFailureText(res.error);
+          err.hidden = false;
+          reload();
+        } else if (res.async) {
+          location.hash = siteHref(node, site.id, 'overview');
+        } else {
+          reload();
+        }
+      },
+    }));
+    return ok;
+  };
+
+  deployBtn.addEventListener('click', () => {
     const problem = fromGit ? gitRefProblem(gitRef.value) : editor.validate();
     err.hidden = true;
     if (problem || (!fromGit && !editor.get().length)) {
@@ -139,42 +187,34 @@ function deploymentsPanel(ctx, site, reload) {
       err.hidden = false;
       return;
     }
-    const payload = fromGit ? { git_ref: gitRef.value.trim() } : { targets: editor.get() };
-    payload.note = note.value.trim() || undefined;
-    const stop = showProgress();
+    const noteText = note.value.trim() || undefined;
+    run(fromGit ? { ref: gitRef.value.trim(), note: noteText } : { targets: editor.get(), note: noteText }, deployBtn);
+  });
+
+  const rollbackNow = async () => {
+    const ok = await confirmDialog({ title: 'Roll back', message: `Return traffic to the previous version? The ${other(site.active)} slot becomes active again.`, confirmLabel: 'Roll back', danger: true });
+    if (!ok) return;
     try {
-      await withBusy(deployBtn, () => nodeApi(node).post(`/sites/${encodeURIComponent(site.id)}/deploy`, payload));
-      stop();
-      toast(`Deployed. ${idle} is now active.`, 'success');
+      await nodeApi(node).post(`/sites/${encodeURIComponent(site.id)}/rollback`);
+      toast('Rolled back', 'success');
       reload();
     } catch (ex) {
-      stop();
-      err.textContent = formatError(ex);
-      err.hidden = false;
-      // A failed health check is a 409 whose record is already in the history, so refresh to show it
-      if (ex && ex.status === 409) {
-        toast(formatError(ex), 'error');
-        reload();
-      }
+      toast(formatError(ex), 'error', 15000);
     }
-  });
+  };
+  const rollback = button('Roll back', { iconName: 'refresh', onClick: rollbackNow });
+  rollback.disabled = !canRollback(site.history, site.active);
+  rollback.title = rollback.disabled ? 'There is no earlier release to return to' : '';
 
-  const rollback = button('Roll back', {
-    iconName: 'refresh',
-    onClick: async () => {
-      const ok = await confirmDialog({ title: 'Roll back', message: `Return traffic to the previous version? The ${other(site.active)} slot becomes active again.`, confirmLabel: 'Roll back', danger: true });
-      if (!ok) return;
-      try {
-        await nodeApi(node).post(`/sites/${encodeURIComponent(site.id)}/rollback`);
-        toast('Rolled back', 'success');
-        reload();
-      } catch (ex) {
-        toast(formatError(ex), 'error');
-      }
-    },
-  });
-
-  const history = [...(site.history || [])].reverse();
+  const history = historyRows(site.history, site.active);
+  const rowActions = (d) => h('div', { class: 'row-actions' },
+    fromGit && d.canRedeploy ? button('Redeploy', {
+      size: 'sm', title: 'Build the latest commit again', onClick: (e) => run({ ref: deployRefFor({}, site.source) }, e.currentTarget),
+    }) : null,
+    fromGit && d.canDeployCommit ? button('Deploy this commit', {
+      size: 'sm', title: `Build ${d.commit}`, onClick: (e) => run({ ref: deployRefFor(d, site.source) }, e.currentTarget),
+    }) : null,
+    d.current && canRollback(site.history, site.active) ? button('Roll back', { size: 'sm', onClick: rollbackNow }) : null);
   return h('div', { class: 'stack' },
     card({
       title: 'Deploy new version',
@@ -194,8 +234,15 @@ function deploymentsPanel(ctx, site, reload) {
           { label: 'When', render: (d) => h('span', { title: fmtDate(d.at) }, relTime(d.at)) },
           { label: 'Action', render: (d) => actionPill(d.action) },
           { label: 'Slot', render: (d) => slotPill(d.slot) },
-          { label: 'Note', render: (d) => d.note || h('span', { class: 'muted' }, '-') },
+          {
+            label: 'Note',
+            render: (d) => (d.note
+              ? h('span', { class: d.failed ? 'error-text wrap-any' : 'wrap-any', title: d.note }, d.note)
+              : h('span', { class: 'muted' }, '-')),
+          },
+          { label: 'Commit', render: (d) => (d.commit ? h('code', { class: 'mono' }, d.commit.slice(0, 7)) : h('span', { class: 'muted' }, '-')) },
           { label: 'Id', render: (d) => h('span', { class: 'mono muted' }, d.id) },
+          { label: '', align: 'right', render: rowActions },
         ],
         rows: history,
         empty: emptyState({ iconName: 'rocket', title: 'No deployments yet', text: 'Deploy a version to start the history.' }),
@@ -204,48 +251,94 @@ function deploymentsPanel(ctx, site, reload) {
 }
 
 function routingPanel(ctx, site, reload) {
+  // check() is called by child controls while they are being built, so its handle is declared before them
+  let queued = 0;
   const name = h('input', { class: 'input', type: 'text', value: site.name, 'aria-label': 'Site name' });
-  const hosts = chipInput({ values: site.hosts || [], label: 'Hosts', placeholder: 'Add host, then Enter', validate: (v) => (HOST_RE.test(v) ? null : `"${v}" is not a valid host name.`) });
+  const kind = h('select', { class: 'select', 'aria-label': 'Kind', value: site.kind || 'site' },
+    KINDS.map((k) => h('option', { value: k }, k === 'api' ? 'API' : 'Site')));
+  let hostList = [...(site.hosts || [])];
+  const hosts = chipInput({
+    values: hostList, label: 'Hosts', placeholder: 'Add host, then Enter', validate: (v) => hostProblem(v),
+    onChange: (list) => { hostList = list; check(); },
+  });
   const pathRows = pathRowsFromSite(site);
-  const paths = conditionList({ rows: pathRows, types: PATH_TYPES, label: 'Path', addLabel: 'Add a path' });
-  const numeric = (value, label) => h('input', { class: 'input mono', type: 'number', min: '0', value: String(value), 'aria-label': label });
-  const path = h('input', { class: 'input mono', type: 'text', value: site.health.path, 'aria-label': 'Health check path' });
+  const paths = conditionList({ rows: pathRows, types: PATH_TYPES, label: 'Path', addLabel: 'Add a path', onChange: () => check() });
+  const numeric = (value, label) => h('input', { class: 'input mono', type: 'number', inputmode: 'numeric', value: String(value), 'aria-label': label });
+  const path = h('input', { class: 'input mono', type: 'text', value: site.health.path, spellcheck: 'false', 'aria-label': 'Health check path' });
   const interval = numeric(site.health.interval_ms, 'Interval in ms');
   const rise = numeric(site.health.rise, 'Rise');
   const fall = numeric(site.health.fall, 'Fall');
   const timeout = numeric(site.health.timeout_ms, 'Timeout in ms');
-  const access = accessCard({ node: ctx.node, site });
+  const access = accessCard({ node: ctx.node, site, onChange: () => check() });
   const err = h('p', { class: 'form-error', role: 'alert', hidden: true });
-  const save = button('Save routing', { kind: 'primary', iconName: 'check' });
+  const save = button('Save settings', { kind: 'primary', iconName: 'check' });
+  const badge = pill('Unsaved changes', 'warn');
+  const dirtyHint = h('span', { class: 'muted', role: 'status', 'aria-live': 'polite' });
+  const errs = {
+    name: h('span', { class: 'error-text', role: 'status', hidden: true }),
+    path: h('span', { class: 'error-text', role: 'status', hidden: true }),
+    interval_ms: h('span', { class: 'error-text', role: 'status', hidden: true }),
+    timeout_ms: h('span', { class: 'error-text', role: 'status', hidden: true }),
+    rise: h('span', { class: 'error-text', role: 'status', hidden: true }),
+    fall: h('span', { class: 'error-text', role: 'status', hidden: true }),
+  };
+  const current = () => ({
+    name: name.value,
+    kind: kind.value,
+    hosts: hostList,
+    pathRows,
+    health: healthFromFields({ path: path.value, interval_ms: interval.value, timeout_ms: timeout.value, rise: rise.value, fall: fall.value }),
+    access: access.get(),
+  });
+  const dirty = makeDirty(() => ({ ...current(), pathRows: pathFieldsFromRows(pathRows) }));
+  // Marks the fields that are wrong as you type; the cheap per-field text is all that changes
+  function check() {
+    cancelAnimationFrame(queued);
+    queued = requestAnimationFrame(() => {
+      const c = current();
+      const nm = nameProblem(c.name);
+      const hp = healthProblems(c.health);
+      const messages = { name: nm, ...hp };
+      for (const [key, el] of Object.entries(errs)) {
+        el.textContent = messages[key] || '';
+        el.hidden = !messages[key];
+      }
+      const isDirty = dirty.dirty();
+      badge.hidden = !isDirty;
+      dirtyHint.textContent = isDirty ? dirtyText(['settings']) : '';
+      save.disabled = !isDirty || Boolean(routingProblem({ ...c, pathRows }));
+    });
+  }
+  for (const el of [name, kind, path, interval, timeout, rise, fall]) {
+    el.addEventListener('input', check);
+    el.addEventListener('change', check);
+  }
+  check();
   save.addEventListener('click', async () => {
     const fail = (m) => {
       err.textContent = m;
       err.hidden = false;
     };
-    if (!name.value.trim()) return fail('The site needs a name.');
-    if (!hosts.get().length) return fail('Keep at least one host.');
-    const pathBad = pathsProblem(pathRows);
-    if (pathBad) return fail(pathBad);
-    if (!path.value.startsWith('/')) return fail('The health check path must start with /.');
+    // get() also takes a host that was typed but not yet confirmed with Enter
+    hostList = hosts.get();
+    const c = current();
+    const bad = routingProblem({ ...c, pathRows });
+    if (bad) return fail(bad.message);
     err.hidden = true;
-    // Editable fields only; id, slots and active are what the Site schema requires and the server ignores them on update
-    const next = {
-      id: site.id,
-      blue: site.blue,
-      green: site.green,
-      active: site.active,
-      name: name.value.trim(),
-      hosts: hosts.get(),
+    const next = siteBody(site, {
+      name: c.name.trim(),
+      kind: c.kind,
+      hosts: c.hosts,
       ...pathFieldsFromRows(pathRows),
-      kind: site.kind,
-      health: { path: path.value, interval_ms: Number(interval.value), rise: Number(rise.value), fall: Number(fall.value), timeout_ms: Number(timeout.value) },
-      source: site.source,
-    };
+      health: c.health,
+    });
+    delete next.access;
     const accessValue = accessForSave(access.get(), site.access);
     if (accessValue) next.access = accessValue;
     try {
       await withBusy(save, () => nodeApi(ctx.node).put(`/sites/${encodeURIComponent(site.id)}`, next));
-      toast('Routing saved', 'success');
+      dirty.reset();
+      toast('Settings saved', 'success');
       // The node makes the secret when the lock goes on, and only a rotate call hands it back
       if (zoneLockTurnedOn(accessOf(site), access.get())) {
         const failures = await rotateAndShow([ctx.node], site.id, reload);
@@ -260,15 +353,31 @@ function routingPanel(ctx, site, reload) {
       fail(formatError(ex));
     }
   });
+  const withError = (label, control, key, hint) => {
+    const f = field(label, control, hint);
+    f.append(errs[key]);
+    return f;
+  };
   return h('div', { class: 'stack' },
-    card({ title: 'Routing', body: h('div', { class: 'form' }, field('Name', name), field('Hosts', hosts.el, null, { group: true }),
-      field('Only for these paths (optional)', paths.el, 'Leave empty to serve every path. A request matching any path is routed here.', { group: true })) }),
+    card({
+      title: 'Site',
+      actions: badge,
+      body: h('div', { class: 'form' },
+        h('div', { class: 'two-col' }, withError('Name', name, 'name'), field('Kind', kind, 'APIs usually route by path prefix; sites by domain.')),
+        field('Hosts', hosts.el, null, { group: true }),
+        field('Only for these paths (optional)', paths.el, 'Leave empty to serve every path. A request matching any path is routed here.', { group: true })),
+    }),
     access.el,
-    card({ title: 'Health check', body: h('div', { class: 'form' },
-      field('Path', path),
-      h('div', { class: 'four-col' }, field('Interval (ms)', interval), field('Timeout (ms)', timeout), field('Rise', rise), field('Fall', fall))) }),
+    card({
+      title: 'Health check',
+      body: h('div', { class: 'form' },
+        withError('Path', path, 'path', 'Requested on every target to decide whether it is ready.'),
+        h('div', { class: 'four-col' },
+          withError('Interval (ms)', interval, 'interval_ms', '100 to 60000.'), withError('Timeout (ms)', timeout, 'timeout_ms', '100 to 10000, not above the interval.'),
+          withError('Rise', rise, 'rise', 'Passes to be healthy, 1 to 10.'), withError('Fall', fall, 'fall', 'Failures to be down, 1 to 10.'))),
+    }),
     err,
-    h('div', { class: 'form-actions' }, save));
+    h('div', { class: 'form-actions' }, dirtyHint, save));
 }
 
 function maintenancePanel(ctx, site, pages, reload) {
@@ -329,17 +438,37 @@ function dangerPanel(ctx, site) {
 // Route shape: #/sites/{node}/{site}/{tab}
 export function siteDetailView(ctx) {
   const [node, id, tabParam] = ctx.params;
-  const tab = TABS.some((t) => t.id === tabParam) ? tabParam : 'overview';
-  const c = { node };
   ctx.setCrumbs([{ label: 'Sites', href: '#/sites' }, { label: id }]);
   const body = h('div', {});
   ctx.root.append(body);
   const n = nodeApi(node);
   loadInto(body, async () => {
-    const [site, pages] = await Promise.all([n.get('/sites/' + encodeURIComponent(id)), n.get('/pages').catch(() => [])]);
-    return { site, pages };
-  }, ({ site, pages }, reload) => {
+    const [site, pages, info] = await Promise.all([
+      n.get('/sites/' + encodeURIComponent(id)),
+      n.get('/pages').catch(() => []),
+      nodeInfoCached(node, () => n.get('/node')).catch(() => null),
+    ]);
+    return { site, pages, info };
+  }, ({ site, pages, info }, reload) => {
     ctx.setCrumbs([{ label: 'Sites', href: '#/sites' }, { label: site.name }]);
+    const TABS = tabsFor(site, info);
+    const tab = TABS.some((t) => t.id === tabParam) ? tabParam : 'overview';
+    const c = { node, info };
+    const features = siteFeatures(info);
+    const canStatus = Boolean(site.source) && features.status;
+    let buildCard = null;
+    let statusRef = null;
+    const makeStatus = () => {
+      statusRef = statusPanel({
+        node,
+        site,
+        onStatus: (status, detected) => {
+          if (buildCard && detected) buildCard.setDetected(detected);
+        },
+        onRedeploy: () => deployWithToasts({ node, siteId: site.id, info }, { onAfter: () => statusRef && statusRef.refresh() }),
+      });
+      return statusRef.el;
+    };
     const swap = button(`Switch to ${other(site.active)}`, {
       kind: 'primary',
       iconName: 'swap',
@@ -361,7 +490,25 @@ export function siteDetailView(ctx) {
         case 'routing': return routingPanel(c, site, reload);
         case 'maintenance': return maintenancePanel(c, site, pages, reload);
         case 'danger': return dangerPanel(c, site);
-        default: return overviewPanel(site);
+        case 'build': {
+          const status = canStatus ? makeStatus() : null;
+          buildCard = buildSettingsCard({ node, site, info, onSaved: () => reload() });
+          return h('div', { class: 'stack' },
+            status, buildCard.el,
+            features.buildEnv ? envCard({
+              node, siteId: site.id, which: 'build-env', title: 'Build environment variables',
+              subtitle: 'Visible to the install and build commands.',
+              note: 'Values are write-only: only the names are shown after saving. Anything a static build bakes into its output is public.',
+            }).el : null,
+            features.runtimeEnv ? envCard({
+              node, siteId: site.id, which: 'runtime-env', title: 'Runtime environment variables',
+              subtitle: 'Given to the running site when it renders on the server.',
+              note: 'Values are write-only: only the names are shown after saving.',
+            }).el : null,
+            features.token ? tokenCard({ node, siteId: site.id, onChanged: () => statusRef && statusRef.refresh() }).el : null);
+        }
+        case 'logs': return logsPanel({ node, site }).el;
+        default: return overviewPanel(site, { status: canStatus ? makeStatus() : null, node, editSource: showsBuildSettings(info, site) });
       }
     };
     const pills = h('div', { class: 'pill-row' }, pill(site.kind === 'api' ? 'API' : 'Site', 'muted'), slotPill(site.active),

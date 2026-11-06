@@ -1,15 +1,24 @@
+mod alertcfg;
+mod analyticsq;
 mod api;
+mod api_issue;
 mod app;
 mod archive;
 mod bots;
+mod certissue;
 mod certs;
 mod cli;
 mod config;
 mod demo;
+mod demo_analytics;
+mod demo_ops;
+mod diagnose;
 mod keychain;
 mod model;
+mod repo;
 mod rules;
 mod scope;
+mod siteops;
 #[cfg(test)]
 mod testkit;
 mod theme;

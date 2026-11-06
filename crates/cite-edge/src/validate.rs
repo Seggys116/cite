@@ -325,6 +325,249 @@ pub fn validate_site(site: &Site) -> Result<(), ValidationError> {
     validate_health(&site.id, &site.health)
 }
 
+// Loading a stored config uses validate_site, which never judges a source an older node already accepted.
+pub fn validate_site_strict(site: &Site) -> Result<(), ValidationError> {
+    validate_site(site)?;
+    if let Some(src) = &site.source {
+        validate_source(src).map_err(|e| ValidationError(format!("site {} {}", site.id, e.0)))?;
+    }
+    Ok(())
+}
+
+const SOURCE_RUNTIMES: [&str; 4] = ["node", "bun", "static", "rust"];
+const SOURCE_NODE_MAJORS: [u8; 2] = [22, 24];
+const MAX_SOURCE_PATH: usize = 255;
+const MAX_SOURCE_COMMAND: usize = 1024;
+const MIN_MEMORY_MB: u32 = 256;
+const MAX_MEMORY_MB: u32 = 1_048_576;
+// The Docker proxy refuses less than a quarter CPU (MIN_STACK_NANO_CPUS).
+const MIN_CPUS: f32 = 0.25;
+const MAX_CPUS: f32 = 1024.0;
+const MAX_POLL_SECS: u64 = 366 * 86_400;
+const START_DENIED_ARGV0: [&str; 8] = ["npm", "npx", "pnpm", "yarn", "cargo", "sh", "bash", "env"];
+
+fn source_error<T>(field: &str, msg: &str) -> Result<T, ValidationError> {
+    invalid(format!("source {field}: {msg}"))
+}
+
+// Errors name the field only; the value may hold a token or other secret.
+pub fn validate_source(src: &crate::model::Source) -> Result<(), ValidationError> {
+    validate_repo(&src.repo)?;
+    if let Some(b) = &src.branch {
+        validate_branch(b)?;
+    }
+    let runtime = src.runtime.as_deref().unwrap_or("node");
+    if !SOURCE_RUNTIMES.contains(&runtime) {
+        return source_error("runtime", "must be node, bun, static or rust");
+    }
+    if let Some(major) = src.node_major
+        && runtime != "rust"
+        && !SOURCE_NODE_MAJORS.contains(&major)
+    {
+        return source_error("node_major", "must be 22 or 24");
+    }
+    if let Some(p) = &src.poll_interval {
+        validate_poll(p)?;
+    }
+    for (field, value) in [
+        ("root_dir", &src.root_dir),
+        ("output_dir", &src.output_dir),
+        ("spa_fallback", &src.spa_fallback),
+    ] {
+        if let Some(v) = value {
+            validate_relative_path(field, v)?;
+        }
+    }
+    for (field, value) in [
+        ("install_command", &src.install_command),
+        ("build_command", &src.build_command),
+    ] {
+        if let Some(v) = value {
+            validate_command_text(field, v)?;
+        }
+    }
+    if let Some(cmd) = &src.start_command {
+        validate_start_command(cmd)?;
+        if src.rendering == Some(crate::model::RenderMode::Static) {
+            return source_error(
+                "rendering",
+                "must not be static when a start_command is set",
+            );
+        }
+    }
+    for (field, value) in [
+        ("memory_mb", src.memory_mb),
+        ("build_memory_mb", src.build_memory_mb),
+    ] {
+        if let Some(mb) = value
+            && !(MIN_MEMORY_MB..=MAX_MEMORY_MB).contains(&mb)
+        {
+            return source_error(field, "must be 256 to 1048576 MiB");
+        }
+    }
+    for (field, value) in [("cpus", src.cpus), ("build_cpus", src.build_cpus)] {
+        if let Some(c) = value
+            && !(c.0.is_finite() && (MIN_CPUS..=MAX_CPUS).contains(&c.0))
+        {
+            return source_error(field, "must be a number from 0.25 to 1024");
+        }
+    }
+    if let Some(v) = &src.framework {
+        let ok = (1..=32).contains(&v.len())
+            && v.bytes()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-');
+        if !ok {
+            return source_error(
+                "framework",
+                "must be 1 to 32 characters of a-z, 0-9 and '-'",
+            );
+        }
+    }
+    // Managers read the forge from the node env only, so a per-site value would be silently ignored.
+    if src.forge.as_deref().is_some_and(|f| !f.is_empty()) {
+        return source_error(
+            "forge",
+            "the forge is set for the whole node by the operator (CITE_STACK_FORGE); a per-site forge is not supported",
+        );
+    }
+    Ok(())
+}
+
+fn validate_repo(repo: &str) -> Result<(), ValidationError> {
+    let part_ok = |p: &str| {
+        (1..=100).contains(&p.len())
+            && p != "."
+            && p != ".."
+            && p.bytes()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'-'))
+    };
+    match repo.split_once('/') {
+        Some((owner, name)) if part_ok(owner) && part_ok(name) => Ok(()),
+        _ => source_error("repo", "must be owner/name"),
+    }
+}
+
+fn validate_branch(b: &str) -> Result<(), ValidationError> {
+    let ok = (1..=255).contains(&b.len())
+        && b.bytes()
+            .all(|c| c.is_ascii_graphic() && !b"~^:?*[\\".contains(&c))
+        && !b.contains("..")
+        && !b.contains("@{")
+        && !b.contains("//")
+        && !b.starts_with(['-', '/'])
+        && !b.ends_with(['/', '.'])
+        && !b.ends_with(".lock");
+    if ok {
+        Ok(())
+    } else {
+        source_error("branch", "is not a valid git branch name")
+    }
+}
+
+// Same grammar as the manager: off or 0 disables polling, otherwise a duration from 60 seconds to 366 days.
+fn validate_poll(text: &str) -> Result<(), ValidationError> {
+    let t = text.trim();
+    if t == "0" || t.eq_ignore_ascii_case("off") {
+        return Ok(());
+    }
+    let bad = || {
+        source_error(
+            "poll_interval",
+            "must be off or a number with a unit such as 5m, 1h or 1d",
+        )
+    };
+    let Some(split) = t.find(|c: char| c.is_ascii_alphabetic()) else {
+        return bad();
+    };
+    let (num, unit) = t.split_at(split);
+    let Ok(n) = num.parse::<u64>() else {
+        return bad();
+    };
+    let secs = match unit.to_ascii_lowercase().as_str() {
+        "ms" => n / 1000,
+        "s" | "sec" | "secs" => n,
+        "m" | "min" | "mins" => n.saturating_mul(60),
+        "h" | "hr" | "hrs" => n.saturating_mul(3_600),
+        "d" | "day" | "days" => n.saturating_mul(86_400),
+        _ => return bad(),
+    };
+    if secs < 60 {
+        return source_error("poll_interval", "must be at least 60 seconds (or off)");
+    }
+    if secs > MAX_POLL_SECS {
+        return source_error("poll_interval", "must be at most 366d");
+    }
+    Ok(())
+}
+
+fn validate_relative_path(field: &str, p: &str) -> Result<(), ValidationError> {
+    let ok = (1..=MAX_SOURCE_PATH).contains(&p.len())
+        && p.bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'/' | b'-'))
+        && !p.starts_with(['/', '-'])
+        && !p.split('/').any(|seg| seg == "..");
+    if ok {
+        Ok(())
+    } else {
+        source_error(
+            field,
+            "must be a relative path of letters, digits, '.', '_', '-' and '/' without '..'",
+        )
+    }
+}
+
+fn validate_command_text(field: &str, cmd: &str) -> Result<(), ValidationError> {
+    if cmd.trim().is_empty() || cmd.len() > MAX_SOURCE_COMMAND {
+        return source_error(field, "must be 1 to 1024 bytes");
+    }
+    if cmd.chars().any(char::is_control) {
+        return source_error(field, "must be one line without control characters");
+    }
+    Ok(())
+}
+
+// The start command is meant to be one program with arguments, so shell syntax is refused instead of escaped.
+fn validate_start_command(cmd: &str) -> Result<(), ValidationError> {
+    const FIELD: &str = "start_command";
+    validate_command_text(FIELD, cmd)?;
+    let mut quote: Option<char> = None;
+    for c in cmd.chars() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some('\''), _) => {}
+            (Some(_), '$' | '`' | '\\') => {
+                return source_error(FIELD, "must not use shell expansion");
+            }
+            (Some(_), _) => {}
+            (None, '\'' | '"') => quote = Some(c),
+            (
+                None,
+                ';' | '|' | '&' | '<' | '>' | '`' | '$' | '(' | ')' | '{' | '}' | '*' | '?' | '~'
+                | '!' | '#' | '\\',
+            ) => {
+                return source_error(FIELD, "must not contain shell metacharacters");
+            }
+            (None, _) => {}
+        }
+    }
+    if quote.is_some() {
+        return source_error(FIELD, "has an unterminated quote");
+    }
+    let argv0 = cmd
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .trim_matches(['\'', '"']);
+    let program = argv0.rsplit('/').next().unwrap_or("");
+    if program.is_empty() || argv0.contains('=') || START_DENIED_ARGV0.contains(&program) {
+        return source_error(
+            FIELD,
+            "must start with the program to run, not a package manager, shell or env",
+        );
+    }
+    Ok(())
+}
+
 pub fn validate_rule(rule: &FirewallRule) -> Result<(), ValidationError> {
     let what = format!("rule {}", rule.id);
     validate_id("rule", &rule.id)?;
@@ -789,7 +1032,8 @@ pub fn validate_page(page: &MaintenancePage) -> Result<(), ValidationError> {
 
 pub fn validate_settings(s: &EdgeSettings) -> Result<(), ValidationError> {
     check_range("settings http_port", s.http_port.into(), 1, 65535)?;
-    if let Some(p) = s.https_port {
+    // 0 tells the node never to bind the TLS port on its own
+    if let Some(p) = s.https_port.filter(|p| *p != 0) {
         check_range("settings https_port", p.into(), 1, 65535)?;
         if p == s.http_port {
             return invalid("settings: https_port must differ from http_port".into());

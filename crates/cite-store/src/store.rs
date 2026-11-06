@@ -10,11 +10,13 @@ use cite_edge::model::LogEvent;
 use rusqlite::Connection;
 use serde::Serialize;
 
+use crate::analytics::{self, Answer, Compare, Facets, PageRequest, RequestPage, TopList};
 use crate::archive::{ArchiveItem, ArchiveList, ArchiveScrub, CutReport};
 use crate::error::{Error, Result};
 use crate::export::{self, CsvSink, ExportFilter, ExportKind, NdjsonSink};
+use crate::filter::AnalyticsFilter;
 use crate::ingest::{Privacy, WriteConn};
-use crate::queries::{self, TopKind};
+use crate::queries::{self, SortBy, TopKind};
 use crate::retention::PruneReport;
 use crate::schema::{self, Reader};
 use crate::writer::{Writer, WriterCore};
@@ -291,6 +293,62 @@ impl Store {
     ) -> Result<Vec<TopItem>> {
         self.inner
             .read(|c| queries::top(c, kind, window_secs, site, now_ms, limit))
+    }
+
+    /// Summary under a filter; rollups answer when only a time range and one site are set, raw rows otherwise.
+    pub fn analytics_summary(&self, f: &AnalyticsFilter, now_ms: i64) -> Result<Answer<Summary>> {
+        self.inner
+            .read(|c| analytics::summary(c, f, now_ms, analytics::SCAN_CAP))
+    }
+
+    pub fn analytics_timeseries(
+        &self,
+        f: &AnalyticsFilter,
+        now_ms: i64,
+    ) -> Result<Answer<Timeseries>> {
+        self.inner
+            .read(|c| analytics::timeseries(c, f, now_ms, analytics::SCAN_CAP))
+    }
+
+    pub fn analytics_bots(&self, f: &AnalyticsFilter, now_ms: i64) -> Result<Answer<BotSummary>> {
+        self.inner
+            .read(|c| analytics::bots(c, f, now_ms, analytics::SCAN_CAP))
+    }
+
+    /// Top list under a filter, at most limit items and never more than 10000.
+    pub fn analytics_top(
+        &self,
+        f: &AnalyticsFilter,
+        list: TopKind,
+        limit: usize,
+        sort: SortBy,
+        now_ms: i64,
+    ) -> Result<Answer<TopList>> {
+        self.inner
+            .read(|c| analytics::top(c, f, list, limit, sort, now_ms, analytics::SCAN_CAP))
+    }
+
+    /// One newest-first page of requests under a filter, at most 1000 per page.
+    pub fn analytics_requests(
+        &self,
+        f: &AnalyticsFilter,
+        page: &PageRequest,
+        now_ms: i64,
+    ) -> Result<RequestPage> {
+        self.inner
+            .read(|c| analytics::requests(c, f, page, now_ms, analytics::SCAN_CAP))
+    }
+
+    /// Distinct sites, hosts, methods, status classes and bot classes with counts under a filter.
+    pub fn analytics_facets(&self, f: &AnalyticsFilter, now_ms: i64) -> Result<Answer<Facets>> {
+        self.inner
+            .read(|c| analytics::facets(c, f, now_ms, analytics::SCAN_CAP))
+    }
+
+    /// The summary of the filter's range next to the one of the equally long range before it.
+    pub fn analytics_compare(&self, f: &AnalyticsFilter, now_ms: i64) -> Result<Compare> {
+        self.inner
+            .read(|c| analytics::compare(c, f, now_ms, analytics::SCAN_CAP))
     }
 
     pub fn stats(&self) -> Result<StoreStats> {

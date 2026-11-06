@@ -84,6 +84,7 @@ export const api = {
   get: (path) => transport('GET', path),
   post: (path, body) => transport('POST', path, body),
   put: (path, body) => transport('PUT', path, body),
+  patch: (path, body) => transport('PATCH', path, body),
   del: (path) => transport('DELETE', path),
 };
 
@@ -93,6 +94,7 @@ export function nodeApi(name) {
     get: (path) => api.get(base + path),
     post: (path, body) => api.post(base + path, body),
     put: (path, body) => api.put(base + path, body),
+    patch: (path, body) => api.patch(base + path, body),
     del: (path) => api.del(base + path),
   };
 }

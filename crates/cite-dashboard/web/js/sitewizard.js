@@ -1,7 +1,7 @@
 // The create-site wizard's model: one decision per step, and the site body built from the answers
-import {
-  branchProblem, cleanToken, pollProblem, repoProblem, runtimeProblem, tokenProblem,
-} from './siteCheck.js';
+import { cleanToken, tokenProblem } from './siteCheck.js';
+import { firstSourceProblem, formToSource, sourceToForm } from './buildlib.js';
+import { parseRepo } from './repolib.js';
 import { accessForSave, accessOf } from './accesslib.js';
 import { pathFieldsFromRows, pathsProblem } from './conditionlib.js';
 
@@ -18,7 +18,7 @@ export const SOURCES = [
   { value: 'servers', title: 'Serve servers I already run', text: 'Send traffic to servers you operate, with weights and a health check.' },
 ];
 
-const ID_RE = /^[a-z0-9][a-z0-9-]{0,62}$/;
+const ID_RE = /^[a-z0-9][a-z0-9-]{0,39}$/;
 
 export function emptySiteForm() {
   return {
@@ -28,11 +28,7 @@ export function emptySiteForm() {
     id: '',
     hosts: [],
     paths: [],
-    repo: '',
-    branch: 'main',
-    runtime: 'node',
-    nodeMajor: '22',
-    poll: '5m',
+    src: sourceToForm({ repo: '' }),
     blue: [],
     green: [],
     targetProblem: null,
@@ -50,8 +46,8 @@ export function stepProblem(form, step, ctx = {}) {
       return form.source ? null : 'Choose where the site comes from.';
     case 1:
       if (form.source === 'github') {
-        return repoProblem(form.repo) || branchProblem(form.branch) || runtimeProblem(form.runtime) || pollProblem(form.poll)
-          || (ctx.tokenPlan ? tokenProblem(ctx.tokenPlan, ctx.token) : null);
+        const bad = firstSourceProblem(form.src);
+        return (bad && bad.message) || (ctx.tokenPlan ? tokenProblem(ctx.tokenPlan, ctx.token) : null);
       }
       if (form.targetProblem) return form.targetProblem;
       if (!form.blue.length) return 'Add at least one server for the live slot.';
@@ -93,13 +89,7 @@ export function buildSite(form) {
     active: 'blue',
     maintenance: { enabled: false, page_id: null },
     health: { path: github ? '/' : form.healthPath, interval_ms: 2000, rise: 2, fall: 3, timeout_ms: 1500 },
-    source: github ? {
-      repo: form.repo.trim(),
-      branch: form.branch.trim(),
-      runtime: form.runtime,
-      node_major: form.runtime === 'rust' ? null : Number(form.nodeMajor),
-      poll_interval: form.poll.trim(),
-    } : null,
+    source: github ? formToSource(form.src) : null,
   };
   const access = accessForSave(form.access, null);
   if (access) site.access = access;
@@ -114,7 +104,7 @@ export function githubToken(token) {
 export function reviewLines(form, { tokenText = '' } = {}) {
   const github = form.source === 'github';
   const lines = [
-    ['Source', github ? `GitHub repository ${form.repo.trim()} (${form.branch.trim()}, ${form.runtime})` : `${form.blue.length} server${form.blue.length === 1 ? '' : 's'} you run`],
+    ['Source', github ? `GitHub repository ${parseRepo(form.src.repo).repo || form.src.repo.trim()} (${form.src.branch.trim()}, ${form.src.runtime})` :`${form.blue.length} server${form.blue.length === 1 ? '' : 's'} you run`],
     ['Name', `${form.name.trim()} (${form.id})`],
     ['Domains', form.hosts.join(', ')],
   ];

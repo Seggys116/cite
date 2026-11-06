@@ -9,6 +9,9 @@ use crate::spec;
 use crate::target::Target;
 
 pub const MAX_BODY: usize = 64 * 1024;
+pub const MAX_LOG_RESPONSE: usize = 4 * 1024 * 1024;
+const MAX_LOG_TAIL: u32 = 1000;
+const MAX_LOG_SINCE: usize = 20;
 
 // Matches the slug rule of site ids (lowercase, digits, dashes, at most 40 characters).
 const ID: &str = "[a-z0-9][a-z0-9-]{0,39}";
@@ -50,6 +53,7 @@ pub enum Route {
     ContainerRestart(String),
     ContainerWait(String),
     ContainerInspect(String),
+    ContainerLogs(String),
     ContainerDelete(String),
     ContainerList,
 }
@@ -85,6 +89,7 @@ impl Route {
             | Route::ContainerStop(n)
             | Route::ContainerRestart(n)
             | Route::ContainerWait(n)
+            | Route::ContainerLogs(n)
             | Route::ContainerDelete(n) => Some(Check::Container(n.clone())),
             _ => None,
         }
@@ -102,6 +107,10 @@ pub struct Policy {
     pub(crate) haproxy: String,
     pub(crate) edge: String,
     pub(crate) github_api_url: Option<String>,
+    pub(crate) forge: Option<String>,
+    pub(crate) forge_api_url: Option<String>,
+    pub(crate) max_memory: i64,
+    pub(crate) max_nano_cpus: i64,
     container: Regex,
     volume: Regex,
     network: Regex,
@@ -124,6 +133,10 @@ impl Policy {
             haproxy: cfg.haproxy_container.clone(),
             edge: cfg.edge_network.clone(),
             github_api_url: cfg.github_api_url.clone(),
+            forge: cfg.forge.clone(),
+            forge_api_url: cfg.forge_api_url.clone(),
+            max_memory: cfg.max_memory,
+            max_nano_cpus: cfg.max_nano_cpus,
             container: stack("manager|executor|init"),
             volume: stack("data|work|cache"),
             network: stack("net|egress"),
@@ -246,6 +259,11 @@ impl Policy {
                 self.container(name)?;
                 Route::ContainerInspect(name.to_string())
             }
+            ("GET", ["containers", name, "logs"]) => {
+                check_logs(q)?;
+                self.container(name)?;
+                Route::ContainerLogs(name.to_string())
+            }
             ("DELETE", ["containers", name]) => {
                 allow_keys(q, &["force"], &[])?;
                 bool_value(q, "force")?;
@@ -343,6 +361,49 @@ fn check_grace(q: &BTreeMap<String, String>) -> Result<(), String> {
         None => Ok(()),
         Some(t) if t.len() <= 3 && t.parse::<u32>().is_ok_and(|n| n <= MAX_STOP_GRACE) => Ok(()),
         Some(_) => Err("stop grace period is out of range".to_string()),
+    }
+}
+
+// A bounded read: no follow, a mandatory line count, and at least one stream, so the engine never holds the request open.
+fn check_logs(q: &BTreeMap<String, String>) -> Result<(), String> {
+    allow_keys(
+        q,
+        &["stdout", "stderr", "tail", "since", "timestamps"],
+        &["tail"],
+    )?;
+    let mut streams = 0;
+    for key in ["stdout", "stderr"] {
+        match q.get(key).map(String::as_str) {
+            None => {}
+            Some("1" | "true") => streams += 1,
+            Some(_) => return Err(format!("query parameter {key:?} must be 1 or true")),
+        }
+    }
+    if streams == 0 {
+        return Err("logs need stdout or stderr".to_string());
+    }
+    let tail = &q["tail"];
+    let tail_ok = tail.len() <= 4
+        && tail.bytes().all(|b| b.is_ascii_digit())
+        && tail
+            .parse::<u32>()
+            .is_ok_and(|n| (1..=MAX_LOG_TAIL).contains(&n));
+    if !tail_ok {
+        return Err("tail is out of range".to_string());
+    }
+    if let Some(since) = q.get("since") {
+        let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+        let shaped = match since.split_once('.') {
+            Some((whole, fraction)) => digits(whole) && digits(fraction),
+            None => digits(since),
+        };
+        if !shaped || since.len() > MAX_LOG_SINCE {
+            return Err("since is not a timestamp".to_string());
+        }
+    }
+    match q.get("timestamps").map(String::as_str) {
+        None | Some("0" | "1" | "true" | "false") => Ok(()),
+        Some(_) => Err("timestamps is not a boolean".to_string()),
     }
 }
 

@@ -4,6 +4,7 @@ import {
   button, card, confirmDialog, dataTable, field, kvList, loadInto, openModal, pill, skeletonBlock, toast, withBusy, formatError, fmtInt,
 } from '../ui.js';
 import { isUnsupported } from '../archivelib.js';
+import { certToolsCard } from './certTools.js';
 import {
   HTTPS_OFF_NOTE, MANUAL_BADGE, MAX_PEM_BYTES, NAME_RULE, SUPPORT_NOTE, isManualCert, expiryState, hostList, parsePort, parseRanges, rangesSaveNote, rangesToText,
   shortFingerprint, uncoveredNote, uploadProblem,
@@ -244,12 +245,14 @@ export function certificatesPanel(node) {
   }, { skeleton: () => skeletonBlock(80) });
 
   uploadBtn.addEventListener('click', () => openCertificateDialog({ node, onDone: done('Uploaded') }));
-  return card({
-    title: 'Certificates',
-    subtitle: 'TLS certificates the node serves for HTTPS. Sites where Cloudflare handles HTTPS do not need one.',
-    actions: [uploadBtn],
-    body: h('div', { class: 'stack-sm' }, host, status),
-  });
+  return h('div', { class: 'stack' },
+    card({
+      title: 'Certificates',
+      subtitle: 'TLS certificates the node serves for HTTPS. Sites where Cloudflare handles HTTPS do not need one.',
+      actions: [uploadBtn],
+      body: h('div', { class: 'stack-sm' }, host, status),
+    }),
+    certToolsCard(node, () => run()));
 }
 
 // Shows the list the edge trusts and lets it be overridden; an empty override means the node's built-in list

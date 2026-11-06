@@ -102,7 +102,8 @@ fn issue_leaf(
     params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
     let now = OffsetDateTime::now_utc();
     params.not_before = now - Duration::days(1);
-    params.not_after = now + Duration::days(LEAF_VALID_DAYS);
+    // Apple clients refuse a leaf valid for more than 825 days, counted from not_before.
+    params.not_after = params.not_before + Duration::days(LEAF_VALID_DAYS);
     let key = KeyPair::generate().map_err(|e| tls_err("key generation failed", e))?;
     let cert = params
         .signed_by(&key, ca, ca_key)
@@ -301,6 +302,16 @@ mod tests {
             names,
             vec!["localhost", "a.example", "127.0.0.1", "::1", "n1"]
         );
+    }
+
+    #[test]
+    fn leaf_lifetime_stays_within_the_825_day_cap_apple_clients_enforce() {
+        let m = generate(&sans(), "node-a").expect("generate");
+        let (_, pem) = x509_parser::pem::parse_x509_pem(m.server_pem.as_bytes()).expect("pem");
+        let cert = pem.parse_x509().expect("x509");
+        let v = cert.validity();
+        let days = (v.not_after.timestamp() - v.not_before.timestamp()) / 86_400;
+        assert!(days <= 825, "leaf lifetime is {days} days");
     }
 
     #[test]
