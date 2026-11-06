@@ -134,7 +134,8 @@ export function rowToRule(row, id) {
 // What to send: rules for new and edited rows, ids for rows that were removed, and nothing for rows left alone
 export function diffRows(rows, originalRules) {
   const originals = (originalRules || []).filter((r) => r.redirect);
-  const taken = new Set([...originals.map((r) => r.id), ...rows.map((r) => r.id).filter(Boolean)]);
+  // every rule id counts, so a new redirect can never reuse the id of a block, header or CORS rule
+  const taken = new Set([...(originalRules || []).map((r) => r.id), ...rows.map((r) => r.id).filter(Boolean)]);
   const replace = [];
   const owners = new Map();
   for (const row of rows) {

@@ -7,7 +7,7 @@ use crate::error::ClientError;
 
 type Res<T> = std::result::Result<T, ClientError>;
 
-pub const MAX_BULK_ENTRIES: usize = 500;
+pub const MAX_BULK_ENTRIES: usize = 200;
 const MAX_RULE_ID_CHARS: usize = 40;
 
 /// Many rule changes applied by the node as one configuration change: one validation and one reload.
