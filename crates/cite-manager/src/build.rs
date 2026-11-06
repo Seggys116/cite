@@ -15,6 +15,7 @@ use cite_core::{
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 
+use crate::report::{BuildEvent, Detected};
 use crate::{ManagerError, Result};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -471,6 +472,19 @@ pub async fn run_build_classified(
     author: &str,
     redactor: &Redactor,
 ) -> BuildResult<BuiltRelease> {
+    run_build_observed(cfg, tarball, sha, message, author, redactor, &|_| {}).await
+}
+
+/// Same as `run_build_classified`, and reports detection and packing to `observer` as they happen.
+pub async fn run_build_observed(
+    cfg: &ManagerConfig,
+    tarball: &[u8],
+    sha: &str,
+    message: &str,
+    author: &str,
+    redactor: &Redactor,
+    observer: &(dyn Fn(BuildEvent) + Send + Sync),
+) -> BuildResult<BuiltRelease> {
     let free = cite_core::filesystem_free_bytes(&cfg.work_dir).map_err(BuildFailure::transient)?;
     if free < cfg.min_free_bytes {
         return Err(BuildFailure::transient(format!(
@@ -486,7 +500,7 @@ pub async fn run_build_classified(
     }
 
     match build_in_job(
-        cfg, tarball, sha, message, author, redactor, &job_id, &job_dir,
+        cfg, tarball, sha, message, author, redactor, &job_id, &job_dir, observer,
     )
     .await
     {
@@ -508,6 +522,7 @@ async fn build_in_job(
     redactor: &Redactor,
     job_id: &str,
     job_dir: &Path,
+    observer: &(dyn Fn(BuildEvent) + Send + Sync),
 ) -> BuildResult<BuiltRelease> {
     let src = job_dir.join("src");
     let home = job_dir.join("home");
@@ -532,6 +547,9 @@ async fn build_in_job(
 
     let build_env = load_build_env(cfg)?;
     log_detection_warnings(&det, redactor);
+    observer(BuildEvent::Detected(Detected::from_detection(
+        &det, rendering,
+    )));
     prepare_job_home(&home)?;
     let mut env = build_env;
     let cache = cfg.build_cache.then_some(cfg.cache_dir.as_path());
@@ -617,6 +635,7 @@ async fn build_in_job(
         max_bytes: cfg.max_release_bytes,
         max_files: cfg.max_entries,
     };
+    observer(BuildEvent::Packing);
     pack_release(cfg, &pack_root, &tar_path, &pack_limits, redactor).await?;
     let report = hash_tree(&pack_root).map_err(BuildFailure::permanent)?;
     if report.bytes > cfg.max_release_bytes {
@@ -2222,12 +2241,14 @@ mod tests {
     fn helper_environment_never_carries_manager_secrets() {
         let mut cmd = std::process::Command::new("true");
         cmd.env("CITE_GITHUB_TOKEN", "ghp_secret");
+        cmd.env("CITE_BUILD_ENV_JSON", r#"{"A":"secret-value"}"#);
         super::apply_helper_env(&mut cmd);
         let keys: Vec<String> = cmd
             .get_envs()
             .map(|(k, _)| k.to_string_lossy().into_owned())
             .collect();
         assert!(!keys.iter().any(|k| k == "CITE_GITHUB_TOKEN"), "{keys:?}");
+        assert!(!keys.iter().any(|k| k == "CITE_BUILD_ENV_JSON"), "{keys:?}");
         assert!(keys.iter().any(|k| k == "PATH"));
     }
 

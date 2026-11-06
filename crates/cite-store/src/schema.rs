@@ -496,6 +496,7 @@ pub(crate) fn open_reader(path: &Path) -> Result<Reader> {
     conn.busy_timeout(BUSY_TIMEOUT)?;
     conn.execute_batch(READER_PRAGMAS)?;
     limit_memory(&conn)?;
+    crate::filter::register_functions(&conn)?;
     conn.set_prepared_statement_cache_capacity(64);
     let base = Instant::now();
     let deadline_ns = Arc::new(AtomicU64::new(0));

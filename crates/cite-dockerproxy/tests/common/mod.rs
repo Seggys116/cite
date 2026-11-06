@@ -53,6 +53,29 @@ pub fn policy_with_github(url: Option<&str>) -> Policy {
     Policy::new(&cfg)
 }
 
+// A policy built from arbitrary proxy settings.
+pub fn policy_with(pairs: &[(&str, &str)]) -> Policy {
+    let cfg = Config::from_lookup(|k| {
+        pairs
+            .iter()
+            .find(|(key, _)| *key == k)
+            .map(|(_, v)| v.to_string())
+    })
+    .unwrap();
+    Policy::new(&cfg)
+}
+
+// A policy whose operator set the manager and executor memory and CPU maxima.
+pub fn policy_with_limits(mem: &str, cpus: &str) -> Policy {
+    let cfg = Config::from_lookup(|k| match k {
+        "CITE_STACK_MAX_MEM" => Some(mem.to_string()),
+        "CITE_STACK_MAX_CPUS" => Some(cpus.to_string()),
+        _ => None,
+    })
+    .unwrap();
+    Policy::new(&cfg)
+}
+
 #[derive(Debug, Clone)]
 pub struct Seen {
     pub method: String,
@@ -76,6 +99,7 @@ pub struct World {
     pub volumes: BTreeMap<String, Value>,
     pub networks: BTreeMap<String, (Value, HashSet<String>)>,
     pub containers: BTreeMap<String, (Value, bool)>,
+    pub logs: BTreeMap<String, String>,
     pub seen: Vec<Seen>,
 }
 
@@ -200,6 +224,10 @@ fn route(w: &mut World, method: &str, path: &str, query: &str, body: &[u8]) -> (
                 })
                 .to_string(),
             ),
+            None => missing(),
+        },
+        ("GET", ["containers", name, "logs"]) => match w.containers.get(*name) {
+            Some(_) => (200, w.logs.get(*name).cloned().unwrap_or_default()),
             None => missing(),
         },
         ("POST", ["containers", name, action]) => match (w.containers.get_mut(*name), *action) {

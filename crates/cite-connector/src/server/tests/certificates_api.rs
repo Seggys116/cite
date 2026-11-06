@@ -583,6 +583,107 @@ async fn a_change_haproxy_rejects_is_rolled_back_and_the_edge_keeps_serving() {
     assert!(!haproxy_config(&h, &t).await.contains("ssl crt"));
 }
 
+fn cf_site_json(id: &str, host: &str) -> Value {
+    let mut site = site_json(id, host);
+    site["access"] = json!({ "cloudflare_only": true });
+    site
+}
+
+fn auto_item(list: &Value, site: &str) -> Option<Value> {
+    list["items"]
+        .as_array()?
+        .iter()
+        .find(|c| c["id"] == format!("auto:{site}").as_str())
+        .cloned()
+}
+
+#[tokio::test]
+async fn a_cloudflare_site_gets_a_read_only_automatic_certificate_that_uploads_supersede() {
+    let h = start().await;
+    let t = h.token().await;
+    let (status, body) = h
+        .post(&t, "/sites", cf_site_json("shop", "shop.example.com"))
+        .await;
+    assert_eq!(status, 200, "{body}");
+
+    let (_, list) = h.get(&t, "/certificates").await;
+    let item = auto_item(&list, "shop").expect("an automatic certificate");
+    assert_eq!(item["source"], "auto");
+    assert_eq!(item["sans"], json!(["shop.example.com"]));
+    assert!(
+        item["warning"].as_str().unwrap().contains("not trust"),
+        "{item}"
+    );
+    assert!(list["https_port"].is_null());
+    assert_eq!(list["https_effective_port"], 443);
+    assert_eq!(list["uncovered_hosts"], json!(["shop.example.com"]));
+    assert!(pem_files(&h).contains(&"auto-shop.pem".to_string()));
+    assert!(haproxy_config(&h, &t).await.contains("bind :443 ssl crt"));
+    assert_eq!(h.get(&t, "/certificates/auto:shop").await.0, 200);
+    assert_eq!(h.get(&t, "/certificates/auto:ghost").await.0, 404);
+
+    let issued = issue(&["x.example.com"]);
+    let (status, body) = h
+        .put(&t, "/certificates/auto:shop", upload("mine", &issued))
+        .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("managed by the node")
+    );
+    let (status, body) = h.delete(&t, "/certificates/auto:shop").await;
+    assert_eq!(status, 400, "{body}");
+    assert!(pem_files(&h).contains(&"auto-shop.pem".to_string()));
+
+    let file = std::fs::read_to_string(certs_dir(&h).join("auto-shop.pem")).unwrap();
+    let mut seen = vec![list.to_string(), haproxy_config(&h, &t).await];
+    seen.push(h.get(&t, "/audit?limit=200").await.1.to_string());
+    for text in &seen {
+        assert_no_key(text, &file);
+    }
+
+    let real = issue(&["shop.example.com"]);
+    let (status, created) = h.post(&t, "/certificates", upload("real", &real)).await;
+    assert_eq!(status, 201, "{created}");
+    let (_, list) = h.get(&t, "/certificates").await;
+    assert!(
+        auto_item(&list, "shop").is_none(),
+        "an uploaded certificate supersedes it"
+    );
+    assert!(!pem_files(&h).contains(&"auto-shop.pem".to_string()));
+    assert_eq!(list["items"].as_array().map(Vec::len), Some(1));
+
+    let id = created["id"].as_str().unwrap();
+    assert_eq!(h.delete(&t, &format!("/certificates/{id}")).await.0, 204);
+    let (_, list) = h.get(&t, "/certificates").await;
+    assert!(
+        auto_item(&list, "shop").is_some(),
+        "it returns when nothing covers the host"
+    );
+
+    assert_eq!(h.delete(&t, "/sites/shop").await.0, 200);
+    assert!(pem_files(&h).is_empty());
+    assert!(!haproxy_config(&h, &t).await.contains("ssl crt"));
+}
+
+#[tokio::test]
+async fn a_node_without_cloudflare_or_flexible_sites_makes_no_automatic_certificate() {
+    let h = start().await;
+    let t = h.token().await;
+    assert_eq!(
+        h.post(&t, "/sites", site_json("plain", "plain.example.com"))
+            .await
+            .0,
+        200
+    );
+    let (_, list) = h.get(&t, "/certificates").await;
+    assert_eq!(list["items"].as_array().map(Vec::len), Some(0));
+    assert!(list["https_effective_port"].is_null());
+    assert!(pem_files(&h).is_empty());
+}
+
 #[tokio::test]
 async fn an_internal_failure_while_applying_never_puts_paths_in_the_response() {
     let tools = tempfile::tempdir().expect("tools");

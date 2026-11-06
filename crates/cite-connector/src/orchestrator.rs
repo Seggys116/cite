@@ -3,11 +3,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use cite_core::parse_poll_interval;
-use cite_edge::model::{Site, Slot, Target};
+use cite_edge::model::{Site, Slot, Source, Target};
+use cite_edge::status::{BuildEnvPatch, LogLine, ManagerReport};
 use cite_edge::validate::is_valid_id;
 use reqwest::Method;
 use serde::Serialize;
 use serde_json::{Value, json};
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 
 use crate::config::{ConnectorConfig, NodeToken};
 use crate::error::{ConnectorError, Result};
@@ -32,12 +35,355 @@ const MAX_GITHUB_URL_LEN: usize = 200;
 pub const DEFAULT_HAPROXY_CONTAINER: &str = "cite-node-haproxy";
 
 const GIB: i64 = 1024 * 1024 * 1024;
-const MANAGER_MEMORY: i64 = 2 * GIB;
+const MIB: i64 = 1024 * 1024;
+const MANAGER_MEMORY: i64 = 4 * GIB;
 const MANAGER_NANO_CPUS: i64 = 2_000_000_000;
 const MANAGER_PIDS: i64 = 2048;
-const EXECUTOR_MEMORY: i64 = GIB;
-const EXECUTOR_NANO_CPUS: i64 = 1_000_000_000;
+const EXECUTOR_MEMORY: i64 = 2 * GIB;
+const EXECUTOR_NANO_CPUS: i64 = 2_000_000_000;
 const EXECUTOR_PIDS: i64 = 256;
+const MIN_MEMORY: i64 = 256 * MIB;
+// The Docker proxy refuses less than a quarter CPU (MIN_STACK_NANO_CPUS).
+const MIN_NANO_CPUS: i64 = 250_000_000;
+const MIN_CPUS: f64 = 0.25;
+const MAX_CPUS: f64 = 1024.0;
+// The Docker proxy's own maximums when CITE_STACK_MAX_MEM and CITE_STACK_MAX_CPUS are unset, and its ceiling.
+const DEFAULT_MAX_MEMORY: i64 = 16 * GIB;
+const DEFAULT_MAX_NANO_CPUS: i64 = 8_000_000_000;
+const CEILING_MEMORY: i64 = 1024 * GIB;
+
+const MAX_REPORT_BYTES: usize = 4096;
+const MAX_LOG_TAIL: u32 = 1000;
+const MAX_LOG_LINE: usize = 4096;
+const MAX_LOG_TOTAL: usize = 1024 * 1024;
+const MIN_REDACT_LEN: usize = 4;
+const MIN_TOKEN_TAIL: usize = 8;
+const TOKEN_PREFIXES: [&str; 6] = ["github_pat_", "ghp_", "gho_", "ghu_", "ghs_", "ghr_"];
+const REDACTED: &str = "[REDACTED]";
+const MAX_DEPLOY_ID_LEN: usize = 64;
+
+// Site settings the manager reads from its env, as (Source field, env key) in the order the proxy rebuilds them.
+const SETTING_KEYS: [(&str, &str); 10] = [
+    ("root_dir", "CITE_ROOT_DIR"),
+    ("output_dir", "CITE_OUTPUT_DIR"),
+    ("spa_fallback", "CITE_SPA_FALLBACK"),
+    ("package_manager", "CITE_PACKAGE_MANAGER"),
+    ("rendering", "CITE_RENDERING"),
+    ("framework", "CITE_FRAMEWORK"),
+    ("prune", "CITE_PRUNE"),
+    ("install_command", "CITE_INSTALL_COMMAND"),
+    ("build_command", "CITE_BUILD_COMMAND"),
+    ("start_command", "CITE_START_COMMAND"),
+];
+// Keys whose removal from the desired spec must recreate a container that still carries them.
+const DEPLOY_ID_KEY: &str = "CITE_DEPLOY_ID";
+const BUILD_ENV_KEY: &str = "CITE_BUILD_ENV_JSON";
+const RUNTIME_ENV_KEY: &str = "CITE_RUNTIME_ENV_JSON";
+// Env entries safe to show a caller; the token and the build and runtime env JSON stay out.
+const VISIBLE_KEYS: [&str; 5] = [
+    DEPLOY_ID_KEY,
+    "CITE_REPO",
+    "CITE_BRANCH",
+    "CITE_NODE",
+    "CITE_POLL_INTERVAL",
+];
+
+const FORGE_KEY: &str = "CITE_FORGE";
+const FORGE_API_URL_KEY: &str = "CITE_FORGE_API_URL";
+const MAX_FORGE_LEN: usize = 32;
+
+/// The operator's forge choice pushed to every manager; unset keeps GitHub and adds no env.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Forge {
+    pub name: Option<String>,
+    pub api_url: Option<String>,
+}
+
+impl Forge {
+    pub fn from_env() -> Result<Forge> {
+        Self::from_lookup(|k| std::env::var(k).ok())
+    }
+
+    pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<Forge> {
+        let set = |k: &str| {
+            get(k)
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        };
+        let forge = Forge {
+            name: set("CITE_STACK_FORGE"),
+            api_url: set("CITE_STACK_FORGE_API_URL"),
+        };
+        forge.validate()?;
+        if let Some(warning) = forge.missing_api_url() {
+            tracing::warn!("{warning}");
+        }
+        Ok(forge)
+    }
+
+    // Only GitHub has a well-known API host, so any other forge without an API URL cannot reach its server.
+    fn missing_api_url(&self) -> Option<String> {
+        let name = self.name.as_deref()?;
+        (name != "github" && self.api_url.is_none()).then(|| {
+            format!(
+                "CITE_STACK_FORGE is {name} but CITE_STACK_FORGE_API_URL is not set, so managers have no API address for that forge"
+            )
+        })
+    }
+
+    fn validate(&self) -> Result<()> {
+        if let Some(name) = self.name.as_deref() {
+            let ok = name.len() <= MAX_FORGE_LEN
+                && name.starts_with(|c: char| c.is_ascii_lowercase())
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+            if !ok {
+                return Err(ConnectorError::BadRequest(format!(
+                    "CITE_STACK_FORGE {name:?} is not a lowercase slug"
+                )));
+            }
+        }
+        if let Some(url) = self.api_url.as_deref() {
+            validate_github_api_url(url).map_err(|e| {
+                ConnectorError::BadRequest(format!("CITE_STACK_FORGE_API_URL: {e}"))
+            })?;
+        }
+        Ok(())
+    }
+
+    fn env(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Some(n) = self.name.as_deref() {
+            out.push(format!("{FORGE_KEY}={n}"));
+        }
+        if let Some(u) = self.api_url.as_deref() {
+            out.push(format!("{FORGE_API_URL_KEY}={u}"));
+        }
+        out
+    }
+}
+
+fn is_setting_key(key: &str) -> bool {
+    key == FORGE_KEY
+        || key == FORGE_API_URL_KEY
+        || key == DEPLOY_ID_KEY
+        || key == BUILD_ENV_KEY
+        || key == RUNTIME_ENV_KEY
+        || SETTING_KEYS.iter().any(|(_, k)| *k == key)
+}
+
+fn env_key(entry: &str) -> &str {
+    entry.split_once('=').map_or(entry, |(k, _)| k)
+}
+
+// The manager env entries for the site settings that are set, nothing for the ones left unset.
+pub fn setting_env(source: &Source) -> Vec<String> {
+    let value = serde_json::to_value(source).unwrap_or(Value::Null);
+    SETTING_KEYS
+        .iter()
+        .filter_map(|(field, key)| match &value[*field] {
+            Value::String(s) if !s.is_empty() => Some(format!("{key}={s}")),
+            Value::Bool(b) => Some(format!("{key}={b}")),
+            Value::Number(n) => Some(format!("{key}={n}")),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Per-deploy values that ride on one ensure call; none of them is ever a label.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct StackOpts {
+    pub deploy_id: Option<String>,
+    pub build_env: Option<BTreeMap<String, String>>,
+    pub runtime_env: Option<BTreeMap<String, String>>,
+}
+
+// Env values are secrets, so only their names are ever printed.
+impl std::fmt::Debug for StackOpts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let names = |m: &Option<BTreeMap<String, String>>| {
+            m.as_ref().map(|m| m.keys().cloned().collect::<Vec<_>>())
+        };
+        f.debug_struct("StackOpts")
+            .field("deploy_id", &self.deploy_id)
+            .field("build_env", &names(&self.build_env))
+            .field("runtime_env", &names(&self.runtime_env))
+            .finish()
+    }
+}
+
+/// Resource limits of the manager (builds) and executor (serving); a site may override its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limits {
+    pub manager_memory: i64,
+    pub manager_nano_cpus: i64,
+    pub executor_memory: i64,
+    pub executor_nano_cpus: i64,
+    pub max_memory: Option<i64>,
+    pub max_nano_cpus: Option<i64>,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Limits {
+            manager_memory: MANAGER_MEMORY,
+            manager_nano_cpus: MANAGER_NANO_CPUS,
+            executor_memory: EXECUTOR_MEMORY,
+            executor_nano_cpus: EXECUTOR_NANO_CPUS,
+            max_memory: Some(DEFAULT_MAX_MEMORY),
+            max_nano_cpus: Some(DEFAULT_MAX_NANO_CPUS),
+        }
+    }
+}
+
+impl Limits {
+    pub fn from_env() -> Result<Limits> {
+        Self::from_lookup(|k| std::env::var(k).ok())
+    }
+
+    pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<Limits> {
+        let set = |k: &str| get(k).filter(|v| !v.trim().is_empty());
+        let mut l = Limits::default();
+        let bad = |k: &str, e: String| ConnectorError::BadRequest(format!("{k}: {e}"));
+        let mem = |k: &str, slot: &mut i64| -> Result<()> {
+            if let Some(v) = set(k) {
+                *slot = parse_memory(&v).map_err(|e| bad(k, e))?;
+            }
+            Ok(())
+        };
+        let cpu = |k: &str, slot: &mut i64| -> Result<()> {
+            if let Some(v) = set(k) {
+                *slot = parse_cpus(&v).map_err(|e| bad(k, e))?;
+            }
+            Ok(())
+        };
+        mem("CITE_MANAGER_MEM", &mut l.manager_memory)?;
+        cpu("CITE_MANAGER_CPUS", &mut l.manager_nano_cpus)?;
+        mem("CITE_EXECUTOR_MEM", &mut l.executor_memory)?;
+        cpu("CITE_EXECUTOR_CPUS", &mut l.executor_nano_cpus)?;
+        if let Some(v) = set("CITE_STACK_MAX_MEM") {
+            let max = parse_memory(&v).map_err(|e| bad("CITE_STACK_MAX_MEM", e))?;
+            if max > CEILING_MEMORY {
+                return Err(bad("CITE_STACK_MAX_MEM", format!("{v:?} is above 1t")));
+            }
+            l.max_memory = Some(max);
+        }
+        if let Some(v) = set("CITE_STACK_MAX_CPUS") {
+            l.max_nano_cpus = Some(parse_cpus(&v).map_err(|e| bad("CITE_STACK_MAX_CPUS", e))?);
+        }
+        Ok(l)
+    }
+
+    fn clamp_memory(&self, bytes: i64) -> i64 {
+        bytes.clamp(
+            MIN_MEMORY,
+            self.max_memory.unwrap_or(i64::MAX).max(MIN_MEMORY),
+        )
+    }
+
+    fn clamp_cpus(&self, nano: i64) -> i64 {
+        nano.clamp(
+            MIN_NANO_CPUS,
+            self.max_nano_cpus.unwrap_or(i64::MAX).max(MIN_NANO_CPUS),
+        )
+    }
+
+    /// Refuses a site override above the node maximum, which the Docker proxy would refuse at create time.
+    pub fn check_source(&self, source: &Source) -> Result<()> {
+        let max_mb = self.max_memory.map(|m| m / MIB);
+        for (field, value) in [
+            ("memory_mb", source.memory_mb),
+            ("build_memory_mb", source.build_memory_mb),
+        ] {
+            if let (Some(mb), Some(max)) = (value, max_mb)
+                && i64::from(mb) > max
+            {
+                return Err(ConnectorError::BadRequest(format!(
+                    "source {field}: {mb} MiB is above this node's maximum of {max} MiB (CITE_STACK_MAX_MEM)"
+                )));
+            }
+        }
+        for (field, value) in [("cpus", source.cpus), ("build_cpus", source.build_cpus)] {
+            if let (Some(c), Some(max)) = (value, self.max_nano_cpus)
+                && (f64::from(c.0) * 1e9).round() as i64 > max
+            {
+                return Err(ConnectorError::BadRequest(format!(
+                    "source {field}: {} CPUs is above this node's maximum of {} CPUs (CITE_STACK_MAX_CPUS)",
+                    c.0,
+                    max as f64 / 1e9
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    // Node defaults with the site's own overrides applied, all clamped to the node maximums.
+    pub fn for_source(&self, source: &Source) -> Limits {
+        let v = serde_json::to_value(source).unwrap_or(Value::Null);
+        let mem = |field: &str, default: i64| {
+            v[field]
+                .as_u64()
+                .filter(|m| *m > 0)
+                .map_or(default, |m| (m.min(1 << 40) as i64) * MIB)
+        };
+        let cpu = |field: &str, default: i64| {
+            v[field]
+                .as_f64()
+                .filter(|c| c.is_finite() && *c > 0.0)
+                .map_or(default, |c| (c.min(MAX_CPUS) * 1e9).round() as i64)
+        };
+        Limits {
+            manager_memory: self.clamp_memory(mem("build_memory_mb", self.manager_memory)),
+            manager_nano_cpus: self.clamp_cpus(cpu("build_cpus", self.manager_nano_cpus)),
+            executor_memory: self.clamp_memory(mem("memory_mb", self.executor_memory)),
+            executor_nano_cpus: self.clamp_cpus(cpu("cpus", self.executor_nano_cpus)),
+            ..*self
+        }
+    }
+}
+
+// Sizes like 512m or 2g (k, m, g, t, optional b or ib suffix); a bare number is bytes. Below 256m is refused.
+pub fn parse_memory(raw: &str) -> std::result::Result<i64, String> {
+    let s = raw.trim().to_ascii_lowercase();
+    let s = s
+        .strip_suffix("ib")
+        .or_else(|| s.strip_suffix('b'))
+        .unwrap_or(&s);
+    let (digits, unit) = match s.char_indices().find(|(_, c)| !c.is_ascii_digit()) {
+        Some((i, _)) => s.split_at(i),
+        None => (s, ""),
+    };
+    let mult: i64 = match unit {
+        "" => 1,
+        "k" => 1024,
+        "m" => MIB,
+        "g" => GIB,
+        "t" => 1024 * GIB,
+        _ => return Err(format!("{raw:?} is not a size like 512m or 2g")),
+    };
+    let bytes = digits
+        .parse::<i64>()
+        .ok()
+        .and_then(|n| n.checked_mul(mult))
+        .ok_or_else(|| format!("{raw:?} is not a size like 512m or 2g"))?;
+    if bytes < MIN_MEMORY {
+        return Err(format!("{raw:?} is below the 256m minimum"));
+    }
+    Ok(bytes)
+}
+
+// CPU counts as decimals (0.5, 2); returned as Docker nano CPUs.
+pub fn parse_cpus(raw: &str) -> std::result::Result<i64, String> {
+    let n: f64 = raw
+        .trim()
+        .parse()
+        .map_err(|_| format!("{raw:?} is not a CPU count"))?;
+    if !n.is_finite() || !(MIN_CPUS..=MAX_CPUS).contains(&n) {
+        return Err(format!("{raw:?} must be between 0.25 and 1024 CPUs"));
+    }
+    Ok((n * 1e9).round() as i64)
+}
 const INIT_MEMORY: i64 = 128 * 1024 * 1024;
 const INIT_PIDS: i64 = 64;
 
@@ -112,6 +458,8 @@ pub struct Orchestrator {
     github_api_url: Option<String>,
     // The token sites fall back to; resolved when a container is planned and never stored.
     default_token: Option<NodeToken>,
+    limits: Limits,
+    forge: Forge,
     reconciled: AtomicBool,
 }
 
@@ -176,25 +524,76 @@ struct Inspected {
     image: String,
     env: Vec<String>,
     network: String,
+    memory: i64,
+    nano_cpus: i64,
+    state: String,
+    health: String,
+    restart_count: u32,
+    exit_code: Option<i32>,
+    oom_killed: bool,
+    report_text: String,
 }
 
 impl Inspected {
-    // The image adds its own env vars, so every requested entry must be present, not equal sets.
+    // The image adds its own env vars, so every requested entry must be present rather than the sets being equal.
     fn matches(&self, spec: &Value) -> bool {
         let image = spec["Image"].as_str().unwrap_or_default();
         let env_ok = spec["Env"]
             .as_array()
             .map(|want| {
-                want.iter()
-                    .filter_map(Value::as_str)
-                    .all(|e| self.env.iter().any(|have| have == e))
+                let want: Vec<&str> = want.iter().filter_map(Value::as_str).collect();
+                want.iter().all(|e| self.env.iter().any(|have| have == e))
+                    && self.env.iter().all(|have| {
+                        let key = env_key(have);
+                        !is_setting_key(key) || want.iter().any(|w| env_key(w) == key)
+                    })
             })
             .unwrap_or(true);
         let network = spec["HostConfig"]["NetworkMode"]
             .as_str()
             .unwrap_or_default();
-        self.image == image && env_ok && self.network == network
+        let limit_ok = |key: &str, have: i64| {
+            spec["HostConfig"][key]
+                .as_i64()
+                .is_none_or(|want| want == have)
+        };
+        self.image == image
+            && env_ok
+            && self.network == network
+            && limit_ok("Memory", self.memory)
+            && limit_ok("NanoCpus", self.nano_cpus)
     }
+}
+
+/// A slot's manager as Docker sees it, plus the one-line report its healthcheck prints.
+#[derive(Debug, Clone)]
+pub struct SlotInspect {
+    pub state: String,
+    pub health: String,
+    pub restart_count: u32,
+    pub exit_code: Option<i32>,
+    pub oom_killed: bool,
+    /// Only the non-secret entries (site settings, deploy id, repo, branch, node, poll interval).
+    pub env: Vec<String>,
+    pub manager_report: Option<ManagerReport>,
+    pub manager_memory: i64,
+    pub manager_nano_cpus: i64,
+    pub executor_memory: i64,
+    pub executor_nano_cpus: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogRole {
+    Manager,
+    Executor,
+}
+
+#[derive(Debug, Clone)]
+pub struct LogsBatch {
+    pub lines: Vec<LogLine>,
+    pub truncated: bool,
+    /// The newest Docker timestamp in the batch (RFC3339); the cursor is taken from it, never from app output.
+    pub last_ts: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -254,7 +653,12 @@ impl Orchestrator {
             Some(host) => Self::new(host, &cfg.edge_network, &cfg.stack_version, &cfg.registry)?
                 .with_haproxy_container(&cfg.haproxy_container)?
                 .with_github_api_url(cfg.github_api_url.as_deref())
-                .map(|o| Some(o.with_default_token(cfg.github_token.clone()))),
+                .and_then(|o| {
+                    Ok(o.with_default_token(cfg.github_token.clone())
+                        .with_limits(Limits::from_env()?)
+                        .with_forge(Forge::from_env()?))
+                })
+                .map(Some),
         }
     }
 
@@ -293,8 +697,24 @@ impl Orchestrator {
             registry: registry.to_string(),
             github_api_url: None,
             default_token: None,
+            limits: Limits::default(),
+            forge: Forge::default(),
             reconciled: AtomicBool::new(false),
         })
+    }
+
+    pub fn with_forge(mut self, forge: Forge) -> Orchestrator {
+        self.forge = forge;
+        self
+    }
+
+    pub fn with_limits(mut self, limits: Limits) -> Orchestrator {
+        self.limits = limits;
+        self
+    }
+
+    pub fn limits(&self) -> &Limits {
+        &self.limits
     }
 
     pub fn with_default_token(mut self, token: Option<NodeToken>) -> Orchestrator {
@@ -355,7 +775,30 @@ impl Orchestrator {
         git_ref: Option<&str>,
         github_token: &str,
     ) -> Result<Vec<Target>> {
-        let plan = plan_stack(site, slot, git_ref, github_token, &self.stack_env())?;
+        self.ensure_stack_with(site, slot, git_ref, github_token, &StackOpts::default())
+            .await
+    }
+
+    // The caller resolves the token (site secret or the node default) and passes the ref it wants, if any.
+    pub async fn ensure_stack_with(
+        &self,
+        site: &Site,
+        slot: Slot,
+        git_ref: Option<&str>,
+        github_token: &str,
+        opts: &StackOpts,
+    ) -> Result<Vec<Target>> {
+        let plan = plan_stack_with(
+            site,
+            slot,
+            git_ref,
+            github_token,
+            &self.stack_env(),
+            opts,
+            &self.limits,
+            &self.forge,
+        )?;
+        self.preflight(site, &plan, opts, true)?;
         self.ensure_reconciled().await;
         let names = &plan.names;
         for image in [&plan.manager_image, &plan.executor_image] {
@@ -393,6 +836,203 @@ impl Orchestrator {
             addr: format!("{}:8080", names.executor),
             weight: 100,
         }])
+    }
+
+    // Converges the manager alone; the executor is never touched, so a live slot keeps serving.
+    pub async fn ensure_manager(
+        &self,
+        site: &Site,
+        slot: Slot,
+        git_ref: Option<&str>,
+        github_token: &str,
+        opts: &StackOpts,
+    ) -> Result<()> {
+        let plan = plan_stack_with(
+            site,
+            slot,
+            git_ref,
+            github_token,
+            &self.stack_env(),
+            opts,
+            &self.limits,
+            &self.forge,
+        )?;
+        self.preflight(site, &plan, opts, false)?;
+        self.ensure_reconciled().await;
+        let names = &plan.names;
+        self.ensure_image(&plan.manager_image).await?;
+        for volume in names.volumes() {
+            self.create_volume(volume, &names.id, names.slot).await?;
+        }
+        self.create_network(&names.egress, &names.id, names.slot, false)
+            .await?;
+        let manager = self.inspect_owned(&names.manager).await?;
+        let manager_ok = manager.as_ref().is_some_and(|c| c.matches(&plan.manager));
+        if manager_ok && manager.as_ref().is_some_and(|c| c.running) {
+            return Ok(());
+        }
+        self.run_init(&plan).await?;
+        self.converge(&names.manager, &plan.manager, manager, manager_ok)
+            .await?;
+        tracing::info!(site = %names.id, slot = names.slot.as_str(), "manager converged");
+        Ok(())
+    }
+
+    /// Reads the slot's manager and executor from Docker; a missing manager reports state "missing".
+    pub async fn inspect_slot(&self, site_id: &str, slot: Slot) -> Result<SlotInspect> {
+        let names = StackNames::new(site_id, slot)?;
+        let manager = self.inspect_owned(&names.manager).await?;
+        let executor = self.inspect_owned(&names.executor).await?;
+        let (exec_memory, exec_cpus) = executor.map_or((0, 0), |e| (e.memory, e.nano_cpus));
+        let Some(m) = manager else {
+            return Ok(SlotInspect {
+                state: "missing".to_string(),
+                health: "none".to_string(),
+                restart_count: 0,
+                exit_code: None,
+                oom_killed: false,
+                env: Vec::new(),
+                manager_report: None,
+                manager_memory: 0,
+                manager_nano_cpus: 0,
+                executor_memory: exec_memory,
+                executor_nano_cpus: exec_cpus,
+            });
+        };
+        Ok(SlotInspect {
+            manager_report: parse_report(&m.report_text),
+            env: m
+                .env
+                .into_iter()
+                .filter(|e| {
+                    let key = env_key(e);
+                    VISIBLE_KEYS.contains(&key) || SETTING_KEYS.iter().any(|(_, k)| *k == key)
+                })
+                .collect(),
+            state: m.state,
+            health: m.health,
+            restart_count: m.restart_count,
+            exit_code: m.exit_code,
+            oom_killed: m.oom_killed,
+            manager_memory: m.memory,
+            manager_nano_cpus: m.nano_cpus,
+            executor_memory: exec_memory,
+            executor_nano_cpus: exec_cpus,
+        })
+    }
+
+    /// True when the running manager carries exactly the site's current settings and limits; the deploy id is ignored.
+    pub fn settings_current(&self, site: &Site, inspected: &SlotInspect) -> bool {
+        let Some(source) = site.source.as_ref() else {
+            return false;
+        };
+        let mut want = setting_env(source);
+        let mut have: Vec<String> = inspected
+            .env
+            .iter()
+            .filter(|e| SETTING_KEYS.iter().any(|(_, k)| *k == env_key(e)))
+            .cloned()
+            .collect();
+        want.sort();
+        have.sort();
+        let limits = self.limits.for_source(source);
+        inspected.state != "missing"
+            && want == have
+            && inspected.manager_memory == limits.manager_memory
+            && inspected.manager_nano_cpus == limits.manager_nano_cpus
+            && inspected.executor_memory == limits.executor_memory
+            && inspected.executor_nano_cpus == limits.executor_nano_cpus
+    }
+
+    /// True when the slot's work or cache volume exists, managed or not.
+    pub async fn build_volumes_exist(&self, site_id: &str, slot: Slot) -> Result<bool> {
+        let names = StackNames::new(site_id, slot)?;
+        for volume in [&names.work, &names.cache] {
+            if self.managed_label("volumes", volume).await?.is_some() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// A volume in use cannot be deleted, so the manager goes first; the executor does not mount them and keeps serving.
+    pub async fn reset_slot_volumes(&self, site_id: &str, slot: Slot) -> Result<()> {
+        let names = StackNames::new(site_id, slot)?;
+        self.remove_container(&names.manager).await?;
+        for volume in [&names.work, &names.cache] {
+            if self.managed_label("volumes", volume).await? == Some(false) {
+                return Err(ConnectorError::Conflict(format!(
+                    "volume {volume} exists and is not managed by cite"
+                )));
+            }
+            self.send(
+                Method::DELETE,
+                &format!("{API}/volumes/{volume}"),
+                &[],
+                None,
+                REQUEST_TIMEOUT,
+                &[404],
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Recent log lines of one container, redacted; a container that does not exist yields an empty batch.
+    pub async fn container_logs(
+        &self,
+        site_id: &str,
+        slot: Slot,
+        role: LogRole,
+        tail: u32,
+        since: Option<&str>,
+        redact: &[String],
+    ) -> Result<LogsBatch> {
+        let names = StackNames::new(site_id, slot)?;
+        let name = match role {
+            LogRole::Manager => &names.manager,
+            LogRole::Executor => &names.executor,
+        };
+        let tail = tail.clamp(1, MAX_LOG_TAIL).to_string();
+        let mut query = vec![
+            ("stdout", "1"),
+            ("stderr", "1"),
+            ("tail", tail.as_str()),
+            ("timestamps", "1"),
+        ];
+        if let Some(since) = since {
+            let ok = !since.is_empty()
+                && since.len() <= 40
+                && since
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | ':' | '-' | '+'));
+            if !ok {
+                return Err(ConnectorError::BadRequest(format!(
+                    "log since {since:?} is not valid"
+                )));
+            }
+            query.push(("since", since));
+        }
+        let reply = self
+            .send(
+                Method::GET,
+                &format!("{API}/containers/{name}/logs"),
+                &query,
+                None,
+                REQUEST_TIMEOUT,
+                &[404],
+            )
+            .await?;
+        if reply.status == 404 {
+            return Ok(LogsBatch {
+                lines: Vec::new(),
+                truncated: false,
+                last_ts: None,
+            });
+        }
+        let mut secrets: Vec<String> = redact.to_vec();
+        secrets.extend(self.default_token().map(str::to_string));
+        Ok(build_batch(&reply.body, role == LogRole::Manager, &secrets))
     }
 
     pub async fn stop_stack(&self, site_id: &str, slot: Slot) -> Result<()> {
@@ -807,6 +1447,23 @@ impl Orchestrator {
                 .as_str()
                 .unwrap_or_default()
                 .to_string(),
+            memory: v["HostConfig"]["Memory"].as_i64().unwrap_or(0),
+            nano_cpus: v["HostConfig"]["NanoCpus"].as_i64().unwrap_or(0),
+            state: state_name(&v["State"]),
+            health: health_name(&v["State"]["Health"]["Status"]),
+            restart_count: v["State"]["RestartCount"]
+                .as_u64()
+                .map_or(0, |n| n.min(u32::MAX as u64) as u32),
+            exit_code: v["State"]["ExitCode"]
+                .as_i64()
+                .and_then(|n| i32::try_from(n).ok()),
+            oom_killed: v["State"]["OOMKilled"].as_bool().unwrap_or(false),
+            report_text: v["State"]["Health"]["Log"]
+                .as_array()
+                .and_then(|log| log.last())
+                .and_then(|entry| entry["Output"].as_str())
+                .unwrap_or_default()
+                .to_string(),
         }))
     }
 
@@ -821,6 +1478,14 @@ impl Orchestrator {
         )
         .await
         .map(|_| ())
+        .map_err(|e| match e {
+            ConnectorError::Internal(m) if m.starts_with("docker api 4") && mentions_limits(&m) => {
+                ConnectorError::Internal(format!(
+                    "{m} (the docker proxy refused the stack limits; raise CITE_STACK_MAX_MEM or CITE_STACK_MAX_CPUS on the proxy or lower the site's limits)"
+                ))
+            }
+            other => other,
+        })
     }
 
     async fn start_container(&self, name: &str) -> Result<()> {
@@ -851,6 +1516,69 @@ impl Orchestrator {
         )
         .await
         .map(|_| ())
+    }
+
+    // The proxy refuses a create only after the old container is gone, so the same rules are checked here first.
+    fn preflight(&self, site: &Site, plan: &Plan, opts: &StackOpts, executor: bool) -> Result<()> {
+        let refuse = |what: &str, why: String| {
+            ConnectorError::BadRequest(format!(
+                "the {what} of {}/{} would be refused by the Docker proxy: {why}; nothing was changed",
+                site.id,
+                plan.names.slot.as_str()
+            ))
+        };
+        if let Some(source) = &site.source {
+            // The forge is the operator's and never reaches the plan, so a stored per-site value is ignored here.
+            let mut checked = source.clone();
+            checked.forge = None;
+            cite_edge::validate::validate_source(&checked).map_err(|e| refuse("manager", e.0))?;
+        }
+        let env_check = |map: &Option<BTreeMap<String, String>>, runtime: bool| {
+            let patch = BuildEnvPatch {
+                set: map.clone().unwrap_or_default(),
+                unset: Vec::new(),
+            };
+            let checked = if runtime {
+                patch.validate_runtime()
+            } else {
+                patch.validate()
+            };
+            checked.map_err(|e| e.0)
+        };
+        env_check(&opts.build_env, false).map_err(|why| refuse("manager", why))?;
+        let max_memory = self.limits.max_memory.unwrap_or(CEILING_MEMORY);
+        let max_cpus = self.limits.max_nano_cpus.unwrap_or((MAX_CPUS * 1e9) as i64);
+        let mut specs = vec![("manager", &plan.manager)];
+        if executor {
+            env_check(&opts.runtime_env, true).map_err(|why| refuse("executor", why))?;
+            specs.push(("executor", &plan.executor));
+        }
+        for (what, spec) in specs {
+            let host = &spec["HostConfig"];
+            let memory = host["Memory"].as_i64().unwrap_or_default();
+            if !(MIN_MEMORY..=max_memory).contains(&memory) {
+                return Err(refuse(
+                    what,
+                    format!(
+                        "memory must be between {} MiB and {} MiB",
+                        MIN_MEMORY / MIB,
+                        max_memory / MIB
+                    ),
+                ));
+            }
+            let cpus = host["NanoCpus"].as_i64().unwrap_or_default();
+            if !(MIN_NANO_CPUS..=max_cpus).contains(&cpus) {
+                return Err(refuse(
+                    what,
+                    format!(
+                        "CPUs must be between {} and {}",
+                        MIN_CPUS,
+                        max_cpus as f64 / 1e9
+                    ),
+                ));
+            }
+        }
+        Ok(())
     }
 
     async fn converge(
@@ -911,6 +1639,267 @@ impl Orchestrator {
                 "init container {name} returned no exit code"
             ))),
         }
+    }
+}
+
+fn mentions_limits(message: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+    ["memory", "cpu", "limit"].iter().any(|w| m.contains(w))
+}
+
+fn state_name(state: &Value) -> String {
+    match state["Status"].as_str() {
+        Some(s @ ("running" | "exited" | "restarting" | "created")) => s.to_string(),
+        Some("paused") => "running".to_string(),
+        Some("dead" | "removing") => "exited".to_string(),
+        _ if state["Restarting"].as_bool() == Some(true) => "restarting".to_string(),
+        _ if state["Running"].as_bool() == Some(true) => "running".to_string(),
+        _ => "exited".to_string(),
+    }
+}
+
+fn health_name(status: &Value) -> String {
+    match status.as_str() {
+        Some(s @ ("healthy" | "unhealthy" | "starting")) => s.to_string(),
+        _ => "none".to_string(),
+    }
+}
+
+// The healthcheck prints the manager's one-line report; anything oversized or malformed is ignored.
+fn parse_report(output: &str) -> Option<ManagerReport> {
+    let line = output
+        .lines()
+        .rev()
+        .find(|l| l.trim_start().starts_with('{'))?
+        .trim();
+    if line.len() > MAX_REPORT_BYTES {
+        return None;
+    }
+    serde_json::from_str(line).ok()
+}
+
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\x1b' => match chars.next() {
+                Some('[') => {
+                    for n in chars.by_ref() {
+                        if ('@'..='~').contains(&n) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    while let Some(n) = chars.next() {
+                        if n == '\x07' {
+                            break;
+                        }
+                        if n == '\x1b' {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            },
+            '\t' => out.push(c),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+fn redact_tokens(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let (mut i, mut last) = (0, 0);
+    while i < b.len() {
+        if let Some(prefix) = TOKEN_PREFIXES
+            .iter()
+            .find(|p| b[i..].starts_with(p.as_bytes()))
+        {
+            let start = i + prefix.len();
+            let mut end = start;
+            while end < b.len() && (b[end].is_ascii_alphanumeric() || b[end] == b'_') {
+                end += 1;
+            }
+            if end - start >= MIN_TOKEN_TAIL {
+                out.push_str(&s[last..i]);
+                out.push_str(REDACTED);
+                (i, last) = (end, end);
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out.push_str(&s[last..]);
+    out
+}
+
+fn redact_text(s: &str, secrets: &[String]) -> String {
+    let mut found: Vec<&String> = secrets
+        .iter()
+        .filter(|x| x.len() >= MIN_REDACT_LEN)
+        .collect();
+    found.sort_by_key(|x| std::cmp::Reverse(x.len()));
+    let mut out = s.to_string();
+    for secret in found {
+        out = out.replace(secret.as_str(), REDACTED);
+    }
+    redact_tokens(&out)
+}
+
+fn cap_str(mut s: String, max: usize) -> String {
+    if s.len() > max {
+        let mut end = max;
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        s.truncate(end);
+    }
+    s
+}
+
+// Splits Docker's multiplexed log stream (8-byte header: stream, 3 zero bytes, big-endian size); headerless input is stdout.
+fn demux(body: &[u8]) -> Vec<(bool, String)> {
+    fn feed(pending: &mut Vec<u8>, data: &[u8], stderr: bool, out: &mut Vec<(bool, String)>) {
+        pending.extend_from_slice(data);
+        while let Some(pos) = pending.iter().position(|b| *b == b'\n') {
+            let line: Vec<u8> = pending.drain(..=pos).collect();
+            out.push((stderr, line_text(&line)));
+        }
+        // A frame stream with no newline for this long is one runaway line.
+        if pending.len() > MAX_LOG_LINE * 4 {
+            out.push((stderr, line_text(pending)));
+            pending.clear();
+        }
+    }
+    fn line_text(raw: &[u8]) -> String {
+        String::from_utf8_lossy(raw)
+            .trim_end_matches(['\n', '\r'])
+            .to_string()
+    }
+    let mut out = Vec::new();
+    let mut pending: [Vec<u8>; 2] = Default::default();
+    let framed = body.len() >= 8 && body[0] <= 2 && body[1..4] == [0, 0, 0];
+    if !framed {
+        feed(&mut pending[0], body, false, &mut out);
+    } else {
+        let mut pos = 0;
+        while pos + 8 <= body.len() {
+            if body[pos] > 2 || body[pos + 1..pos + 4] != [0, 0, 0] {
+                break;
+            }
+            let size =
+                u32::from_be_bytes([body[pos + 4], body[pos + 5], body[pos + 6], body[pos + 7]])
+                    as usize;
+            let start = pos + 8;
+            let end = start + size.min(body.len() - start);
+            let which = usize::from(body[pos] == 2);
+            feed(&mut pending[which], &body[start..end], which == 1, &mut out);
+            pos = end;
+        }
+    }
+    for (which, rest) in pending.iter().enumerate() {
+        if !rest.is_empty() {
+            out.push((which == 1, line_text(rest)));
+        }
+    }
+    out
+}
+
+fn looks_like_timestamp(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() >= 20 && b[..4].iter().all(u8::is_ascii_digit) && b[4] == b'-' && s.contains('T')
+}
+
+// Docker's own RFC3339 prefix, written by the daemon when it received the line.
+fn split_docker_ts(raw: &str) -> (Option<OffsetDateTime>, &str, &str) {
+    match raw.split_once(' ') {
+        Some((first, rest)) if looks_like_timestamp(first) => {
+            (OffsetDateTime::parse(first, &Rfc3339).ok(), first, rest)
+        }
+        _ => (None, "", raw),
+    }
+}
+
+fn parse_log_line(raw: &str, stderr: bool, manager: bool, secrets: &[String]) -> LogLine {
+    let (_, docker_ts, rest) = split_docker_ts(raw);
+    let mut ts = docker_ts.to_string();
+    let mut level = if stderr { "error" } else { "info" }.to_string();
+    let mut phase: Option<String> = None;
+    let mut text = rest.to_string();
+    if manager
+        && rest.trim_start().starts_with('{')
+        && let Ok(v) = serde_json::from_str::<Value>(rest.trim())
+    {
+        let msg = v["msg"]
+            .as_str()
+            .or_else(|| v["message"].as_str())
+            .or_else(|| v["fields"]["message"].as_str());
+        let phase_text = v["phase"].as_str();
+        if msg.is_some() || phase_text.is_some() {
+            text = msg.or(phase_text).unwrap_or_default().to_string();
+            phase = phase_text.map(str::to_string);
+            // The app's own clock may be skewed, so its time only fills in when Docker gave none.
+            if ts.is_empty()
+                && let Some(t) = v["ts"].as_str().or_else(|| v["timestamp"].as_str())
+                && !t.contains(char::is_whitespace)
+            {
+                ts = t.to_string();
+            }
+            if let Some(l) = v["level"].as_str() {
+                level = l.to_ascii_lowercase();
+            }
+        }
+    }
+    let clean = |s: &str, max: usize| cap_str(redact_text(&strip_ansi(s), secrets), max);
+    LogLine {
+        ts: (!ts.is_empty()).then(|| cap_str(ts, 64)),
+        stream: if stderr { "stderr" } else { "stdout" }.to_string(),
+        level: Some(clean(&level, 16)),
+        phase: phase.map(|p| clean(&p, 64)),
+        text: clean(&text, MAX_LOG_LINE),
+    }
+}
+
+fn line_cost(line: &LogLine) -> usize {
+    line.ts.as_deref().map_or(0, str::len)
+        + line.stream.len()
+        + line.level.as_deref().map_or(0, str::len)
+        + line.phase.as_deref().map_or(0, str::len)
+        + line.text.len()
+}
+
+fn build_batch(body: &[u8], manager: bool, secrets: &[String]) -> LogsBatch {
+    let mut newest: Option<OffsetDateTime> = None;
+    let mut lines: Vec<LogLine> = demux(body)
+        .into_iter()
+        .map(|(stderr, raw)| {
+            if let (Some(at), _, _) = split_docker_ts(&raw) {
+                newest = Some(newest.map_or(at, |n| n.max(at)));
+            }
+            parse_log_line(&raw, stderr, manager, secrets)
+        })
+        .collect();
+    let mut total = 0;
+    let mut keep = lines.len();
+    for (i, line) in lines.iter().enumerate().rev() {
+        total += line_cost(line);
+        if total > MAX_LOG_TOTAL {
+            break;
+        }
+        keep = i;
+    }
+    let truncated = keep > 0;
+    lines.drain(..keep);
+    LogsBatch {
+        lines,
+        truncated,
+        last_ts: newest.and_then(|t| t.format(&Rfc3339).ok()),
     }
 }
 
@@ -1093,6 +2082,29 @@ fn plan_stack(
     token: &str,
     env: &StackEnv<'_>,
 ) -> Result<Plan> {
+    plan_stack_with(
+        site,
+        slot,
+        git_ref,
+        token,
+        env,
+        &StackOpts::default(),
+        &Limits::default(),
+        &Forge::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_stack_with(
+    site: &Site,
+    slot: Slot,
+    git_ref: Option<&str>,
+    token: &str,
+    env: &StackEnv<'_>,
+    opts: &StackOpts,
+    limits: &Limits,
+    forge: &Forge,
+) -> Result<Plan> {
     let (registry, version) = (env.registry, env.version);
     let names = StackNames::new(&site.id, slot)?;
     let source = site.source.as_ref().ok_or_else(|| {
@@ -1138,6 +2150,25 @@ fn plan_stack(
         ]
         .map(str::to_string),
     );
+    forge.validate()?;
+    manager_env.extend(forge.env());
+    manager_env.extend(setting_env(source));
+    if let Some(id) = opts.deploy_id.as_deref() {
+        let ok = !id.is_empty()
+            && id.len() <= MAX_DEPLOY_ID_LEN
+            && id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'));
+        if !ok {
+            return Err(ConnectorError::BadRequest(format!(
+                "deploy id {id:?} is not valid"
+            )));
+        }
+        manager_env.push(format!("{DEPLOY_ID_KEY}={id}"));
+    }
+    if let Some(map) = opts.build_env.as_ref() {
+        manager_env.push(format!("{BUILD_ENV_KEY}={}", serde_json::to_string(map)?));
+    }
 
     let mut executor_env = vec![
         "CITE_LISTEN=0.0.0.0:8080".to_string(),
@@ -1151,15 +2182,29 @@ fn plan_stack(
         executor_env.push("CITE_NODE_BIN=/nodejs/bin/node".to_string());
         executor_env.push(format!("CITE_NODE={node_major}"));
     }
+    if let Some(map) = opts.runtime_env.as_ref() {
+        executor_env.push(format!("{RUNTIME_ENV_KEY}={}", serde_json::to_string(map)?));
+    }
 
     let executor_network = if env.isolate {
         names.net.clone()
     } else {
         env.edge_network.to_string()
     };
+    let limits = if let Some(source) = site.source.as_ref() {
+        limits.for_source(source)
+    } else {
+        *limits
+    };
     Ok(Plan {
-        manager: manager_spec(&names, &manager_image, &manager_env),
-        executor: executor_spec(&names, &executor_image, &executor_env, &executor_network),
+        manager: manager_spec(&names, &manager_image, &manager_env, &limits),
+        executor: executor_spec(
+            &names,
+            &executor_image,
+            &executor_env,
+            &executor_network,
+            &limits,
+        ),
         init: init_spec(&names, &manager_image),
         names,
         manager_image,
@@ -1205,7 +2250,7 @@ fn volume_mount(volume: &str, target: &str, subpath: Option<&str>, read_only: bo
 }
 
 // Mirrors the manager service in docker-compose.yml, on the per-stack egress network only.
-fn manager_spec(names: &StackNames, image: &str, env: &[String]) -> Value {
+fn manager_spec(names: &StackNames, image: &str, env: &[String], limits: &Limits) -> Value {
     let data = names.data.as_str();
     json!({
         "Image": image,
@@ -1231,9 +2276,9 @@ fn manager_spec(names: &StackNames, image: &str, env: &[String]) -> Value {
                 volume_mount(&names.cache, "/var/lib/cite/cache", None, false),
             ],
             "NetworkMode": names.egress,
-            "Memory": MANAGER_MEMORY,
-            "MemorySwap": MANAGER_MEMORY,
-            "NanoCpus": MANAGER_NANO_CPUS,
+            "Memory": limits.manager_memory,
+            "MemorySwap": limits.manager_memory,
+            "NanoCpus": limits.manager_nano_cpus,
             "PidsLimit": MANAGER_PIDS,
             "RestartPolicy": { "Name": "unless-stopped" },
             "LogConfig": log_config(),
@@ -1243,7 +2288,13 @@ fn manager_spec(names: &StackNames, image: &str, env: &[String]) -> Value {
 }
 
 // Mirrors the executor service in docker-compose.yml; reachable only through an internal network.
-fn executor_spec(names: &StackNames, image: &str, env: &[String], network: &str) -> Value {
+fn executor_spec(
+    names: &StackNames,
+    image: &str,
+    env: &[String],
+    network: &str,
+    limits: &Limits,
+) -> Value {
     let data = names.data.as_str();
     json!({
         "Image": image,
@@ -1263,9 +2314,9 @@ fn executor_spec(names: &StackNames, image: &str, env: &[String], network: &str)
                 volume_mount(data, "/var/lib/cite/status", Some("status"), false),
             ],
             "NetworkMode": network,
-            "Memory": EXECUTOR_MEMORY,
-            "MemorySwap": EXECUTOR_MEMORY,
-            "NanoCpus": EXECUTOR_NANO_CPUS,
+            "Memory": limits.executor_memory,
+            "MemorySwap": limits.executor_memory,
+            "NanoCpus": limits.executor_nano_cpus,
             "PidsLimit": EXECUTOR_PIDS,
             "RestartPolicy": { "Name": "unless-stopped" },
             "LogConfig": log_config(),
@@ -1434,9 +2485,13 @@ pub(crate) mod tests {
 
     const TOKEN: &str = "ghp_secrettoken123";
 
+    #[derive(Default)]
     pub(crate) struct Ctr {
         spec: Value,
         running: bool,
+        // Extra keys merged into State on inspect: Health, RestartCount, ExitCode, OOMKilled, Status.
+        state: Value,
+        logs: Vec<u8>,
     }
 
     struct Net {
@@ -1599,6 +2654,7 @@ pub(crate) mod tests {
                     Ctr {
                         spec,
                         running: false,
+                        ..Default::default()
                     },
                 );
                 (201, "{\"Id\":\"c\"}".to_string())
@@ -1632,22 +2688,42 @@ pub(crate) mod tests {
                     not_found()
                 }
             }
+            ("GET", p) if p.starts_with("/containers/") && p.ends_with("/logs") => {
+                let name = &p["/containers/".len()..p.len() - "/logs".len()];
+                f.log.push(format!("LOGQ {query}"));
+                match f.containers.get(name) {
+                    Some(c) => (200, String::from_utf8(c.logs.clone()).unwrap()),
+                    None => not_found(),
+                }
+            }
             ("GET", p) if p.starts_with("/containers/") && p.ends_with("/json") => {
                 let name = &p["/containers/".len()..p.len() - "/json".len()];
                 match f.containers.get(name) {
-                    Some(c) => (
-                        200,
-                        json!({
-                            "State": { "Running": c.running },
-                            "Config": {
-                                "Image": c.spec["Image"],
-                                "Env": c.spec["Env"],
-                                "Labels": c.spec["Labels"],
-                            },
-                            "HostConfig": { "NetworkMode": c.spec["HostConfig"]["NetworkMode"] },
-                        })
-                        .to_string(),
-                    ),
+                    Some(c) => {
+                        let mut state = json!({ "Running": c.running });
+                        if let Some(extra) = c.state.as_object() {
+                            for (k, v) in extra {
+                                state[k] = v.clone();
+                            }
+                        }
+                        (
+                            200,
+                            json!({
+                                "State": state,
+                                "Config": {
+                                    "Image": c.spec["Image"],
+                                    "Env": c.spec["Env"],
+                                    "Labels": c.spec["Labels"],
+                                },
+                                "HostConfig": {
+                                    "NetworkMode": c.spec["HostConfig"]["NetworkMode"],
+                                    "Memory": c.spec["HostConfig"]["Memory"],
+                                    "NanoCpus": c.spec["HostConfig"]["NanoCpus"],
+                                },
+                            })
+                            .to_string(),
+                        )
+                    }
                     None => not_found(),
                 }
             }
@@ -1702,6 +2778,10 @@ pub(crate) mod tests {
             }
             _ => not_found(),
         }
+    }
+
+    pub(crate) fn drop_container(fake: &Arc<Mutex<Fake>>, name: &str) {
+        fake.lock().unwrap().containers.remove(name);
     }
 
     // The Env array a created container was given, as text, for checking where a token ended up.
@@ -1770,13 +2850,31 @@ pub(crate) mod tests {
         (orch, fake)
     }
 
-    fn count(fake: &Arc<Mutex<Fake>>, entry: &str) -> usize {
+    pub(crate) fn count(fake: &Arc<Mutex<Fake>>, entry: &str) -> usize {
         fake.lock()
             .unwrap()
             .log
             .iter()
             .filter(|l| l.starts_with(entry))
             .count()
+    }
+
+    // Built through serde so the tests keep compiling as optional Source fields are added.
+    fn source_with(runtime: Option<&str>, extra: Value) -> Source {
+        let mut v = json!({ "repo": "acme/shop" });
+        if let Some(r) = runtime {
+            v["runtime"] = json!(r);
+        }
+        for (k, val) in extra.as_object().cloned().unwrap_or_default() {
+            v[k] = val;
+        }
+        serde_json::from_value(v).unwrap()
+    }
+
+    fn site_with(id: &str, extra: Value) -> Site {
+        let mut s = site(id, None);
+        s.source = Some(source_with(None, extra));
+        s
     }
 
     fn site(id: &str, runtime: Option<&str>) -> Site {
@@ -1792,14 +2890,7 @@ pub(crate) mod tests {
             active: Slot::Blue,
             maintenance: Maintenance::default(),
             health: HealthCheck::default(),
-            source: Some(Source {
-                repo: "acme/shop".to_string(),
-                branch: None,
-                runtime: runtime.map(str::to_string),
-                node_major: None,
-                poll_interval: None,
-                secret: None,
-            }),
+            source: Some(source_with(runtime, json!({}))),
             history: Vec::new(),
             access: Default::default(),
         }
@@ -1969,7 +3060,7 @@ pub(crate) mod tests {
         assert_eq!(hc["ReadonlyRootfs"], json!(true));
         assert_eq!(hc["SecurityOpt"], json!(["no-new-privileges:true"]));
         assert_eq!(hc["PidsLimit"], json!(2048));
-        assert_eq!(hc["Memory"], json!(2 * GIB));
+        assert_eq!(hc["Memory"], json!(4 * GIB));
         assert_eq!(hc["NanoCpus"], json!(2_000_000_000i64));
         assert_eq!(hc["Tmpfs"]["/tmp"], json!("size=256m,mode=1777"));
         assert_eq!(hc["Tmpfs"]["/run/cite"], json!("size=16m,mode=0750"));
@@ -2002,7 +3093,8 @@ pub(crate) mod tests {
         assert_eq!(hc["ReadonlyRootfs"], json!(true));
         assert_eq!(hc["SecurityOpt"], json!(["no-new-privileges:true"]));
         assert_eq!(hc["PidsLimit"], json!(256));
-        assert_eq!(hc["Memory"], json!(GIB));
+        assert_eq!(hc["Memory"], json!(2 * GIB));
+        assert_eq!(hc["NanoCpus"], json!(2_000_000_000i64));
         assert_eq!(
             hc["Tmpfs"]["/tmp"],
             json!("size=64m,mode=1777,noexec,nosuid,nodev")
@@ -2443,6 +3535,130 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn ensure_manager_never_touches_a_stale_executor() {
+        let (orch, fake) = start_fake().await;
+        let s = site("shop", None);
+        orch.ensure_stack(&s, Slot::Blue, None, TOKEN)
+            .await
+            .unwrap();
+        let resized = site_with("shop", json!({ "memory_mb": 512, "cpus": 0.5 }));
+        let orch = orch.with_limits(Limits {
+            manager_memory: 3 * GIB,
+            ..Limits::default()
+        });
+        let opts = StackOpts {
+            runtime_env: Some([("API".to_string(), "v2".to_string())].into()),
+            ..StackOpts::default()
+        };
+        let before = fake.lock().unwrap().containers["cite-shop-blue-executor"]
+            .spec
+            .clone();
+        let log_start = fake.lock().unwrap().log.len();
+        orch.ensure_manager(&resized, Slot::Blue, None, "ghp_rotated", &opts)
+            .await
+            .unwrap();
+        assert_eq!(count(&fake, "CREATE cite-shop-blue-manager"), 2);
+        assert_eq!(count(&fake, "CREATE cite-shop-blue-executor"), 1);
+        {
+            let f = fake.lock().unwrap();
+            let executor = &f.containers["cite-shop-blue-executor"];
+            assert!(executor.running);
+            assert_eq!(executor.spec, before);
+            let touched: Vec<&String> = f.log[log_start..]
+                .iter()
+                .filter(|e| e.contains("cite-shop-blue-executor"))
+                .collect();
+            assert!(touched.is_empty(), "{touched:?}");
+            let env = f.containers["cite-shop-blue-manager"].spec["Env"].to_string();
+            assert!(env.contains("ghp_rotated"));
+        }
+        orch.ensure_manager(&resized, Slot::Blue, None, "ghp_rotated", &opts)
+            .await
+            .unwrap();
+        assert_eq!(count(&fake, "CREATE cite-shop-blue-manager"), 2);
+    }
+
+    #[tokio::test]
+    async fn a_spec_the_proxy_would_refuse_never_removes_the_running_containers() {
+        let (orch, fake) = start_fake().await;
+        let s = site("shop", None);
+        orch.ensure_stack(&s, Slot::Blue, None, TOKEN)
+            .await
+            .unwrap();
+        let log_start = fake.lock().unwrap().log.len();
+        let owned = StackOpts {
+            runtime_env: Some([("NODE_ENV".to_string(), "production".to_string())].into()),
+            ..StackOpts::default()
+        };
+        let err = orch
+            .ensure_stack_with(&s, Slot::Blue, None, TOKEN, &owned)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, ConnectorError::BadRequest(m) if m.contains("executor") && m.contains("NODE_ENV")),
+            "{err:?}"
+        );
+        let reserved = StackOpts {
+            build_env: Some([("SHELL".to_string(), "/bin/bash".to_string())].into()),
+            ..StackOpts::default()
+        };
+        let err = orch
+            .ensure_manager(&s, Slot::Blue, None, "ghp_rotated", &reserved)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, ConnectorError::BadRequest(m) if m.contains("SHELL")),
+            "{err:?}"
+        );
+        let legacy = site_with("shop", json!({ "cpus": 0.1 }));
+        let err = orch
+            .ensure_stack(&legacy, Slot::Blue, None, TOKEN)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, ConnectorError::BadRequest(m) if m.contains("cpus")),
+            "{err:?}"
+        );
+        let f = fake.lock().unwrap();
+        assert_eq!(f.log.len(), log_start, "{:?}", &f.log[log_start..]);
+        assert!(f.containers["cite-shop-blue-executor"].running);
+        assert!(f.containers["cite-shop-blue-manager"].running);
+    }
+
+    #[test]
+    fn site_overrides_above_the_node_maximum_are_refused() {
+        let node = Limits::default();
+        node.check_source(&source_with(
+            None,
+            json!({ "memory_mb": 16384, "cpus": 8.0, "build_memory_mb": 512, "build_cpus": 0.25 }),
+        ))
+        .unwrap();
+        let err = node
+            .check_source(&source_with(None, json!({ "memory_mb": 16385 })))
+            .unwrap_err();
+        assert!(
+            matches!(&err, ConnectorError::BadRequest(m) if m.contains("memory_mb") && m.contains("CITE_STACK_MAX_MEM")),
+            "{err:?}"
+        );
+        let err = node
+            .check_source(&source_with(None, json!({ "build_cpus": 8.5 })))
+            .unwrap_err();
+        assert!(
+            matches!(&err, ConnectorError::BadRequest(m) if m.contains("build_cpus") && m.contains("CITE_STACK_MAX_CPUS")),
+            "{err:?}"
+        );
+        let tight =
+            Limits::from_lookup(|k| (k == "CITE_STACK_MAX_MEM").then(|| "1g".to_string())).unwrap();
+        assert!(
+            tight
+                .check_source(&source_with(None, json!({ "build_memory_mb": 2048 })))
+                .is_err()
+        );
+        let huge = Limits::from_lookup(|k| (k == "CITE_STACK_MAX_MEM").then(|| "2t".to_string()));
+        assert!(matches!(huge, Err(ConnectorError::BadRequest(_))));
+    }
+
+    #[tokio::test]
     async fn changed_ref_recreates_the_manager() {
         let (orch, fake) = start_fake().await;
         let s = site("shop", None);
@@ -2515,13 +3731,10 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn unmanaged_container_name_is_a_conflict() {
         let (orch, fake) = start_fake().await;
-        fake.lock().unwrap().containers.insert(
-            "cite-shop-blue-manager".to_string(),
-            Ctr {
-                spec: json!({ "Image": "evil", "Env": [], "Labels": {} }),
-                running: true,
-            },
-        );
+        fake.lock()
+            .unwrap()
+            .containers
+            .insert("cite-shop-blue-manager".to_string(), unmanaged_ctr());
         let err = orch
             .ensure_stack(&site("shop", None), Slot::Blue, None, TOKEN)
             .await
@@ -2662,6 +3875,7 @@ pub(crate) mod tests {
         Ctr {
             spec: json!({ "Image": "evil", "Env": [], "Labels": {} }),
             running: true,
+            ..Default::default()
         }
     }
 
@@ -2967,5 +4181,865 @@ pub(crate) mod tests {
         assert_eq!(count(&fake, "CREATE cite-shop-blue-executor"), 2);
         assert_eq!(count(&fake, "CREATE cite-shop-blue-manager"), 1);
         assert!(members(&fake, "cite-shop-blue-net").contains(HAPROXY));
+    }
+
+    fn env_of(spec: &Value) -> Vec<String> {
+        spec["Env"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn frame(stream: u8, payload: &[u8]) -> Vec<u8> {
+        let mut v = vec![stream, 0, 0, 0];
+        v.extend((payload.len() as u32).to_be_bytes());
+        v.extend_from_slice(payload);
+        v
+    }
+
+    const TS: &str = "2026-01-02T03:04:05.123456789Z";
+
+    fn set_logs(fake: &Arc<Mutex<Fake>>, name: &str, logs: Vec<u8>) {
+        fake.lock().unwrap().containers.get_mut(name).unwrap().logs = logs;
+    }
+
+    fn set_state(fake: &Arc<Mutex<Fake>>, name: &str, state: Value) {
+        fake.lock().unwrap().containers.get_mut(name).unwrap().state = state;
+    }
+
+    #[test]
+    fn setting_env_lists_only_set_fields_in_order() {
+        let all = source_with(
+            None,
+            json!({
+                "root_dir": "web",
+                "output_dir": "dist",
+                "spa_fallback": "index.html",
+                "package_manager": "pnpm",
+                "rendering": "static",
+                "framework": "vite",
+                "prune": true,
+                "install_command": "pnpm install",
+                "build_command": "pnpm build",
+                "start_command": "node server.js",
+            }),
+        );
+        assert_eq!(
+            setting_env(&all),
+            vec![
+                "CITE_ROOT_DIR=web",
+                "CITE_OUTPUT_DIR=dist",
+                "CITE_SPA_FALLBACK=index.html",
+                "CITE_PACKAGE_MANAGER=pnpm",
+                "CITE_RENDERING=static",
+                "CITE_FRAMEWORK=vite",
+                "CITE_PRUNE=true",
+                "CITE_INSTALL_COMMAND=pnpm install",
+                "CITE_BUILD_COMMAND=pnpm build",
+                "CITE_START_COMMAND=node server.js",
+            ]
+        );
+        assert!(setting_env(&source_with(None, json!({}))).is_empty());
+        assert_eq!(
+            setting_env(&source_with(
+                None,
+                json!({ "prune": false, "build_command": "" })
+            )),
+            vec!["CITE_PRUNE=false"]
+        );
+    }
+
+    #[test]
+    fn plan_carries_only_set_settings_on_the_manager() {
+        let s = site_with("shop", json!({ "root_dir": "web", "prune": false }));
+        let p = plan_stack(
+            &s,
+            Slot::Blue,
+            None,
+            TOKEN,
+            &stack_env("r.io/o", "1", false),
+        )
+        .unwrap();
+        let env = env_of(&p.manager);
+        assert!(env.contains(&"CITE_ROOT_DIR=web".to_string()));
+        assert!(env.contains(&"CITE_PRUNE=false".to_string()));
+        assert!(!env.iter().any(|e| e.starts_with("CITE_OUTPUT_DIR")));
+        assert!(!p.executor.to_string().contains("CITE_ROOT_DIR"));
+    }
+
+    #[test]
+    fn stack_opts_debug_shows_env_names_only() {
+        let opts = StackOpts {
+            deploy_id: Some("D1".into()),
+            build_env: Some([("API_KEY".to_string(), "build-secret-77".to_string())].into()),
+            runtime_env: Some([("DB_PASS".to_string(), "run-secret-88".to_string())].into()),
+        };
+        let shown = format!("{opts:?}");
+        assert!(shown.contains("API_KEY") && shown.contains("DB_PASS") && shown.contains("D1"));
+        assert!(!shown.contains("build-secret-77") && !shown.contains("run-secret-88"));
+    }
+
+    #[test]
+    fn default_opts_plan_is_unchanged() {
+        let p = plan(None, None).unwrap();
+        let dir = "/var/lib/cite";
+        assert_eq!(
+            env_of(&p.manager),
+            vec![
+                "CITE_REPO=acme/shop".to_string(),
+                "CITE_BRANCH=main".to_string(),
+                "CITE_POLL_INTERVAL=5m".to_string(),
+                "CITE_NODE=22".to_string(),
+                format!("CITE_GITHUB_TOKEN={TOKEN}"),
+                format!("CITE_DATA_DIR={dir}"),
+                format!("CITE_RELEASES_DIR={dir}/releases"),
+                format!("CITE_CONTROL_DIR={dir}/control"),
+                format!("CITE_STATUS_DIR={dir}/status"),
+                format!("CITE_STATE_DIR={dir}/state"),
+                format!("CITE_WORK_DIR={dir}/work"),
+                format!("CITE_CACHE_DIR={dir}/cache"),
+                "CITE_SOCKET=/run/cite/manager.sock".to_string(),
+                "RUST_LOG=info".to_string(),
+            ]
+        );
+        assert_eq!(
+            env_of(&p.executor),
+            vec![
+                "CITE_LISTEN=0.0.0.0:8080".to_string(),
+                format!("CITE_DATA_DIR={dir}"),
+                format!("CITE_RELEASES_DIR={dir}/releases"),
+                format!("CITE_CONTROL_DIR={dir}/control"),
+                format!("CITE_STATUS_DIR={dir}/status"),
+                "RUST_LOG=info".to_string(),
+                "CITE_NODE_BIN=/nodejs/bin/node".to_string(),
+                "CITE_NODE=22".to_string(),
+            ]
+        );
+        let same = plan_stack_with(
+            &site("shop", None),
+            Slot::Blue,
+            None,
+            TOKEN,
+            &stack_env("ghcr.io/seggys116", "0.2.0", false),
+            &StackOpts::default(),
+            &Limits::default(),
+            &Forge::default(),
+        )
+        .unwrap();
+        assert_eq!(same.manager, p.manager);
+        assert_eq!(same.executor, p.executor);
+        assert_eq!(same.init, p.init);
+    }
+
+    #[test]
+    fn deploy_and_build_env_stay_out_of_labels_and_off_the_executor() {
+        let opts = StackOpts {
+            deploy_id: Some("01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string()),
+            build_env: Some(BTreeMap::from([("API_KEY".into(), "buildsecret".into())])),
+            runtime_env: Some(BTreeMap::from([("DB_URL".into(), "runtimesecret".into())])),
+        };
+        let p = plan_stack_with(
+            &site("shop", None),
+            Slot::Blue,
+            None,
+            TOKEN,
+            &stack_env("r.io/o", "1", false),
+            &opts,
+            &Limits::default(),
+            &Forge::default(),
+        )
+        .unwrap();
+        let mgr = env_of(&p.manager);
+        assert!(mgr.contains(&"CITE_DEPLOY_ID=01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string()));
+        assert!(mgr.contains(&r#"CITE_BUILD_ENV_JSON={"API_KEY":"buildsecret"}"#.to_string()));
+        assert!(!mgr.iter().any(|e| e.contains("runtimesecret")));
+        let exec = env_of(&p.executor);
+        assert!(exec.contains(&r#"CITE_RUNTIME_ENV_JSON={"DB_URL":"runtimesecret"}"#.to_string()));
+        assert!(
+            !exec
+                .iter()
+                .any(|e| e.contains("buildsecret") || e.contains("DEPLOY_ID"))
+        );
+        for spec in [&p.manager, &p.executor, &p.init] {
+            let labels = spec["Labels"].to_string();
+            assert!(!labels.contains("secret") && !labels.contains("01ARZ3"));
+        }
+        assert!(!p.init.to_string().contains("secret"));
+        let bad = StackOpts {
+            deploy_id: Some("a b".to_string()),
+            ..Default::default()
+        };
+        let err = plan_stack_with(
+            &site("shop", None),
+            Slot::Blue,
+            None,
+            TOKEN,
+            &stack_env("r.io/o", "1", false),
+            &bad,
+            &Limits::default(),
+            &Forge::default(),
+        );
+        assert!(matches!(err, Err(ConnectorError::BadRequest(_))));
+    }
+
+    #[tokio::test]
+    async fn removing_a_setting_recreates_the_manager() {
+        let (orch, fake) = start_fake().await;
+        let with = site_with("shop", json!({ "root_dir": "web" }));
+        orch.ensure_stack(&with, Slot::Blue, None, TOKEN)
+            .await
+            .unwrap();
+        orch.ensure_stack(&with, Slot::Blue, None, TOKEN)
+            .await
+            .unwrap();
+        assert_eq!(count(&fake, "CREATE cite-shop-blue-manager"), 1);
+        orch.ensure_stack(&site("shop", None), Slot::Blue, None, TOKEN)
+            .await
+            .unwrap();
+        assert_eq!(count(&fake, "CREATE cite-shop-blue-manager"), 2);
+        assert_eq!(count(&fake, "CREATE cite-shop-blue-executor"), 1);
+        let f = fake.lock().unwrap();
+        assert!(!container_env_of(&f, "cite-shop-blue-manager").contains("CITE_ROOT_DIR"));
+    }
+
+    fn container_env_of(f: &Fake, name: &str) -> String {
+        f.containers[name].spec["Env"].to_string()
+    }
+
+    #[tokio::test]
+    async fn deploy_id_and_runtime_env_changes_recreate_and_removal_does_too() {
+        let (orch, fake) = start_fake().await;
+        let s = site("shop", None);
+        let opts = StackOpts {
+            deploy_id: Some("d1".to_string()),
+            build_env: Some(BTreeMap::new()),
+            runtime_env: Some(BTreeMap::from([("A".into(), "1".into())])),
+        };
+        orch.ensure_stack_with(&s, Slot::Blue, None, TOKEN, &opts)
+            .await
+            .unwrap();
+        orch.ensure_stack_with(&s, Slot::Blue, None, TOKEN, &opts)
+            .await
+            .unwrap();
+        assert_eq!(count(&fake, "CREATE cite-shop-blue-manager"), 1);
+        assert_eq!(count(&fake, "CREATE cite-shop-blue-executor"), 1);
+        let next = StackOpts {
+            deploy_id: Some("d2".to_string()),
+            ..opts.clone()
+        };
+        orch.ensure_stack_with(&s, Slot::Blue, None, TOKEN, &next)
+            .await
+            .unwrap();
+        assert_eq!(count(&fake, "CREATE cite-shop-blue-manager"), 2);
+        assert_eq!(count(&fake, "CREATE cite-shop-blue-executor"), 1);
+        orch.ensure_stack(&s, Slot::Blue, None, TOKEN)
+            .await
+            .unwrap();
+        assert_eq!(count(&fake, "CREATE cite-shop-blue-manager"), 3);
+        assert_eq!(count(&fake, "CREATE cite-shop-blue-executor"), 2);
+    }
+
+    #[test]
+    fn size_and_cpu_parsing() {
+        assert_eq!(parse_memory("512m").unwrap(), 512 * MIB);
+        assert_eq!(parse_memory("2g").unwrap(), 2 * GIB);
+        assert_eq!(parse_memory("2GiB").unwrap(), 2 * GIB);
+        assert_eq!(parse_memory(" 256MB ").unwrap(), 256 * MIB);
+        assert_eq!(parse_memory("268435456").unwrap(), 256 * MIB);
+        for bad in [
+            "255m",
+            "128m",
+            "0",
+            "",
+            "g",
+            "1.5g",
+            "2x",
+            "-1g",
+            "99999999999t",
+        ] {
+            assert!(parse_memory(bad).is_err(), "{bad}");
+        }
+        assert_eq!(parse_cpus("2").unwrap(), 2_000_000_000);
+        assert_eq!(parse_cpus("0.5").unwrap(), 500_000_000);
+        assert_eq!(parse_cpus("0.25").unwrap(), 250_000_000);
+        for bad in ["0", "0.01", "0.1", "0.24", "-1", "abc", "nan", "5000", ""] {
+            assert!(parse_cpus(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn node_limits_come_from_env_with_decent_defaults() {
+        let none = Limits::from_lookup(|_| None).unwrap();
+        assert_eq!(none, Limits::default());
+        assert_eq!(none.manager_memory, 4 * GIB);
+        assert_eq!(none.executor_memory, 2 * GIB);
+        assert_eq!(none.executor_nano_cpus, 2_000_000_000);
+        let set = |k: &str| {
+            let v = match k {
+                "CITE_MANAGER_MEM" => Some("6g"),
+                "CITE_MANAGER_CPUS" => Some("3"),
+                "CITE_EXECUTOR_MEM" => Some("512m"),
+                "CITE_EXECUTOR_CPUS" => Some("0.5"),
+                "CITE_STACK_MAX_MEM" => Some("8g"),
+                "CITE_STACK_MAX_CPUS" => Some("4"),
+                _ => None,
+            };
+            v.map(str::to_string)
+        };
+        let l = Limits::from_lookup(set).unwrap();
+        assert_eq!(l.manager_memory, 6 * GIB);
+        assert_eq!(l.manager_nano_cpus, 3_000_000_000);
+        assert_eq!(l.executor_memory, 512 * MIB);
+        assert_eq!(l.executor_nano_cpus, 500_000_000);
+        assert_eq!(l.max_memory, Some(8 * GIB));
+        assert_eq!(l.max_nano_cpus, Some(4_000_000_000));
+        let low = Limits::from_lookup(|k| (k == "CITE_EXECUTOR_MEM").then(|| "128m".to_string()));
+        assert!(
+            matches!(low, Err(ConnectorError::BadRequest(m)) if m.contains("CITE_EXECUTOR_MEM"))
+        );
+    }
+
+    #[test]
+    fn site_limits_override_and_clamp() {
+        let node = Limits {
+            max_memory: Some(3 * GIB),
+            max_nano_cpus: Some(3_000_000_000),
+            ..Limits::default()
+        };
+        let plain = node.for_source(&source_with(None, json!({})));
+        assert_eq!(plain.executor_memory, 2 * GIB);
+        assert_eq!(
+            plain.manager_memory,
+            3 * GIB,
+            "node default is clamped to the maximum"
+        );
+        let over = node.for_source(&source_with(
+            None,
+            json!({ "memory_mb": 1024, "cpus": 0.5, "build_memory_mb": 99999, "build_cpus": 64.0 }),
+        ));
+        assert_eq!(over.executor_memory, GIB);
+        assert_eq!(over.executor_nano_cpus, 500_000_000);
+        assert_eq!(over.manager_memory, 3 * GIB);
+        assert_eq!(over.manager_nano_cpus, 3_000_000_000);
+        let tiny = node.for_source(&source_with(
+            None,
+            json!({ "memory_mb": 16, "cpus": 0.001 }),
+        ));
+        assert_eq!(tiny.executor_memory, 256 * MIB);
+        assert_eq!(tiny.executor_nano_cpus, 250_000_000);
+        let s = site_with("shop", json!({ "memory_mb": 768, "build_cpus": 1.5 }));
+        let p = plan_stack_with(
+            &s,
+            Slot::Blue,
+            None,
+            TOKEN,
+            &stack_env("r.io/o", "1", false),
+            &StackOpts::default(),
+            &Limits::default(),
+            &Forge::default(),
+        )
+        .unwrap();
+        assert_eq!(p.executor["HostConfig"]["Memory"], json!(768 * MIB));
+        assert_eq!(p.executor["HostConfig"]["MemorySwap"], json!(768 * MIB));
+        assert_eq!(p.manager["HostConfig"]["NanoCpus"], json!(1_500_000_000i64));
+        assert_eq!(p.manager["HostConfig"]["Memory"], json!(4 * GIB));
+    }
+
+    #[tokio::test]
+    async fn changed_limits_recreate_the_container() {
+        let (orch, fake) = start_fake().await;
+        let s = site("shop", None);
+        orch.ensure_stack(&s, Slot::Blue, None, TOKEN)
+            .await
+            .unwrap();
+        let bigger = Limits {
+            executor_memory: 3 * GIB,
+            ..Limits::default()
+        };
+        let orch = orch.with_limits(bigger);
+        orch.ensure_stack(&s, Slot::Blue, None, TOKEN)
+            .await
+            .unwrap();
+        assert_eq!(count(&fake, "CREATE cite-shop-blue-executor"), 2);
+        assert_eq!(count(&fake, "CREATE cite-shop-blue-manager"), 1);
+        let sized = site_with("shop", json!({ "memory_mb": 512 }));
+        orch.ensure_stack(&sized, Slot::Blue, None, TOKEN)
+            .await
+            .unwrap();
+        assert_eq!(count(&fake, "CREATE cite-shop-blue-executor"), 3);
+        let cpus = site_with("shop", json!({ "memory_mb": 512, "build_cpus": 1.0 }));
+        orch.ensure_stack(&cpus, Slot::Blue, None, TOKEN)
+            .await
+            .unwrap();
+        assert_eq!(count(&fake, "CREATE cite-shop-blue-manager"), 2);
+        assert_eq!(count(&fake, "CREATE cite-shop-blue-executor"), 3);
+        orch.ensure_stack(&cpus, Slot::Blue, None, TOKEN)
+            .await
+            .unwrap();
+        assert_eq!(count(&fake, "CREATE cite-shop-blue-manager"), 2);
+    }
+
+    #[tokio::test]
+    async fn inspect_slot_reads_state_health_and_report() {
+        let (orch, fake) = start_fake().await;
+        let s = site("shop", None);
+        let missing = orch.inspect_slot("shop", Slot::Blue).await.unwrap();
+        assert_eq!(missing.state, "missing");
+        assert_eq!(missing.health, "none");
+        assert!(missing.manager_report.is_none() && missing.env.is_empty());
+        orch.ensure_stack(&s, Slot::Blue, Some("dev"), TOKEN)
+            .await
+            .unwrap();
+        let plain = orch.inspect_slot("shop", Slot::Blue).await.unwrap();
+        assert_eq!(plain.state, "running");
+        assert_eq!(plain.health, "none");
+        assert_eq!(
+            (plain.restart_count, plain.exit_code, plain.oom_killed),
+            (0, None, false)
+        );
+        assert!(plain.env.contains(&"CITE_BRANCH=dev".to_string()));
+        assert!(
+            !plain
+                .env
+                .iter()
+                .any(|e| e.contains("TOKEN") || e.contains(TOKEN))
+        );
+        let report = r#"{"v":1,"phase":"idle","since":"2026-01-01T00:00:00Z"}"#;
+        set_state(
+            &fake,
+            "cite-shop-blue-manager",
+            json!({
+                "Status": "restarting",
+                "Health": { "Status": "unhealthy", "Log": [
+                    { "Output": "stale" },
+                    { "Output": format!("{report}\n") },
+                ] },
+                "RestartCount": 7,
+                "ExitCode": 137,
+                "OOMKilled": true,
+            }),
+        );
+        let got = orch.inspect_slot("shop", Slot::Blue).await.unwrap();
+        assert_eq!(got.state, "restarting");
+        assert_eq!(got.health, "unhealthy");
+        assert_eq!(got.restart_count, 7);
+        assert_eq!(got.exit_code, Some(137));
+        assert!(got.oom_killed);
+        assert!(got.manager_report.is_some());
+        for output in [
+            json!(""),
+            json!("not json at all"),
+            json!("{\"v\":"),
+            json!(format!(
+                "{{\"v\":1,\"pad\":\"{}\"}}",
+                "x".repeat(MAX_REPORT_BYTES)
+            )),
+            json!(null),
+        ] {
+            set_state(
+                &fake,
+                "cite-shop-blue-manager",
+                json!({ "Health": { "Status": "starting", "Log": [{ "Output": output }] } }),
+            );
+            let got = orch.inspect_slot("shop", Slot::Blue).await.unwrap();
+            assert!(got.manager_report.is_none());
+            assert_eq!(got.health, "starting");
+        }
+        set_state(
+            &fake,
+            "cite-shop-blue-manager",
+            json!({ "Health": { "Log": [] } }),
+        );
+        assert!(
+            orch.inspect_slot("shop", Slot::Blue)
+                .await
+                .unwrap()
+                .manager_report
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn settings_current_tracks_settings_and_limits_not_the_deploy_id() {
+        let (orch, _fake) = start_fake().await;
+        let s = site_with("shop", json!({ "root_dir": "web", "memory_mb": 512 }));
+        let opts = StackOpts {
+            deploy_id: Some("d1".to_string()),
+            ..Default::default()
+        };
+        orch.ensure_stack_with(&s, Slot::Blue, None, TOKEN, &opts)
+            .await
+            .unwrap();
+        let got = orch.inspect_slot("shop", Slot::Blue).await.unwrap();
+        assert!(got.env.contains(&"CITE_DEPLOY_ID=d1".to_string()));
+        assert!(orch.settings_current(&s, &got));
+        let other = site_with("shop", json!({ "root_dir": "app", "memory_mb": 512 }));
+        assert!(!orch.settings_current(&other, &got));
+        let dropped = site_with("shop", json!({ "memory_mb": 512 }));
+        assert!(!orch.settings_current(&dropped, &got));
+        let resized = site_with("shop", json!({ "root_dir": "web", "memory_mb": 1024 }));
+        assert!(!orch.settings_current(&resized, &got));
+        let missing = orch.inspect_slot("shop", Slot::Green).await.unwrap();
+        assert!(!orch.settings_current(&s, &missing));
+    }
+
+    #[test]
+    fn demux_handles_partial_odd_and_raw_streams() {
+        let mut body = frame(1, b"one\n");
+        body.extend(frame(2, b"two\n"));
+        body.extend(frame(1, b"spl"));
+        body.extend(frame(2, b"err\n"));
+        body.extend(frame(1, b"it\n"));
+        body.extend(frame(1, b""));
+        body.extend(frame(1, b"tail no newline"));
+        assert_eq!(
+            demux(&body),
+            vec![
+                (false, "one".to_string()),
+                (true, "two".to_string()),
+                (true, "err".to_string()),
+                (false, "split".to_string()),
+                (false, "tail no newline".to_string()),
+            ]
+        );
+        let mut cut = frame(1, b"whole\n");
+        cut.extend([1, 0, 0, 0, 0, 0, 0x7f, 0xff]);
+        cut.extend(b"claims more than present");
+        assert_eq!(
+            demux(&cut),
+            vec![
+                (false, "whole".to_string()),
+                (false, "claims more than present".to_string())
+            ]
+        );
+        let mut half = frame(1, b"ok\n");
+        half.extend([1, 0, 0]);
+        assert_eq!(demux(&half), vec![(false, "ok".to_string())]);
+        let mut corrupt = frame(1, b"ok\n");
+        corrupt.extend([9, 9, 9, 9, 0, 0, 0, 1, b'x']);
+        assert_eq!(demux(&corrupt), vec![(false, "ok".to_string())]);
+        assert_eq!(
+            demux(b"plain tty line\r\nsecond\n"),
+            vec![
+                (false, "plain tty line".to_string()),
+                (false, "second".to_string())
+            ]
+        );
+        assert!(demux(b"").is_empty());
+        assert!(demux(&[1, 0]).len() <= 1);
+    }
+
+    #[test]
+    fn ansi_and_token_redaction() {
+        assert_eq!(strip_ansi("\x1b[31mred\x1b[0m ok\x1b[2K"), "red ok");
+        assert_eq!(strip_ansi("a\x1b]0;title\x07b\x1b]8;;u\x1b\\c"), "abc");
+        assert_eq!(strip_ansi("bell\x07 tab\there\r"), "bell tab\there");
+        let token = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+        let pat = "github_pat_11ABCDEFG0_abcdefghijklmnop";
+        let text = format!(
+            "clone {token} then {pat}; gho_abcdefgh1 ghu_abcdefgh2 ghs_abcdefgh3 ghr_abcdefgh4"
+        );
+        let out = redact_text(&text, &[]);
+        assert_eq!(
+            out,
+            "clone [REDACTED] then [REDACTED]; [REDACTED] [REDACTED] [REDACTED] [REDACTED]"
+        );
+        assert_eq!(redact_text("ghp_short and ghp_", &[]), "ghp_short and ghp_");
+        let secrets = vec![
+            "hunter22".to_string(),
+            "abc".to_string(),
+            "hunter22x".to_string(),
+        ];
+        assert_eq!(
+            redact_text("pw hunter22x hunter22 abc", &secrets),
+            "pw [REDACTED] [REDACTED] abc"
+        );
+    }
+
+    #[tokio::test]
+    async fn container_logs_demux_parse_redact_and_cap() {
+        let (orch, fake) = start_fake().await;
+        orch.ensure_stack(&site("shop", None), Slot::Blue, None, TOKEN)
+            .await
+            .unwrap();
+        let json_line = format!(
+            "{TS} {{\"ts\":\"2026-02-02T00:00:00Z\",\"level\":\"WARN\",\"msg\":\"building pw=hunter22\",\"phase\":\"build\"}}\n"
+        );
+        let mut body = frame(1, json_line.as_bytes());
+        body.extend(frame(
+            2,
+            format!("{TS} \x1b[31mfailed\x1b[0m {TOKEN} hunter22\n").as_bytes(),
+        ));
+        body.extend(frame(1, format!("{TS} {{\"unrelated\":1}}\n").as_bytes()));
+        body.extend(frame(
+            1,
+            format!("{TS} {}\n", "a".repeat(10_000)).as_bytes(),
+        ));
+        set_logs(&fake, "cite-shop-blue-manager", body.clone());
+        let secrets = vec!["hunter22".to_string()];
+        let batch = orch
+            .container_logs(
+                "shop",
+                Slot::Blue,
+                LogRole::Manager,
+                5000,
+                Some("1700000000"),
+                &secrets,
+            )
+            .await
+            .unwrap();
+        assert!(!batch.truncated);
+        assert_eq!(batch.lines.len(), 4);
+        let first = &batch.lines[0];
+        assert_eq!(first.text, "building pw=[REDACTED]");
+        assert_eq!(first.level.as_deref(), Some("warn"));
+        assert_eq!(first.phase.as_deref(), Some("build"));
+        assert_eq!(
+            first.ts.as_deref(),
+            Some(TS),
+            "Docker's time wins over the app's"
+        );
+        assert_eq!(first.stream, "stdout");
+        let second = &batch.lines[1];
+        assert_eq!(second.text, "failed [REDACTED] [REDACTED]");
+        assert_eq!(second.stream, "stderr");
+        assert_eq!(second.level.as_deref(), Some("error"));
+        assert_eq!(second.ts.as_deref(), Some(TS));
+        assert_eq!(batch.lines[2].text, "{\"unrelated\":1}");
+        assert_eq!(batch.lines[3].text.len(), MAX_LOG_LINE);
+        let query = fake
+            .lock()
+            .unwrap()
+            .log
+            .iter()
+            .find(|l| l.starts_with("LOGQ"))
+            .cloned()
+            .unwrap();
+        for part in [
+            "stdout=1",
+            "stderr=1",
+            "tail=1000",
+            "timestamps=1",
+            "since=1700000000",
+        ] {
+            assert!(query.contains(part), "{query}");
+        }
+        let exec = orch
+            .container_logs("shop", Slot::Blue, LogRole::Executor, 10, None, &[])
+            .await
+            .unwrap();
+        assert!(exec.lines.is_empty());
+        set_logs(
+            &fake,
+            "cite-shop-blue-executor",
+            frame(1, format!("{TS} {{\"msg\":\"x\"}}\n").as_bytes()),
+        );
+        let exec = orch
+            .container_logs("shop", Slot::Blue, LogRole::Executor, 10, None, &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            exec.lines[0].text, "{\"msg\":\"x\"}",
+            "executor lines stay plain text"
+        );
+        let bad = orch
+            .container_logs("shop", Slot::Blue, LogRole::Manager, 10, Some("1; rm"), &[])
+            .await;
+        assert!(matches!(bad, Err(ConnectorError::BadRequest(_))));
+        let gone = orch
+            .container_logs("ghost", Slot::Green, LogRole::Manager, 10, None, &[])
+            .await
+            .unwrap();
+        assert!(gone.lines.is_empty() && !gone.truncated);
+    }
+
+    #[test]
+    fn the_cursor_follows_docker_time_not_a_skewed_app_clock() {
+        let later = "2026-01-02T03:04:06.000000001Z";
+        let mut body = frame(
+            1,
+            format!("{TS} {{\"ts\":\"2099-01-01T00:00:00Z\",\"msg\":\"ahead\"}}\n").as_bytes(),
+        );
+        body.extend(frame(
+            2,
+            format!("{later} {{\"ts\":\"2000-01-01T00:00:00Z\",\"msg\":\"behind\"}}\n").as_bytes(),
+        ));
+        body.extend(frame(1, b"{\"ts\":\"2026 01 01\",\"msg\":\"spaced\"}\n"));
+        let batch = build_batch(&body, true, &[]);
+        assert_eq!(batch.lines.len(), 3);
+        assert_eq!(batch.lines[0].ts.as_deref(), Some(TS));
+        assert_eq!(batch.lines[1].ts.as_deref(), Some(later));
+        assert_eq!(batch.lines[2].ts, None);
+        assert_eq!(batch.last_ts.as_deref(), Some(later));
+        let plain = parse_log_line(
+            r#"{"ts":"2026-03-03T00:00:00Z","msg":"m"}"#,
+            false,
+            true,
+            &[],
+        );
+        assert_eq!(plain.ts.as_deref(), Some("2026-03-03T00:00:00Z"));
+        assert!(build_batch(b"", true, &[]).last_ts.is_none());
+    }
+
+    #[test]
+    fn log_batch_drops_oldest_beyond_one_mebibyte() {
+        let mut body = Vec::new();
+        for i in 0..400 {
+            let line = format!("{TS} n{i:04} {}\n", "x".repeat(MAX_LOG_LINE - 6));
+            body.extend(frame(1, line.as_bytes()));
+        }
+        let batch = build_batch(&body, false, &[]);
+        assert!(batch.truncated);
+        assert!(batch.lines.len() < 400);
+        let total: usize = batch.lines.iter().map(line_cost).sum();
+        assert!(total <= MAX_LOG_TOTAL);
+        assert!(batch.lines.last().unwrap().text.starts_with("n0399"));
+        assert!(!batch.lines.iter().any(|l| l.text.starts_with("n0000")));
+        let small = build_batch(&frame(1, format!("{TS} hi\n").as_bytes()), false, &[]);
+        assert!(!small.truncated && small.lines.len() == 1);
+    }
+
+    #[tokio::test]
+    async fn reset_slot_volumes_drops_work_and_cache_only() {
+        let (orch, fake) = start_fake().await;
+        let s = site("shop", None);
+        orch.ensure_stack(&s, Slot::Blue, None, TOKEN)
+            .await
+            .unwrap();
+        orch.ensure_stack(&s, Slot::Green, None, TOKEN)
+            .await
+            .unwrap();
+        orch.reset_slot_volumes("shop", Slot::Blue).await.unwrap();
+        {
+            let f = fake.lock().unwrap();
+            assert!(!f.volumes.contains_key("cite-shop-blue-work"));
+            assert!(!f.volumes.contains_key("cite-shop-blue-cache"));
+            assert!(f.volumes.contains_key("cite-shop-blue-data"));
+            assert!(f.volumes.contains_key("cite-shop-green-work"));
+            assert!(!f.containers.contains_key("cite-shop-blue-manager"));
+            assert!(f.containers.contains_key("cite-shop-blue-executor"));
+        }
+        orch.reset_slot_volumes("shop", Slot::Blue).await.unwrap();
+        orch.ensure_stack(&s, Slot::Blue, None, TOKEN)
+            .await
+            .unwrap();
+        let f = fake.lock().unwrap();
+        assert!(f.volumes.contains_key("cite-shop-blue-work"));
+        assert!(f.containers["cite-shop-blue-manager"].running);
+    }
+
+    #[tokio::test]
+    async fn reset_refuses_a_foreign_volume() {
+        let (orch, fake) = start_fake().await;
+        fake.lock()
+            .unwrap()
+            .volumes
+            .insert("cite-shop-blue-work".to_string(), json!({}));
+        let err = orch
+            .reset_slot_volumes("shop", Slot::Blue)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ConnectorError::Conflict(_)), "{err}");
+        assert!(
+            fake.lock()
+                .unwrap()
+                .volumes
+                .contains_key("cite-shop-blue-work")
+        );
+    }
+
+    fn forge(name: &str, url: Option<&str>) -> Forge {
+        Forge {
+            name: Some(name.to_string()),
+            api_url: url.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn forge_env_parsing_and_validation() {
+        assert_eq!(Forge::from_lookup(|_| None).unwrap(), Forge::default());
+        assert!(Forge::default().env().is_empty());
+        let got = Forge::from_lookup(|k| match k {
+            "CITE_STACK_FORGE" => Some(" gitea ".to_string()),
+            "CITE_STACK_FORGE_API_URL" => Some("https://git.example.com/api/v1".to_string()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(got, forge("gitea", Some("https://git.example.com/api/v1")));
+        for bad in ["Gitea", "git ea", "1git", "a".repeat(40).as_str()] {
+            let r = Forge::from_lookup(|k| (k == "CITE_STACK_FORGE").then(|| bad.to_string()));
+            assert!(matches!(r, Err(ConnectorError::BadRequest(_))), "{bad}");
+        }
+        let r = Forge::from_lookup(|k| {
+            (k == "CITE_STACK_FORGE_API_URL").then(|| "https://u@evil.test".to_string())
+        });
+        assert!(matches!(r, Err(ConnectorError::BadRequest(_))));
+        assert!(Forge::default().missing_api_url().is_none());
+        assert!(forge("github", None).missing_api_url().is_none());
+        assert!(
+            forge("gitea", Some("https://git.example.com/api/v1"))
+                .missing_api_url()
+                .is_none()
+        );
+        let warning = forge("gitlab", None).missing_api_url().unwrap();
+        assert!(warning.contains("gitlab") && warning.contains("CITE_STACK_FORGE_API_URL"));
+    }
+
+    #[test]
+    fn forge_reaches_only_the_manager_env() {
+        let f = forge("gitea", Some("https://git.example.com/api/v1"));
+        let p = plan_stack_with(
+            &site("shop", None),
+            Slot::Blue,
+            None,
+            TOKEN,
+            &stack_env("r.io/o", "1", false),
+            &StackOpts::default(),
+            &Limits::default(),
+            &f,
+        )
+        .unwrap();
+        let env = env_of(&p.manager);
+        assert!(env.contains(&"CITE_FORGE=gitea".to_string()));
+        assert!(env.contains(&"CITE_FORGE_API_URL=https://git.example.com/api/v1".to_string()));
+        for spec in [&p.manager, &p.executor, &p.init] {
+            assert!(!spec["Labels"].to_string().contains("gitea"));
+        }
+        assert!(!p.executor.to_string().contains("CITE_FORGE"));
+        assert!(!p.init.to_string().contains("CITE_FORGE"));
+    }
+
+    #[tokio::test]
+    async fn changed_or_removed_forge_recreates_the_manager() {
+        let (orch, fake) = start_fake().await;
+        let s = site("shop", None);
+        orch.ensure_stack(&s, Slot::Blue, None, TOKEN)
+            .await
+            .unwrap();
+        assert!(!container_env(&fake, "cite-shop-blue-manager").contains("CITE_FORGE"));
+        let orch = orch.with_forge(forge("gitea", None));
+        orch.ensure_stack(&s, Slot::Blue, None, TOKEN)
+            .await
+            .unwrap();
+        assert_eq!(count(&fake, "CREATE cite-shop-blue-manager"), 2);
+        orch.ensure_stack(&s, Slot::Blue, None, TOKEN)
+            .await
+            .unwrap();
+        assert_eq!(count(&fake, "CREATE cite-shop-blue-manager"), 2);
+        let orch = orch.with_forge(forge("forgejo", None));
+        orch.ensure_stack(&s, Slot::Blue, None, TOKEN)
+            .await
+            .unwrap();
+        assert_eq!(count(&fake, "CREATE cite-shop-blue-manager"), 3);
+        let orch = orch.with_forge(Forge::default());
+        orch.ensure_stack(&s, Slot::Blue, None, TOKEN)
+            .await
+            .unwrap();
+        assert_eq!(count(&fake, "CREATE cite-shop-blue-manager"), 4);
+        assert_eq!(count(&fake, "CREATE cite-shop-blue-executor"), 1);
+        assert!(!container_env(&fake, "cite-shop-blue-manager").contains("CITE_FORGE"));
     }
 }

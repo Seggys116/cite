@@ -4,21 +4,23 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use cite_core::schema::{
-    DeployRecord, DesiredAction, ManagerState, Outcome, Slot, now_rfc3339, read_desired,
-    read_state, write_state,
+    DeployOutcome, DeployRecord, DeployResult, DesiredAction, MAX_OUTCOME_REASON, ManagerState,
+    Outcome, Slot, now_rfc3339, read_desired, read_state, token_fingerprint, write_state,
 };
-use cite_core::{ManagerConfig, PollInterval, ensure_dir};
+use cite_core::{ManagerConfig, PollInterval, Redactor, ensure_dir};
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
-use crate::build::{cleanup_job, load_build_env, make_redactor, run_build_classified, wipe_work};
-use crate::github::{CommitInfo, GithubClient, PollResult};
+use crate::build::{cleanup_job, load_build_env, make_redactor, run_build_observed, wipe_work};
+use crate::forge::{ForgeClient, ForgeSettings};
+use crate::github::{CommitInfo, PollResult};
 use crate::poll::{jittered_interval, next_poll_stamp, parse_rfc3339};
 use crate::promote::{
     PromoteContext, PromoteOutcome, any_sealed_release, delete_unsealed_slots, ensure_slot_dirs,
     promote, write_action,
 };
 use crate::reconcile::{load_or_init_state, reconcile};
+use crate::report::{BuildEvent, Phase, Progress, ReportParts, build_report, ellipsize};
 use crate::{ManagerError, Result};
 
 #[derive(Debug, Clone)]
@@ -34,7 +36,7 @@ pub enum DeployCmd {
 
 pub struct Deployer {
     pub cfg: ManagerConfig,
-    pub github: GithubClient,
+    pub github: ForgeClient,
     pub state: Mutex<ManagerState>,
     /// Newest head seen while a build was running; built next instead of queueing each one.
     pub pending_head: Mutex<Option<CommitInfo>>,
@@ -42,6 +44,9 @@ pub struct Deployer {
     poll_failures: AtomicU32,
     shutting_down: AtomicBool,
     rejected_token: Mutex<Option<String>>,
+    progress: StdMutex<Progress>,
+    /// True once GitHub accepted the token since the last rejection.
+    token_verified: AtomicBool,
 }
 
 const LOG_CAPACITY: usize = 500;
@@ -160,8 +165,9 @@ impl Deployer {
         delete_unsealed_slots(&cfg)?;
         reconcile(&cfg)?;
 
-        let github = GithubClient::new(
-            &cfg.github_api_url,
+        let forge = ForgeSettings::from_env(&cfg.github_api_url)?;
+        let github = ForgeClient::new(
+            &forge,
             &cfg.owner,
             &cfg.name,
             &cfg.branch,
@@ -179,7 +185,26 @@ impl Deployer {
             poll_failures: AtomicU32::new(0),
             shutting_down: AtomicBool::new(false),
             rejected_token: Mutex::new(None),
+            progress: StdMutex::new(Progress::default()),
+            token_verified: AtomicBool::new(false),
         }))
+    }
+
+    fn mark_token_invalid(&self, state: &mut ManagerState) {
+        state.token_invalid = true;
+        state.token_invalid_fingerprint =
+            self.github.read_token().ok().map(|t| token_fingerprint(&t));
+    }
+
+    pub fn progress(&self) -> Progress {
+        self.progress
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    fn with_progress(&self, change: impl FnOnce(&mut Progress)) {
+        change(&mut self.progress.lock().unwrap_or_else(|e| e.into_inner()));
     }
 
     pub async fn validate_github_with_backoff(self: &Arc<Self>) {
@@ -189,16 +214,22 @@ impl Deployer {
                 Ok(ok) => {
                     let mut state = self.state.lock().await;
                     state.token_invalid = false;
+                    state.token_invalid_fingerprint = None;
                     state.token_expires_at = ok.token_expires_at;
+                    self.token_verified.store(true, Ordering::SeqCst);
                     let _ = write_state(&self.cfg.state_path(), &state);
-                    info!("GitHub access validated");
+                    info!("{} access validated", self.github.kind().display_name());
                     return;
                 }
                 Err(err) => {
-                    error!(error = %err, "GitHub validation failed; retrying");
+                    error!(
+                        error = %err,
+                        "{} validation failed; retrying",
+                        self.github.kind().display_name()
+                    );
                     let mut state = self.state.lock().await;
                     if err.to_string().contains("token") {
-                        state.token_invalid = true;
+                        self.mark_token_invalid(&mut state);
                     }
                     let _ = write_state(&self.cfg.state_path(), &state);
                     tokio::time::sleep(delay).await;
@@ -228,6 +259,14 @@ impl Deployer {
             && let Err(err) = self.adopt_reality().await
         {
             warn!(error = %err, "could not reconcile with executor status");
+        }
+        // A waiting deploy id is itself a forced build of the head, so it answers these two requests.
+        if matches!(
+            cmd,
+            DeployCmd::Poll { .. } | DeployCmd::Redeploy { sha: None }
+        ) && let Some(done) = self.run_pending_deploy_id().await
+        {
+            return done;
         }
         match cmd {
             DeployCmd::Pause => {
@@ -346,7 +385,8 @@ impl Deployer {
                 let rejected = self.github.read_token().ok();
                 *self.rejected_token.lock().await = rejected;
                 let mut state = self.state.lock().await;
-                state.token_invalid = true;
+                self.mark_token_invalid(&mut state);
+                self.token_verified.store(false, Ordering::SeqCst);
                 write_state(&self.cfg.state_path(), &state)?;
                 return Err(PollFailure {
                     err,
@@ -363,7 +403,9 @@ impl Deployer {
         {
             let mut state = self.state.lock().await;
             state.token_invalid = false;
+            state.token_invalid_fingerprint = None;
         }
+        self.token_verified.store(true, Ordering::SeqCst);
         *self.rejected_token.lock().await = None;
 
         let commit = match result {
@@ -537,6 +579,23 @@ impl Deployer {
         message: &str,
         author: &str,
     ) -> Result<serde_json::Value> {
+        self.with_progress(|p| p.begin(sha));
+        let result = self.deploy_sha_attempt(sha, message, author).await;
+        let ended = match &result {
+            Ok(done) if done["outcome"] == "live" => Phase::Idle,
+            Err(_) if self.shutting_down.load(Ordering::SeqCst) => Phase::Idle,
+            _ => Phase::Failed,
+        };
+        self.with_progress(|p| p.end(ended));
+        result
+    }
+
+    async fn deploy_sha_attempt(
+        self: &Arc<Self>,
+        sha: &str,
+        message: &str,
+        author: &str,
+    ) -> Result<serde_json::Value> {
         info!(%sha, "deploy starting");
         let token = self.github.read_token()?;
         let build_env = load_build_env(&self.cfg)?;
@@ -546,7 +605,7 @@ impl Deployer {
             Ok(bytes) => bytes,
             Err(err) => {
                 if err.to_string().contains("token_invalid") {
-                    self.state.lock().await.token_invalid = true;
+                    self.mark_token_invalid(&mut *self.state.lock().await);
                 }
                 self.record_transient_failure(sha, &err.to_string()).await?;
                 return Err(err);
@@ -557,8 +616,15 @@ impl Deployer {
             return Err(ManagerError::new("shutdown requested; build not started"));
         }
 
-        let built = match run_build_classified(&self.cfg, &tarball, sha, message, author, &redactor)
-            .await
+        self.with_progress(|p| p.enter(Phase::Building));
+        let observe = |event: BuildEvent| match event {
+            BuildEvent::Detected(detected) => self.with_progress(|p| p.detected = Some(detected)),
+            BuildEvent::Packing => self.with_progress(|p| p.enter(Phase::Packing)),
+        };
+        let built = match run_build_observed(
+            &self.cfg, &tarball, sha, message, author, &redactor, &observe,
+        )
+        .await
         {
             Ok(b) => b,
             Err(failure) => {
@@ -574,7 +640,7 @@ impl Deployer {
                 } else {
                     let mut state = self.state.lock().await;
                     state.last_failed_sha = Some(sha.to_string());
-                    state.last_failed_reason = Some(err.to_string());
+                    state.last_failed_reason = Some(redactor.redact_line(&err.to_string()));
                     write_state(&self.cfg.state_path(), &state)?;
                 }
                 return Err(err);
@@ -586,6 +652,7 @@ impl Deployer {
             crate::promote::generation_floor(&self.cfg, state.generation)
         };
 
+        self.with_progress(|p| p.enter(Phase::Promoting));
         let promote_result = promote(PromoteContext {
             cfg: &self.cfg,
             built: &built,
@@ -679,6 +746,112 @@ impl Deployer {
         }
     }
 
+    /// Builds the branch head once for an unhandled deploy id; `None` when nothing was pending or the token is not verified yet.
+    pub async fn run_pending_deploy_id(self: &Arc<Self>) -> Option<Result<serde_json::Value>> {
+        let id = self.cfg.deploy_id.clone()?;
+        if !self.token_verified.load(Ordering::SeqCst) {
+            return None;
+        }
+        self.attempt_deploy_id(&id, self.redeploy(None)).await
+    }
+
+    async fn attempt_deploy_id(
+        self: &Arc<Self>,
+        id: &str,
+        attempt: impl std::future::Future<Output = Result<serde_json::Value>>,
+    ) -> Option<Result<serde_json::Value>> {
+        {
+            let mut state = self.state.lock().await;
+            if state.deploy_id_handled.as_deref() == Some(id) {
+                return None;
+            }
+            state.last_failed_sha = None;
+            if let Err(err) = write_state(&self.cfg.state_path(), &state) {
+                return Some(Err(err.into()));
+            }
+        }
+        let started_at = now_rfc3339();
+        let result = attempt.await;
+        if let Err(err) = self.record_outcome(id, &started_at, &result).await {
+            warn!(error = %err, "could not record the deploy outcome");
+        }
+        Some(result)
+    }
+
+    /// Marks the id handled once the attempt has ended; a coalesced request or a shutdown abort has not.
+    async fn record_outcome(
+        &self,
+        id: &str,
+        started_at: &str,
+        result: &Result<serde_json::Value>,
+    ) -> Result<()> {
+        let redactor = self.report_redactor();
+        let mut state = self.state.lock().await;
+        let current_sha = self.progress().sha;
+        let (outcome, sha, reason) = match result {
+            Ok(done) if done["outcome"] == "live" => (
+                DeployResult::Live,
+                done["sha"].as_str().map(str::to_string),
+                String::new(),
+            ),
+            Ok(done) if done["outcome"] == "failed" => {
+                let reason = state
+                    .last_failed_reason
+                    .clone()
+                    .filter(|reason| !reason.is_empty())
+                    .unwrap_or_else(|| "the new release did not become healthy".into());
+                (
+                    DeployResult::Failed,
+                    done["sha"].as_str().map(str::to_string),
+                    reason,
+                )
+            }
+            Ok(_) => return Ok(()),
+            Err(_) if self.shutting_down.load(Ordering::SeqCst) => return Ok(()),
+            Err(err) => (DeployResult::Failed, current_sha, err.to_string()),
+        };
+        let reason = ellipsize(&redactor.redact_line(&reason), MAX_OUTCOME_REASON);
+        state.last_outcome = Some(DeployOutcome {
+            deploy_id: id.to_string(),
+            result: outcome,
+            sha,
+            reason,
+            started_at: started_at.to_string(),
+            finished_at: now_rfc3339(),
+        });
+        state.deploy_id_handled = Some(id.to_string());
+        write_state(&self.cfg.state_path(), &state)?;
+        Ok(())
+    }
+
+    /// Masks the token and every build env value, the same set the build log uses.
+    fn report_redactor(&self) -> Redactor {
+        let token = self.github.read_token().unwrap_or_default();
+        let env = load_build_env(&self.cfg).unwrap_or_default();
+        make_redactor(&token, &env)
+    }
+
+    /// The single line `cite-manager healthcheck` prints; it never waits on a build.
+    pub async fn health_report(&self) -> String {
+        let state = match tokio::time::timeout(Duration::from_secs(1), self.state.lock()).await {
+            Ok(state) => state.clone(),
+            Err(_) => read_state(&self.cfg.state_path()).unwrap_or_default(),
+        };
+        let status = cite_core::read_status(&self.cfg.status_path()).ok();
+        let progress = self.progress();
+        let fingerprint = self.github.read_token().ok().map(|t| token_fingerprint(&t));
+        build_report(
+            &ReportParts {
+                token_fingerprint: fingerprint.as_deref(),
+                progress: &progress,
+                state: &state,
+                status: status.as_ref(),
+                token_verified: self.token_verified.load(Ordering::SeqCst),
+            },
+            &self.report_redactor(),
+        )
+    }
+
     async fn record_transient_failure(self: &Arc<Self>, _sha: &str, reason: &str) -> Result<()> {
         let mut state = self.state.lock().await;
         state.last_failed_reason = Some(reason.to_string());
@@ -732,6 +905,9 @@ impl Deployer {
             "executor_unresponsive": !responsive,
             "executor_reported": executor_reported,
             "disk_free_bytes": disk_free_bytes,
+            "phase": self.progress().phase,
+            "deploy_id_handled": state.deploy_id_handled,
+            "last_outcome": state.last_outcome,
         }))
     }
 
@@ -876,5 +1052,248 @@ mod tests {
             .unwrap();
         assert_eq!(done["generation"], 10);
         assert_eq!(deployer.state.lock().await.generation, 10);
+    }
+
+    const ID_ONE: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    const ID_TWO: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAW";
+
+    fn id_cfg(root: &std::path::Path, deploy_id: &str) -> cite_core::ManagerConfig {
+        let token = root.join("token");
+        std::fs::write(&token, "ghp_citeMockGithubPat00000000000000001\n").unwrap();
+        std::fs::set_permissions(&token, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .unwrap();
+        let env: std::collections::HashMap<String, String> = [
+            ("CITE_REPO", "owner/name"),
+            ("CITE_DATA_DIR", root.join("data").to_str().unwrap()),
+            ("CITE_WORK_DIR", root.join("work").to_str().unwrap()),
+            ("CITE_CACHE_DIR", root.join("cache").to_str().unwrap()),
+            (
+                "CITE_BUILD_ENV_FILE",
+                root.join("none.env").to_str().unwrap(),
+            ),
+            ("CITE_GITHUB_TOKEN_FILE", token.to_str().unwrap()),
+            ("CITE_DEV_SAME_USER", "true"),
+            ("CITE_MIN_FREE_BYTES", "1"),
+            ("CITE_POLL_INTERVAL", "off"),
+            ("CITE_DEPLOY_ID", deploy_id),
+            (
+                "CITE_BUILD_ENV_JSON",
+                r#"{"API_KEY":"hunter2-build-secret"}"#,
+            ),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        cite_core::ManagerConfig::load_from(&env, None).unwrap()
+    }
+
+    fn live(sha: &str) -> crate::Result<serde_json::Value> {
+        Ok(serde_json::json!({"outcome": "live", "sha": sha}))
+    }
+
+    #[tokio::test]
+    async fn a_new_deploy_id_forces_a_build_clears_the_failed_sha_and_records_live() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sha = "a".repeat(40);
+        let deployer = super::Deployer::new(id_cfg(tmp.path(), ID_ONE))
+            .await
+            .unwrap();
+        {
+            let mut state = deployer.state.lock().await;
+            state.last_deployed_sha = Some(sha.clone());
+            state.last_failed_sha = Some(sha.clone());
+        }
+        let seen = std::sync::Arc::clone(&deployer);
+        let attempt = {
+            let sha = sha.clone();
+            async move {
+                assert!(
+                    seen.state.lock().await.last_failed_sha.is_none(),
+                    "the failed sha is cleared before the build starts"
+                );
+                live(&sha)
+            }
+        };
+        let done = deployer.attempt_deploy_id(ID_ONE, attempt).await;
+        assert!(done.expect("attempted").is_ok());
+
+        let state = cite_core::read_state(&deployer.cfg.state_path()).unwrap();
+        assert_eq!(state.deploy_id_handled.as_deref(), Some(ID_ONE));
+        let outcome = state.last_outcome.expect("outcome recorded");
+        assert_eq!(outcome.deploy_id, ID_ONE);
+        assert_eq!(outcome.result, cite_core::DeployResult::Live);
+        assert_eq!(outcome.sha.as_deref(), Some(sha.as_str()));
+        assert!(outcome.reason.is_empty());
+        assert!(state.last_failed_sha.is_none());
+    }
+
+    #[tokio::test]
+    async fn the_same_deploy_id_is_not_rebuilt_after_a_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sha = "b".repeat(40);
+        let first = super::Deployer::new(id_cfg(tmp.path(), ID_ONE))
+            .await
+            .unwrap();
+        assert!(
+            first
+                .attempt_deploy_id(ID_ONE, async { live(&sha) })
+                .await
+                .is_some()
+        );
+
+        let restarted = super::Deployer::new(id_cfg(tmp.path(), ID_ONE))
+            .await
+            .unwrap();
+        let ran = std::sync::atomic::AtomicBool::new(false);
+        let again = restarted
+            .attempt_deploy_id(ID_ONE, async {
+                ran.store(true, std::sync::atomic::Ordering::SeqCst);
+                live(&sha)
+            })
+            .await;
+        assert!(again.is_none());
+        assert!(!ran.load(std::sync::atomic::Ordering::SeqCst));
+
+        let next = restarted
+            .attempt_deploy_id(ID_TWO, async { live(&sha) })
+            .await;
+        assert!(next.is_some(), "a different id builds again");
+        let state = restarted.state.lock().await;
+        assert_eq!(state.deploy_id_handled.as_deref(), Some(ID_TWO));
+    }
+
+    #[tokio::test]
+    async fn a_failed_attempt_records_the_redacted_reason_and_still_marks_the_id_handled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let deployer = super::Deployer::new(id_cfg(tmp.path(), ID_ONE))
+            .await
+            .unwrap();
+        let reason = "install failed: hunter2-build-secret rejected\nsecond line";
+        let done = deployer
+            .attempt_deploy_id(ID_ONE, async { Err(crate::ManagerError::new(reason)) })
+            .await;
+        assert!(done.expect("attempted").is_err());
+
+        let state = cite_core::read_state(&deployer.cfg.state_path()).unwrap();
+        assert_eq!(state.deploy_id_handled.as_deref(), Some(ID_ONE));
+        let outcome = state.last_outcome.expect("outcome recorded");
+        assert_eq!(outcome.result, cite_core::DeployResult::Failed);
+        assert!(
+            outcome.reason.contains("install failed"),
+            "{}",
+            outcome.reason
+        );
+        assert!(outcome.reason.contains("second line"));
+        assert!(!outcome.reason.contains("hunter2-build-secret"));
+        assert!(outcome.reason.contains("[REDACTED]"));
+        assert!(!outcome.started_at.is_empty() && !outcome.finished_at.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failed_promote_outcome_uses_the_stored_failure_reason() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sha = "c".repeat(40);
+        let deployer = super::Deployer::new(id_cfg(tmp.path(), ID_ONE))
+            .await
+            .unwrap();
+        deployer.state.lock().await.last_failed_reason = Some("health gate failed".into());
+        let failed = serde_json::json!({"outcome": "failed", "sha": sha});
+        deployer
+            .attempt_deploy_id(ID_ONE, async { Ok(failed) })
+            .await;
+        let outcome = deployer.state.lock().await.last_outcome.clone().unwrap();
+        assert_eq!(outcome.result, cite_core::DeployResult::Failed);
+        assert_eq!(outcome.reason, "health gate failed");
+        assert_eq!(outcome.sha.as_deref(), Some(sha.as_str()));
+    }
+
+    #[tokio::test]
+    async fn coalesced_and_shutdown_attempts_leave_the_id_pending() {
+        let tmp = tempfile::tempdir().unwrap();
+        let deployer = super::Deployer::new(id_cfg(tmp.path(), ID_ONE))
+            .await
+            .unwrap();
+        let coalesced = deployer
+            .attempt_deploy_id(ID_ONE, async { Ok(serde_json::json!({"coalesced": true})) })
+            .await;
+        assert!(coalesced.is_some());
+        assert!(deployer.state.lock().await.deploy_id_handled.is_none());
+
+        deployer.request_shutdown();
+        deployer
+            .attempt_deploy_id(ID_ONE, async { Err(crate::ManagerError::new("aborted")) })
+            .await;
+        let state = deployer.state.lock().await;
+        assert!(state.deploy_id_handled.is_none() && state.last_outcome.is_none());
+    }
+
+    #[tokio::test]
+    async fn the_pending_id_waits_for_a_verified_token_and_is_absent_without_a_configured_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let deployer = super::Deployer::new(id_cfg(tmp.path(), ID_ONE))
+            .await
+            .unwrap();
+        assert!(deployer.run_pending_deploy_id().await.is_none());
+        assert!(deployer.state.lock().await.deploy_id_handled.is_none());
+
+        let other = tempfile::tempdir().unwrap();
+        let mut cfg = id_cfg(other.path(), ID_ONE);
+        cfg.deploy_id = None;
+        let plain = super::Deployer::new(cfg).await.unwrap();
+        plain
+            .token_verified
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(plain.run_pending_deploy_id().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn health_report_is_one_short_line_with_the_progress_and_outcome() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sha = "d".repeat(40);
+        let deployer = super::Deployer::new(id_cfg(tmp.path(), ID_ONE))
+            .await
+            .unwrap();
+        deployer
+            .attempt_deploy_id(ID_ONE, async { live(&sha) })
+            .await;
+        deployer.with_progress(|p| p.begin(&sha));
+        deployer.state.lock().await.last_failed_reason =
+            Some(format!("boom hunter2-build-secret {}", "x".repeat(20_000)));
+        let line = deployer.health_report().await;
+        assert!(line.len() <= crate::report::REPORT_MAX_BYTES);
+        assert!(!line.contains('\n') && !line.contains("hunter2-build-secret"));
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["phase"], "fetching");
+        assert_eq!(v["deploy"]["id"], ID_ONE);
+        assert_eq!(v["deploy"]["result"], "live");
+        assert_eq!(v["token"], "unknown");
+    }
+
+    #[tokio::test]
+    async fn a_persisted_rejection_applies_only_to_the_token_that_was_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = id_cfg(tmp.path(), ID_ONE);
+        let deployer = super::Deployer::new(cfg.clone()).await.unwrap();
+        {
+            let mut state = deployer.state.lock().await;
+            deployer.mark_token_invalid(&mut state);
+            assert!(state.token_invalid && state.token_invalid_fingerprint.is_some());
+        }
+        let token = |line: String| {
+            serde_json::from_str::<serde_json::Value>(&line).unwrap()["token"].clone()
+        };
+        assert_eq!(token(deployer.health_report().await), "invalid");
+
+        let path = tmp.path().join("token");
+        std::fs::write(&path, "ghp_citeReplacementPat0000000000000002\n").unwrap();
+        assert_eq!(token(deployer.health_report().await), "unknown");
+
+        std::fs::write(&path, "ghp_citeMockGithubPat00000000000000001\n").unwrap();
+        assert_eq!(token(deployer.health_report().await), "invalid");
+        assert!(
+            !std::fs::read_to_string(cfg.state_path())
+                .unwrap_or_default()
+                .contains("ghp_cite")
+        );
     }
 }

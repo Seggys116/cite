@@ -505,6 +505,148 @@ fn cloudflare_only_gates_on_the_tcp_peer_on_real_haproxy() {
     }
 }
 
+// Prints how many of 25 requests to the flex site, which is not cloudflare_only, were answered 429, once with a different CF-Connecting-IP per request and once with a single one.
+const RATE_PROBE: &str = r#"count() { n=0; hits=0; while [ $n -lt 25 ]; do n=$((n+1)); ip=$(eval "echo $1"); c=$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: flex.example.com' -H "CF-Connecting-IP: $ip" "http://$HAP/"); [ "$c" = 429 ] && hits=$((hits+1)); done; printf '%s|%s\n' "$2" "$hits"; }
+count '203.0.113.$n' distinct
+count '198.51.100.77' same
+"#;
+
+#[test]
+#[ignore = "needs docker and real haproxy"]
+fn rate_limit_counts_the_forwarded_visitor_only_for_cloudflare_peers_on_real_haproxy() {
+    let id = format!("{}-rl", std::process::id());
+    let dir = std::env::temp_dir().join(format!("cite-live-{id}"));
+    std::fs::create_dir_all(dir.join("maps")).expect("dir");
+    std::fs::create_dir_all(dir.join("pages")).expect("dir");
+    let _env = Env {
+        dir: dir.clone(),
+        id: id.clone(),
+    };
+    let opts = RenderOptions {
+        maps_dir: "/conf/haproxy/maps".into(),
+        pages_dir: "/conf/haproxy/pages".into(),
+        runtime_addr: "unix@/tmp/admin.sock".into(),
+        log_addr: "/tmp/log.sock".into(),
+        tls_dir: None,
+        cloudflare_file: Some("/conf/haproxy/maps/cloudflare.lst".into()),
+    };
+    write(
+        &dir,
+        "nginx.conf",
+        "server { listen 80; location / { default_type text/plain; return 200 \"ok\"; } }\n",
+    );
+    write(&dir, "probe.sh", RATE_PROBE);
+    let net = format!("cite-live-{id}");
+    let d = dir.to_str().expect("utf8 path").to_string();
+    let hap = format!("cite-live-{id}-hap");
+    let run = |args: &[&str]| {
+        let (ok, text) = docker(args);
+        assert!(ok, "docker {args:?}: {text}");
+        text
+    };
+    run(&["network", "create", &net]);
+    run(&[
+        "run",
+        "-d",
+        "--name",
+        &format!("cite-live-{id}-echo"),
+        "--network",
+        &net,
+        "--network-alias",
+        "echo",
+        "-v",
+        &format!("{d}/nginx.conf:/etc/nginx/conf.d/default.conf:ro"),
+        "nginx:alpine",
+    ]);
+    // the probe container sits on this network, so its address is the TCP peer HAProxy sees
+    let subnet = run(&[
+        "network",
+        "inspect",
+        "-f",
+        "{{(index .IPAM.Config 0).Subnet}}",
+        &net,
+    ])
+    .trim()
+    .to_string();
+    assert!(subnet.contains('/'), "subnet {subnet:?}");
+
+    let phase = |ranges: Vec<String>| -> Vec<String> {
+        let rendered = render(&cloudflare_config(ranges), &opts).expect("render");
+        write(&dir, "haproxy.cfg", &for_docker(&rendered.config));
+        write(&dir, "maps/active.map", &rendered.active_map);
+        write(&dir, "maps/maint.map", &rendered.maint_map);
+        write(&dir, "maps/cloudflare.lst", &rendered.cloudflare_list);
+        for (name, html) in &rendered.pages {
+            write(&dir.join("pages"), name, html);
+        }
+        let (ok, text) = docker(&[
+            "run",
+            "--rm",
+            "--network",
+            &net,
+            "-v",
+            &format!("{d}:/conf/haproxy:ro"),
+            "haproxy:3.2-bookworm",
+            "haproxy",
+            "-c",
+            "-f",
+            "/conf/haproxy/haproxy.cfg",
+        ]);
+        assert!(ok, "haproxy -c: {text}");
+        let _ = docker(&["rm", "-f", &hap]);
+        run(&[
+            "run",
+            "-d",
+            "--name",
+            &hap,
+            "--network",
+            &net,
+            "-v",
+            &format!("{d}:/conf/haproxy:ro"),
+            "haproxy:3.2-bookworm",
+            "haproxy",
+            "-db",
+            "-f",
+            "/conf/haproxy/haproxy.cfg",
+        ]);
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        run(&[
+            "run",
+            "--rm",
+            "--network",
+            &net,
+            "-e",
+            &format!("HAP={hap}"),
+            "-v",
+            &format!("{d}:/conf:ro"),
+            "--entrypoint",
+            "sh",
+            "curlimages/curl",
+            "/conf/probe.sh",
+        ])
+        .lines()
+        .map(str::to_string)
+        .collect()
+    };
+    let hits = |lines: &[String], name: &str| -> u32 {
+        lines
+            .iter()
+            .find_map(|l| l.strip_prefix(&format!("{name}|")))
+            .and_then(|n| n.trim().parse().ok())
+            .unwrap_or_else(|| panic!("no {name} line in {lines:?}"))
+    };
+
+    // the probe is not a Cloudflare peer, so a forged header must not split its traffic into separate buckets
+    let forged = phase(vec![]);
+    assert!(hits(&forged, "distinct") > 0, "{forged:?}");
+    assert!(hits(&forged, "same") > 0, "{forged:?}");
+
+    // a Cloudflare peer is trusted: distinct visitors stay under the limit, one visitor does not
+    let trusted = phase(vec![subnet]);
+    assert_eq!(hits(&trusted, "distinct"), 0, "{trusted:?}");
+    assert!(hits(&trusted, "same") > 0, "{trusted:?}");
+}
+
 // A pattern that PCRE2 would abort on (and HAProxy then counts as no match, failing a deny rule open) never reaches the renderer.
 #[test]
 fn catastrophic_deny_patterns_are_refused_before_rendering() {

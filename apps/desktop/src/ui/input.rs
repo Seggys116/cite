@@ -130,6 +130,14 @@ impl TextInput {
         self.min_lines > 1
     }
 
+    // Only repaints when the hint really changes, so calling it on every load is cheap.
+    pub fn set_placeholder(&mut self, text: &str, cx: &mut Context<Self>) {
+        if self.placeholder.as_ref() != text {
+            self.placeholder = SharedString::from(text.to_string());
+            cx.notify();
+        }
+    }
+
     pub fn set_text(&mut self, text: &str, cx: &mut Context<Self>) {
         self.content = text.to_string();
         let end = self.content.len();

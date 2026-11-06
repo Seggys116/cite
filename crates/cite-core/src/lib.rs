@@ -20,7 +20,7 @@ pub use argv::{render_argv, split_command, validate_start_argv};
 pub use atomic::{AtomicPoint, ensure_dir, set_tight_umask, write_atomic, write_atomic_failpoint};
 pub use config::{
     BinShims, ExecutorConfig, GithubToken, ManagerConfig, RenderingSetting, SiteEnv,
-    node_flag_denied, parse_env_file,
+    node_flag_denied, parse_build_env_json, parse_env_file,
 };
 pub use confined::{FileKey, FileName, NAME_MAX, TrustedDir};
 pub use detect::{Detection, detect_site, detect_site_configured, detect_site_with};
@@ -31,10 +31,11 @@ pub use pack::{PackLimits, PackReport, hash_tree, normalized_mode, pack_dir};
 pub use pathsafe::{ContainedOpen, UrlPath, host_allowed, open_contained, request_path};
 pub use redact::{Redactor, secrets_equal};
 pub use schema::{
-    ControlRequest, ControlResponse, DeployRecord, Desired, DesiredAction, ExecutorStatus, Health,
-    HealthExpect, LastResult, ManagerState, Outcome, ReleaseManifest, RuntimeKind, SCHEMA_VERSION,
-    Slot, SlotState, SlotStatus, decode_desired, decode_release, decode_state, decode_status,
-    escape_control, new_id, now_rfc3339, read_desired, read_release, read_state, read_status,
+    ControlRequest, ControlResponse, DeployOutcome, DeployRecord, DeployResult, Desired,
+    DesiredAction, ExecutorStatus, Health, HealthExpect, LastResult, MAX_OUTCOME_REASON,
+    ManagerState, Outcome, ReleaseManifest, RuntimeKind, SCHEMA_VERSION, Slot, SlotState,
+    SlotStatus, decode_desired, decode_release, decode_state, decode_status, escape_control,
+    is_deploy_id, new_id, now_rfc3339, read_desired, read_release, read_state, read_status,
     write_desired, write_release, write_state, write_status,
 };
 pub use volume::{

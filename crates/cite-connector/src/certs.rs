@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 
 use cite_core::atomic::{ensure_dir, write_atomic_in};
 use cite_core::confined::{FileName, TrustedDir};
+use cite_edge::model::{EdgeConfig, Site, TlsMode};
+use cite_edge::validate::is_valid_id;
 use rustls::pki_types::{
     CertificateDer, PrivateKeyDer, PrivatePkcs1KeyDer, PrivatePkcs8KeyDer, PrivateSec1KeyDer,
 };
@@ -34,7 +36,12 @@ const CERT_TAG: &str = "CERTIFICATE";
 const FILE_MAGIC: &str = "# cite certificate v1";
 const NAME_LINE: &str = "# name: ";
 const CREATED_LINE: &str = "# created_at: ";
+const MANAGED_LINE: &str = "# managed: ";
 const DIR_MODE: u32 = 0o750;
+pub const MAX_ISSUE_HOSTS: usize = 32;
+pub const RENEW_BEFORE_SECS: i64 = 30 * DAY_SECS;
+const MAX_HOST_LEN: usize = 253;
+const MAX_LABEL_LEN: usize = 63;
 const OID_RSA: &str = "1.2.840.113549.1.1.1";
 const OID_EC: &str = "1.2.840.10045.2.1";
 const OID_ED25519: &str = "1.3.101.112";
@@ -123,6 +130,7 @@ pub struct CertInfo {
 pub enum Source {
     Api,
     Manual,
+    Auto,
 }
 
 impl Source {
@@ -130,8 +138,52 @@ impl Source {
         match self {
             Source::Api => "api",
             Source::Manual => "manual",
+            Source::Auto => "auto",
         }
     }
+}
+
+// How the node renews a certificate it issued itself; written into the file so it survives restarts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Managed {
+    OriginCa { days: u32 },
+    Acme { staging: bool },
+}
+
+impl Managed {
+    pub fn kind(self) -> &'static str {
+        match self {
+            Managed::OriginCa { .. } => "origin-ca",
+            Managed::Acme { .. } => "acme",
+        }
+    }
+
+    pub fn staging(self) -> bool {
+        matches!(self, Managed::Acme { staging: true })
+    }
+
+    fn encode(self) -> String {
+        match self {
+            Managed::OriginCa { days } => format!("origin-ca {days}"),
+            Managed::Acme { staging: true } => "acme staging".into(),
+            Managed::Acme { staging: false } => "acme production".into(),
+        }
+    }
+
+    fn decode(text: &str) -> Option<Self> {
+        match text.trim().split_once(' ')? {
+            ("origin-ca", days) => days.parse().ok().map(|days| Managed::OriginCa { days }),
+            ("acme", "production") => Some(Managed::Acme { staging: false }),
+            ("acme", "staging") => Some(Managed::Acme { staging: true }),
+            _ => None,
+        }
+    }
+}
+
+// Thirty days ahead, or a third of the lifetime for short certificates so a seven-day one is not renewed on every pass.
+pub fn renew_at(info: &CertInfo) -> i64 {
+    let lifetime = (info.not_after - info.not_before).max(0);
+    info.not_after - RENEW_BEFORE_SECS.min(lifetime / 3)
 }
 
 #[derive(Debug, Clone)]
@@ -142,6 +194,7 @@ pub struct Stored {
     pub info: CertInfo,
     pub source: Source,
     pub warning: Option<String>,
+    pub managed: Option<Managed>,
 }
 
 // A file the connector owns but cannot read: it still counts, and still loads in HAProxy, so it is listed and can be deleted or replaced.
@@ -156,6 +209,7 @@ fn unreadable(id: &str) -> Stored {
         },
         source: Source::Api,
         warning: Some("the certificate file cannot be read; replace or delete it".into()),
+        managed: None,
     }
 }
 
@@ -177,6 +231,10 @@ pub struct Cert {
     pub source: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub warning: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub managed: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub renew_at: Option<String>,
 }
 
 impl Cert {
@@ -187,7 +245,8 @@ impl Cert {
             .iter()
             .cloned()
             .partition(|host| info.sans.iter().any(|san| name_matches(san, host)));
-        let readable = stored.warning.is_none();
+        // an automatic certificate carries its explanation in `warning` and is always readable
+        let readable = stored.warning.is_none() || stored.source == Source::Auto;
         Cert {
             id: stored.id.clone(),
             name: stored.name.clone(),
@@ -216,6 +275,8 @@ impl Cert {
             uncovered_hosts,
             source: stored.source.as_str(),
             warning: stored.warning.clone(),
+            managed: stored.managed.map(Managed::kind),
+            renew_at: stored.managed.map(|_| rfc3339(renew_at(info))),
         }
     }
 }
@@ -243,16 +304,300 @@ pub fn name_matches(san: &str, host: &str) -> bool {
     }
 }
 
+// Automatic certificates never count as coverage: they exist precisely for the hosts nothing else covers.
 pub fn uncovered_hosts(certs: &[Stored], hosts: &[String]) -> Vec<String> {
     hosts
         .iter()
         .filter(|host| {
             !certs
                 .iter()
+                .filter(|c| c.source != Source::Auto)
                 .any(|c| c.info.sans.iter().any(|san| name_matches(san, host)))
         })
         .cloned()
         .collect()
+}
+
+pub const AUTO_NOTE: &str = "Automatic self-signed certificate. Browsers do not trust it. It is fine behind Cloudflare Full (not strict).";
+pub const AUTO_HTTPS_PORT: u16 = 443;
+// https_port 0 in the settings opts out of the automatic listener, for hosts where 443 is taken.
+pub const NO_HTTPS_PORT: u16 = 0;
+const AUTO_PREFIX: &str = "auto-";
+const AUTO_MAGIC: &str = "# cite automatic certificate v1";
+const AUTO_SITE_LINE: &str = "# site: ";
+const AUTO_LIFETIME_DAYS: i64 = 3650;
+const AUTO_RENEW_BEFORE_SECS: i64 = 30 * DAY_SECS;
+
+// Sites behind Cloudflare, or served as Flexible, are reached on the TLS port by Cloudflare itself, so the node needs a certificate there whether or not the owner uploaded one.
+pub fn auto_active(cfg: &EdgeConfig) -> bool {
+    cfg.settings.https_port != Some(NO_HTTPS_PORT) && cfg.sites.iter().any(cloudflare_aware)
+}
+
+fn cloudflare_aware(site: &Site) -> bool {
+    site.access.cloudflare_only || site.access.tls == TlsMode::Flexible
+}
+
+// The TLS port the node binds: an explicit setting wins, otherwise 443 when automatic certificates are in play; 0 means never bind one.
+pub fn effective_https_port(cfg: &EdgeConfig) -> Option<u16> {
+    match cfg.settings.https_port {
+        Some(NO_HTTPS_PORT) => None,
+        Some(port) => Some(port),
+        None => auto_active(cfg).then_some(AUTO_HTTPS_PORT),
+    }
+}
+
+fn auto_file_name(site: &str) -> String {
+    format!("{AUTO_PREFIX}{site}{FILE_SUFFIX}")
+}
+
+fn auto_site_of(name: &str) -> Option<&str> {
+    name.strip_prefix(AUTO_PREFIX)
+        .and_then(|rest| rest.strip_suffix(FILE_SUFFIX))
+        .filter(|site| is_valid_id(site))
+}
+
+fn is_auto_marked(bytes: &[u8]) -> bool {
+    bytes
+        .strip_prefix(AUTO_MAGIC.as_bytes())
+        .is_some_and(|rest| rest.first() == Some(&b'\n'))
+}
+
+// Hosts of each Cloudflare-aware site that no uploaded or hand-placed certificate covers, which is what that site's automatic certificate must name.
+fn auto_wanted(cfg: &EdgeConfig, others: &[Stored]) -> Vec<(String, Vec<String>)> {
+    if !auto_active(cfg) {
+        return Vec::new();
+    }
+    cfg.sites
+        .iter()
+        .filter(|site| cloudflare_aware(site))
+        .filter_map(|site| {
+            let mut hosts: Vec<String> = site
+                .hosts
+                .iter()
+                .map(|h| h.to_ascii_lowercase())
+                .filter(|h| {
+                    !others
+                        .iter()
+                        .any(|c| c.info.sans.iter().any(|san| name_matches(san, h)))
+                })
+                .collect();
+            hosts.sort();
+            hosts.dedup();
+            (!hosts.is_empty()).then(|| (site.id.clone(), hosts))
+        })
+        .collect()
+}
+
+fn subject_for(hosts: &[String]) -> rcgen::DistinguishedName {
+    let mut dn = rcgen::DistinguishedName::new();
+    // a common name is limited to 64 characters; the names themselves live in the SANs
+    if let Some(first) = hosts.first().filter(|h| h.len() <= 64) {
+        dn.push(rcgen::DnType::CommonName, first.clone());
+    }
+    dn
+}
+
+fn new_key() -> Result<rcgen::KeyPair> {
+    rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
+        .map_err(|e| internal("cannot generate a key", e))
+}
+
+fn sign_self(hosts: &[String], days: i64, now: i64) -> Result<Generated> {
+    let key = new_key()?;
+    let mut params = rcgen::CertificateParams::new(hosts.to_vec())
+        .map_err(|e| internal("cannot describe the certificate", e))?;
+    params.distinguished_name = subject_for(hosts);
+    let start = OffsetDateTime::from_unix_timestamp(now).unwrap_or(OffsetDateTime::UNIX_EPOCH);
+    params.not_before = start - time::Duration::days(1);
+    params.not_after = start + time::Duration::days(days);
+    let cert = params
+        .self_signed(&key)
+        .map_err(|e| internal("cannot sign the certificate", e))?;
+    Ok(Generated {
+        chain_pem: cert.pem(),
+        key_pem: Zeroizing::new(key.serialize_pem()),
+    })
+}
+
+fn generate_auto(site: &str, hosts: &[String], now: i64) -> Result<Zeroizing<Vec<u8>>> {
+    let pair = sign_self(hosts, AUTO_LIFETIME_DAYS, now)?;
+    let head = format!(
+        "{AUTO_MAGIC}\n{AUTO_SITE_LINE}{site}\n{CREATED_LINE}{}\n",
+        rfc3339(now)
+    );
+    let mut out = Zeroizing::new(Vec::new());
+    out.extend_from_slice(head.as_bytes());
+    out.extend_from_slice(pair.chain_pem.as_bytes());
+    out.extend_from_slice(pair.key_pem.as_bytes());
+    Ok(out)
+}
+
+// A certificate made on the node or returned by an issuer, with the key the node generated for it.
+pub struct Generated {
+    pub chain_pem: String,
+    pub key_pem: Zeroizing<String>,
+}
+
+impl fmt::Debug for Generated {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Generated")
+            .field("chain_pem", &self.chain_pem.len())
+            .field("key_pem", &"<redacted>")
+            .finish()
+    }
+}
+
+impl Generated {
+    // Goes through the same checks as an upload, and refuses a certificate that does not name every requested host.
+    pub fn prepare(self, now: i64, hosts: &[String], managed: Option<Managed>) -> Result<Prepared> {
+        let mut prepared =
+            validate_upload(&self.chain_pem, &self.key_pem, now).map_err(|e| match e {
+                ConnectorError::BadRequest(msg) => ConnectorError::Unavailable(format!(
+                    "the issued certificate cannot be used: {msg}"
+                )),
+                other => other,
+            })?;
+        let missing = hosts
+            .iter()
+            .find(|h| !prepared.info.sans.iter().any(|s| s.eq_ignore_ascii_case(h)));
+        if let Some(host) = missing {
+            return Err(ConnectorError::Unavailable(format!(
+                "the issued certificate does not name {host}"
+            )));
+        }
+        prepared.managed = managed;
+        Ok(prepared)
+    }
+}
+
+pub fn self_signed(hosts: &[String], days: u32, now: i64) -> Result<Generated> {
+    sign_self(hosts, i64::from(days), now)
+}
+
+// The key stays on the node; only the request goes to the issuer.
+pub struct KeyAndCsr {
+    pub key_pem: Zeroizing<String>,
+    pub csr_der: Vec<u8>,
+    pub csr_pem: String,
+}
+
+impl fmt::Debug for KeyAndCsr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("KeyAndCsr")
+            .field("csr_pem", &self.csr_pem)
+            .field("key_pem", &"<redacted>")
+            .finish()
+    }
+}
+
+pub fn key_and_csr(hosts: &[String]) -> Result<KeyAndCsr> {
+    let key = new_key()?;
+    let mut params = rcgen::CertificateParams::new(hosts.to_vec())
+        .map_err(|e| internal("cannot describe the certificate request", e))?;
+    params.distinguished_name = subject_for(hosts);
+    let csr = params
+        .serialize_request(&key)
+        .map_err(|e| internal("cannot sign the certificate request", e))?;
+    let csr_pem = csr
+        .pem()
+        .map_err(|e| internal("cannot encode the certificate request", e))?;
+    let der: &[u8] = csr.der().as_ref();
+    Ok(KeyAndCsr {
+        key_pem: Zeroizing::new(key.serialize_pem()),
+        csr_der: der.to_vec(),
+        csr_pem,
+    })
+}
+
+fn is_dns_label(label: &str) -> bool {
+    let b = label.as_bytes();
+    let edge = |c: Option<&u8>| c.is_some_and(|c| c.is_ascii_alphanumeric());
+    b.len() <= MAX_LABEL_LEN
+        && edge(b.first())
+        && edge(b.last())
+        && b.iter().all(|c| c.is_ascii_alphanumeric() || *c == b'-')
+}
+
+// The same hostname rules as site hosts; a public issuer also needs a dot, and a wildcard needs two labels under it.
+fn is_issuable_name(name: &str, public: bool) -> bool {
+    let base = name.strip_prefix("*.").unwrap_or(name);
+    let wildcard = base.len() != name.len();
+    name.len() <= MAX_HOST_LEN
+        && base.split('.').all(is_dns_label)
+        && (!(public || wildcard) || base.contains('.'))
+}
+
+// Lowercased and deduplicated; IP addresses only for certificates the node signs itself.
+pub fn validate_issue_hosts(hosts: &[String], allow_ip: bool) -> Result<Vec<String>> {
+    if hosts.is_empty() || hosts.len() > MAX_ISSUE_HOSTS {
+        return Err(bad(format!(
+            "hosts must list 1 to {MAX_ISSUE_HOSTS} hostnames"
+        )));
+    }
+    let mut out: Vec<String> = Vec::with_capacity(hosts.len());
+    for host in hosts {
+        let lower = host.to_ascii_lowercase();
+        let name = match lower.parse::<IpAddr>() {
+            Ok(ip) if allow_ip => ip.to_string(),
+            Ok(_) => {
+                return Err(bad(format!(
+                    "hosts: {:?} is an IP address, which this issuer cannot certify",
+                    label(host)
+                )));
+            }
+            Err(_) if is_issuable_name(&lower, !allow_ip) => lower,
+            Err(_) => {
+                return Err(bad(format!(
+                    "hosts: {:?} is not a valid hostname or *.wildcard",
+                    label(host)
+                )));
+            }
+        };
+        if !out.contains(&name) {
+            out.push(name);
+        }
+    }
+    Ok(out)
+}
+
+// A name for a certificate the caller did not name, built from its first host and cut to the name rules.
+pub fn default_name(prefix: &str, host: &str) -> String {
+    let host = host.replace("*.", "wildcard.");
+    let mut name: String = format!("{prefix} {host}")
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, ' ' | '.' | '_' | '-') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .take(MAX_NAME)
+        .collect();
+    while name.ends_with(' ') || name.contains("-----") {
+        name.pop();
+    }
+    if validate_name(&name).is_ok() {
+        name
+    } else {
+        prefix.to_string()
+    }
+}
+
+fn sorted_lower(names: &[String]) -> Vec<String> {
+    let mut v: Vec<String> = names.iter().map(|n| n.to_ascii_lowercase()).collect();
+    v.sort();
+    v.dedup();
+    v
+}
+
+// What a sync changed, so a failed apply can put the directory back.
+pub struct AutoUndo(Vec<(String, Option<Zeroizing<Vec<u8>>>)>);
+
+impl AutoUndo {
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -282,6 +627,7 @@ pub struct Prepared {
     pub info: CertInfo,
     chain: Vec<Vec<u8>>,
     key: KeyMaterial,
+    managed: Option<Managed>,
 }
 
 impl fmt::Debug for Prepared {
@@ -550,7 +896,12 @@ pub fn validate_upload(certificate: &str, private_key: &str, now: i64) -> Result
         )));
     }
     check_pair(&chain, &key)?;
-    Ok(Prepared { info, chain, key })
+    Ok(Prepared {
+        info,
+        chain,
+        key,
+        managed: None,
+    })
 }
 
 fn encode_block(tag: &str, der: &[u8]) -> Zeroizing<String> {
@@ -563,7 +914,10 @@ fn encode_block(tag: &str, der: &[u8]) -> Zeroizing<String> {
 impl Prepared {
     // HAProxy reads certificate and key from one file, chain first; the comment lines carry our metadata.
     fn file_bytes(&self, name: &str, created_at: &str) -> Zeroizing<Vec<u8>> {
-        let head = format!("{FILE_MAGIC}\n{NAME_LINE}{name}\n{CREATED_LINE}{created_at}\n");
+        let mut head = format!("{FILE_MAGIC}\n{NAME_LINE}{name}\n{CREATED_LINE}{created_at}\n");
+        if let Some(managed) = self.managed {
+            head.push_str(&format!("{MANAGED_LINE}{}\n", managed.encode()));
+        }
         let chain: String = self
             .chain
             .iter()
@@ -598,18 +952,21 @@ fn chain_range(text: &str) -> (usize, usize) {
 struct FileView {
     name: Option<String>,
     created_at: Option<String>,
+    managed: Option<Managed>,
     info: CertInfo,
 }
 
 fn parse_file(bytes: &[u8]) -> Result<FileView> {
     let text = std::str::from_utf8(bytes).map_err(|_| internal("certificate file", "not text"))?;
     let (start, end) = chain_range(text);
-    let (mut name, mut created_at) = (None, None);
+    let (mut name, mut created_at, mut managed) = (None, None, None);
     for line in text[..start].lines() {
         if let Some(value) = line.strip_prefix(NAME_LINE) {
             name = Some(value.trim().to_string());
         } else if let Some(value) = line.strip_prefix(CREATED_LINE) {
             created_at = Some(value.trim().to_string());
+        } else if let Some(value) = line.strip_prefix(MANAGED_LINE) {
+            managed = Managed::decode(value);
         }
     }
     let blocks = pem::parse_many(&text[start..end]).map_err(|e| internal("certificate file", e))?;
@@ -622,6 +979,7 @@ fn parse_file(bytes: &[u8]) -> Result<FileView> {
     Ok(FileView {
         name,
         created_at,
+        managed,
         info,
     })
 }
@@ -641,6 +999,7 @@ fn parse_stored(id: &str, bytes: &[u8]) -> Result<Stored> {
         info: view.info,
         source: Source::Api,
         warning: None,
+        managed: view.managed,
     })
 }
 
@@ -654,6 +1013,24 @@ fn parse_manual(name: &str, bytes: &[u8]) -> Result<Stored> {
         info: view.info,
         source: Source::Manual,
         warning: None,
+        managed: None,
+    })
+}
+
+// The node's own certificate for a site; the id cannot be mistaken for an uploaded one and the entry is read-only.
+fn parse_auto(site: &str, bytes: &[u8]) -> Result<Stored> {
+    let view = parse_file(bytes)?;
+    Ok(Stored {
+        id: format!("auto:{site}"),
+        name: format!("{AUTO_PREFIX}{site}"),
+        created_at: view
+            .created_at
+            .filter(|c| !c.is_empty())
+            .unwrap_or_else(|| rfc3339(view.info.not_before)),
+        info: view.info,
+        source: Source::Auto,
+        warning: Some(AUTO_NOTE.to_string()),
+        managed: None,
     })
 }
 
@@ -844,6 +1221,7 @@ pub struct CertStore {
     dir: PathBuf,
     mode: u32,
     gate: Mutex<()>,
+    issuing: crate::acme::Issuing,
     // Test hook: the next write fails right after its rename, as a failed directory fsync would.
     #[cfg(test)]
     fail_after_rename: std::sync::atomic::AtomicBool,
@@ -855,9 +1233,15 @@ impl CertStore {
             dir,
             mode,
             gate: Mutex::new(()),
+            issuing: crate::acme::Issuing::new(),
             #[cfg(test)]
             fail_after_rename: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    // Jobs, limits and outbound endpoints of the certificates the node issues itself.
+    pub(crate) fn issuing(&self) -> &crate::acme::Issuing {
+        &self.issuing
     }
 
     // Held for the whole of a mutation, so two uploads never interleave their files and reloads.
@@ -927,7 +1311,10 @@ impl CertStore {
                         .map(Zeroizing::new)
                         .map_err(|e| internal("cannot read the certificate file", e))
                 })
-                .and_then(|bytes| parse_manual(&name, &bytes));
+                .and_then(|bytes| match auto_site_of(&name) {
+                    Some(site) if is_auto_marked(&bytes) => parse_auto(site, &bytes),
+                    _ => parse_manual(&name, &bytes),
+                });
             match parsed {
                 Ok(item) => out.push(item),
                 Err(e) => {
@@ -944,7 +1331,137 @@ impl CertStore {
         Ok(out)
     }
 
+    // Brings the node's own certificates in line with the config: one per site that has hosts no other certificate covers, rewritten only when those hosts change, removed when nothing needs it.
+    pub fn sync_auto(&self, cfg: &EdgeConfig, now: i64) -> Result<AutoUndo> {
+        let others: Vec<Stored> = self
+            .list()?
+            .into_iter()
+            .filter(|c| c.source != Source::Auto)
+            .collect();
+        let wanted = auto_wanted(cfg, &others);
+        let existing: Vec<String> = loaded_names(&self.dir)
+            .into_iter()
+            .filter(|n| auto_site_of(n).is_some())
+            .collect();
+        if wanted.is_empty() && existing.is_empty() {
+            return Ok(AutoUndo(Vec::new()));
+        }
+        let dir = self.open_for_write()?;
+        let mut undo = AutoUndo(Vec::new());
+        let result = self.sync_auto_files(&dir, &wanted, &existing, now, &mut undo);
+        if let Err(err) = result {
+            if let Err(e) = self.rollback_auto(undo) {
+                tracing::error!(error = %e, "could not undo a failed automatic certificate sync");
+            }
+            return Err(err);
+        }
+        Ok(undo)
+    }
+
+    fn sync_auto_files(
+        &self,
+        dir: &TrustedDir,
+        wanted: &[(String, Vec<String>)],
+        existing: &[String],
+        now: i64,
+        undo: &mut AutoUndo,
+    ) -> Result<()> {
+        for name in existing {
+            let Some(site) = auto_site_of(name) else {
+                continue;
+            };
+            let file = FileName::new(name).map_err(|e| internal("certificate file name", e))?;
+            let Ok(bytes) = dir.read_limited(&file, MAX_FILE_BYTES).map(Zeroizing::new) else {
+                continue;
+            };
+            // a hand-placed file that merely has an auto- name is not ours to touch
+            if !is_auto_marked(&bytes) {
+                continue;
+            }
+            let keep = wanted
+                .iter()
+                .find(|(id, _)| id == site)
+                .is_some_and(|(_, hosts)| {
+                    parse_file(&bytes).is_ok_and(|v| {
+                        sorted_lower(&v.info.sans) == *hosts
+                            && v.info.not_after - now > AUTO_RENEW_BEFORE_SECS
+                    })
+                });
+            if keep {
+                continue;
+            }
+            undo.0.push((name.clone(), Some(bytes)));
+            if wanted.iter().all(|(id, _)| id != site) {
+                dir.unlink(&file)
+                    .map_err(|e| internal("cannot remove an automatic certificate", e))?;
+            }
+        }
+        for (site, hosts) in wanted {
+            let name = auto_file_name(site);
+            let file = FileName::new(&name).map_err(|e| internal("certificate file name", e))?;
+            let current = match dir.read_limited(&file, MAX_FILE_BYTES) {
+                Ok(bytes) => Some(Zeroizing::new(bytes)),
+                Err(cite_core::Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => return Err(internal("cannot read an automatic certificate", e)),
+            };
+            if let Some(bytes) = &current {
+                if !is_auto_marked(bytes) {
+                    tracing::warn!(file = %name, "a hand-placed file has the name of an automatic certificate; none is generated for this site");
+                    continue;
+                }
+                let fresh = parse_file(bytes).is_ok_and(|v| {
+                    sorted_lower(&v.info.sans) == *hosts
+                        && v.info.not_after - now > AUTO_RENEW_BEFORE_SECS
+                });
+                if fresh {
+                    continue;
+                }
+            }
+            let bytes = match generate_auto(site, hosts, now) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    tracing::warn!(%site, error = %e, "no automatic certificate could be made for this site");
+                    continue;
+                }
+            };
+            if !undo.0.iter().any(|(n, _)| *n == name) {
+                undo.0.push((name.clone(), current));
+            }
+            write_atomic_in(dir, &file, &bytes, self.mode)
+                .map_err(|e| internal("cannot write an automatic certificate", e))?;
+        }
+        Ok(())
+    }
+
+    // Puts the automatic certificates back as they were before a sync, newest change first.
+    pub fn rollback_auto(&self, undo: AutoUndo) -> Result<()> {
+        if undo.is_empty() {
+            return Ok(());
+        }
+        let dir = self.open_for_write()?;
+        for (name, previous) in undo.0.into_iter().rev() {
+            let file = FileName::new(&name).map_err(|e| internal("certificate file name", e))?;
+            match previous {
+                Some(bytes) => write_atomic_in(&dir, &file, &bytes, self.mode)
+                    .map_err(|e| internal("cannot restore an automatic certificate", e))?,
+                None => match dir.unlink(&file) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(internal("cannot remove an automatic certificate", e)),
+                },
+            }
+        }
+        let _ = dir.sync();
+        Ok(())
+    }
+
     pub fn get(&self, id: &str) -> Result<Option<Stored>> {
+        if id.starts_with("auto:") {
+            return Ok(self
+                .list()?
+                .into_iter()
+                .find(|c| c.source == Source::Auto && c.id == id));
+        }
         if !is_cert_id(id) {
             return Ok(None);
         }
@@ -1036,6 +1553,7 @@ impl CertStore {
             info: prepared.info.clone(),
             source: Source::Api,
             warning: None,
+            managed: prepared.managed,
         };
         Ok((stored, Undo { id, previous: None }))
     }
@@ -1075,6 +1593,7 @@ impl CertStore {
             info: prepared.info.clone(),
             source: Source::Api,
             warning: None,
+            managed: prepared.managed,
         };
         Ok((
             stored,
@@ -1523,6 +2042,162 @@ mod tests {
         assert_eq!(live_set(&certs).count, 0);
     }
 
+    fn cf_site(id: &str, hosts: &[&str]) -> cite_edge::model::Site {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "name": id, "hosts": hosts,
+            "blue": {"targets": []}, "green": {"targets": []}, "active": "blue",
+            "access": {"cloudflare_only": true}
+        }))
+        .unwrap()
+    }
+
+    fn config_with(sites: Vec<cite_edge::model::Site>) -> EdgeConfig {
+        EdgeConfig {
+            version: cite_edge::model::CONFIG_VERSION,
+            sites,
+            ..EdgeConfig::default()
+        }
+    }
+
+    fn auto_entry(store: &CertStore, site: &str) -> Option<Stored> {
+        store
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|c| c.id == format!("auto:{site}"))
+    }
+
+    #[test]
+    fn automatic_certificates_name_exactly_the_uncovered_hosts() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        store
+            .create("up", &prepared(&["a.example.com"]), "t")
+            .unwrap();
+        let cfg = config_with(vec![cf_site("shop", &["a.example.com", "B.example.com"])]);
+        store.sync_auto(&cfg, now()).unwrap();
+
+        let auto = auto_entry(&store, "shop").expect("an automatic certificate");
+        assert_eq!(auto.info.sans, ["b.example.com"]);
+        assert_eq!(auto.source, Source::Auto);
+        assert_eq!(auto.warning.as_deref(), Some(AUTO_NOTE));
+        assert_eq!(auto.info.key_type, "ecdsa-p256");
+        assert!(
+            auto.info.not_after - now() > 3649 * DAY_SECS,
+            "valid for about ten years"
+        );
+        let path = store.dir.join("auto-shop.pem");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        // loaded by HAProxy, so it counts in the live set next to the upload
+        assert_eq!(live_set(&store.dir).count, 2);
+        let listed = store.list().unwrap();
+        let shown = serde_json::to_string(&Cert::new(&auto, &[], now())).unwrap();
+        assert!(!shown.contains("PRIVATE KEY"), "{shown}");
+        assert_eq!(
+            uncovered_hosts(&listed, &["b.example.com".into()]),
+            ["b.example.com"]
+        );
+    }
+
+    #[test]
+    fn an_unchanged_site_keeps_its_certificate_and_changed_hosts_replace_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        let mut cfg = config_with(vec![cf_site("shop", &["a.example.com"])]);
+        store.sync_auto(&cfg, now()).unwrap();
+        let path = store.dir.join("auto-shop.pem");
+        let first = std::fs::read(&path).unwrap();
+        store.sync_auto(&cfg, now()).unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            first,
+            "no churn when nothing changed"
+        );
+
+        cfg.sites[0].hosts = vec!["a.example.com".into(), "c.example.com".into()];
+        store.sync_auto(&cfg, now()).unwrap();
+        assert_ne!(std::fs::read(&path).unwrap(), first);
+        assert_eq!(
+            auto_entry(&store, "shop").unwrap().info.sans,
+            ["a.example.com", "c.example.com"]
+        );
+    }
+
+    #[test]
+    fn deleting_a_site_or_uploading_cover_removes_the_automatic_certificate() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        let cfg = config_with(vec![cf_site("shop", &["a.example.com"])]);
+        store.sync_auto(&cfg, now()).unwrap();
+        assert!(auto_entry(&store, "shop").is_some());
+
+        store.sync_auto(&config_with(Vec::new()), now()).unwrap();
+        assert!(auto_entry(&store, "shop").is_none());
+        assert_eq!(live_set(&store.dir).count, 0);
+
+        store.sync_auto(&cfg, now()).unwrap();
+        store
+            .create("up", &prepared(&["*.example.com"]), "t")
+            .unwrap();
+        store.sync_auto(&cfg, now()).unwrap();
+        assert!(
+            auto_entry(&store, "shop").is_none(),
+            "an uploaded certificate supersedes it"
+        );
+        assert_eq!(live_set(&store.dir).count, 1);
+    }
+
+    #[test]
+    fn nodes_without_cloudflare_or_flexible_sites_get_no_automatic_certificates() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        let mut plain = cf_site("shop", &["a.example.com"]);
+        plain.access.cloudflare_only = false;
+        let cfg = config_with(vec![plain]);
+        store.sync_auto(&cfg, now()).unwrap();
+        assert!(!store.dir.exists() || live_set(&store.dir).count == 0);
+        assert_eq!(effective_https_port(&cfg), None);
+        let mut flexible = cfg.clone();
+        flexible.sites[0].access.tls = TlsMode::Flexible;
+        assert_eq!(effective_https_port(&flexible), Some(443));
+        flexible.settings.https_port = Some(8443);
+        assert_eq!(effective_https_port(&flexible), Some(8443));
+    }
+
+    #[test]
+    fn automatic_certificates_name_only_cloudflare_aware_sites_and_zero_opts_out() {
+        let mut plain = cf_site("blog", &["blog.example.com"]);
+        plain.access.cloudflare_only = false;
+        let mut cfg = config_with(vec![plain, cf_site("shop", &["shop.example.com"])]);
+        let wanted = auto_wanted(&cfg, &[]);
+        assert_eq!(wanted.len(), 1);
+        assert_eq!(wanted[0].0, "shop");
+        cfg.settings.https_port = Some(NO_HTTPS_PORT);
+        assert!(!auto_active(&cfg));
+        assert!(auto_wanted(&cfg, &[]).is_empty());
+        assert_eq!(effective_https_port(&cfg), None);
+    }
+
+    #[test]
+    fn a_failed_sync_can_be_undone_and_a_hand_placed_lookalike_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        store.open_for_write().unwrap();
+        let cfg = config_with(vec![cf_site("shop", &["a.example.com"])]);
+        let undo = store.sync_auto(&cfg, now()).unwrap();
+        assert!(store.dir.join("auto-shop.pem").is_file());
+        store.rollback_auto(undo).unwrap();
+        assert!(!store.dir.join("auto-shop.pem").exists());
+
+        std::fs::write(store.dir.join("auto-shop.pem"), "hand made").unwrap();
+        store.sync_auto(&cfg, now()).unwrap();
+        assert_eq!(
+            std::fs::read(store.dir.join("auto-shop.pem")).unwrap(),
+            b"hand made"
+        );
+    }
+
     #[test]
     fn a_changed_sidecar_key_changes_the_digest_but_is_not_counted() {
         let dir = tempfile::tempdir().unwrap();
@@ -1766,5 +2441,179 @@ mod tests {
         for text in [format!("{p:?}"), format!("{undo:?}")] {
             assert!(!text.contains(&body[..20]), "{text}");
         }
+    }
+
+    fn names(hosts: &[&str]) -> Vec<String> {
+        hosts.iter().map(|h| h.to_string()).collect()
+    }
+
+    #[test]
+    fn managed_markers_round_trip_and_ignore_garbage() {
+        for m in [
+            Managed::OriginCa { days: 5475 },
+            Managed::Acme { staging: true },
+            Managed::Acme { staging: false },
+        ] {
+            assert_eq!(Managed::decode(&m.encode()), Some(m));
+        }
+        for junk in ["", "acme", "acme later", "origin-ca x", "other 1"] {
+            assert_eq!(Managed::decode(junk), None, "{junk}");
+        }
+    }
+
+    #[test]
+    fn managed_certificates_keep_their_marker_until_replaced_by_hand() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        let hosts = names(&["a.example.com"]);
+        let acme = Managed::Acme { staging: true };
+        let p = self_signed(&hosts, 90, now())
+            .unwrap()
+            .prepare(now(), &hosts, Some(acme))
+            .unwrap();
+        let (stored, _) = store.create("n", &p, "t").unwrap();
+        assert_eq!(stored.managed, Some(acme));
+        assert_eq!(store.get(&stored.id).unwrap().unwrap().managed, Some(acme));
+        let cert = Cert::new(&stored, &[], now());
+        assert_eq!(cert.managed, Some("acme"));
+        assert_eq!(cert.renew_at, Some(rfc3339(renew_at(&stored.info))));
+
+        let origin = Managed::OriginCa { days: 365 };
+        let renewed = self_signed(&hosts, 90, now())
+            .unwrap()
+            .prepare(now(), &hosts, Some(origin))
+            .unwrap();
+        store.replace(&stored.id, None, &renewed, "t").unwrap();
+        let listed = store.list().unwrap();
+        assert_eq!(listed[0].managed, Some(origin));
+        assert_eq!(listed[0].name, "n");
+
+        let (by_hand, _) = store
+            .replace(&stored.id, None, &prepared(&["a.example.com"]), "t")
+            .unwrap();
+        assert_eq!(by_hand.managed, None);
+        assert_eq!(store.get(&stored.id).unwrap().unwrap().managed, None);
+        assert!(Cert::new(&by_hand, &[], now()).renew_at.is_none());
+    }
+
+    #[test]
+    fn renewal_is_due_thirty_days_ahead_or_at_two_thirds_of_a_short_life() {
+        let info = |days: i64| CertInfo {
+            not_before: 0,
+            not_after: days * DAY_SECS,
+            ..CertInfo::default()
+        };
+        assert_eq!(renew_at(&info(90)), 60 * DAY_SECS);
+        assert_eq!(renew_at(&info(365)), 335 * DAY_SECS);
+        assert_eq!(renew_at(&info(7)), 7 * DAY_SECS - 7 * DAY_SECS / 3);
+    }
+
+    #[test]
+    fn issue_hosts_follow_the_hostname_rules() {
+        assert_eq!(
+            validate_issue_hosts(
+                &names(&["Shop.Example.com", "*.example.net", "shop.example.com"]),
+                false
+            )
+            .unwrap(),
+            ["shop.example.com", "*.example.net"]
+        );
+        assert_eq!(
+            validate_issue_hosts(&names(&["10.0.0.5", "2001:DB8::1", "localhost"]), true).unwrap(),
+            ["10.0.0.5", "2001:db8::1", "localhost"]
+        );
+        let long_label = format!("{}.example.com", "a".repeat(64));
+        for bad in [
+            "",
+            "exa mple.com",
+            "*.com",
+            "*.*.example.com",
+            "a..example.com",
+            "-a.example.com",
+            "a_b.example.com",
+            "example.com.",
+            "localhost",
+            "10.0.0.5",
+            long_label.as_str(),
+        ] {
+            assert!(
+                validate_issue_hosts(&names(&[bad]), false).is_err(),
+                "{bad}"
+            );
+        }
+        assert!(validate_issue_hosts(&[], true).is_err());
+        let many: Vec<String> = (0..=MAX_ISSUE_HOSTS)
+            .map(|i| format!("h{i}.example.com"))
+            .collect();
+        assert!(validate_issue_hosts(&many, true).is_err());
+        assert!(validate_issue_hosts(&many[..MAX_ISSUE_HOSTS], true).is_ok());
+    }
+
+    #[test]
+    fn default_names_pass_the_name_rules() {
+        assert_eq!(
+            default_name("letsencrypt", "*.example.com"),
+            "letsencrypt wildcard.example.com"
+        );
+        assert_eq!(
+            default_name("self-signed", "2001:db8::1"),
+            "self-signed 2001-db8--1"
+        );
+        let long = default_name("origin-ca", &format!("{}.example.com", "a".repeat(63)));
+        assert_eq!(long.len(), MAX_NAME);
+        assert!(validate_name(&long).is_ok());
+    }
+
+    #[test]
+    fn a_signing_request_names_every_host_with_a_p256_key() {
+        let hosts = names(&["shop.example.com", "*.shop.example.com"]);
+        let req = key_and_csr(&hosts).unwrap();
+        let (_, csr) =
+            x509_parser::certification_request::X509CertificationRequest::from_der(&req.csr_der)
+                .unwrap();
+        let mut sans = Vec::new();
+        for ext in csr.requested_extensions().into_iter().flatten() {
+            if let ParsedExtension::SubjectAlternativeName(san) = ext {
+                for name in &san.general_names {
+                    if let GeneralName::DNSName(dns) = name {
+                        sans.push(dns.to_string());
+                    }
+                }
+            }
+        }
+        assert_eq!(sans, hosts);
+        let point = &csr
+            .certification_request_info
+            .subject_pki
+            .subject_public_key
+            .data;
+        assert_eq!(point.len(), 65);
+        assert!(req.csr_pem.contains("BEGIN CERTIFICATE REQUEST"));
+        assert!(req.key_pem.contains("BEGIN PRIVATE KEY"));
+        let key_line = req.key_pem.lines().nth(1).unwrap();
+        assert!(!format!("{req:?}").contains(&key_line[..20]));
+    }
+
+    #[test]
+    fn generated_certificates_must_name_the_requested_hosts() {
+        let hosts = names(&["a.example.com", "10.0.0.5"]);
+        let p = self_signed(&hosts, 30, now())
+            .unwrap()
+            .prepare(now(), &hosts, None)
+            .unwrap();
+        assert_eq!(p.info.sans, hosts);
+        assert_eq!(p.info.subject, p.info.issuer);
+        assert!(p.info.not_after - now() <= 30 * DAY_SECS);
+        let err = self_signed(&hosts, 30, now())
+            .unwrap()
+            .prepare(now(), &names(&["b.example.com"]), None)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("does not name b.example.com"),
+            "{err}"
+        );
+        let generated = self_signed(&hosts, 30, now()).unwrap();
+        let key_line = generated.key_pem.lines().nth(1).unwrap().to_string();
+        assert!(!format!("{generated:?}").contains(&key_line[..20]));
     }
 }

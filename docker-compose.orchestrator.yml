@@ -3,7 +3,7 @@
 
 services:
   dockerproxy:
-    image: ghcr.io/seggys116/cite-dockerproxy:${CITE_VERSION:-0.3.1}
+    image: ghcr.io/seggys116/cite-dockerproxy:${CITE_VERSION:-0.4.0}
     restart: unless-stopped
     init: true
     user: "10001:10001"
@@ -21,6 +21,10 @@ services:
       CITE_PROXY_HAPROXY_CONTAINER: cite-node-haproxy
       CITE_PROXY_EDGE_NETWORK: cite_edge
       CITE_PROXY_GITHUB_API_URL: ${CITE_GITHUB_API_URL:-}
+      CITE_STACK_FORGE: ${CITE_STACK_FORGE:-}
+      CITE_STACK_FORGE_API_URL: ${CITE_STACK_FORGE_API_URL:-}
+      CITE_STACK_MAX_MEM: ${CITE_STACK_MAX_MEM:-16g}
+      CITE_STACK_MAX_CPUS: ${CITE_STACK_MAX_CPUS:-8}
       RUST_LOG: ${RUST_LOG:-info}
     # A read-only bind does not restrict the API on a unix socket; the filter in the proxy does.
     volumes:
@@ -45,6 +49,10 @@ services:
         condition: service_healthy
     environment:
       CITE_DOCKER_HOST: http://dockerproxy:2375
+      CITE_STACK_FORGE: ${CITE_STACK_FORGE:-}
+      CITE_STACK_FORGE_API_URL: ${CITE_STACK_FORGE_API_URL:-}
+      CITE_STACK_MAX_MEM: ${CITE_STACK_MAX_MEM:-16g}
+      CITE_STACK_MAX_CPUS: ${CITE_STACK_MAX_CPUS:-8}
       CITE_HAPROXY_CONTAINER: cite-node-haproxy
       CITE_REGISTRY: ${CITE_REGISTRY:-ghcr.io/seggys116}
       CITE_STACK_VERSION: ${CITE_STACK_VERSION:-}

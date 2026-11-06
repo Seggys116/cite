@@ -15,8 +15,8 @@ const MAX_NAME_CHARS: usize = 64;
 const COVERS_SHOWN: usize = 3;
 const CERT_LABEL: &str = "CERTIFICATE";
 
-pub const FULL_HELP: &str = "Visitors and Cloudflare reach the node over HTTPS, so a certificate that covers the host is needed. Upload one in Settings.";
-pub const FLEXIBLE_HELP: &str = "Cloudflare serves the certificate to visitors and talks to your server over plain http. Pick this if you do not want to upload a certificate. Traffic between Cloudflare and your server is not encrypted.";
+pub const FULL_HELP: &str = "Visitors (and Cloudflare, if you use it) reach the node over HTTPS, so a certificate that covers the host is needed. Upload one in Settings.";
+pub const FLEXIBLE_HELP: &str = "Cloudflare serves the certificate to visitors and talks to your server over plain http, so no certificate is needed on the node. Traffic between Cloudflare and your server is not encrypted. Flexible SSL does not require the proxy option, but without it anyone can reach your server directly over plain http.";
 
 // The desktop's own view of the node's certificate data, so only api.rs knows the client types.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -806,9 +806,10 @@ pub fn bots_warning(policy: BotPolicy) -> Option<&'static str> {
 pub const BOTS_NOTE: &str = "Bots are recognised by their User-Agent header, which a scraper can fake, so this is not a security boundary. Blocked requests still appear in analytics.";
 
 pub const PROXY_LABEL: &str = "Only allow traffic through the Cloudflare proxy";
-pub const PROXY_HELP: &str = "Visitors must come through Cloudflare (orange cloud on). Direct requests to your server address are refused. You do not need to create any Cloudflare rule for this.";
-pub const FULL_LABEL: &str = "Node serves HTTPS";
-pub const FLEXIBLE_LABEL: &str = "Cloudflare handles HTTPS (no certificate on the node)";
+pub const PROXY_HELP: &str = "When on, requests that do not arrive from Cloudflare's network are refused. Turn it on only for sites that are proxied by Cloudflare (orange cloud).";
+pub const FULL_LABEL: &str = "Full (the node serves its own certificate)";
+pub const FLEXIBLE_LABEL: &str =
+    "Flexible SSL (Cloudflare serves HTTPS to visitors and talks to your server over plain http)";
 pub const ZONE_LABEL: &str =
     "Also require that requests come from MY Cloudflare account (advanced)";
 pub const ZONE_HELP: &str = "Without this, anyone using Cloudflare could send traffic to your server address. This adds a secret header that you set once in a Cloudflare Transform Rule. Optional.";
@@ -825,10 +826,10 @@ pub fn zone_lock_help(cloudflare_only: bool, zone_lock: bool) -> &'static str {
     }
 }
 
-// Flexible without the Cloudflare restriction leaves plain HTTP reachable by anyone who finds the node.
+// Flexible SSL is allowed without the proxy option, but then plain HTTP is reachable by anyone who finds the node.
 pub fn flexible_warning(cloudflare_only: bool, flexible: bool) -> Option<&'static str> {
     (flexible && !cloudflare_only).then_some(
-        "Cloudflare handles HTTPS only works safely together with the Cloudflare proxy option: otherwise anyone can reach your server over plain http, bypassing Cloudflare. Turn on Only allow traffic through the Cloudflare proxy.",
+        "Flexible SSL does not require the Cloudflare proxy option, but without it anyone can reach your server directly over plain http. If this site is proxied by Cloudflare, turn on Only allow traffic through the Cloudflare proxy.",
     )
 }
 
@@ -1489,10 +1490,31 @@ mod tests {
                     && !lower.contains("header")
             );
         }
-        assert!(PROXY_HELP.contains("You do not need to create any Cloudflare rule"));
         assert!(ZONE_LABEL.contains("MY Cloudflare account") && ZONE_LABEL.contains("advanced"));
         assert!(ZONE_HELP.contains("Transform Rule") && ZONE_HELP.contains("Optional"));
-        assert!(FLEXIBLE_LABEL.contains("no certificate on the node"));
+    }
+
+    #[test]
+    fn the_https_choice_says_flexible_ssl_and_the_proxy_option_is_not_assumed() {
+        assert_eq!(FULL_LABEL, "Full (the node serves its own certificate)");
+        assert_eq!(
+            FLEXIBLE_LABEL,
+            "Flexible SSL (Cloudflare serves HTTPS to visitors and talks to your server over plain http)"
+        );
+        assert!(PROXY_HELP.contains("do not arrive from Cloudflare's network"));
+        assert!(PROXY_HELP.contains("only for sites that are proxied by Cloudflare"));
+        assert!(!PROXY_HELP.contains("Visitors must come through Cloudflare"));
+        assert!(FLEXIBLE_HELP.contains("does not require the proxy option"));
+        assert!(FLEXIBLE_HELP.contains("directly over plain http"));
+        let warning = flexible_warning(false, true).expect("warn");
+        assert!(warning.contains("does not require") && warning.contains("directly"));
+        assert!(flexible_warning(false, false).is_none() && flexible_warning(true, true).is_none());
+        let d = AccessDraft {
+            flexible: true,
+            ..AccessDraft::default()
+        };
+        assert!(!d.to_access().cloudflare_only);
+        assert_eq!(d.to_access().tls, TlsMode::Flexible);
         assert!(
             flexible_warning(false, true)
                 .expect("warn")

@@ -2,9 +2,20 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 const MAX_GITHUB_URL_LEN: usize = 200;
+pub const FORGES: [&str; 3] = ["github", "gitlab", "gitea"];
+pub const MIN_STACK_MEMORY: i64 = 256 << 20;
+pub const MIN_STACK_NANO_CPUS: i64 = 250_000_000;
+const DEFAULT_MAX_MEMORY: i64 = 16 << 30;
+const DEFAULT_MAX_NANO_CPUS: i64 = 8_000_000_000;
+const CEILING_MEMORY: i64 = 1 << 40;
+const CEILING_NANO_CPUS: i64 = 1024 * 1_000_000_000;
 
 #[derive(Debug, Clone)]
 pub struct Config {
+    pub forge: Option<String>,
+    pub forge_api_url: Option<String>,
+    pub max_memory: i64,
+    pub max_nano_cpus: i64,
     pub listen: SocketAddr,
     pub socket: PathBuf,
     pub registry: String,
@@ -62,6 +73,49 @@ pub fn validate_github_api_url(url: &str) -> Result<(), String> {
         return Err("has an empty or relative path segment".to_string());
     }
     Ok(())
+}
+
+// Whole bytes with an optional k, m, g or t suffix (powers of 1024), optionally followed by b or ib.
+pub fn parse_memory(raw: &str) -> Result<i64, String> {
+    let lower = raw.trim().to_ascii_lowercase();
+    let body = lower
+        .strip_suffix("ib")
+        .or_else(|| lower.strip_suffix('b'))
+        .unwrap_or(&lower);
+    let (digits, shift) = match body.chars().last() {
+        Some('k') => (&body[..body.len() - 1], 10),
+        Some('m') => (&body[..body.len() - 1], 20),
+        Some('g') => (&body[..body.len() - 1], 30),
+        Some('t') => (&body[..body.len() - 1], 40),
+        _ => (body, 0),
+    };
+    if digits.is_empty() || digits.len() > 15 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err("is not a size like 512m or 16g".to_string());
+    }
+    digits
+        .parse::<i64>()
+        .ok()
+        .and_then(|n| n.checked_mul(1 << shift))
+        .ok_or_else(|| "is too large".to_string())
+}
+
+// Whole or decimal CPUs with at most nine fraction digits, returned as Docker nano CPUs.
+pub fn parse_cpus(raw: &str) -> Result<i64, String> {
+    let text = raw.trim();
+    let (whole, fraction) = text.split_once('.').unwrap_or((text, ""));
+    let digits = |s: &str| s.bytes().all(|b| b.is_ascii_digit());
+    let shaped = !whole.is_empty()
+        && whole.len() <= 4
+        && digits(whole)
+        && fraction.len() <= 9
+        && digits(fraction)
+        && (!text.contains('.') || !fraction.is_empty());
+    if !shaped {
+        return Err("is not a CPU count like 4 or 0.5".to_string());
+    }
+    let nanos = format!("{fraction:0<9}").parse::<i64>().unwrap_or(0);
+    let whole = whole.parse::<i64>().unwrap_or(0);
+    Ok(whole * 1_000_000_000 + nanos)
 }
 
 impl Config {
@@ -122,7 +176,61 @@ impl Config {
             }
             None => None,
         };
+        let max_memory = match get("CITE_STACK_MAX_MEM")
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+        {
+            Some(raw) => {
+                parse_memory(&raw).map_err(|e| format!("CITE_STACK_MAX_MEM {raw:?} {e}"))?
+            }
+            None => DEFAULT_MAX_MEMORY,
+        };
+        if !(MIN_STACK_MEMORY..=CEILING_MEMORY).contains(&max_memory) {
+            return Err("CITE_STACK_MAX_MEM must be between 256m and 1t".to_string());
+        }
+        let max_nano_cpus = match get("CITE_STACK_MAX_CPUS")
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+        {
+            Some(raw) => {
+                parse_cpus(&raw).map_err(|e| format!("CITE_STACK_MAX_CPUS {raw:?} {e}"))?
+            }
+            None => DEFAULT_MAX_NANO_CPUS,
+        };
+        if !(MIN_STACK_NANO_CPUS..=CEILING_NANO_CPUS).contains(&max_nano_cpus) {
+            return Err("CITE_STACK_MAX_CPUS must be between 0.25 and 1024".to_string());
+        }
+        let optional = |key: &str| {
+            get(key)
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        };
+        let forge = optional("CITE_STACK_FORGE");
+        let forge_api_url = optional("CITE_STACK_FORGE_API_URL");
+        if forge.is_some() != forge_api_url.is_some() {
+            return Err(
+                "CITE_STACK_FORGE and CITE_STACK_FORGE_API_URL must be set together".to_string(),
+            );
+        }
+        if let Some(kind) = &forge
+            && !FORGES.contains(&kind.as_str())
+        {
+            return Err(format!(
+                "CITE_STACK_FORGE {kind:?} must be github, gitlab or gitea"
+            ));
+        }
+        if let Some(url) = &forge_api_url {
+            if !url.starts_with("https://") {
+                return Err(format!("CITE_STACK_FORGE_API_URL {url:?} must be https"));
+            }
+            validate_github_api_url(url)
+                .map_err(|e| format!("CITE_STACK_FORGE_API_URL {url:?} {e}"))?;
+        }
         Ok(Config {
+            forge,
+            forge_api_url,
+            max_memory,
+            max_nano_cpus,
             listen,
             socket: PathBuf::from(socket),
             registry,
@@ -215,5 +323,116 @@ mod tests {
         ] {
             assert!(cfg(&pairs).is_err(), "{pairs:?}");
         }
+    }
+
+    #[test]
+    fn forge_settings_are_optional_paired_and_https_only() {
+        let c = cfg(&[]).unwrap();
+        assert_eq!((c.forge, c.forge_api_url), (None, None));
+        let c = cfg(&[
+            ("CITE_STACK_FORGE", " gitlab "),
+            (
+                "CITE_STACK_FORGE_API_URL",
+                "https://gitlab.example.com/api/v4",
+            ),
+        ])
+        .unwrap();
+        assert_eq!(c.forge.as_deref(), Some("gitlab"));
+        assert_eq!(
+            c.forge_api_url.as_deref(),
+            Some("https://gitlab.example.com/api/v4")
+        );
+        for pairs in [
+            vec![("CITE_STACK_FORGE", "gitlab")],
+            vec![("CITE_STACK_FORGE_API_URL", "https://gitlab.example.com")],
+            vec![
+                ("CITE_STACK_FORGE", "bitbucket"),
+                ("CITE_STACK_FORGE_API_URL", "https://x.example.com"),
+            ],
+            vec![
+                ("CITE_STACK_FORGE", "GitLab"),
+                ("CITE_STACK_FORGE_API_URL", "https://x.example.com"),
+            ],
+            vec![
+                ("CITE_STACK_FORGE", "gitea"),
+                ("CITE_STACK_FORGE_API_URL", "http://gitea.example.com"),
+            ],
+            vec![
+                ("CITE_STACK_FORGE", "gitea"),
+                ("CITE_STACK_FORGE_API_URL", "https://user@gitea.example.com"),
+            ],
+        ] {
+            assert!(cfg(&pairs).is_err(), "{pairs:?}");
+        }
+    }
+
+    #[test]
+    fn stack_limits_default_to_sixteen_gib_and_eight_cpus() {
+        let c = cfg(&[]).unwrap();
+        assert_eq!(c.max_memory, 16 << 30);
+        assert_eq!(c.max_nano_cpus, 8_000_000_000);
+    }
+
+    #[test]
+    fn stack_limits_are_read_from_the_environment() {
+        let c = cfg(&[
+            ("CITE_STACK_MAX_MEM", " 32G "),
+            ("CITE_STACK_MAX_CPUS", "12.5"),
+        ])
+        .unwrap();
+        assert_eq!(c.max_memory, 32 << 30);
+        assert_eq!(c.max_nano_cpus, 12_500_000_000);
+        let low = cfg(&[
+            ("CITE_STACK_MAX_MEM", "256m"),
+            ("CITE_STACK_MAX_CPUS", "0.25"),
+        ])
+        .unwrap();
+        assert_eq!(low.max_memory, 256 << 20);
+        assert_eq!(low.max_nano_cpus, 250_000_000);
+        let blank = cfg(&[("CITE_STACK_MAX_MEM", " "), ("CITE_STACK_MAX_CPUS", "")]).unwrap();
+        assert_eq!(blank.max_memory, 16 << 30);
+    }
+
+    #[test]
+    fn stack_limit_values_outside_the_allowed_range_are_refused() {
+        for pairs in [
+            [("CITE_STACK_MAX_MEM", "255m")],
+            [("CITE_STACK_MAX_MEM", "0")],
+            [("CITE_STACK_MAX_MEM", "2t")],
+            [("CITE_STACK_MAX_MEM", "lots")],
+            [("CITE_STACK_MAX_MEM", "-4g")],
+            [("CITE_STACK_MAX_MEM", "1.5g")],
+            [("CITE_STACK_MAX_MEM", "g")],
+            [("CITE_STACK_MAX_MEM", "99999999999999t")],
+            [("CITE_STACK_MAX_CPUS", "0.2")],
+            [("CITE_STACK_MAX_CPUS", "0")],
+            [("CITE_STACK_MAX_CPUS", "1025")],
+            [("CITE_STACK_MAX_CPUS", "-1")],
+            [("CITE_STACK_MAX_CPUS", "4.")],
+            [("CITE_STACK_MAX_CPUS", ".5")],
+            [("CITE_STACK_MAX_CPUS", "1.0000000001")],
+            [("CITE_STACK_MAX_CPUS", "1e1")],
+            [("CITE_STACK_MAX_CPUS", "four")],
+        ] {
+            assert!(cfg(&pairs).is_err(), "{pairs:?}");
+        }
+    }
+
+    #[test]
+    fn sizes_accept_the_usual_suffixes() {
+        for (text, want) in [
+            ("1024", 1024),
+            ("1k", 1 << 10),
+            ("512m", 512 << 20),
+            ("512MB", 512 << 20),
+            ("16g", 16 << 30),
+            ("16GiB", 16 << 30),
+            ("1t", 1 << 40),
+        ] {
+            assert_eq!(parse_memory(text), Ok(want), "{text}");
+        }
+        assert_eq!(parse_cpus("4"), Ok(4_000_000_000));
+        assert_eq!(parse_cpus("0.25"), Ok(250_000_000));
+        assert_eq!(parse_cpus("1.000000001"), Ok(1_000_000_001));
     }
 }

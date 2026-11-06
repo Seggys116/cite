@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  FLEXIBLE_WARNING, NO_BOT_BLOCKING, TLS_FULL_LABEL, botStatusLine, userAgentRulesFor, userAgentRulesLine,
   CLOUDFLARE_ONLY_HELP, CLOUDFLARE_ONLY_LABEL, TLS_FLEXIBLE_LABEL, ZONE_LOCK_HELP, ZONE_LOCK_LABEL, ZONE_LOCK_NEEDS_CLOUDFLARE, zoneLockOpenByDefault,
   BOT_POLICIES, FLEXIBLE_HELP, FULL_HELP, SEO_WARNING, ZONE_HEADER, ZONE_STEPS, accessForSave, accessOf, botWarning, flexibleWithoutCloudflare,
   SECRET_CLOSE_WARNING, ZONE_UNREADABLE_NOTE, createVerdict, isDefaultAccess, rotationFailureLines, rangesLine, secretCloseNeedsConfirm, tlsHelp, zoneLockTurnedOn, zoneStatusLine,
@@ -159,13 +160,47 @@ test('each SSL mode has its own explanation', () => {
   assert.equal(tlsHelp('flexible'), FLEXIBLE_HELP);
   assert.equal(tlsHelp('full'), FULL_HELP);
   assert.match(FLEXIBLE_HELP, /plain http/);
-  assert.match(FLEXIBLE_HELP, /do not want to upload a certificate/);
-  assert.match(FULL_HELP, /certificate/);
+  assert.match(FLEXIBLE_HELP, /no certificate is needed on the node/);
+  assert.match(FULL_HELP, /node answers with its own certificate/);
+});
+
+test('the HTTPS choices and the proxy option are worded separately', () => {
+  assert.equal(TLS_FULL_LABEL, 'Full (the node serves its own certificate)');
+  assert.equal(TLS_FLEXIBLE_LABEL, 'Flexible SSL (Cloudflare serves HTTPS to visitors and talks to your server over plain http)');
+  assert.equal(CLOUDFLARE_ONLY_HELP, 'When on, requests that do not arrive from Cloudflare\'s network are refused. Turn it on only for sites that are proxied by Cloudflare (orange cloud).');
+  assert.doesNotMatch(CLOUDFLARE_ONLY_HELP, /every site|all sites/i);
+  assert.match(FLEXIBLE_WARNING, /anyone can reach your server directly over plain http/);
+});
+
+test('allowing bots is never presented as protection', () => {
+  assert.equal(botStatusLine('allow'), 'No bot blocking is active for this site');
+  assert.equal(botStatusLine(undefined), NO_BOT_BLOCKING);
+  assert.match(botStatusLine('block_bad'), /blocked/);
+  assert.match(botStatusLine('block_all'), /search engines/);
+});
+
+test('firewall rules that look at user agents are listed for the site', () => {
+  const rules = [
+    { id: 'a', name: 'Scanners', enabled: true, action: 'tarpit', matchers: { user_agent_regexes: ['(sqlmap|nikto)'] }, site: null },
+    { id: 'b', name: 'Old single', enabled: true, action: 'deny', matchers: { user_agent_regex: 'curl' }, site: 'shop' },
+    { id: 'c', name: 'Other site', enabled: true, action: 'deny', matchers: { user_agent_regexes: ['x'] }, site: 'api' },
+    { id: 'd', name: 'Paths only', enabled: true, action: 'deny', matchers: { path_prefixes: ['/x'] }, site: null },
+    { id: 'e', name: 'Off', enabled: false, action: 'deny', matchers: { user_agent_regexes: ['bot'] }, site: 'shop' },
+  ];
+  const list = userAgentRulesFor(rules, 'shop');
+  assert.deepEqual(list.map((r) => r.id), ['a', 'b', 'e']);
+  assert.deepEqual(list.map((r) => r.scope), ['all sites', 'this site', 'this site']);
+  assert.deepEqual(list[1].patterns, ['curl']);
+  assert.equal(list[2].enabled, false);
+  assert.deepEqual(userAgentRulesFor(null, 'shop'), []);
+  assert.equal(userAgentRulesLine([]), 'No firewall rule looks at user agents for this site.');
+  assert.match(userAgentRulesLine(list), /^2 firewall rules may block by user agent/);
+  assert.match(userAgentRulesLine([list[2]]), /but it is switched off/);
+  assert.match(userAgentRulesLine([list[0]]), /^1 firewall rule may block/);
 });
 
 test('the plain Cloudflare options use plain words and never mention rules, secrets or headers', () => {
   assert.equal(CLOUDFLARE_ONLY_LABEL, 'Only allow traffic through the Cloudflare proxy');
-  assert.equal(TLS_FLEXIBLE_LABEL, 'Cloudflare handles HTTPS (no certificate on the node)');
   assert.equal(ZONE_LOCK_LABEL, 'Also require that requests come from MY Cloudflare account (advanced)');
   for (const text of [CLOUDFLARE_ONLY_LABEL, CLOUDFLARE_ONLY_HELP, TLS_FLEXIBLE_LABEL, FLEXIBLE_HELP, FULL_HELP]) {
     assert.doesNotMatch(text, /transform|secret|header|X-Cite/i, text);

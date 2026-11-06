@@ -26,6 +26,14 @@ pub fn healthcheck() -> Result<()> {
     let cfg = load_cfg()?;
     let resp = socket::request(&cfg.socket_path, &ControlRequest::Healthcheck)?;
     if resp.ok {
+        let report = resp
+            .data
+            .as_ref()
+            .and_then(|data| data.get("report"))
+            .and_then(|report| report.as_str());
+        if let Some(line) = report {
+            println!("{line}");
+        }
         Ok(())
     } else {
         Err(ManagerError::new(

@@ -944,7 +944,13 @@ pub fn access_controls(
     AccessControls {
         cloudflare_box,
         zone_box: zone.into_any_element(),
-        ssl_mode: seg_row(ssl),
+        // The two labels are long sentences, so they stack instead of sharing one row.
+        ssl_mode: div()
+            .flex()
+            .flex_col()
+            .items_start()
+            .gap(px(6.))
+            .children(ssl),
         bots: seg_row(bots),
     }
 }

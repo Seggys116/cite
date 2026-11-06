@@ -201,15 +201,15 @@ fingerprint_of() {
 }
 
 served_fingerprint() {
-  openssl s_client -connect "127.0.0.1:$HTTPS_PORT" -servername "$CERT_HOST" </dev/null 2>/dev/null |
+  openssl s_client -connect "127.0.0.1:$HTTPS_PORT" -servername "${1:-$CERT_HOST}" </dev/null 2>/dev/null |
     openssl x509 -noout -fingerprint -sha256 2>/dev/null | fingerprint_of
 }
 
-# Waits until HAProxy presents the certificate with this fingerprint on the HTTPS port.
+# Waits until HAProxy presents the certificate with this fingerprint on the HTTPS port; the optional third argument is the SNI name.
 wait_served() {
   local want=$1 got=""
   for _ in $(seq 1 20); do
-    got=$(served_fingerprint || true)
+    got=$(served_fingerprint "${3:-$CERT_HOST}" || true)
     [ "$got" = "$want" ] && break
     sleep 1
   done
@@ -804,6 +804,47 @@ done
 api GET /api/v1/settings
 api PUT /api/v1/settings "$(printf '%s' "$BODY" | jq -c '.cloudflare_ranges = []')"
 code_is "restore the built-in cloudflare ranges" 200
+
+echo "== automatic certificates"
+AUTO_HOST=auto.e2e.test
+auto_edge() {
+  curl -sS --max-time 5 -k --resolve "$AUTO_HOST:$HTTPS_PORT:127.0.0.1" -H 'CF-Connecting-IP: 203.0.113.9' "$@" "https://$AUTO_HOST:$HTTPS_PORT/"
+}
+api GET /api/v1/settings
+api PUT /api/v1/settings "$(printf '%s' "$BODY" | jq -c --arg ip "$EDGE_CLIENT" '.https_port = null | .cloudflare_ranges = [$ip]')"
+code_is "no explicit https port; the cloudflare ranges name the test client" 200
+api POST /api/v1/sites "$(plain_site auto "$AUTO_HOST" e2e-green:80 '{"cloudflare_only":true,"tls":"flexible"}')"
+code_is "create a flexible cloudflare site with no certificate" 200
+api GET /api/v1/certificates
+jq_ok "an automatic certificate is listed and the node binds 443 by itself" '.https_effective_port == 443 and .https_port == null and ([.items[] | select(.id == "auto:auto" and .source == "auto" and (.warning | test("self-signed")))] | length) == 1'
+AUTO_FP=$(printf '%s' "$BODY" | jq -er '.items[] | select(.id == "auto:auto") | .fingerprint_sha256')
+wait_served "$AUTO_FP" "the node presents the automatic certificate for the site's name" "$AUTO_HOST"
+expect "the site is served over the automatic certificate" green-v2 "$(auto_edge)"
+expect "port 80 still serves the site" green-v2 "$(EDGE_HOST=$AUTO_HOST edge / -H 'CF-Connecting-IP: 203.0.113.9')"
+api DELETE /api/v1/certificates/auto:auto
+code_is "an automatic certificate cannot be deleted" 400
+
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 30 \
+  -keyout "$WORK/auto-real.key" -out "$WORK/auto-real.pem" -subj "/CN=$AUTO_HOST" -addext "subjectAltName=DNS:$AUTO_HOST" >/dev/null 2>&1 ||
+  fail "openssl could not create a certificate"
+REAL_FP=$(openssl x509 -in "$WORK/auto-real.pem" -noout -fingerprint -sha256 | fingerprint_of)
+api POST /api/v1/certificates "$(upload_body "auto host" "$WORK/auto-real")"
+code_is "upload a certificate for the site" 201
+REAL_ID=$(printf '%s' "$BODY" | jq -er .id)
+api GET /api/v1/certificates
+jq_ok "the automatic certificate is gone" '[.items[] | select(.source == "auto" and .id == "auto:auto")] | length == 0'
+wait_served "$REAL_FP" "the node presents the uploaded certificate instead" "$AUTO_HOST"
+api DELETE "/api/v1/certificates/$REAL_ID"
+code_is "remove the uploaded certificate" 204
+api GET /api/v1/certificates
+jq_ok "the automatic certificate returns" '[.items[] | select(.id == "auto:auto")] | length == 1'
+api DELETE /api/v1/sites/auto
+code_is "remove the site" 200
+api GET /api/v1/certificates
+jq_ok "deleting the site removed its automatic certificate" '[.items[] | select(.source == "auto" and (.sans | index("auto.e2e.test")) != null)] | length == 0'
+api GET /api/v1/settings
+api PUT /api/v1/settings "$(printf '%s' "$BODY" | jq -c '.cloudflare_ranges = []')"
+code_is "restore the built-in cloudflare ranges after the automatic certificate checks" 200
 
 echo "== upgrade from a volume that has only /conf/haproxy"
 remove_stack

@@ -54,7 +54,7 @@ The database is a single SQLite file, `analytics.db`, in WAL mode. Its default l
 
 Repeated text such as hosts, user agents, client addresses and header values is stored once in a dictionary table and referenced by id, which keeps the file small. Alongside the raw rows the connector keeps rollups per site: hourly ones for long windows and minute ones for short windows, so a query does not have to scan every row.
 
-Windows of up to 6 hours (15 minutes and 1 hour are the usual ones) read the minute rollups, and longer windows read the hourly rollups. Answers from the minute rollups are exact, the same as a scan of the raw rows would give. Three cases read raw rows instead: a window that reaches back before the minute rollups began (a database upgraded from an earlier version, for the first 6 hours), a window that contains a minute loaded by a backfill or import (events spanning more than 10 minutes in one batch skip the minute rollups), and a window that contains a minute with more than 30,000 distinct values of one kind (paths, addresses, agents or referers), which is dropped from the minute rollups so a flood of unique values cannot grow them. Those queries are exact but as slow as a raw scan. Latency percentiles are reported as a histogram bucket midpoint, with roughly 12% error above 4 ms. Windows are `15m`, `1h`, `24h`, `7d` or `30d`. The request list and the exports always read raw rows.
+Windows of up to 6 hours (15 minutes and 1 hour are the usual ones) read the minute rollups, and longer windows read the hourly rollups. Answers from the minute rollups are exact, the same as a scan of the raw rows would give. Three cases read raw rows instead: a window that reaches back before the minute rollups began (a database upgraded from an earlier version, for the first 6 hours), a window that contains a minute loaded by a backfill or import (events spanning more than 10 minutes in one batch skip the minute rollups), and a window that contains a minute with more than 30,000 distinct values of one kind (paths, addresses, agents or referers), which is dropped from the minute rollups so a flood of unique values cannot grow them. Those queries are exact but as slow as a raw scan. Latency percentiles are reported as a histogram bucket midpoint, with roughly 12% error above 4 ms. Windows are `15m`, `1h`, `24h`, `7d` or `30d`, or any range of up to 400 days given as `from` and `to`. The request list and the exports always read raw rows, and so does any query that filters on more than a time range and one site (see [Filtering](#filtering)).
 
 Reads use their own connections and do not wait for ingest. Events reach the database in batches of up to 1000 rows or 250 ms, whichever comes first, so a new request shows up in queries within about a quarter of a second. On a clean shutdown the receiver reads the datagrams already waiting on the socket (until it has been quiet for 100 ms, at most 2 s), hands over its last partial batch, and the connector commits everything queued before folding the write-ahead log into the main file; if the writer still cannot commit, it logs an error with the number of events lost. After a hard stop, events that were still in memory (up to about 250 ms of traffic, plus anything waiting behind a saturated writer) are lost, and the database itself is intact.
 
@@ -192,10 +192,12 @@ The routes below are `GET` under `/api/v1/analytics` and need the same bearer to
 | Route | Returns |
 |---|---|
 | `/summary` | Totals, latency, status classes, methods, content types, size buckets and the top lists. |
-| `/timeseries` | Points per minute (windows up to 48 hours) or per hour: requests, bytes out, errors, blocked and average latency. |
-| `/requests` | Requests, newest first, filtered by `status`, `method`, `path`, `ip`, `blocked` or `site`. At most 1000 per call. |
+| `/timeseries` | Points per minute (windows up to 48 hours) or per hour: requests, bytes out, errors, blocked and average latency. A filtered query picks the step from the range instead (see [Filtering](#filtering)). |
+| `/requests` | Requests, newest first, under the filter below, paged with `limit`, `offset` or a cursor. At most 1000 per call. |
 | `/bots` | Bot share, counts per class, signal and user agent, and a score histogram. |
-| `/top` | The highest-count values of one field: paths, hosts, referers, agents, content types, statuses, IPs or languages. |
+| `/top` | The highest values of one field, by request count or by bytes: paths, hosts, referers, agents, content types, statuses, IPs or languages. |
+| `/facets` | The sites, hosts, methods, status classes and bot classes present under the filter, with counts, for filter pickers. |
+| `/compare` | The summary of the range and of the equally long range before it, with the change of each headline number. |
 | `/stats` | Row count, file size, oldest and newest timestamp, writer counters, retention days (0 is unlimited), whether archiving is on, size cap. |
 | `/export` | A download of the underlying data. |
 
@@ -209,6 +211,43 @@ curl -sH "Authorization: Bearer $TOKEN" "$NODE/api/v1/analytics/stats"
 ```
 
 The dashboard's Traffic view shows the same data and refreshes the live request list every 3 seconds.
+
+### Filtering
+
+`/summary`, `/timeseries`, `/bots`, `/top`, `/requests`, `/facets` and `/compare` share one filter. Give a time range as `window`, or as `from` and `to` (milliseconds since the epoch or RFC 3339, `to` defaulting to now, at most 400 days, `from` earlier than `to`). Naming both a window and a range is a 400. Then add any of these, and a row has to match all of them:
+
+| Parameter | Matches |
+|---|---|
+| `site` | Any of up to 20 site ids, as a comma list or repeated. |
+| `host` | The exact `Host`. |
+| `path_prefix`, `path_exact` | Paths that start with the text, or equal it. (`/requests` also keeps its original `path`, a substring match.) |
+| `method` | Any of the listed methods, in any letter case. |
+| `status`, `status_min`, `status_max`, `status_class` | One status, an inclusive range, or any of the classes `1xx` to `5xx`. |
+| `blocked` | `true` for requests a rule blocked, `unblocked` for the rest, `rule:<id>` for one rule. `false` is accepted and does not filter, as it never did. |
+| `bot_class`, `min_bot_score`, `max_bot_score` | Any of the listed classes, and a score range. |
+| `client_ip` | One address, or a network such as `10.0.0.0/8` or `2001:db8::/32`. |
+| `user_agent`, `referer` | Contains the text, ignoring ASCII letter case. 3 to 64 characters; `%` and `_` match themselves. |
+| `min_duration_ms` | Total time of at least this many milliseconds. |
+| `content_type` | Starts with the text, ignoring ASCII letter case. |
+
+Every value is bound as a parameter, never joined into the SQL, and a bad value or an unknown parameter is a 400 that names it. The node records no country, so there is no country filter.
+
+A query with only a time range and at most one site is answered from the rollups, exactly as before. A range that is not a window is also served from the rollups when it falls on whole hours (or whole minutes, within the last six hours); an end of now counts as the current hour. Any other filter reads raw rows through the existing indexes (the time index bounds every such query, so no extra index is kept) and examines at most 5,000,000 raw rows, newest first. When the range holds more, the answer covers only the newest part and says so: `partial` is `true`, `scanned` is the row count examined, and `from_ms` is where the covered part starts. Narrow the range or the filter to see the rest. The 20 second query limit applies as well. A step for a filtered `/timeseries` is the smallest of 1 minute, 5 minutes, 15 minutes, 1 hour, 6 hours and 1 day that keeps the chart within 360 points.
+
+Every answer repeats what it applied: `filters` (the filter after parsing), `partial`, `scanned` when raw rows were read, `from_ms` and `to_ms` (the range used; rollup answers cover whole buckets), and `source`. `/requests` still returns the bare array it always did; add `envelope=true` for an object with `items`, the same fields and a `next_cursor`. Pass the cursor back as `before_ts` and `before_id` to get the next page; unlike `offset`, it does not shift when new requests arrive, and after a `partial` page it resumes below the rows already read. On the plain list `window` is still ignored; the envelope form honours it.
+
+```sh
+# 5xx on two sites in a date range, from one address block
+curl -sH "Authorization: Bearer $TOKEN" \
+  "$NODE/api/v1/analytics/summary?from=2026-11-01T00:00:00Z&to=2026-11-05T00:00:00Z&site=blog,shop&status_class=5xx&client_ip=203.0.113.0/24"
+
+# page through requests whose user agent mentions curl
+curl -sH "Authorization: Bearer $TOKEN" \
+  "$NODE/api/v1/analytics/requests?window=24h&user_agent=curl&limit=200&envelope=true"
+
+# what changed against the day before
+curl -sH "Authorization: Bearer $TOKEN" "$NODE/api/v1/analytics/compare?window=24h&site=blog"
+```
 
 ### Export
 
@@ -288,9 +327,12 @@ Do not write to the file, and do not copy it while the connector runs without al
 
 | Limit | Value |
 |---|---|
-| Requests listed per call | 1000. |
+| Requests listed per call | 1000 (offset up to 100,000; deeper pages use the cursor). |
 | Top items per call | 1000 (the summary lists 20). |
+| Facet values per list | 50. |
+| Sites in one filter | 20. |
+| Raw rows one filtered query examines | 5,000,000, newest first. |
 | Rows per export | 1,000,000. |
 | Exports at once | 2 per node. |
-| Longest window | 30 days in the API. |
+| Longest window | 30 days as `window`; 400 days as `from` and `to`. |
 | Events queued before the database | About 16,000 in the connector plus 16,000 in the writer, then the socket reader waits. |

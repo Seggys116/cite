@@ -3,13 +3,15 @@ import { nodeApi } from '../api.js';
 import { currentNode, state, themeMode, setTheme } from '../state.js';
 import {
   pageHeader, button, iconButton, loadInto, card, pill, dataTable, emptyState, field, toggle, segmented, routeTabs,
-  openModal, confirmDialog, toast, withBusy, formatError, copyText, kvList, fmtInt, fmtBytes, fmtDate, relTime, skeletonRows,
+  openModal, confirmDialog, toast, withBusy, formatError, copyText, kvList, fmtInt, fmtBytes, fmtDate, relTime, skeletonRows, skeletonBlock,
 } from '../ui.js';
 import { noNodes, nodeNotice, healthKind, healthDots } from './common.js';
 import {
   ARCHIVE_NOTE, DELETE_WARNING, FOREVER_NOTE, MAX_RETENTION_DAYS, applyRetentionForm, deletesWithoutArchive, retentionFormFrom,
 } from '../archivelib.js';
 import { certificatesPanel, cloudflarePanel } from './certificates.js';
+import { alertsPanel } from './alerts.js';
+import { hasFeature, nodeInfoCached } from '../caplib.js';
 
 const TABS = [
   { id: 'retention', label: 'Retention', icon: 'clock' },
@@ -341,18 +343,36 @@ function dashboardPanel(ctx) {
     }));
 }
 
+const ALERTS_TAB = { id: 'alerts', label: 'Alerts', icon: 'alert' };
+
 export function settingsView(ctx) {
-  const tab = TABS.some((t) => t.id === ctx.params[0]) ? ctx.params[0] : 'retention';
-  ctx.setCrumbs([{ label: 'Settings' }, { label: TABS.find((t) => t.id === tab).label }]);
+  const allTabs = [...TABS.slice(0, 5), ALERTS_TAB, ...TABS.slice(5)];
+  const tab = allTabs.some((t) => t.id === ctx.params[0]) ? ctx.params[0] : 'retention';
+  ctx.setCrumbs([{ label: 'Settings' }, { label: allTabs.find((t) => t.id === tab).label }]);
   const node = currentNode();
   const perNode = tab !== 'dashboard';
   const holder = h('div', { class: 'tab-panel' });
+  const tabsNav = h('div', {}, routeTabs(TABS, tab, (t) => '#/settings/' + t));
   ctx.root.append(...[
     pageHeader({ title: 'Settings', subtitle: perNode && node ? 'Configuration of ' + node : 'Console preferences' }),
-    routeTabs(TABS, tab, (t) => '#/settings/' + t),
+    tabsNav,
     perNode ? nodeNotice(node) : null,
     holder,
   ].filter(Boolean));
+  // The Alerts tab appears only for a node that lists the feature
+  const alertsOk = node ? nodeInfoCached(node, () => nodeApi(node).get('/node')).then((info) => hasFeature(info, 'alerts'), () => false) : Promise.resolve(false);
+  alertsOk.then((ok) => {
+    if (ok) tabsNav.replaceChildren(routeTabs(allTabs, tab, (t) => '#/settings/' + t));
+  });
+  if (tab === 'alerts' && node) {
+    holder.appendChild(skeletonBlock(120));
+    alertsOk.then((ok) => {
+      holder.replaceChildren(ok
+        ? alertsPanel(node)
+        : emptyState({ iconName: 'alert', title: 'Alerts are not available on this node', text: 'Update the connector to configure alerts.' }));
+    });
+    return;
+  }
   if (!perNode) {
     holder.appendChild(dashboardPanel(ctx));
     return;

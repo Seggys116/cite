@@ -12,7 +12,7 @@ Compose-level settings live in `.env` (copy `.env.example`). `.env` is gitignore
 | `CITE_GITHUB_TOKEN` | — | **required**, PAT with `contents:read`; passed to the manager only |
 | `CITE_BRANCH` | `main` | |
 | `CITE_POLL_INTERVAL` | `5m` | `1m`…`1d`, or `off` |
-| `CITE_VERSION` | `0.3.1` | Image tag shared by manager + executor |
+| `CITE_VERSION` | `0.4.0` | Image tag shared by manager + executor |
 | `CITE_NODE` | `22` | `22` or `24` — selects image pair |
 | `CITE_PORT` | `8080` | Host published port (container always `:8080`) |
 | `CITE_BIND` | `0.0.0.0` | Host bind address |
@@ -59,6 +59,8 @@ Compose-level settings live in `.env` (copy `.env.example`). `.env` is gitignore
 | `CITE_MAX_SOURCE_BYTES` / `CITE_MAX_WORK_BYTES` / `CITE_MAX_RELEASE_BYTES` | `2GB` / `4GB` / `1.5GB` | |
 | `CITE_MIN_FREE_BYTES` | `2GB` | Refuse to build below this |
 | `CITE_BUILD_ENV_FILE` | `/run/cite/build.env` | Build-time env file; read if present and overrides container env |
+| `CITE_BUILD_ENV_JSON` | unset | Internal: set by the node. A JSON object `{"NAME": "value"}` of build variables. At most 64 keys and 12 KiB; names match `[A-Z_][A-Z0-9_]{0,63}`, must not start with `CITE_`, and must not be a name the build sets itself (`HOME`, `PATH`, `TMPDIR`, `XDG_*`, `PNPM_HOME`, the cache variables) or a loader, proxy or git key (`LD_*`, `NODE_OPTIONS`, `NODE_EXTRA_CA_CERTS`, `SSL_CERT_*`, `*_PROXY`, `GIT_*`); values are at most 4096 bytes with no control characters. Precedence: `CITE_BUILD_ENV_FILE` over this JSON over plain container variables. Only the build job receives it, and its values are masked in build logs and the status report. Values shorter than 4 bytes are not masked, and a build that prints a transformed value (encoded, split, reversed) can still leak it |
+| `CITE_DEPLOY_ID` | unset | Internal: set by the node. A 26-character ULID. When it differs from the last handled id, the manager forces one build of the branch head (even if that sha was deployed or failed before), records the outcome, and marks the id handled when the attempt ends, so a restart never rebuilds the same id |
 | `CITE_GITHUB_API_URL` | `https://api.github.com` | Override for mocks |
 | `RUST_LOG` | `info` | JSON logs |
 
@@ -78,6 +80,8 @@ Compose-level settings live in `.env` (copy `.env.example`). `.env` is gitignore
 | `CITE_MAX_BODY` | `100MB` | |
 | `CITE_STATIC_HEADERS` | defaults | Extra/override static headers |
 | `CITE_RUNTIME_ENV_FILE` | `/run/cite/runtime.env` | Runtime env file; read if present and overrides container env |
+| `CITE_RUNTIME_ENV_JSON` | unset | JSON object of owner runtime variables, merged into the SSR child only. At most 12 KiB and 64 names (`[A-Z_][A-Z0-9_]{0,63}`), string values up to 4096 bytes without control characters. Loader, proxy, home and path names, `CITE_*`, and keys the executor sets itself are refused at startup; static sites ignore it |
+| `CITE_GZIP_CACHE_BYTES` | `67108864` | Memory budget for cached gzip bodies of static files; `0` disables the cache |
 | runtime env | — | Container env not prefixed `CITE_` (see below) goes to the site process |
 
 ## Site environment variables
@@ -98,7 +102,7 @@ Builds run with a cleared environment plus these variables, so `CITE_GITHUB_TOKE
 ```yaml
 services:
   executor:
-    image: ghcr.io/seggys116/cite-executor-static:${CITE_VERSION:-0.3.1}
+    image: ghcr.io/seggys116/cite-executor-static:${CITE_VERSION:-0.4.0}
 ```
 
 Use `cite-executor-bun` for Bun sites. Both images set `CITE_RUNTIME` themselves.

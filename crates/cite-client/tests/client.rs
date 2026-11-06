@@ -9,9 +9,10 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use cite_client::{
-    ArchiveKind, CertificateUpload, ClientError, CutRequest, ExportFormat, ExportKind, ExportQuery,
-    FirewallBulk, MAX_PEM_BYTES, NodeClient, NodeConfig, NodeTargets, ReplicationMode,
-    ReplicationPlan, apply_site_to_nodes, fan_out,
+    AnalyticsQuery, ArchiveKind, BlockedFilter, CertificateUpload, ClientError, CutRequest,
+    EnvPatch, ExportFormat, ExportKind, ExportQuery, FirewallBulk, GithubTokenBody, LogsQuery,
+    MAX_PEM_BYTES, NodeClient, NodeConfig, NodeTargets, ReplicationMode, ReplicationPlan,
+    RequestCursor, TopSort, apply_site_to_nodes, fan_out,
 };
 use cite_edge::analytics::Summary;
 use cite_edge::model::{
@@ -206,6 +207,77 @@ async fn top(State(s): State<Shared>, headers: HeaderMap, RawQuery(query): RawQu
     }
     *s.last_query.lock().expect("lock") = query;
     Json(json!({ "items": [{ "key": "/", "count": 9, "bytes": 90 }] })).into_response()
+}
+
+async fn timeseries(
+    State(s): State<Shared>,
+    headers: HeaderMap,
+    RawQuery(query): RawQuery,
+) -> Response {
+    if let Err(resp) = check(&s, &headers) {
+        return resp;
+    }
+    *s.last_query.lock().expect("lock") = query;
+    Json(json!({
+        "step_secs": 300,
+        "points": [{ "ts": 10, "requests": 4, "bytes_out": 8, "errors": 1, "blocked": 0, "avg_ms": 2.5 }],
+        "partial": true, "scanned": 5_000_000, "from_ms": 1000, "to_ms": 2000, "source": "raw"
+    }))
+    .into_response()
+}
+
+async fn requests(
+    State(s): State<Shared>,
+    headers: HeaderMap,
+    RawQuery(query): RawQuery,
+) -> Response {
+    if let Err(resp) = check(&s, &headers) {
+        return resp;
+    }
+    *s.last_query.lock().expect("lock") = query;
+    Json(json!({
+        "items": [],
+        "next_cursor": { "before_ts": 77, "before_id": 12 },
+        "partial": false, "filters": { "status_class": ["5xx"] }
+    }))
+    .into_response()
+}
+
+async fn facets(
+    State(s): State<Shared>,
+    headers: HeaderMap,
+    RawQuery(query): RawQuery,
+) -> Response {
+    if let Err(resp) = check(&s, &headers) {
+        return resp;
+    }
+    *s.last_query.lock().expect("lock") = query;
+    Json(json!({
+        "site": [{ "key": "shop", "count": 3 }],
+        "host": [], "method": [{ "key": "GET", "count": 3 }],
+        "status_class": [], "bot_class": []
+    }))
+    .into_response()
+}
+
+async fn compare(
+    State(s): State<Shared>,
+    headers: HeaderMap,
+    RawQuery(query): RawQuery,
+) -> Response {
+    if let Err(resp) = check(&s, &headers) {
+        return resp;
+    }
+    *s.last_query.lock().expect("lock") = query;
+    let mut current = serde_json::to_value(Summary::default()).expect("json");
+    current["requests"] = json!(12);
+    Json(json!({
+        "against": "previous",
+        "current": current,
+        "previous": Summary::default(),
+        "delta": { "requests": { "current": 12, "previous": 0, "abs": 12 } }
+    }))
+    .into_response()
 }
 
 async fn stats(State(s): State<Shared>, headers: HeaderMap) -> Response {
@@ -518,6 +590,46 @@ async fn firewall_bulk_route(
     Json(json!({ "created": replace, "replaced": 0, "deleted": delete })).into_response()
 }
 
+async fn token_route(
+    State(s): State<Shared>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if let Err(resp) = check(&s, &headers) {
+        return resp;
+    }
+    s.created_bodies.lock().expect("lock").push(body);
+    Json(json!({ "source": "site", "site_token_set": true, "node_token_configured": false }))
+        .into_response()
+}
+
+async fn env_route(
+    State(s): State<Shared>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if let Err(resp) = check(&s, &headers) {
+        return resp;
+    }
+    let names: Vec<String> = body["set"]
+        .as_object()
+        .map(|m| m.keys().cloned().collect())
+        .unwrap_or_default();
+    s.created_bodies.lock().expect("lock").push(body);
+    Json(json!({ "names": names })).into_response()
+}
+
+async fn status_route(
+    State(s): State<Shared>,
+    headers: HeaderMap,
+    RawQuery(query): RawQuery,
+) -> Response {
+    if let Err(resp) = check(&s, &headers) {
+        return resp;
+    }
+    Json(json!({ "phase": "idle", "query": query })).into_response()
+}
+
 async fn haproxy_config() -> Response {
     ([(header::CONTENT_TYPE, "text/plain")], "global\n  daemon\n").into_response()
 }
@@ -548,6 +660,10 @@ async fn spawn(state: Shared) -> String {
         .route("/api/v1/sites/{id}", get(get_site).put(put_site))
         .route("/api/v1/analytics/summary", get(summary))
         .route("/api/v1/analytics/bots", get(bots))
+        .route("/api/v1/analytics/timeseries", get(timeseries))
+        .route("/api/v1/analytics/requests", get(requests))
+        .route("/api/v1/analytics/facets", get(facets))
+        .route("/api/v1/analytics/compare", get(compare))
         .route("/api/v1/analytics/top", get(top))
         .route("/api/v1/analytics/stats", get(stats))
         .route("/api/v1/analytics/export", get(export))
@@ -570,6 +686,16 @@ async fn spawn(state: Shared) -> String {
                 .delete(certificate_delete),
         )
         .route("/api/v1/firewall/bulk", post(firewall_bulk_route))
+        .route(
+            "/api/v1/sites/{id}/github-token",
+            axum::routing::put(token_route),
+        )
+        .route(
+            "/api/v1/sites/{id}/build-env",
+            axum::routing::patch(env_route),
+        )
+        .route("/api/v1/sites/{id}/status", get(status_route))
+        .route("/api/v1/sites/{id}/logs", get(status_route))
         .route("/api/v1/cloudflare/ranges", get(cloudflare_ranges))
         .route(
             "/api/v1/sites/{id}/zone-secret",
@@ -842,6 +968,170 @@ async fn bot_top_and_stats_routes_decode() {
     assert_eq!(stats.rows, 12);
     assert_eq!(stats.oldest_ts_ms, None);
     assert_eq!(stats.newest_ts_ms, Some(5));
+}
+
+fn last_query(state: &Fake) -> Vec<(String, String)> {
+    let raw = state
+        .last_query
+        .lock()
+        .expect("lock")
+        .clone()
+        .expect("query");
+    raw.split('&')
+        .map(|pair| {
+            let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+            (percent_decode(k), percent_decode(v))
+        })
+        .collect()
+}
+
+fn percent_decode(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' => {
+                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).expect("hex");
+                out.push(u8::from_str_radix(hex, 16).expect("hex digits"));
+                i += 3;
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).expect("utf8")
+}
+
+#[tokio::test]
+async fn filtered_reads_send_encoded_parameters_and_decode_the_extra_fields() {
+    let state = fake("cite_good", 0);
+    let url = spawn(state.clone()).await;
+    let c = client("n1", &url, "cite_good");
+    let q = AnalyticsQuery::new()
+        .range(1000, 2000)
+        .sites(["shop", "blog"])
+        .path_prefix("/a b&x=1#frag")
+        .status_class("5xx")
+        .blocked(BlockedFilter::Rule("r1".into()))
+        .client_ip("10.0.0.0/8");
+
+    let series = c.analytics_timeseries_q(&q).await.expect("timeseries");
+    assert_eq!(series.series.step_secs, 300);
+    assert!(series.meta.partial);
+    assert_eq!(series.meta.scanned, Some(5_000_000));
+    assert_eq!(series.meta.source.as_deref(), Some("raw"));
+    let got = last_query(&state);
+    for (k, v) in [
+        ("from", "1000"),
+        ("to", "2000"),
+        ("site", "shop,blog"),
+        ("path_prefix", "/a b&x=1#frag"),
+        ("status_class", "5xx"),
+        ("blocked", "rule:r1"),
+        ("client_ip", "10.0.0.0/8"),
+    ] {
+        assert!(got.contains(&(k.into(), v.into())), "{k}={v} in {got:?}");
+    }
+    assert_eq!(got.len(), 7, "{got:?}");
+
+    let sum = c.analytics_summary_q(&q).await.expect("summary");
+    assert_eq!(sum.summary, Summary::default());
+    assert!(!sum.meta.partial);
+    let bots = c.analytics_bots_q(&q).await.expect("bots");
+    assert_eq!(bots.bots.bot_requests, 50);
+}
+
+#[tokio::test]
+async fn top_requests_facets_and_compare_calls() {
+    let state = fake("cite_good", 0);
+    let url = spawn(state.clone()).await;
+    let c = client("n1", &url, "cite_good");
+    let q = AnalyticsQuery::new().window("24h");
+
+    let top = c
+        .analytics_top_q("agents", &q, Some(20), TopSort::Bytes)
+        .await
+        .expect("top");
+    assert_eq!(top.items[0].count, 9);
+    let got = last_query(&state);
+    for (k, v) in [
+        ("window", "24h"),
+        ("kind", "agents"),
+        ("limit", "20"),
+        ("sort", "bytes"),
+    ] {
+        assert!(got.contains(&(k.into(), v.into())), "{k}={v} in {got:?}");
+    }
+    assert!(matches!(
+        c.analytics_top_q("bogus", &q, None, TopSort::Count).await,
+        Err(ClientError::Config(_))
+    ));
+    assert!(matches!(
+        c.analytics_top_q("paths", &q, Some(0), TopSort::Count)
+            .await,
+        Err(ClientError::Config(_))
+    ));
+
+    let cursor = RequestCursor {
+        before_ts: 5,
+        before_id: 6,
+    };
+    let page = c
+        .analytics_requests_q(&q, Some(200), Some(&cursor))
+        .await
+        .expect("requests");
+    assert_eq!(
+        page.next_cursor,
+        Some(RequestCursor {
+            before_ts: 77,
+            before_id: 12
+        })
+    );
+    assert!(!page.meta.partial);
+    let got = last_query(&state);
+    for (k, v) in [
+        ("envelope", "true"),
+        ("limit", "200"),
+        ("before_ts", "5"),
+        ("before_id", "6"),
+    ] {
+        assert!(got.contains(&(k.into(), v.into())), "{k}={v} in {got:?}");
+    }
+
+    let facets = c.analytics_facets(&q).await.expect("facets");
+    assert_eq!(facets.site[0].key, "shop");
+    assert_eq!(facets.method[0].count, 3);
+    assert!(facets.host.is_empty());
+
+    let compare = c.analytics_compare(&q).await.expect("compare");
+    assert_eq!(compare.against, "previous");
+    assert_eq!(compare.current.summary.requests, 12);
+    assert_eq!(compare.delta.requests.abs, 12.0);
+    assert_eq!(compare.delta.requests.pct, None);
+}
+
+#[tokio::test]
+async fn an_invalid_filter_never_reaches_the_node() {
+    let state = fake("cite_good", 0);
+    let url = spawn(state.clone()).await;
+    let c = client("n1", &url, "cite_good");
+    let bad = AnalyticsQuery::new().window("1h").range(1, 2);
+    assert!(matches!(
+        c.analytics_facets(&bad).await,
+        Err(ClientError::Config(_))
+    ));
+    assert!(matches!(
+        c.analytics_requests_q(&bad, None, None).await,
+        Err(ClientError::Config(_))
+    ));
+    assert!(state.last_query.lock().expect("lock").is_none());
 }
 
 #[tokio::test]
@@ -1206,6 +1496,75 @@ async fn firewall_bulk_sends_one_request_and_decodes_the_counts() {
 }
 
 #[tokio::test]
+async fn site_token_and_env_calls_send_the_documented_bodies() {
+    let state = fake("cite_good", 0);
+    let url = spawn(state.clone()).await;
+    let c = client("n1", &url, "cite_good");
+    let value = ["ghp", "_", "abc123"].concat();
+    let status = c
+        .github_token_set("shop", &GithubTokenBody::new(&value).expect("token"))
+        .await
+        .expect("set");
+    assert!(status.site_token_set);
+    assert_eq!(status.source, "site");
+    let mut patch = EnvPatch::default();
+    patch
+        .set
+        .insert("API_URL".into(), "https://x.example".into());
+    let names = c.build_env_patch("shop", &patch).await.expect("patch");
+    assert_eq!(names.names, vec!["API_URL".to_string()]);
+    let bodies = state.created_bodies.lock().expect("lock").clone();
+    assert!(bodies[0]["token"] == value.as_str(), "token not sent");
+    assert_eq!(bodies[1]["set"]["API_URL"], "https://x.example");
+}
+
+#[tokio::test]
+async fn site_status_and_logs_validate_before_sending() {
+    let state = fake("cite_good", 0);
+    let url = spawn(state.clone()).await;
+    let c = client("n1", &url, "cite_good");
+    let status = c.site_status("shop").await.expect("status");
+    assert_eq!(status["phase"], "idle");
+    let q = LogsQuery {
+        source: "manager".into(),
+        slot: Some("blue".into()),
+        tail: Some(50),
+        since: None,
+    };
+    let logs = c.site_logs("shop", &q).await.expect("logs");
+    let seen = logs["query"].as_str().expect("query");
+    assert!(seen.contains("source=manager") && seen.contains("tail=50"));
+    let before = state.seen_auth.lock().expect("lock").len();
+    assert!(c.site_status("../x").await.is_err());
+    let bad = LogsQuery {
+        source: "other".into(),
+        ..LogsQuery::default()
+    };
+    assert!(c.site_logs("shop", &bad).await.is_err());
+    assert!(
+        c.build_env_patch("shop", &EnvPatch::default())
+            .await
+            .is_err()
+    );
+    assert_eq!(state.seen_auth.lock().expect("lock").len(), before);
+}
+
+#[tokio::test]
+async fn env_patches_are_refused_by_the_kind_they_are_sent_to() {
+    let state = fake("cite_good", 0);
+    let url = spawn(state.clone()).await;
+    let c = client("n1", &url, "cite_good");
+    let before = state.seen_auth.lock().expect("lock").len();
+    let mut runtime_only = EnvPatch::default();
+    runtime_only.set.insert("NODE_ENV".into(), "x".into());
+    assert!(c.runtime_env_patch("shop", &runtime_only).await.is_err());
+    let mut build_only = EnvPatch::default();
+    build_only.set.insert("SHELL".into(), "x".into());
+    assert!(c.build_env_patch("shop", &build_only).await.is_err());
+    assert_eq!(state.seen_auth.lock().expect("lock").len(), before);
+}
+
+#[tokio::test]
 async fn firewall_bulk_is_validated_before_any_request() {
     let state = fake("cite_good", 0);
     let url = spawn(state.clone()).await;
@@ -1482,6 +1841,7 @@ async fn create_site_sends_the_github_token_beside_the_site() {
         node_major: None,
         poll_interval: None,
         secret: None,
+        ..Default::default()
     });
     c.create_site(&with_source, Some("ghp_example"))
         .await

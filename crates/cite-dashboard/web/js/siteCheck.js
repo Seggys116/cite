@@ -1,17 +1,18 @@
-const ID_RE = /^[a-z0-9][a-z0-9-]{0,62}$/;
-const REPO_PART_RE = /^[A-Za-z0-9._-]+$/;
+import { pollProblem as nodePollProblem } from './buildlib.js';
+import { parseRepo } from './repolib.js';
+
+const ID_RE = /^[a-z0-9][a-z0-9-]{0,39}$/;
 const BRANCH_RE = /^[A-Za-z0-9._/-]+$/;
-const POLL_RE = /^[0-9]+(s|m|h)$/;
 const REF_RE = /^[A-Za-z0-9._/-]{1,100}$/;
 
 export const RUNTIMES = ['node', 'bun', 'static', 'rust'];
 export const NODE_MAJORS = [22, 24];
 
-// Mirrors cite_core's owner/name rule: two non-empty tokens of letters, digits, dot, underscore and dash, none starting with a dot.
+// A pasted address is accepted too (see repolib); a leading dot in a part is refused as before
 export function repoProblem(repo) {
-  const parts = String(repo || '').trim().split('/');
-  const ok = parts.length === 2 && parts.every((p) => p && !p.startsWith('.') && REPO_PART_RE.test(p));
-  return ok ? null : 'The repository must look like owner/name.';
+  const parsed = parseRepo(repo);
+  const dotted = parsed.ok && parsed.repo.split('/').some((p) => p.startsWith('.'));
+  return parsed.ok && !dotted ? null : 'The repository must look like owner/name.';
 }
 
 export function branchProblem(branch) {
@@ -25,7 +26,7 @@ export function runtimeProblem(runtime) {
 }
 
 export function pollProblem(poll) {
-  return POLL_RE.test(String(poll || '').trim()) ? null : 'The poll interval must be a number with s, m or h, such as 5m.';
+  return nodePollProblem(poll);
 }
 
 export function gitRefProblem(ref) {

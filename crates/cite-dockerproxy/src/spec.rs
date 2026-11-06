@@ -1,9 +1,10 @@
 use serde_json::{Map, Value, json};
 
+use crate::config::{MIN_STACK_MEMORY, MIN_STACK_NANO_CPUS};
+use crate::envval;
 use crate::policy::{Policy, Stack};
 
 // Upper bounds for the resource limits a create body may ask for.
-const GIB: i64 = 1 << 30;
 const MIB: i64 = 1 << 20;
 const MAX_ENV_ENTRIES: usize = 32;
 const MAX_TOKEN_LEN: usize = 512;
@@ -37,9 +38,25 @@ enum EnvRule {
     Node,
     Token,
     GithubApi,
+    RelPath,
+    Enum(&'static [&'static str]),
+    Slug,
+    Bool,
+    // Runs through sh -c inside the sandboxed build helper by design, so only length and control characters are checked.
+    ShellCmd,
+    StartCmd,
+    DeployId,
+    BuildEnvJson,
+    RuntimeEnvJson,
+    // Both forge keys are tied to the operator's own setting, so a manager cannot point a token at another host.
+    Forge,
+    ForgeApi,
 }
 
-const MANAGER_ENV: [(&str, EnvRule); 15] = [
+const PACKAGE_MANAGERS: &[&str] = &["npm", "pnpm", "yarn", "bun"];
+const RENDERINGS: &[&str] = &["static", "ssr"];
+
+const MANAGER_ENV: [(&str, EnvRule); 29] = [
     ("CITE_REPO", EnvRule::Repo),
     ("CITE_BRANCH", EnvRule::Branch),
     ("CITE_POLL_INTERVAL", EnvRule::Poll),
@@ -58,9 +75,23 @@ const MANAGER_ENV: [(&str, EnvRule); 15] = [
     ("CITE_CACHE_DIR", EnvRule::Fixed("/var/lib/cite/cache")),
     ("CITE_SOCKET", EnvRule::Fixed("/run/cite/manager.sock")),
     ("RUST_LOG", EnvRule::Fixed("info")),
+    ("CITE_ROOT_DIR", EnvRule::RelPath),
+    ("CITE_OUTPUT_DIR", EnvRule::RelPath),
+    ("CITE_SPA_FALLBACK", EnvRule::RelPath),
+    ("CITE_PACKAGE_MANAGER", EnvRule::Enum(PACKAGE_MANAGERS)),
+    ("CITE_RENDERING", EnvRule::Enum(RENDERINGS)),
+    ("CITE_FRAMEWORK", EnvRule::Slug),
+    ("CITE_PRUNE", EnvRule::Bool),
+    ("CITE_INSTALL_COMMAND", EnvRule::ShellCmd),
+    ("CITE_BUILD_COMMAND", EnvRule::ShellCmd),
+    ("CITE_START_COMMAND", EnvRule::StartCmd),
+    ("CITE_DEPLOY_ID", EnvRule::DeployId),
+    ("CITE_BUILD_ENV_JSON", EnvRule::BuildEnvJson),
+    ("CITE_FORGE", EnvRule::Forge),
+    ("CITE_FORGE_API_URL", EnvRule::ForgeApi),
 ];
 
-const EXECUTOR_ENV: [(&str, EnvRule); 8] = [
+const EXECUTOR_ENV: [(&str, EnvRule); 9] = [
     ("CITE_LISTEN", EnvRule::Fixed("0.0.0.0:8080")),
     ("CITE_DATA_DIR", EnvRule::Fixed("/var/lib/cite")),
     (
@@ -72,6 +103,7 @@ const EXECUTOR_ENV: [(&str, EnvRule); 8] = [
     ("RUST_LOG", EnvRule::Fixed("info")),
     ("CITE_NODE_BIN", EnvRule::Fixed("/nodejs/bin/node")),
     ("CITE_NODE", EnvRule::Node),
+    ("CITE_RUNTIME_ENV_JSON", EnvRule::RuntimeEnvJson),
 ];
 
 fn labels(id: &str, slot: &str, role: &str) -> Value {
@@ -208,23 +240,26 @@ fn object<'a>(v: &'a Value, what: &str) -> Result<&'a Map<String, Value>, String
         .ok_or_else(|| format!("{what} is not an object"))
 }
 
-fn within(host: &Map<String, Value>, key: &str, max: i64) -> Result<i64, String> {
+fn within(host: &Map<String, Value>, key: &str, min: i64, max: i64) -> Result<i64, String> {
     match host.get(key).and_then(Value::as_i64) {
-        Some(n) if (1..=max).contains(&n) => Ok(n),
+        Some(n) if (min..=max).contains(&n) => Ok(n),
         _ => Err(format!("HostConfig.{key} is missing or out of range")),
     }
 }
 
-fn read_limits(role: Role, host: &Map<String, Value>) -> Result<Limits, String> {
+// Manager and executor memory and CPU follow the operator's bounds; init and the pid caps stay fixed.
+fn read_limits(policy: &Policy, role: Role, host: &Map<String, Value>) -> Result<Limits, String> {
     let (memory, cpus, pids) = match role {
-        Role::Manager => (4 * GIB, Some(4_000_000_000), 4096),
-        Role::Executor => (2 * GIB, Some(2_000_000_000), 1024),
-        Role::Init => (256 * MIB, None, 128),
+        Role::Manager => ((MIN_STACK_MEMORY, policy.max_memory), true, 4096),
+        Role::Executor => ((MIN_STACK_MEMORY, policy.max_memory), true, 1024),
+        Role::Init => ((1, 256 * MIB), false, 128),
     };
     Ok(Limits {
-        memory: within(host, "Memory", memory)?,
-        nano_cpus: cpus.map(|max| within(host, "NanoCpus", max)).transpose()?,
-        pids: within(host, "PidsLimit", pids)?,
+        memory: within(host, "Memory", memory.0, memory.1)?,
+        nano_cpus: cpus
+            .then(|| within(host, "NanoCpus", MIN_STACK_NANO_CPUS, policy.max_nano_cpus))
+            .transpose()?,
+        pids: within(host, "PidsLimit", 1, pids)?,
     })
 }
 
@@ -261,6 +296,17 @@ fn env_value_ok(policy: &Policy, rule: &EnvRule, value: &str) -> bool {
         }
         // The manager sends the token here, so only the operator's own setting is accepted.
         EnvRule::GithubApi => policy.github_api_url.as_deref() == Some(value),
+        EnvRule::RelPath => envval::rel_path(value),
+        EnvRule::Enum(options) => options.contains(&value),
+        EnvRule::Slug => envval::slug(value),
+        EnvRule::Bool => envval::boolean(value),
+        EnvRule::ShellCmd => envval::shell_cmd(value),
+        EnvRule::StartCmd => envval::start_cmd(value),
+        EnvRule::DeployId => envval::deploy_id(value),
+        EnvRule::BuildEnvJson => envval::build_env_json(value),
+        EnvRule::RuntimeEnvJson => envval::runtime_env_json(value),
+        EnvRule::Forge => policy.forge.as_deref() == Some(value),
+        EnvRule::ForgeApi => policy.forge_api_url.as_deref() == Some(value),
     }
 }
 
@@ -340,7 +386,7 @@ pub fn validate_container(policy: &Policy, name: &str, body: &Value) -> Result<(
         .map(|h| object(h, "HostConfig"))
         .transpose()?;
     let host = host.ok_or("HostConfig is missing")?;
-    let limits = read_limits(role, host)?;
+    let limits = read_limits(policy, role, host)?;
     let mode = host
         .get("NetworkMode")
         .and_then(Value::as_str)

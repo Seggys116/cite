@@ -20,7 +20,7 @@ use crate::util::{
 
 const SCORE_KEYS: [&str; 5] = ["0-19", "20-39", "40-59", "60-79", "80-100"];
 // Groups fetched before folding in Rust (content types, methods, signal lists); bounds work on hostile cardinality.
-const FOLD_FETCH: usize = 5000;
+pub(crate) const FOLD_FETCH: usize = 5000;
 // Key bytes a top query keeps in memory before it stops reading ranked rows.
 pub(crate) const TOP_RESULT_BYTES: usize = 64 * 1024 * 1024;
 
@@ -94,7 +94,7 @@ pub(crate) fn text(s: &str) -> Value {
     Value::Text(s.to_string())
 }
 
-fn dict_params(k: u8, val: &str) -> [Value; 2] {
+pub(crate) fn dict_params(k: u8, val: &str) -> [Value; 2] {
     [int(i64::from(k)), text(val)]
 }
 
@@ -109,7 +109,7 @@ fn count_col(row: &Row, i: usize) -> rusqlite::Result<u64> {
     Ok(from_i64(row.get(i)?))
 }
 
-fn collect<T>(
+pub(crate) fn collect<T>(
     conn: &Connection,
     sql: &str,
     params: &[Value],
@@ -182,7 +182,7 @@ impl Window {
         }
     }
 
-    fn level(&self) -> &'static Level {
+    pub(crate) fn level(&self) -> &'static Level {
         if self.source == Source::Hour {
             &HOURLY
         } else {
@@ -200,7 +200,7 @@ impl Window {
 }
 
 // First minute the minute rollups cover completely.
-fn valid_from(conn: &Connection) -> Result<i64> {
+pub(crate) fn valid_from(conn: &Connection) -> Result<i64> {
     Ok(conn.query_row("SELECT valid_from FROM rollup_state", [], |r| r.get(0))?)
 }
 
@@ -210,7 +210,7 @@ fn folded_id(conn: &Connection) -> Result<i64> {
 }
 
 // A read snapshot, so the statements of one query see the same rollups and watermark.
-fn snapshot(conn: &Connection) -> Result<rusqlite::Transaction<'_>> {
+pub(crate) fn snapshot(conn: &Connection) -> Result<rusqlite::Transaction<'_>> {
     Ok(conn.unchecked_transaction()?)
 }
 
@@ -237,7 +237,7 @@ fn raw_where(win: &Window, site: Option<&str>) -> Where {
     range_where(win.from, win.to, site)
 }
 
-fn roll_where(win: &Window, site: Option<&str>) -> Where {
+pub(crate) fn roll_where(win: &Window, site: Option<&str>) -> Where {
     let (lo, hi) = win.range_frags();
     let mut w = Where::default();
     w.and(lo, [int(win.first)]).and(hi, [int(win.last)]);
@@ -306,42 +306,85 @@ fn run_top_int(conn: &Connection, sql: &str, params: &[Value]) -> Result<Vec<Top
     })
 }
 
+/// Ranking of a top list: by request count, or by response bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortBy {
+    Count,
+    Bytes,
+}
+
+impl SortBy {
+    fn order(self) -> &'static str {
+        match self {
+            SortBy::Count => "2 DESC, 1 ASC",
+            SortBy::Bytes => "3 DESC, 2 DESC, 1 ASC",
+        }
+    }
+}
+
 fn raw_top_dict(
     conn: &Connection,
     col: &'static str,
     w: &Where,
     limit: usize,
 ) -> Result<Vec<TopItem>> {
+    raw_top_dict_by(conn, col, w, limit, SortBy::Count)
+}
+
+pub(crate) fn raw_top_dict_by(
+    conn: &Connection,
+    col: &'static str,
+    w: &Where,
+    limit: usize,
+    sort: SortBy,
+) -> Result<Vec<TopItem>> {
     let sql = format!(
         "SELECT d.val, count(*), coalesce(sum(r.bytes_out), 0) FROM requests r \
-         JOIN dict d ON d.id = r.{col}{} GROUP BY r.{col} ORDER BY 2 DESC, 1 ASC LIMIT ?",
-        w.clause()
+         JOIN dict d ON d.id = r.{col}{} GROUP BY r.{col} ORDER BY {} LIMIT ?",
+        w.clause(),
+        sort.order()
     );
     run_top(conn, &sql, &w.bind([int(to_i64(limit as u64))]))
 }
 
 fn raw_top_path(conn: &Connection, w: &Where, limit: usize) -> Result<Vec<TopItem>> {
+    raw_top_path_by(conn, w, limit, SortBy::Count)
+}
+
+fn raw_top_path_by(
+    conn: &Connection,
+    w: &Where,
+    limit: usize,
+    sort: SortBy,
+) -> Result<Vec<TopItem>> {
     let mut w = w.clone();
     w.and("path <> ''", []);
     let sql = format!(
         "SELECT r.path, count(*), coalesce(sum(r.bytes_out), 0) FROM requests r{} \
-         GROUP BY r.path ORDER BY 2 DESC, 1 ASC LIMIT ?",
-        w.clause()
+         GROUP BY r.path ORDER BY {} LIMIT ?",
+        w.clause(),
+        sort.order()
     );
     run_top(conn, &sql, &w.bind([int(to_i64(limit as u64))]))
 }
 
-fn raw_top_status(conn: &Connection, w: &Where, limit: usize) -> Result<Vec<TopItem>> {
+fn raw_top_status(
+    conn: &Connection,
+    w: &Where,
+    limit: usize,
+    sort: SortBy,
+) -> Result<Vec<TopItem>> {
     let sql = format!(
         "SELECT r.status, count(*), coalesce(sum(r.bytes_out), 0) FROM requests r{} \
-         GROUP BY r.status ORDER BY 2 DESC, 1 ASC LIMIT ?",
-        w.clause()
+         GROUP BY r.status ORDER BY {} LIMIT ?",
+        w.clause(),
+        sort.order()
     );
     run_top_int(conn, &sql, &w.bind([int(to_i64(limit as u64))]))
 }
 
 // Groups first and joins the dictionary only for groups at or above the limit-th count, so the join stays small.
-fn rollup_top_dict(
+pub(crate) fn rollup_top_dict(
     conn: &Connection,
     d: u8,
     win: &Window,
@@ -408,7 +451,7 @@ fn tail_where(win: &Window, site: Option<&str>, after: i64) -> Where {
 }
 
 // False when a minute of the window outgrew the key cap or came in with a backfill, so the tables do not hold it.
-fn heavy_ready(conn: &Connection, d: u8, win: &Window) -> Result<bool> {
+pub(crate) fn heavy_ready(conn: &Connection, d: u8, win: &Window) -> Result<bool> {
     let over = conn.prepare_cached(
         "SELECT EXISTS (SELECT 1 FROM rollup_over WHERE dim IN (?1, ?4) AND minute >= ?2 AND minute <= ?3)",
     )?
@@ -580,6 +623,10 @@ fn minute_top_dict(
 
 // Merges raw content types under their normalised media type.
 fn fold_ctypes(items: Vec<TopItem>, limit: usize) -> Vec<TopItem> {
+    fold_ctypes_by(items, limit, SortBy::Count)
+}
+
+fn fold_ctypes_by(items: Vec<TopItem>, limit: usize, sort: SortBy) -> Vec<TopItem> {
     let mut merged: HashMap<String, (u64, u64)> = HashMap::new();
     for it in items {
         let key = normalize_ctype(&it.key);
@@ -594,7 +641,15 @@ fn fold_ctypes(items: Vec<TopItem>, limit: usize) -> Vec<TopItem> {
         .into_iter()
         .map(|(key, (count, bytes))| TopItem { key, count, bytes })
         .collect();
-    sort_items(&mut out);
+    match sort {
+        SortBy::Count => sort_items(&mut out),
+        SortBy::Bytes => out.sort_by(|a, b| {
+            b.bytes
+                .cmp(&a.bytes)
+                .then_with(|| b.count.cmp(&a.count))
+                .then_with(|| a.key.cmp(&b.key))
+        }),
+    }
     out.truncate(limit);
     out
 }
@@ -628,17 +683,29 @@ pub(crate) fn top_raw(
     w: &Where,
     limit: usize,
 ) -> Result<Vec<TopItem>> {
+    top_raw_by(conn, kind, w, limit, SortBy::Count)
+}
+
+pub(crate) fn top_raw_by(
+    conn: &Connection,
+    kind: TopKind,
+    w: &Where,
+    limit: usize,
+    sort: SortBy,
+) -> Result<Vec<TopItem>> {
     match kind {
-        TopKind::Paths => raw_top_path(conn, w, limit),
-        TopKind::Hosts => raw_top_dict(conn, "host_id", w, limit),
-        TopKind::Referers => raw_top_dict(conn, "referer_id", w, limit),
-        TopKind::UserAgents => raw_top_dict(conn, "ua_id", w, limit),
-        TopKind::ClientIps => raw_top_dict(conn, "client_ip_id", w, limit),
-        TopKind::Languages => raw_top_dict(conn, "accept_lang_id", w, limit),
-        TopKind::StatusCodes => raw_top_status(conn, w, limit),
-        TopKind::ContentTypes => Ok(fold_ctypes(
-            raw_top_dict(conn, "ctype_id", w, FOLD_FETCH)?,
+        TopKind::Paths => raw_top_path_by(conn, w, limit, sort),
+        TopKind::Hosts => raw_top_dict_by(conn, "host_id", w, limit, sort),
+        TopKind::Referers => raw_top_dict_by(conn, "referer_id", w, limit, sort),
+        TopKind::UserAgents => raw_top_dict_by(conn, "ua_id", w, limit, sort),
+        TopKind::ClientIps => raw_top_dict_by(conn, "client_ip_id", w, limit, sort),
+        TopKind::Languages => raw_top_dict_by(conn, "accept_lang_id", w, limit, sort),
+        TopKind::StatusCodes => raw_top_status(conn, w, limit, sort),
+        // Groups are folded under their media type in Rust, so the SQL fetch is ranked the same way and then re-ranked.
+        TopKind::ContentTypes => Ok(fold_ctypes_by(
+            raw_top_dict_by(conn, "ctype_id", w, FOLD_FETCH, sort)?,
             limit,
+            sort,
         )),
     }
 }
@@ -655,59 +722,70 @@ pub(crate) fn top(
     if limit == 0 {
         return Ok(Vec::new());
     }
-    let site = site.filter(|s| !s.is_empty());
     let conn = &snapshot(conn)?;
     let win = Window::pick(conn, window_secs, now_ms, false)?;
+    top_in(conn, kind, &win, site, limit)
+}
+
+// Top list of a prepared window; limit must already be clamped.
+pub(crate) fn top_in(
+    conn: &Connection,
+    kind: TopKind,
+    win: &Window,
+    site: Option<&str>,
+    limit: usize,
+) -> Result<Vec<TopItem>> {
+    let site = site.filter(|s| !s.is_empty());
     match win.source {
         Source::Raw => {}
         Source::Minute => match kind {
-            TopKind::Hosts => return rollup_top_dict(conn, dim::HOST, &win, site, limit),
-            TopKind::Languages => return rollup_top_dict(conn, dim::LANGUAGE, &win, site, limit),
+            TopKind::Hosts => return rollup_top_dict(conn, dim::HOST, win, site, limit),
+            TopKind::Languages => return rollup_top_dict(conn, dim::LANGUAGE, win, site, limit),
             TopKind::ContentTypes => {
-                return rollup_top_dict(conn, dim::CONTENT_TYPE, &win, site, limit);
+                return rollup_top_dict(conn, dim::CONTENT_TYPE, win, site, limit);
             }
-            TopKind::StatusCodes => return rollup_top_int(conn, dim::STATUS, &win, site, limit),
-            TopKind::Paths => return minute_top_path(conn, &win, site, limit),
+            TopKind::StatusCodes => return rollup_top_int(conn, dim::STATUS, win, site, limit),
+            TopKind::Paths => return minute_top_path(conn, win, site, limit),
             TopKind::ClientIps => {
                 return minute_top_dict(
                     conn,
                     dim::CLIENT_IP,
                     "client_ip_id",
                     false,
-                    &win,
+                    win,
                     site,
                     limit,
                 );
             }
             TopKind::UserAgents => {
-                return minute_top_dict(conn, dim::USER_AGENT, "ua_id", false, &win, site, limit);
+                return minute_top_dict(conn, dim::USER_AGENT, "ua_id", false, win, site, limit);
             }
             TopKind::Referers => {
-                return minute_top_dict(conn, dim::REFERER, "referer_id", false, &win, site, limit);
+                return minute_top_dict(conn, dim::REFERER, "referer_id", false, win, site, limit);
             }
         },
         Source::Hour => match kind {
-            TopKind::Hosts => return rollup_top_dict(conn, dim::HOST, &win, site, limit),
-            TopKind::Languages => return rollup_top_dict(conn, dim::LANGUAGE, &win, site, limit),
+            TopKind::Hosts => return rollup_top_dict(conn, dim::HOST, win, site, limit),
+            TopKind::Languages => return rollup_top_dict(conn, dim::LANGUAGE, win, site, limit),
             TopKind::ContentTypes => {
-                return rollup_top_dict(conn, dim::CONTENT_TYPE, &win, site, limit);
+                return rollup_top_dict(conn, dim::CONTENT_TYPE, win, site, limit);
             }
-            TopKind::StatusCodes => return rollup_top_int(conn, dim::STATUS, &win, site, limit),
+            TopKind::StatusCodes => return rollup_top_int(conn, dim::STATUS, win, site, limit),
             // The heavy-key rollups only hold TOP_KEEP keys per hour, so deeper lists read raw rows.
-            TopKind::Paths if limit <= TOP_N => return rollup_top_path(conn, &win, site, limit),
+            TopKind::Paths if limit <= TOP_N => return rollup_top_path(conn, win, site, limit),
             TopKind::ClientIps if limit <= TOP_N => {
-                return rollup_top_dict(conn, dim::CLIENT_IP, &win, site, limit);
+                return rollup_top_dict(conn, dim::CLIENT_IP, win, site, limit);
             }
             TopKind::UserAgents if limit <= TOP_N => {
-                return rollup_top_dict(conn, dim::USER_AGENT, &win, site, limit);
+                return rollup_top_dict(conn, dim::USER_AGENT, win, site, limit);
             }
             TopKind::Referers if limit <= TOP_N => {
-                return rollup_top_dict(conn, dim::REFERER, &win, site, limit);
+                return rollup_top_dict(conn, dim::REFERER, win, site, limit);
             }
             _ => {}
         },
     }
-    top_raw(conn, kind, &raw_where(&win, site), limit)
+    top_raw(conn, kind, &raw_where(win, site), limit)
 }
 
 struct Totals {
@@ -923,14 +1001,19 @@ pub(crate) fn summary_in(conn: &Connection, win: &Window, site: Option<&str>) ->
             [paths, ips, uas, hosts, blocked],
         ));
     }
-    let paths = raw_top_path(conn, &raw, TOP_N)?;
-    let ips = raw_top_dict(conn, "client_ip_id", &raw, TOP_N)?;
-    let uas = raw_top_dict(conn, "ua_id", &raw, TOP_N)?;
-    let totals = raw_totals(conn, &raw)?;
-    let methods = fold_methods(raw_top_dict(conn, "method_id", &raw, FOLD_FETCH)?);
-    let ctypes = fold_ctypes(raw_top_dict(conn, "ctype_id", &raw, FOLD_FETCH)?, TOP_N);
-    let hosts = raw_top_dict(conn, "host_id", &raw, TOP_N)?;
-    let blocked = raw_top_dict(conn, "blocked_id", &raw, TOP_N)?;
+    summary_raw(conn, &raw)
+}
+
+// The summary of the raw rows a where clause selects.
+pub(crate) fn summary_raw(conn: &Connection, raw: &Where) -> Result<Summary> {
+    let paths = raw_top_path(conn, raw, TOP_N)?;
+    let ips = raw_top_dict(conn, "client_ip_id", raw, TOP_N)?;
+    let uas = raw_top_dict(conn, "ua_id", raw, TOP_N)?;
+    let totals = raw_totals(conn, raw)?;
+    let methods = fold_methods(raw_top_dict(conn, "method_id", raw, FOLD_FETCH)?);
+    let ctypes = fold_ctypes(raw_top_dict(conn, "ctype_id", raw, FOLD_FETCH)?, TOP_N);
+    let hosts = raw_top_dict(conn, "host_id", raw, TOP_N)?;
+    let blocked = raw_top_dict(conn, "blocked_id", raw, TOP_N)?;
     Ok(assemble(
         totals,
         methods,
@@ -950,7 +1033,7 @@ pub(crate) fn timeseries(
     timeseries_in(conn, &win, site)
 }
 
-type Bucketed = (u64, u64, u64, u64, u64);
+pub(crate) type Bucketed = (u64, u64, u64, u64, u64);
 
 pub(crate) fn timeseries_in(
     conn: &Connection,
@@ -1013,7 +1096,11 @@ pub(crate) fn timeseries_in(
     })
 }
 
-fn bucket_rows(conn: &Connection, sql: &str, w: &Where) -> Result<HashMap<i64, Bucketed>> {
+pub(crate) fn bucket_rows(
+    conn: &Connection,
+    sql: &str,
+    w: &Where,
+) -> Result<HashMap<i64, Bucketed>> {
     let rows = collect(conn, sql, &w.bind([]), |r| {
         Ok((
             r.get::<_, i64>(0)?,
@@ -1029,7 +1116,7 @@ fn bucket_rows(conn: &Connection, sql: &str, w: &Where) -> Result<HashMap<i64, B
     Ok(rows.into_iter().collect())
 }
 
-const EVENT_SELECT: &str = "SELECT r.id, r.ts, ip.val, h.val, m.val, r.path, r.query_len, r.status, \
+pub(crate) const EVENT_SELECT: &str = "SELECT r.id, r.ts, ip.val, h.val, m.val, r.path, r.query_len, r.status, \
     r.bytes_in, r.bytes_out, r.total_ms, ua.val, rf.val, ct.val, be.val, sv.val, st.val, bl.val, hv.val, \
     ac.val, al.val, ae.val, fs.val, fm.val, fd.val, cu.val, tl.val, r.resp_ms, r.bot_score, bc.val, bs.val \
     FROM requests r \
@@ -1055,7 +1142,7 @@ const EVENT_SELECT: &str = "SELECT r.id, r.ts, ip.val, h.val, m.val, r.path, r.q
     LEFT JOIN dict bc ON bc.id = r.bot_class_id \
     LEFT JOIN dict bs ON bs.id = r.bot_signals_id";
 
-fn decode(row: &Row) -> rusqlite::Result<(i64, LogEvent)> {
+pub(crate) fn decode(row: &Row) -> rusqlite::Result<(i64, LogEvent)> {
     let blocked = match row.get_ref(17)? {
         ValueRef::Text(b) | ValueRef::Blob(b) => Some(String::from_utf8_lossy(b).into_owned()),
         _ => None,
@@ -1161,13 +1248,18 @@ pub(crate) fn bots(
     site: Option<&str>,
     now_ms: i64,
 ) -> Result<BotSummary> {
-    let site = site.filter(|s| !s.is_empty());
     let conn = &snapshot(conn)?;
     let win = Window::pick(conn, window_secs, now_ms, false)?;
+    bots_in(conn, &win, site)
+}
+
+// Bot breakdown of a prepared window, from rollups or raw rows depending on its source.
+pub(crate) fn bots_in(conn: &Connection, win: &Window, site: Option<&str>) -> Result<BotSummary> {
+    let site = site.filter(|s| !s.is_empty());
     if win.source == Source::Raw {
         return bots_raw(conn, win.from, win.to, site, TOP_N);
     }
-    let rw = roll_where(&win, site);
+    let rw = roll_where(win, site);
     let sql = format!(
         "SELECT coalesce(sum(requests), 0), coalesce(sum(bot_requests), 0) FROM {}{}",
         win.level().rollup,
@@ -1176,18 +1268,18 @@ pub(crate) fn bots(
     let (total, bot) = conn.query_row(&sql, params_from_iter(rw.bind([]).iter()), |r| {
         Ok((count_col(r, 0)?, count_col(r, 1)?))
     })?;
-    let classes = rollup_top_dict(conn, dim::BOT_CLASS, &win, site, TOP_N)?;
-    let signals = rollup_top_dict(conn, dim::SIGNAL, &win, site, TOP_N)?;
+    let classes = rollup_top_dict(conn, dim::BOT_CLASS, win, site, TOP_N)?;
+    let signals = rollup_top_dict(conn, dim::SIGNAL, win, site, TOP_N)?;
     let mut scores = vec![(0u64, 0u64); SCORE_KEYS.len()];
-    for it in rollup_top_int(conn, dim::SCORE, &win, site, SCORE_KEYS.len())? {
+    for it in rollup_top_int(conn, dim::SCORE, win, site, SCORE_KEYS.len())? {
         if let Some(slot) = it.key.parse::<usize>().ok().and_then(|i| scores.get_mut(i)) {
             *slot = (it.count, it.bytes);
         }
     }
     let agents = if win.source == Source::Minute {
-        minute_top_dict(conn, dim::BOT_AGENT, "ua_id", true, &win, site, TOP_N)?
+        minute_top_dict(conn, dim::BOT_AGENT, "ua_id", true, win, site, TOP_N)?
     } else {
-        rollup_top_dict(conn, dim::BOT_AGENT, &win, site, TOP_N)?
+        rollup_top_dict(conn, dim::BOT_AGENT, win, site, TOP_N)?
     };
     Ok(bot_summary(total, bot, classes, signals, agents, &scores))
 }
@@ -1201,15 +1293,19 @@ pub(crate) fn bots_raw(
     n: usize,
 ) -> Result<BotSummary> {
     let site = site.filter(|s| !s.is_empty());
-    let w = range_where(from, to, site);
-    let total = count_requests(conn, &w)?;
+    bots_from_where(conn, &range_where(from, to, site), n)
+}
+
+// Bot breakdown of the raw rows a where clause selects.
+pub(crate) fn bots_from_where(conn: &Connection, w: &Where, n: usize) -> Result<BotSummary> {
+    let total = count_requests(conn, w)?;
     let mut bot_w = w.clone();
     bot_w.and(NOT_HUMAN, dict_params(kind::BOT_CLASS, "human"));
     let bot = count_requests(conn, &bot_w)?;
-    let classes = raw_top_dict(conn, "bot_class_id", &w, n)?;
+    let classes = raw_top_dict(conn, "bot_class_id", w, n)?;
     let agents = raw_top_dict(conn, "ua_id", &bot_w, n)?;
     let mut merged: HashMap<String, (u64, u64)> = HashMap::new();
-    for it in raw_top_dict(conn, "bot_signals_id", &w, FOLD_FETCH)? {
+    for it in raw_top_dict(conn, "bot_signals_id", w, FOLD_FETCH)? {
         for sig in split_signals(&it.key) {
             let e = merged.entry(sig.to_string()).or_default();
             e.0 += it.count;

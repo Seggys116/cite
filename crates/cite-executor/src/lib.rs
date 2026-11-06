@@ -11,6 +11,9 @@ mod route;
 mod server;
 mod static_files;
 mod supervisor;
+mod userenv;
+
+pub use userenv::UserEnv;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -18,7 +21,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
-use cite_core::{ExecutorConfig, ExecutorStatus, Redactor, Result, ensure_dir, write_status};
+use cite_core::{
+    ExecutorConfig, ExecutorStatus, Redactor, Result, RuntimeKind, ensure_dir, write_status,
+};
 use tokio::sync::{Mutex, Notify, Semaphore, watch};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
@@ -73,14 +78,28 @@ pub fn raise_nofile_limit() -> Option<u64> {
     }
 }
 
+/// Static runtimes never start a child, so the variables are not even parsed for them.
+pub fn load_user_env(config: &ExecutorConfig) -> Result<UserEnv> {
+    if config.runtime == RuntimeKind::Static {
+        return Ok(UserEnv::default());
+    }
+    UserEnv::from_process_env()
+}
+
 pub async fn spawn(config: ExecutorConfig) -> Result<RunningExecutor> {
+    let user_env = load_user_env(&config)?;
+    spawn_with_env(config, user_env).await
+}
+
+pub async fn spawn_with_env(config: ExecutorConfig, user_env: UserEnv) -> Result<RunningExecutor> {
     ensure_dir(&config.releases_dir, 0o755)?;
     ensure_dir(&config.control_dir, 0o755)?;
     ensure_dir(&config.status_dir, 0o755)?;
     ensure_dir(&config.releases_dir.join("blue"), 0o755)?;
     ensure_dir(&config.releases_dir.join("green"), 0o755)?;
 
-    let redactor = runtime_redactor(&config);
+    let mut redactor = runtime_redactor(&config);
+    add_user_secrets(&mut redactor, &user_env);
     let status = Arc::new(Mutex::new(ExecutorStatus::initial(&config.version)));
     {
         let guard = status.lock().await;
@@ -92,7 +111,8 @@ pub async fn spawn(config: ExecutorConfig) -> Result<RunningExecutor> {
     let draining = Arc::new(AtomicBool::new(false));
     let conn_count = Arc::new(AtomicU64::new(0));
     let requests = Arc::new(AtomicU64::new(0));
-    let slot_mgr = Arc::new(SlotManager::new(config.clone(), redactor.clone()));
+    let slot_mgr =
+        Arc::new(SlotManager::new(config.clone(), redactor.clone()).with_user_env(user_env));
     let limiter = limits::Limiter::new(limits::LimitConfig::from_executor(&config));
 
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
@@ -188,6 +208,13 @@ pub fn runtime_redactor(config: &ExecutorConfig) -> Redactor {
         redactor.push_secret(value);
     }
     redactor
+}
+
+/// Owner values must not appear in executor logs even if a child echoes them.
+pub fn add_user_secrets(redactor: &mut Redactor, user_env: &UserEnv) {
+    for value in user_env.vars().values() {
+        redactor.push_secret(value.clone());
+    }
 }
 
 async fn sweep_loop(limiter: Arc<limits::Limiter>, mut shutdown: watch::Receiver<bool>) {

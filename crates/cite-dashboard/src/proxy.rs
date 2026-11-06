@@ -8,7 +8,7 @@ use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use cite_client::{
     ClientError, NodeClient, archive_download_name, archive_kind_from_name, export_file_name,
-    validate_archive_name, validate_certificate_id, validate_site_id,
+    validate_archive_name, validate_certificate_id, validate_job_id, validate_site_id,
 };
 
 use crate::error::ApiError;
@@ -19,27 +19,40 @@ pub const MAX_REQUEST_BODY: usize = 1024 * 1024;
 pub const MAX_CERTIFICATE_BODY: usize = 144 * 1024;
 // Several hundred rules in one change; a rule is a few hundred bytes, so this is generous and still half the general cap.
 pub const MAX_BULK_BODY: usize = 512 * 1024;
-const BULK_ROUTE: &str = "firewall/bulk";
+// A token is a few dozen characters; a kilobyte leaves room for the JSON and nothing more.
+pub const MAX_TOKEN_BODY: usize = 1024;
+pub const MAX_ENV_BODY: usize = 64 * 1024;
+pub const MAX_ISSUE_BODY: usize = 16 * 1024;
+pub const MAX_ALERTS_BODY: usize = 64 * 1024;
 
 const PREFIX: &str = "/api/v1/nodes/";
 const PROXY_TIMEOUT: Duration = Duration::from_secs(30);
 // Switch, rollback, deploy and create wait on health checks and stack starts, which can take over a minute.
 const LONG_TIMEOUT: Duration = Duration::from_secs(700);
-const LONG_ACTIONS: [&str; 4] = ["switch", "rollback", "deploy", "maintenance"];
+const LONG_ACTIONS: [&str; 5] = [
+    "switch",
+    "rollback",
+    "deploy",
+    "maintenance",
+    "github-token",
+];
 const MAX_SEGMENT_LEN: usize = 128;
 const EXPORT_ROUTE: &str = "analytics/export";
-const ANALYTICS_ROUTES: [&str; 7] = [
+const ANALYTICS_ROUTES: [&str; 9] = [
     "summary",
     "timeseries",
     "requests",
     "bots",
     "top",
+    "facets",
+    "compare",
     "stats",
     "export",
 ];
 const ANALYTICS_WRITE_ROUTES: [&str; 3] = ["backup", "cut", "restore"];
 const ARCHIVE_PREFIX: &str = "analytics/archives/";
-const ALLOWED_PREFIXES: [&str; 11] = [
+const ALLOWED_PREFIXES: [&str; 12] = [
+    "alerts",
     "node",
     "settings",
     "audit",
@@ -114,11 +127,20 @@ fn certificate_route_ok(method: &Method, rest: &str) -> bool {
         return true;
     }
     let second = segments.next();
+    let third = segments.next();
+    if first == Some("certificates") && second == Some("acme") {
+        let more = segments.next().is_some();
+        return match third {
+            None => method == Method::GET || method == Method::POST,
+            Some(job) => !more && method == Method::GET && validate_job_id(job).is_ok(),
+        };
+    }
     // Anything beyond the exact shapes below is refused, but only for these two prefixes.
-    if segments.next().is_some() {
+    if third.is_some() {
         return false;
     }
     match (first, second) {
+        (Some("certificates"), Some("generate" | "origin-ca")) => method == Method::POST,
         (Some("certificates"), None) => method == Method::GET || method == Method::POST,
         (Some("certificates"), Some(id)) => {
             (method == Method::GET || method == Method::PUT || method == Method::DELETE)
@@ -153,18 +175,94 @@ fn bulk_route_ok(method: &Method, rest: &str) -> bool {
     segments.next().is_none() && method == Method::POST
 }
 
+// Site status, logs, token and environment routes are exact (method, route) pairs; the other site actions keep prefix-level access.
+const SITE_OPS: [&str; 5] = ["status", "logs", "github-token", "build-env", "runtime-env"];
+
+fn site_ops_action(rest: &str) -> Option<&str> {
+    let segments: Vec<&str> = rest.split('/').collect();
+    match segments.as_slice() {
+        ["sites", _, action, ..] if SITE_OPS.contains(action) => Some(*action),
+        _ => None,
+    }
+}
+
+fn site_ops_route_ok(method: &Method, rest: &str) -> bool {
+    let Some(action) = site_ops_action(rest) else {
+        return true;
+    };
+    let segments: Vec<&str> = rest.split('/').collect();
+    let [_, id, _] = segments.as_slice() else {
+        return false;
+    };
+    if validate_site_id(id).is_err() {
+        return false;
+    }
+    match action {
+        "status" | "logs" => method == Method::GET,
+        "github-token" => {
+            method == Method::GET || method == Method::PUT || method == Method::DELETE
+        }
+        _ => method == Method::GET || method == Method::PATCH,
+    }
+}
+
+fn alerts_route_ok(method: &Method, rest: &str) -> bool {
+    let mut segments = rest.split('/');
+    if segments.next() != Some("alerts") {
+        return true;
+    }
+    let second = segments.next();
+    if segments.next().is_some() {
+        return false;
+    }
+    match second {
+        None => method == Method::GET || method == Method::PUT,
+        Some("test") => method == Method::POST,
+        Some(_) => false,
+    }
+}
+
+// Tokens, status, logs and certificate issuing carry secrets or live state, so no cache may keep them.
+fn is_no_store(rest: &str) -> bool {
+    if is_zone_secret_route(rest) {
+        return true;
+    }
+    if site_ops_action(rest).is_some() {
+        return true;
+    }
+    let mut segments = rest.split('/');
+    matches!(
+        (segments.next(), segments.next()),
+        (
+            Some("certificates"),
+            Some("generate" | "origin-ca" | "acme")
+        ) | (Some("alerts"), _)
+    )
+}
+
 fn route_ok(method: &Method, rest: &str) -> bool {
     analytics_route_ok(method, rest)
         && certificate_route_ok(method, rest)
         && zone_secret_route_ok(method, rest)
         && bulk_route_ok(method, rest)
+        && site_ops_route_ok(method, rest)
+        && alerts_route_ok(method, rest)
 }
 
 fn body_limit_for(method: &Method, rest: &str) -> usize {
-    let write = matches!(*method, Method::POST | Method::PUT);
-    match rest.split('/').next() {
-        Some("certificates") if write => MAX_CERTIFICATE_BODY,
-        Some("firewall") if write && rest == BULK_ROUTE => MAX_BULK_BODY,
+    let write = matches!(*method, Method::POST | Method::PUT | Method::PATCH);
+    if !write {
+        return MAX_REQUEST_BODY;
+    }
+    let segments: Vec<&str> = rest.split('/').collect();
+    match segments.as_slice() {
+        ["certificates", "generate" | "origin-ca" | "acme"] => MAX_ISSUE_BODY,
+        ["certificates", ..] if *method != Method::PATCH => MAX_CERTIFICATE_BODY,
+        ["firewall", "bulk"] if *method == Method::POST => MAX_BULK_BODY,
+        ["sites", _, "github-token"] if *method == Method::PUT => MAX_TOKEN_BODY,
+        ["sites", _, "build-env" | "runtime-env"] if *method == Method::PATCH => MAX_ENV_BODY,
+        ["alerts"] if *method == Method::PUT => MAX_ALERTS_BODY,
+        ["alerts", "test"] => MAX_TOKEN_BODY,
         _ => MAX_REQUEST_BODY,
     }
 }
@@ -274,6 +372,7 @@ fn timeout_for(method: &Method, rest: &str) -> Duration {
         (Some("analytics"), Some(route), None, _) => {
             method == Method::POST && ANALYTICS_WRITE_ROUTES.contains(&route)
         }
+        (Some("certificates"), Some("acme" | "origin-ca"), None, _) => method == Method::POST,
         _ => false,
     };
     if long { LONG_TIMEOUT } else { PROXY_TIMEOUT }
@@ -299,10 +398,14 @@ async fn forward(state: &AppState, req: Request) -> Result<Response, ApiError> {
     if !allowed(rest) || !route_ok(&parts.method, rest) {
         return Err(not_found());
     }
-    if !matches!(
+    // PATCH exists only for the environment routes, and route_ok has already pinned it to them.
+    let env_patch = parts.method == Method::PATCH
+        && matches!(site_ops_action(rest), Some("build-env" | "runtime-env"));
+    if !(matches!(
         parts.method,
         Method::GET | Method::POST | Method::PUT | Method::DELETE
-    ) {
+    ) || env_patch)
+    {
         return Err(ApiError::new(
             StatusCode::METHOD_NOT_ALLOWED,
             "method not allowed",
@@ -320,7 +423,7 @@ async fn forward(state: &AppState, req: Request) -> Result<Response, ApiError> {
     {
         return stream_archive(&client, name).await;
     }
-    let payload = if matches!(parts.method, Method::POST | Method::PUT) {
+    let payload = if matches!(parts.method, Method::POST | Method::PUT | Method::PATCH) {
         to_bytes(body, body_limit_for(&parts.method, rest))
             .await
             .map_err(|_| {
@@ -360,7 +463,7 @@ async fn forward(state: &AppState, req: Request) -> Result<Response, ApiError> {
         response_content_type(forwarded.content_type.as_deref()),
     );
     // A rotated secret is shown once, so no cache may keep it
-    if is_zone_secret_route(rest) {
+    if is_no_store(rest) {
         builder = builder.header(header::CACHE_CONTROL, "no-store");
     }
     builder
@@ -430,6 +533,18 @@ mod tests {
             assert!(!analytics_route_ok(
                 &Method::POST,
                 &format!("analytics/{route}")
+            ));
+        }
+        assert_eq!(ANALYTICS_ROUTES.len(), 9);
+        for route in ["facets", "compare"] {
+            assert!(ANALYTICS_ROUTES.contains(&route));
+            assert!(!analytics_route_ok(
+                &Method::DELETE,
+                &format!("analytics/{route}")
+            ));
+            assert!(!analytics_route_ok(
+                &Method::GET,
+                &format!("analytics/{route}/extra")
             ));
         }
         assert!(!analytics_route_ok(&Method::GET, "analytics"));
@@ -548,6 +663,110 @@ mod tests {
             timeout_for(&Method::POST, "sites/shop/zone-secret"),
             PROXY_TIMEOUT
         );
+    }
+
+    #[test]
+    fn site_status_token_and_env_routes_are_exact_pairs() {
+        let yes = [
+            (Method::GET, "sites/shop/status"),
+            (Method::GET, "sites/shop/logs"),
+            (Method::GET, "sites/shop/github-token"),
+            (Method::PUT, "sites/shop/github-token"),
+            (Method::DELETE, "sites/shop/github-token"),
+            (Method::GET, "sites/shop/build-env"),
+            (Method::PATCH, "sites/shop/build-env"),
+            (Method::GET, "sites/shop/runtime-env"),
+            (Method::PATCH, "sites/shop/runtime-env"),
+            (Method::POST, "sites/shop/deploy"),
+        ];
+        for (method, rest) in yes {
+            assert!(allowed(rest) && route_ok(&method, rest), "{method} {rest}");
+        }
+        let no = [
+            (Method::POST, "sites/shop/status"),
+            (Method::PUT, "sites/shop/logs"),
+            (Method::POST, "sites/shop/github-token"),
+            (Method::PATCH, "sites/shop/github-token"),
+            (Method::PUT, "sites/shop/build-env"),
+            (Method::DELETE, "sites/shop/runtime-env"),
+            (Method::GET, "sites/shop/status/extra"),
+            (Method::GET, "sites/Bad_Id/status"),
+            (Method::PUT, "sites/../github-token"),
+        ];
+        for (method, rest) in no {
+            assert!(!route_ok(&method, rest), "{method} {rest}");
+        }
+        assert!(is_no_store("sites/shop/status") && is_no_store("sites/shop/github-token"));
+        assert!(is_no_store("sites/shop/logs") && is_no_store("certificates/acme"));
+        assert!(!is_no_store("sites/shop") && !is_no_store("sites/shop/deploy"));
+    }
+
+    #[test]
+    fn certificate_issue_and_alert_routes_are_exact_pairs() {
+        let yes = [
+            (Method::POST, "certificates/generate"),
+            (Method::POST, "certificates/origin-ca"),
+            (Method::POST, "certificates/acme"),
+            (Method::GET, "certificates/acme"),
+            (Method::GET, "certificates/acme/job-1"),
+            (Method::GET, "alerts"),
+            (Method::PUT, "alerts"),
+            (Method::POST, "alerts/test"),
+        ];
+        for (method, rest) in yes {
+            assert!(allowed(rest) && route_ok(&method, rest), "{method} {rest}");
+        }
+        let no = [
+            (Method::GET, "certificates/generate"),
+            (Method::PUT, "certificates/acme"),
+            (Method::POST, "certificates/acme/job-1"),
+            (Method::GET, "certificates/acme/job-1/extra"),
+            (Method::GET, "certificates/acme/a%2Fb"),
+            (Method::POST, "alerts"),
+            (Method::DELETE, "alerts"),
+            (Method::GET, "alerts/test"),
+            (Method::POST, "alerts/other"),
+            (Method::PUT, "alerts/test/x"),
+        ];
+        for (method, rest) in no {
+            assert!(!route_ok(&method, rest), "{method} {rest}");
+        }
+    }
+
+    #[test]
+    fn the_new_write_routes_have_their_own_body_caps() {
+        assert_eq!(body_limit_for(&Method::PUT, "sites/a/github-token"), 1024);
+        assert_eq!(
+            body_limit_for(&Method::PATCH, "sites/a/build-env"),
+            64 * 1024
+        );
+        assert_eq!(
+            body_limit_for(&Method::PATCH, "sites/a/runtime-env"),
+            64 * 1024
+        );
+        assert_eq!(
+            body_limit_for(&Method::POST, "certificates/generate"),
+            16 * 1024
+        );
+        assert_eq!(
+            body_limit_for(&Method::POST, "certificates/acme"),
+            16 * 1024
+        );
+        assert_eq!(body_limit_for(&Method::PUT, "alerts"), 64 * 1024);
+        assert_eq!(
+            body_limit_for(&Method::POST, "certificates"),
+            MAX_CERTIFICATE_BODY
+        );
+        assert_eq!(timeout_for(&Method::POST, "sites/a/deploy"), LONG_TIMEOUT);
+        assert_eq!(
+            timeout_for(&Method::PUT, "sites/a/github-token"),
+            LONG_TIMEOUT
+        );
+        assert_eq!(
+            timeout_for(&Method::POST, "certificates/acme"),
+            LONG_TIMEOUT
+        );
+        assert_eq!(timeout_for(&Method::GET, "sites/a/status"), PROXY_TIMEOUT);
     }
 
     #[test]

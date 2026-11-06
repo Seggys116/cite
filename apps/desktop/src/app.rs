@@ -21,8 +21,8 @@ use crate::theme::{
 use crate::ui::input::TextInput;
 use crate::ui::widgets::{BtnKind, btn, id, strong, text_dim};
 use crate::ui::{
-    bots, certs, create, detail, firewall, maintenance, nodes, overview, settings, sites, storage,
-    traffic,
+    alertspanel, analytics, bots, certs, certtools, create, detail, firewall, maintenance, nodes,
+    ops, overview, settings, sites, storage, traffic,
 };
 use crate::zone::keep_for_site;
 
@@ -30,6 +30,27 @@ const TICK: Duration = Duration::from_millis(500);
 const LOGO_FLIP_TICKS: u64 = 5;
 const REFRESH_TICKS: u64 = 6;
 const TOAST_TICKS: u64 = 8;
+
+// Errors never expire on their own; everything else disappears after a few ticks.
+fn toast_until(tone: Tone, tick: u64) -> u64 {
+    if tone == Tone::Bad {
+        u64::MAX
+    } else {
+        tick + TOAST_TICKS
+    }
+}
+
+#[cfg(test)]
+mod toast_tests {
+    use super::*;
+
+    #[test]
+    fn errors_stay_and_other_toasts_expire() {
+        assert_eq!(toast_until(Tone::Bad, 10), u64::MAX);
+        assert_eq!(toast_until(Tone::Ok, 10), 10 + TOAST_TICKS);
+        assert_eq!(toast_until(Tone::Warn, 0), TOAST_TICKS);
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum View {
@@ -39,6 +60,7 @@ pub enum View {
     SiteDetail { node: String, id: String },
     SiteNew,
     Traffic,
+    Analytics,
     Bots,
     Explore,
     Export,
@@ -59,6 +81,7 @@ impl View {
             },
             "site-new" => View::SiteNew,
             "traffic" => View::Traffic,
+            "analytics" => View::Analytics,
             "bots" => View::Bots,
             "explore" => View::Explore,
             "export" => View::Export,
@@ -75,6 +98,7 @@ impl View {
             View::Nodes => "Nodes",
             View::Sites | View::SiteDetail { .. } | View::SiteNew => "Sites",
             View::Traffic | View::Bots | View::Explore | View::Export => "Traffic",
+            View::Analytics => "Analytics",
             View::Firewall => "Firewall",
             View::Maintenance => "Maintenance",
             View::Settings => "Settings",
@@ -86,6 +110,7 @@ impl View {
             "Nodes" => View::Nodes,
             "Sites" => View::Sites,
             "Traffic" => View::Traffic,
+            "Analytics" => View::Analytics,
             "Firewall" => View::Firewall,
             "Maintenance" => View::Maintenance,
             "Settings" => View::Settings,
@@ -94,11 +119,12 @@ impl View {
     }
 }
 
-const NAV: [&str; 7] = [
+const NAV: [&str; 8] = [
     "Overview",
     "Nodes",
     "Sites",
     "Traffic",
+    "Analytics",
     "Firewall",
     "Maintenance",
     "Settings",
@@ -165,16 +191,22 @@ pub struct Console {
     pub toast: Option<Toast>,
     pub confirm: Option<Confirm>,
     pub tick: u64,
+    // Set on every paint, so timers can stay quiet while the window is in the background.
+    pub window_active: bool,
     pub scope: Scope,
     pub overview: overview::State,
     pub nodes: nodes::State,
     pub sites: sites::State,
     pub detail: detail::State,
+    pub ops: ops::OpsState,
     pub create: create::State,
     pub traffic: traffic::State,
+    pub analytics: analytics::State,
     pub bots: bots::State,
     pub archives: storage::State,
     pub certs: certs::State,
+    pub(crate) certtools: certtools::CertToolsState,
+    pub(crate) alerts: alertspanel::AlertsState,
     pub firewall: firewall::State,
     pub maintenance: maintenance::State,
     pub settings: settings::State,
@@ -208,24 +240,30 @@ impl Console {
             toast: None,
             confirm: None,
             tick: 0,
+            window_active: true,
             scope: Scope::default(),
             overview: overview::State::default(),
             nodes: nodes::State::new(cx),
             sites: sites::State::new(cx),
             detail: detail::State::new(cx),
+            ops: ops::OpsState::new(cx),
             create: create::State::new(cx),
             traffic: traffic::State {
                 auto_inspect: opts.inspect,
                 ..traffic::State::default()
             },
+            analytics: analytics::State::new(cx),
             bots: bots::State::new(cx),
             archives: storage::State::new(cx),
             certs: certs::State::new(cx),
+            certtools: Default::default(),
+            alerts: Default::default(),
             firewall: firewall::State::new(cx),
             maintenance: maintenance::State::new(cx),
             settings: settings::State::new(cx),
         };
         console.connect();
+        console.analytics.node = console.selected.clone();
         if let View::SiteDetail { node, .. } = &mut console.view
             && node.is_empty()
         {
@@ -351,6 +389,9 @@ impl Console {
         F: Future<Output = Result<T, ClientError>> + Send + 'static,
     {
         let origin = self.origin();
+        if self.toast.as_ref().is_some_and(|t| t.tone == Tone::Bad) {
+            self.toast = None;
+        }
         self.fetch(cx, fut, move |this, res, cx| {
             let here = this.still_here(&origin);
             apply(this, res, here, &origin, cx);
@@ -385,14 +426,20 @@ impl Console {
         self.certs.unsupported = false;
         self.certs.ranges_unsupported = false;
         self.archives.list = Load::Idle;
+        self.analytics.data = Load::Idle;
+        self.analytics.node_modern.clear();
+        self.analytics.modern_any = true;
+        self.analytics.log.rows.clear();
+        self.analytics.log.cursors.clear();
+        self.analytics.log.inspect = None;
     }
 
-    // Toasts expire on the tick loop so no timer is held per message.
+    // Toasts expire on the tick loop so no timer is held per message; an error stays until it is clicked away or the next action starts.
     pub fn say(&mut self, text: impl Into<String>, tone: Tone) {
         self.toast = Some(Toast {
             text: text.into(),
             tone,
-            until: self.tick + TOAST_TICKS,
+            until: toast_until(tone, self.tick),
         });
     }
 
@@ -411,6 +458,7 @@ impl Console {
         self.detail.busy = false;
         // A key typed on the certificate panel must not outlive the visit to Settings.
         self.close_panel(cx);
+        self.certtools_close(cx);
         // Arriving on a site page starts without the error of an earlier visit.
         self.detail.error = None;
         self.detail.site_id.clear();
@@ -432,6 +480,10 @@ impl Console {
         self.certs
             .ranges_input
             .update(cx, |input, cx| input.set_text("", cx));
+        self.certtools_reset(cx);
+        self.alerts_reset(cx);
+        self.ops_reset(cx);
+        self.analytics.node = self.selected.clone();
     }
 
     pub fn select_node(&mut self, name: Option<String>, cx: &mut Context<Self>) {
@@ -450,6 +502,7 @@ impl Console {
             View::SiteDetail { node, id } => self.load_detail(node, id, cx),
             View::SiteNew => self.reset_create(cx),
             View::Traffic => self.load_traffic(cx),
+            View::Analytics => self.load_analytics(false, cx),
             View::Bots => self.load_bots(cx),
             View::Explore => self.load_explore(cx),
             View::Export => {}
@@ -463,10 +516,13 @@ impl Console {
         (self.tick / LOGO_FLIP_TICKS) % 2 == 1
     }
 
-    // Runs every half second: flips the logo colours, expires toasts and refreshes live traffic.
+    // Runs every half second: flips the logo colours, expires toasts and refreshes live data.
     fn on_tick(&mut self, cx: &mut Context<Self>) {
         self.tick += 1;
-        let mut dirty = self.tick.is_multiple_of(LOGO_FLIP_TICKS);
+        // A window in the background is not repainted for the logo.
+        let mut dirty = self.window_active && self.tick.is_multiple_of(LOGO_FLIP_TICKS);
+        self.ops_tick(cx);
+        self.analytics_tick(cx);
         if self.toast.as_ref().is_some_and(|t| t.until <= self.tick) {
             self.toast = None;
             dirty = true;
@@ -708,19 +764,32 @@ impl Console {
         }
         if let Some(toast) = &self.toast {
             let color = toast.tone.color();
-            let body = div()
+            let sticky = toast.tone == Tone::Bad;
+            let mut body = div()
+                .id("toast")
                 .absolute()
                 .bottom(px(20.))
                 .right(px(20.))
                 .max_w(px(420.))
                 .px(px(14.))
                 .py(px(10.))
+                .flex()
+                .flex_col()
+                .gap(px(4.))
                 .rounded(px(CARD_RADIUS))
                 .border_1()
                 .border_color(tint(color, 0.5))
                 .bg(c(SURFACE))
                 .text_size(px(13.))
+                .cursor_pointer()
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.toast = None;
+                    cx.notify();
+                }))
                 .child(toast.text.clone());
+            if sticky {
+                body = body.child(text_dim("Click to dismiss").text_size(px(11.)));
+            }
             out.push(deferred(body).with_priority(60).into_any_element());
         }
         out
@@ -728,7 +797,8 @@ impl Console {
 }
 
 impl Render for Console {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.window_active = window.is_window_active();
         let content = match self.view.clone() {
             View::Overview => self.render_overview(cx),
             View::Nodes => self.render_nodes(cx),
@@ -736,6 +806,7 @@ impl Render for Console {
             View::SiteDetail { .. } => self.render_detail(cx),
             View::SiteNew => self.render_create(cx),
             View::Traffic => self.render_traffic(cx),
+            View::Analytics => self.render_analytics(cx),
             View::Bots => self.render_bots(cx),
             View::Explore => self.render_explore(cx),
             View::Export => self.render_export(cx),

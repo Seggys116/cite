@@ -117,6 +117,12 @@ impl SiteEnv {
         Self { file, vars }
     }
 
+    /// Entries that override the plain process variables but still lose to the env file.
+    fn with_overlay(mut self, overlay: BTreeMap<String, String>) -> Self {
+        self.vars.extend(overlay);
+        self
+    }
+
     pub fn resolve(&self) -> Result<BTreeMap<String, String>> {
         let mut vars = self.vars.clone();
         match std::fs::read_to_string(&self.file) {
@@ -164,6 +170,8 @@ pub struct ManagerConfig {
     pub min_free_bytes: u64,
     pub max_entries: u64,
     pub build_env: SiteEnv,
+    /// Set by the node to force one build of the branch head per id.
+    pub deploy_id: Option<String>,
     pub github_api_url: String,
     pub node_major: String,
     pub runtime: RuntimeKind,
@@ -178,6 +186,115 @@ pub struct ManagerConfig {
     pub build_uid: u32,
     pub build_gid: u32,
     pub dev_same_user: bool,
+}
+
+const BUILD_ENV_JSON_MAX_KEYS: usize = 64;
+const BUILD_ENV_JSON_MAX_BYTES: usize = 12 * 1024;
+const BUILD_ENV_VALUE_MAX_BYTES: usize = 4096;
+
+/// Names the build job, its caches or the host environment set themselves, plus loader and proxy keys; compared upper-cased.
+const RESERVED_BUILD_KEYS: &[&str] = &[
+    "PATH",
+    "HOME",
+    "HOSTNAME",
+    "TERM",
+    "SHELL",
+    "USER",
+    "LOGNAME",
+    "BASH_ENV",
+    "ENV",
+    "RUST_LOG",
+    "NODE_VERSION",
+    "YARN_VERSION",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    "PNPM_HOME",
+    "NODE_OPTIONS",
+    "NODE_PATH",
+    "NODE_EXTRA_CA_CERTS",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "REQUESTS_CA_BUNDLE",
+    "CURL_CA_BUNDLE",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "NPM_CONFIG_CACHE",
+    "NPM_CONFIG_STORE_DIR",
+    "PNPM_CONFIG_STORE_DIR",
+    "COREPACK_HOME",
+    "COREPACK_ENABLE_DOWNLOAD_PROMPT",
+    "BUN_INSTALL_CACHE_DIR",
+    "YARN_CACHE_FOLDER",
+    "YARN_GLOBAL_FOLDER",
+    "YARN_ENABLE_GLOBAL_CACHE",
+    "CARGO_HOME",
+    "CARGO_TARGET_DIR",
+    "CARGO_TERM_COLOR",
+];
+
+const RESERVED_BUILD_PREFIXES: &[&str] = &["CITE_", "LD_", "DYLD_", "GIT_", "XDG_"];
+
+fn build_env_key_reserved(key: &str) -> bool {
+    let upper = key.to_ascii_uppercase();
+    RESERVED_BUILD_KEYS.contains(&upper.as_str())
+        || RESERVED_BUILD_PREFIXES
+            .iter()
+            .any(|prefix| upper.starts_with(prefix))
+}
+
+fn build_env_key_valid(key: &str) -> bool {
+    let bytes = key.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 64
+        && (bytes[0] == b'_' || bytes[0].is_ascii_uppercase())
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || *b == b'_')
+}
+
+/// Parses `CITE_BUILD_ENV_JSON`. Errors name the offending key at most and never quote a value.
+pub fn parse_build_env_json(text: &str) -> Result<BTreeMap<String, String>> {
+    let fail = |why: String| Error::Config(format!("CITE_BUILD_ENV_JSON: {why}"));
+    if text.len() > BUILD_ENV_JSON_MAX_BYTES {
+        return Err(fail(format!(
+            "larger than {BUILD_ENV_JSON_MAX_BYTES} bytes"
+        )));
+    }
+    let value: serde_json::Value =
+        serde_json::from_str(text).map_err(|_| fail("not valid JSON".into()))?;
+    let serde_json::Value::Object(map) = value else {
+        return Err(fail("must be a JSON object of NAME: value".into()));
+    };
+    if map.len() > BUILD_ENV_JSON_MAX_KEYS {
+        return Err(fail(format!("more than {BUILD_ENV_JSON_MAX_KEYS} keys")));
+    }
+    let mut vars = BTreeMap::new();
+    for (index, (key, value)) in map.into_iter().enumerate() {
+        if !build_env_key_valid(&key) {
+            return Err(fail(format!(
+                "entry {index} has a name that is not [A-Z_][A-Z0-9_]{{0,63}}"
+            )));
+        }
+        if build_env_key_reserved(&key) {
+            return Err(fail(format!("name {key} is reserved")));
+        }
+        let serde_json::Value::String(value) = value else {
+            return Err(fail(format!("value of {key} must be a string")));
+        };
+        if value.len() > BUILD_ENV_VALUE_MAX_BYTES {
+            return Err(fail(format!(
+                "value of {key} is larger than {BUILD_ENV_VALUE_MAX_BYTES} bytes"
+            )));
+        }
+        if value.chars().any(char::is_control) {
+            return Err(fail(format!("value of {key} contains control characters")));
+        }
+        vars.insert(key, value);
+    }
+    Ok(vars)
 }
 
 /// What the executor does with a `node_modules/.bin` entry that is a shell script (pnpm writes these).
@@ -298,7 +415,23 @@ impl ManagerConfig {
             check_rel_path(path)?;
         }
         let data = pick(env, &file, "CITE_DATA_DIR", "data_dir", "/var/lib/cite");
+        let json_vars = match env.get("CITE_BUILD_ENV_JSON") {
+            Some(text) if !text.trim().is_empty() => parse_build_env_json(text)?,
+            _ => BTreeMap::new(),
+        };
+        let deploy_id = match env.get("CITE_DEPLOY_ID").map(|id| id.trim()) {
+            Some(id) if !id.is_empty() => {
+                if !crate::schema::is_deploy_id(id) {
+                    return Err(Error::Config(
+                        "CITE_DEPLOY_ID must be a 26-character ULID".into(),
+                    ));
+                }
+                Some(id.to_string())
+            }
+            _ => None,
+        };
         let cfg = Self {
+            deploy_id,
             repo,
             owner,
             name,
@@ -424,7 +557,8 @@ impl ManagerConfig {
                     "build_env_file",
                     "/run/cite/build.env",
                 )),
-            ),
+            )
+            .with_overlay(json_vars),
             github_api_url: pick(
                 env,
                 &file,
@@ -1513,5 +1647,222 @@ mod tests {
         assert!(!merged.values().any(|v| v.contains("ghp_")));
         assert!(!format!("{cfg:?}").contains("https://api.example"));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn load_json(json: &str) -> Result<ManagerConfig> {
+        ManagerConfig::load_from(
+            &env(&[
+                ("CITE_REPO", "owner/name"),
+                ("CITE_BUILD_ENV_FILE", "/nonexistent/cite-build.env"),
+                ("CITE_BUILD_ENV_JSON", json),
+            ]),
+            None,
+        )
+    }
+
+    #[test]
+    fn build_env_json_is_merged_into_the_build_env() {
+        let cfg = load_json(r#"{"API_URL":"https://api.example","_X9":"1"}"#).unwrap();
+        let vars = cfg.build_env.resolve().unwrap();
+        assert_eq!(
+            vars.get("API_URL").map(String::as_str),
+            Some("https://api.example")
+        );
+        assert_eq!(vars.get("_X9").map(String::as_str), Some("1"));
+        assert!(
+            load_json("")
+                .unwrap()
+                .build_env
+                .resolve()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            load_json("  ")
+                .unwrap()
+                .build_env
+                .resolve()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            load_json("{}")
+                .unwrap()
+                .build_env
+                .resolve()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn build_env_json_limits() {
+        let many: String = (0..64)
+            .map(|i| format!("\"K{i}\":\"v\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(load_json(&format!("{{{many}}}")).is_ok());
+        let too_many = format!("{{{many},\"K64\":\"v\"}}");
+        assert!(
+            load_json(&too_many)
+                .unwrap_err()
+                .to_string()
+                .contains("64 keys")
+        );
+
+        let ok_value = "a".repeat(4096);
+        assert!(load_json(&format!("{{\"BIG\":\"{ok_value}\"}}")).is_ok());
+        let bad_value = "a".repeat(4097);
+        assert!(load_json(&format!("{{\"BIG\":\"{bad_value}\"}}")).is_err());
+
+        let padding = " ".repeat(12 * 1024);
+        let err = load_json(&format!("{{}}{padding}"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("larger than"), "{err}");
+
+        let long_key = format!("A{}", "B".repeat(63));
+        assert!(load_json(&format!("{{\"{long_key}\":\"v\"}}")).is_ok());
+        assert!(load_json(&format!("{{\"{long_key}B\":\"v\"}}")).is_err());
+    }
+
+    #[test]
+    fn build_env_json_rejects_bad_shapes_keys_and_values() {
+        for json in [
+            "[]",
+            "\"text\"",
+            "{not json",
+            r#"{"lower":"v"}"#,
+            r#"{"1ABC":"v"}"#,
+            r#"{"A-B":"v"}"#,
+            r#"{"":"v"}"#,
+            r#"{"A":1}"#,
+            r#"{"A":null}"#,
+            r#"{"A":"line\nbreak"}"#,
+            r#"{"A":"nul\u0000byte"}"#,
+            r#"{"A":"bell\u0007"}"#,
+            r#"{"A":"del\u007f"}"#,
+        ] {
+            assert!(load_json(json).is_err(), "{json}");
+        }
+    }
+
+    #[test]
+    fn build_env_json_refuses_reserved_names() {
+        for key in [
+            "CITE_GITHUB_TOKEN",
+            "CITE_X",
+            "PATH",
+            "HOME",
+            "TMPDIR",
+            "TMP",
+            "TEMP",
+            "XDG_CACHE_HOME",
+            "XDG_ANYTHING",
+            "PNPM_HOME",
+            "NPM_CONFIG_CACHE",
+            "CARGO_HOME",
+            "CARGO_TARGET_DIR",
+            "LD_PRELOAD",
+            "LD_LIBRARY_PATH",
+            "LD_AUDIT",
+            "DYLD_INSERT_LIBRARIES",
+            "NODE_OPTIONS",
+            "NODE_EXTRA_CA_CERTS",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "NO_PROXY",
+            "SSL_CERT_FILE",
+            "SSL_CERT_DIR",
+            "GIT_ASKPASS",
+            "GIT_SSH_COMMAND",
+        ] {
+            let err = load_json(&format!("{{\"{key}\":\"v\"}}"))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("reserved"), "{key}: {err}");
+        }
+        assert!(build_env_key_reserved("http_proxy"));
+        assert!(build_env_key_reserved("npm_config_cache"));
+        assert!(!build_env_key_reserved("NEXT_PUBLIC_API"));
+    }
+
+    #[test]
+    fn build_env_json_errors_never_echo_values() {
+        let secret = "s3cr3t-value-that-must-not-leak";
+        for json in [
+            format!(r#"{{"A":"{secret}\n"}}"#),
+            format!(r#"{{"LD_PRELOAD":"{secret}"}}"#),
+            format!(r#"{{"bad key":"{secret}"}}"#),
+            format!(r#"{{"A":"ok","B":["{secret}"]}}"#),
+            format!(r#"{{"A":"{secret}""#),
+            format!(r#"["{secret}"]"#),
+            format!(r#"{{"A":"{}"}}"#, secret.repeat(200)),
+        ] {
+            let err = load_json(&json).unwrap_err().to_string();
+            assert!(!err.contains(secret), "{err}");
+        }
+    }
+
+    #[test]
+    fn build_env_precedence_is_file_then_json_then_process_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("build.env");
+        std::fs::write(&file, "FROM_FILE=file\nBOTH=file\n").unwrap();
+        let cfg = ManagerConfig::load_from(
+            &env(&[
+                ("CITE_REPO", "owner/name"),
+                ("CITE_BUILD_ENV_FILE", file.to_str().unwrap()),
+                (
+                    "CITE_BUILD_ENV_JSON",
+                    r#"{"BOTH":"json","JSON_ONLY":"json","PLAIN_AND_JSON":"json"}"#,
+                ),
+                ("PLAIN_AND_JSON", "plain"),
+                ("PLAIN_ONLY", "plain"),
+                ("BOTH_PLAIN", "plain"),
+            ]),
+            None,
+        )
+        .unwrap();
+        let vars = cfg.build_env.resolve().unwrap();
+        let get = |k: &str| vars.get(k).map(String::as_str);
+        assert_eq!(get("BOTH"), Some("file"));
+        assert_eq!(get("FROM_FILE"), Some("file"));
+        assert_eq!(get("JSON_ONLY"), Some("json"));
+        assert_eq!(get("PLAIN_AND_JSON"), Some("json"));
+        assert_eq!(get("PLAIN_ONLY"), Some("plain"));
+        assert!(!vars.contains_key("CITE_BUILD_ENV_JSON"));
+    }
+
+    #[test]
+    fn build_env_json_is_never_exported_or_debug_printed() {
+        let cfg = load_json(r#"{"NOT_EXPORTED_KEY_7F":"hunter2hunter2"}"#).unwrap();
+        assert!(std::env::var("NOT_EXPORTED_KEY_7F").is_err());
+        assert!(std::env::var("CITE_BUILD_ENV_JSON").is_err());
+        let shown = format!("{cfg:?} {}", cfg.redacted_display());
+        assert!(!shown.contains("hunter2hunter2"), "{shown}");
+    }
+
+    #[test]
+    fn deploy_id_is_optional_and_must_be_a_ulid() {
+        let load = |id: Option<&str>| {
+            let mut pairs = vec![("CITE_REPO", "owner/name")];
+            if let Some(id) = id {
+                pairs.push(("CITE_DEPLOY_ID", id));
+            }
+            ManagerConfig::load_from(&env(&pairs), None)
+        };
+        assert_eq!(load(None).unwrap().deploy_id, None);
+        assert_eq!(load(Some("")).unwrap().deploy_id, None);
+        let id = "01JABCDEFGHJKMNPQRSTVWXYZ0";
+        assert_eq!(load(Some(id)).unwrap().deploy_id.as_deref(), Some(id));
+        for bad in [
+            "short",
+            "01jabcdefghjkmnpqrstvwxyz0",
+            "01JABCDEFGHJKMNPQRSTVWXYZ00",
+            "01JABCDEFGHJKMNPQRSTVWXY-0",
+        ] {
+            assert!(load(Some(bad)).is_err(), "{bad}");
+        }
     }
 }

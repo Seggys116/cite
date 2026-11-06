@@ -298,7 +298,7 @@ The `cite-edge` run covers log ingest rate, dashboard query latency over 90 days
 | [Troubleshooting](docs/troubleshooting.md) | [Orchestrator](docs/orchestrator.md) |
 | [Multiple sites](docs/multi-site.md) | [Connector API](docs/node-api.md) |
 | [Running real sites](docs/sites.md) | [Security model](docs/security-model.md) |
-| [HTTPS in front](docs/https.md) | |
+| [HTTPS in front](docs/https.md) | [Site status, logs and build settings](docs/site-status.md) |
 
 [SECURITY](SECURITY.md) describes how to report a vulnerability.
 

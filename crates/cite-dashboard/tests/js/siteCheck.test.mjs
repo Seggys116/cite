@@ -77,9 +77,11 @@ const src = { repo: 'acme/shop', branch: 'main', runtime: 'node', poll: '5m' };
 test('repository must be owner/name with allowed characters', () => {
   assert.equal(repoProblem('acme/shop'), null);
   assert.equal(repoProblem(' a.b/c_d-e '), null);
-  for (const bad of ['', 'acme', 'a/b/c', '/b', 'a/', '.a/b', 'a/..', 'a/.hidden', 'a b/c', 'https://github.com/a/b']) {
+  for (const bad of ['', 'acme', 'a/b/c', '/b', 'a/', '.a/b', 'a/..', 'a/.hidden', 'a b/c']) {
     assert.match(repoProblem(bad), /owner\/name/, bad);
   }
+  assert.equal(repoProblem('https://github.com/a/b'), null);
+  assert.equal(repoProblem('git@github.com:a/b.git'), null);
 });
 
 test('branch, runtime and poll interval are checked', () => {
@@ -90,8 +92,8 @@ test('branch, runtime and poll interval are checked', () => {
   assert.ok(branchProblem('a b'));
   assert.equal(runtimeProblem('bun'), null);
   assert.ok(runtimeProblem('python'));
-  for (const ok of ['30s', '5m', '1h']) assert.equal(pollProblem(ok), null);
-  for (const bad of ['', '5', 'm', '5 m', '5d', '-5m']) assert.ok(pollProblem(bad), bad);
+  for (const ok of ['60s', '5m', '1h', '5d', 'off', '0', '366d']) assert.equal(pollProblem(ok), null, ok);
+  for (const bad of ['', '5', 'm', '5 m', '30s', '-5m', '367d', '5w']) assert.ok(pollProblem(bad), bad);
 });
 
 test('git refs follow the deploy endpoint rule', () => {

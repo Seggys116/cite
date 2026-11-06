@@ -44,12 +44,22 @@ fn is_false(v: &bool) -> bool {
     !*v
 }
 
+// A saved analytics filter: only its name and the shareable key=value text, never a secret.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SavedPreset {
+    pub name: String,
+    pub query: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DesktopConfig {
     pub version: u32,
     #[serde(default)]
     pub nodes: Vec<DesktopNode>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub analytics_presets: Vec<SavedPreset>,
 }
 
 impl Default for DesktopConfig {
@@ -57,6 +67,7 @@ impl Default for DesktopConfig {
         Self {
             version: CONFIG_VERSION,
             nodes: Vec::new(),
+            analytics_presets: Vec::new(),
         }
     }
 }

@@ -18,7 +18,7 @@ use cite_edge::auth::{
 };
 use cite_edge::model::Site;
 use cite_edge::totp;
-use cite_edge::validate::validate_site;
+use cite_edge::validate::validate_site_strict;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -498,7 +498,7 @@ async fn deployments(
     if names.len() > MAX_NODES {
         return Err(ApiError::bad_request("too many nodes selected"));
     }
-    validate_site(&body.site).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    validate_site_strict(&body.site).map_err(|e| ApiError::bad_request(e.to_string()))?;
     let mut site = body.site;
     site.history.clear();
     let token = body

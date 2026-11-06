@@ -1,7 +1,7 @@
 mod common;
 
 use cite_connector::orchestrator::{SpecSet, StackEnv, stack_specs};
-use cite_dockerproxy::policy::Route;
+use cite_dockerproxy::policy::{MAX_BODY, Route};
 use cite_dockerproxy::target::normalise;
 use cite_edge::model::{HealthCheck, Maintenance, Site, SiteKind, Slot, Source, Upstream};
 use serde_json::{Value, json};
@@ -35,6 +35,7 @@ fn site(id: &str, runtime: &str, node_major: Option<u8>) -> Site {
             node_major,
             poll_interval: Some("10m".to_string()),
             secret: None,
+            ..Default::default()
         }),
         history: Vec::new(),
         access: Default::default(),
@@ -435,6 +436,478 @@ fn environment_is_restricted_to_known_keys() {
     denied(init(|b| b["Env"] = json!(["CITE_REPO=a/b"])));
 }
 
+fn with_entries(entries: &[String]) -> Result<(), String> {
+    manager(|b| {
+        b["Env"]
+            .as_array_mut()
+            .unwrap()
+            .extend(entries.iter().map(|e| json!(e)))
+    })
+}
+
+fn with_entry(key: &str, value: &str) -> Result<(), String> {
+    with_entries(&[format!("{key}={value}")])
+}
+
+fn refuse_all(key: &str, values: &[&str]) {
+    for value in values {
+        assert!(
+            with_entry(key, value).is_err(),
+            "{key}={value:?} was accepted"
+        );
+    }
+}
+
+fn accept_all(key: &str, values: &[&str]) {
+    for value in values {
+        if let Err(e) = with_entry(key, value) {
+            panic!("{key}={value:?} was refused: {e}");
+        }
+    }
+}
+
+// Text of exactly `total` bytes whose escaped quotes make it grow the most inside a create body.
+fn build_env_json_of(total: usize) -> String {
+    let quotes = "\"".repeat(4096);
+    let fixed = serde_json::to_string(&json!({ "A": quotes, "B": "" }))
+        .unwrap()
+        .len();
+    let rest = total - fixed;
+    let b = format!("{}{}", "\"".repeat(rest / 2), "x".repeat(rest % 2));
+    let text = serde_json::to_string(&json!({ "A": quotes, "B": b })).unwrap();
+    assert_eq!(text.len(), total);
+    text
+}
+
+#[test]
+fn every_new_build_setting_is_accepted_with_a_valid_value() {
+    accept_all("CITE_ROOT_DIR", &[".", "apps/web", "a.b_c-d/e", "./site"]);
+    accept_all(
+        "CITE_OUTPUT_DIR",
+        &["dist", "build/client", ".output/public"],
+    );
+    accept_all("CITE_SPA_FALLBACK", &["index.html", "app/200.html"]);
+    accept_all("CITE_PACKAGE_MANAGER", &["npm", "pnpm", "yarn", "bun"]);
+    accept_all("CITE_RENDERING", &["static", "ssr"]);
+    accept_all("CITE_FRAMEWORK", &["react-router", "next", "svelte-kit2"]);
+    accept_all("CITE_PRUNE", &["true", "false"]);
+    accept_all(
+        "CITE_INSTALL_COMMAND",
+        &[
+            "npm ci",
+            "pnpm install --frozen-lockfile && echo 'done' | cat",
+        ],
+    );
+    accept_all(
+        "CITE_BUILD_COMMAND",
+        &["npm run build", "cd web && npm run build > build.log"],
+    );
+    accept_all(
+        "CITE_START_COMMAND",
+        &[
+            "node build/server/index.js",
+            "react-router-serve ./build/server/index.js",
+            "node \"my server.js\" --port 8080",
+        ],
+    );
+    accept_all("CITE_DEPLOY_ID", &["01HZX3K9M2N4P5Q6R7S8T9V0WX"]);
+    accept_all(
+        "CITE_BUILD_ENV_JSON",
+        &[
+            "{}",
+            "{\"API_URL\":\"https://api.example.com\",\"FLAG\":\"1\"}",
+        ],
+    );
+}
+
+#[test]
+fn relative_path_settings_refuse_anything_that_could_leave_the_checkout() {
+    let hostile = [
+        "",
+        "/",
+        "/etc/passwd",
+        "..",
+        "../x",
+        "a/../b",
+        "a/..",
+        "a\nb",
+        "a\0b",
+        "a b",
+        "a;b",
+        "`id`",
+        "$(id)",
+        "a'b",
+        "a\"b",
+        "a\\b",
+        "a%2e%2e",
+        "~/x",
+        "\u{ff44}ist",
+        "d\u{0456}st",
+        "\u{2024}\u{2024}/x",
+    ];
+    for key in ["CITE_ROOT_DIR", "CITE_OUTPUT_DIR", "CITE_SPA_FALLBACK"] {
+        refuse_all(key, &hostile);
+        assert!(with_entry(key, &"a".repeat(255)).is_ok());
+        assert!(with_entry(key, &"a".repeat(256)).is_err());
+    }
+}
+
+#[test]
+fn choice_settings_refuse_everything_off_the_list() {
+    refuse_all(
+        "CITE_PACKAGE_MANAGER",
+        &[
+            "",
+            "NPM",
+            "npm ",
+            "npm\n",
+            "pip",
+            "bunx",
+            "npm;id",
+            "npm,pnpm",
+            "\u{ff4e}\u{ff50}\u{ff4d}",
+        ],
+    );
+    refuse_all(
+        "CITE_RENDERING",
+        &["", "SSR", "static\n", "hybrid", "ssr ", "\u{ff53}sr"],
+    );
+    refuse_all(
+        "CITE_PRUNE",
+        &[
+            "", "True", "TRUE", "1", "0", "yes", "true\n", "true ", "false;",
+        ],
+    );
+    refuse_all(
+        "CITE_FRAMEWORK",
+        &[
+            "",
+            "React",
+            "re_act",
+            "a b",
+            "a;b",
+            "$(id)",
+            "a\n",
+            "a/b",
+            "re\u{0430}ct",
+            "a.b",
+        ],
+    );
+    assert!(with_entry("CITE_FRAMEWORK", &"a".repeat(32)).is_ok());
+    assert!(with_entry("CITE_FRAMEWORK", &"a".repeat(33)).is_err());
+}
+
+#[test]
+fn deploy_ids_are_exactly_twenty_six_uppercase_characters() {
+    refuse_all(
+        "CITE_DEPLOY_ID",
+        &[
+            "",
+            "01HZX3K9M2N4P5Q6R7S8T9V0W",
+            "01HZX3K9M2N4P5Q6R7S8T9V0WXY",
+            "01hzx3k9m2n4p5q6r7s8t9v0wx",
+            "01HZX3K9M2N4P5Q6R7S8T9V0W\n",
+            "01HZX3K9M2N4P5Q6R7S8T9V0W;",
+            "01HZX3K9M2N4P5Q6R7S8T9V0W\0",
+            "\u{ff10}\u{ff11}HZX3K9M2N4P5Q6R7S8T9V0W",
+        ],
+    );
+}
+
+#[test]
+fn install_and_build_commands_refuse_control_characters_and_excess_length() {
+    for key in ["CITE_INSTALL_COMMAND", "CITE_BUILD_COMMAND"] {
+        refuse_all(
+            key,
+            &[
+                "",
+                "a\nb",
+                "a\rb",
+                "a\0b",
+                "a\tb",
+                "a\x1bb",
+                "a\x7fb",
+                "a\u{85}b",
+                "a\nrm -rf /",
+            ],
+        );
+        assert!(with_entry(key, &"a".repeat(1024)).is_ok());
+        assert!(with_entry(key, &"a".repeat(1025)).is_err());
+    }
+}
+
+#[test]
+fn start_commands_are_plain_argv_without_shell_syntax() {
+    refuse_all(
+        "CITE_START_COMMAND",
+        &[
+            "",
+            "   ",
+            "node a; id",
+            "node a && id",
+            "node a | tee x",
+            "node a > x",
+            "node a < x",
+            "node `id`",
+            "node $(id)",
+            "node $HOME",
+            "node \"$HOME\"",
+            "node (a)",
+            "node {a,b}",
+            "node *.js",
+            "node a?",
+            "node ~/x",
+            "node !x",
+            "node #x",
+            "node a\\ b",
+            "node a\nb",
+            "node a\0b",
+            "node 'unterminated",
+            "npm start",
+            "npx serve",
+            "pnpm start",
+            "yarn start",
+            "cargo run",
+            "sh -c id",
+            "bash -c id",
+            "env A=1 node x.js",
+            "/bin/sh -c id",
+            "/usr/bin/env node x.js",
+        ],
+    );
+    assert!(with_entry("CITE_START_COMMAND", &format!("node {}", "a".repeat(1019))).is_ok());
+    assert!(with_entry("CITE_START_COMMAND", &format!("node {}", "a".repeat(1020))).is_err());
+}
+
+#[test]
+fn build_environment_json_is_bounded_and_cannot_set_dangerous_variables() {
+    refuse_all(
+        "CITE_BUILD_ENV_JSON",
+        &[
+            "",
+            "[]",
+            "null",
+            "{\"A\":1}",
+            "{\"A\":null}",
+            "{\"A\":[\"x\"]}",
+            "{\"a\":\"1\"}",
+            "{\"CITE_X\":\"1\"}",
+            "{\"CITE_BUILD_UID\":\"0\"}",
+            "{\"LD_PRELOAD\":\"/tmp/x.so\"}",
+            "{\"LD_LIBRARY_PATH\":\"/tmp\"}",
+            "{\"LD_AUDIT\":\"/tmp/x.so\"}",
+            "{\"NODE_OPTIONS\":\"--require /tmp/x.js\"}",
+            "{\"NODE_EXTRA_CA_CERTS\":\"/tmp/ca.pem\"}",
+            "{\"HOME\":\"/\"}",
+            "{\"PATH\":\"/tmp\"}",
+            "{\"TMPDIR\":\"/\"}",
+            "{\"XDG_CONFIG_HOME\":\"/\"}",
+            "{\"SSL_CERT_FILE\":\"/tmp/ca.pem\"}",
+            "{\"SSL_CERT_DIR\":\"/tmp\"}",
+            "{\"HTTP_PROXY\":\"http://evil\"}",
+            "{\"HTTPS_PROXY\":\"http://evil\"}",
+            "{\"NO_PROXY\":\"*\"}",
+            "{\"ALL_PROXY\":\"http://evil\"}",
+            "{\"http_proxy\":\"http://evil\"}",
+            "{\"GIT_SSH_COMMAND\":\"sh\"}",
+            "{\"GIT_ASKPASS\":\"/tmp/x\"}",
+            "{\"PNPM_HOME\":\"/tmp\"}",
+            "{\"npm_config_registry\":\"http://evil\"}",
+            "{\"NPM_CONFIG_REGISTRY\":\"http://evil\"}",
+            "{\"A\":\"1\",\"A\":\"2\"}",
+            "{\"A\":\"line\\nbreak\"}",
+            "{\"A\":\"nul\\u0000byte\"}",
+            "{\"A\":\"1\"}\n",
+            "{\"A\":\"1\"} {\"B\":\"2\"}",
+            "{\"A\":\"1\"",
+        ],
+    );
+    let value = |n: usize| format!("{{\"A\":\"{}\"}}", "x".repeat(n));
+    assert!(with_entry("CITE_BUILD_ENV_JSON", &value(4096)).is_ok());
+    assert!(with_entry("CITE_BUILD_ENV_JSON", &value(4097)).is_err());
+    let keys = |n: usize| {
+        let items: Vec<String> = (0..n).map(|i| format!("\"K{i}\":\"v\"")).collect();
+        format!("{{{}}}", items.join(","))
+    };
+    assert!(with_entry("CITE_BUILD_ENV_JSON", &keys(64)).is_ok());
+    assert!(with_entry("CITE_BUILD_ENV_JSON", &keys(65)).is_err());
+}
+
+// The quoted literals of one `const NAME: &[&str] = &[...];` in the manager's config source.
+fn core_list(name: &str) -> Vec<String> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../cite-core/src/config.rs");
+    let source = std::fs::read_to_string(&path).expect("cite-core config source");
+    let marker = format!("const {name}: &[&str] = &[");
+    let start = source
+        .find(&marker)
+        .unwrap_or_else(|| panic!("{name} not found"))
+        + marker.len();
+    let body = &source[start..];
+    let body = &body[..body.find("];").expect("end of list")];
+    body.split('"')
+        .skip(1)
+        .step_by(2)
+        .map(str::to_string)
+        .collect()
+}
+
+#[test]
+fn build_environment_json_refuses_every_name_the_manager_reserves() {
+    let keys = core_list("RESERVED_BUILD_KEYS");
+    assert!(keys.len() >= 39, "{} keys parsed", keys.len());
+    let mut names = keys;
+    for prefix in core_list("RESERVED_BUILD_PREFIXES") {
+        names.push(format!("{prefix}EXAMPLE"));
+    }
+    for name in names {
+        for variant in [name.clone(), name.to_ascii_lowercase()] {
+            let text = format!("{{\"{variant}\":\"1\"}}");
+            assert!(
+                with_entry("CITE_BUILD_ENV_JSON", &text).is_err(),
+                "{variant} was accepted"
+            );
+        }
+    }
+}
+
+#[test]
+fn settings_the_manager_must_never_receive_stay_forbidden() {
+    for entry in [
+        "CITE_BUILD_UID=0",
+        "CITE_BUILD_GID=0",
+        "CITE_DEV_SAME_USER=1",
+        "CITE_BUILD_ENV_FILE=/etc/shadow",
+        "CITE_MAX_ARCHIVE_BYTES=1",
+        "CITE_MAX_FILES=1",
+        "CITE_MAX_FILE_BYTES=1",
+        "CITE_BUILD_TIMEOUT=1",
+        "CITE_SITE_API_URL=http://169.254.169.254",
+        "CITE_API_URL=http://evil",
+        "CITE_BUILD_DIR=/",
+        "CITE_TMP_DIR=/",
+        "CITE_HOME_DIR=/",
+        "CITE_DEPLOY_DIR=/",
+        "CITE_ROOT_DIR_EXTRA=x",
+        "cite_root_dir=x",
+        "CITE_ROOT_DIR =x",
+        "CITE_ROOT_DIR",
+    ] {
+        assert!(
+            with_entries(&[entry.to_string()]).is_err(),
+            "{entry} was accepted"
+        );
+    }
+}
+
+#[test]
+fn new_settings_are_manager_only_and_cannot_repeat() {
+    for entry in [
+        "CITE_ROOT_DIR=dist",
+        "CITE_PACKAGE_MANAGER=npm",
+        "CITE_START_COMMAND=node x.js",
+        "CITE_BUILD_ENV_JSON={}",
+        "CITE_DEPLOY_ID=01HZX3K9M2N4P5Q6R7S8T9V0WX",
+    ] {
+        denied(executor(|b| {
+            b["Env"].as_array_mut().unwrap().push(json!(entry))
+        }));
+        denied(init(|b| b["Env"] = json!([entry])));
+    }
+    denied(with_entries(&[
+        "CITE_ROOT_DIR=a".to_string(),
+        "CITE_ROOT_DIR=b".to_string(),
+    ]));
+    denied(with_entries(&[
+        "CITE_BUILD_ENV_JSON={}".to_string(),
+        "CITE_BUILD_ENV_JSON={}".to_string(),
+    ]));
+}
+
+// Every manager key at its longest value, with the characters that grow most when escaped.
+fn maximal_manager_env(build_env_json: &str) -> Vec<String> {
+    let mut start = String::from("x");
+    while start.len() + 4 <= 1024 {
+        start.push_str(" '\"'");
+    }
+    start.push_str(&"y".repeat(1024 - start.len()));
+    let long_path = "d".repeat(255);
+    let quotes = |n: usize| "\"".repeat(n);
+    let pairs: Vec<(&str, String)> = vec![
+        (
+            "CITE_REPO",
+            format!("{}/{}", "a".repeat(100), "b".repeat(100)),
+        ),
+        ("CITE_BRANCH", "c".repeat(100)),
+        ("CITE_POLL_INTERVAL", "9".repeat(16)),
+        ("CITE_NODE", "24".to_string()),
+        ("CITE_GITHUB_TOKEN", quotes(512)),
+        ("CITE_GITHUB_API_URL", max_github_url()),
+        ("CITE_DATA_DIR", "/var/lib/cite".to_string()),
+        ("CITE_RELEASES_DIR", "/var/lib/cite/releases".to_string()),
+        ("CITE_CONTROL_DIR", "/var/lib/cite/control".to_string()),
+        ("CITE_STATUS_DIR", "/var/lib/cite/status".to_string()),
+        ("CITE_STATE_DIR", "/var/lib/cite/state".to_string()),
+        ("CITE_WORK_DIR", "/var/lib/cite/work".to_string()),
+        ("CITE_CACHE_DIR", "/var/lib/cite/cache".to_string()),
+        ("CITE_SOCKET", "/run/cite/manager.sock".to_string()),
+        ("RUST_LOG", "info".to_string()),
+        ("CITE_ROOT_DIR", long_path.clone()),
+        ("CITE_OUTPUT_DIR", long_path.clone()),
+        ("CITE_SPA_FALLBACK", long_path),
+        ("CITE_PACKAGE_MANAGER", "pnpm".to_string()),
+        ("CITE_RENDERING", "static".to_string()),
+        ("CITE_FRAMEWORK", "a".repeat(32)),
+        ("CITE_PRUNE", "false".to_string()),
+        ("CITE_INSTALL_COMMAND", quotes(1024)),
+        ("CITE_BUILD_COMMAND", quotes(1024)),
+        ("CITE_START_COMMAND", start),
+        ("CITE_DEPLOY_ID", "9".repeat(26)),
+        ("CITE_BUILD_ENV_JSON", build_env_json.to_string()),
+        ("CITE_FORGE", "gitlab".to_string()),
+        ("CITE_FORGE_API_URL", max_github_url()),
+    ];
+    pairs.into_iter().map(|(k, v)| format!("{k}={v}")).collect()
+}
+
+// The longest URL the proxy's own configuration accepts.
+fn max_github_url() -> String {
+    format!("https://{}", "a".repeat(192))
+}
+
+fn create_with_env(env: &[String]) -> (usize, Result<(), String>) {
+    let url = max_github_url();
+    let policy = common::policy_with(&[
+        ("CITE_PROXY_GITHUB_API_URL", url.as_str()),
+        ("CITE_STACK_FORGE", "gitlab"),
+        ("CITE_STACK_FORGE_API_URL", url.as_str()),
+    ]);
+    let s = specs("shop", "node", Slot::Blue, true);
+    let mut body = s.manager.clone();
+    body["Env"] = json!(env);
+    let bytes = serde_json::to_vec(&body).unwrap();
+    let parsed = cite_dockerproxy::strict::parse(&bytes).unwrap();
+    let target = normalise(&format!("/v1.45/containers/create?name={}", s.manager_name)).unwrap();
+    let route = policy.classify("POST", &target).unwrap();
+    (bytes.len(), policy.validate_body(&route, &parsed))
+}
+
+#[test]
+fn the_largest_legal_create_body_fits_the_body_cap() {
+    assert_eq!(max_github_url().len(), 200);
+    let env = maximal_manager_env(&build_env_json_of(12 * 1024));
+    assert_eq!(env.len(), 29);
+    let (size, result) = create_with_env(&env);
+    result.unwrap();
+    assert!(size < MAX_BODY, "{size} bytes");
+    assert!(size > 30_000, "{size} bytes is not the worst case");
+}
+
+#[test]
+fn one_byte_more_than_the_largest_legal_build_environment_is_refused() {
+    let (_, result) = create_with_env(&maximal_manager_env(&build_env_json_of(12 * 1024 + 1)));
+    assert!(result.is_err());
+}
+
 #[test]
 fn duplicate_and_oversized_environments_are_refused() {
     denied(manager(|b| {
@@ -572,6 +1045,257 @@ fn resource_limits_are_bounded() {
         b["HostConfig"].as_object_mut().unwrap().remove("PidsLimit");
     }));
     denied(init(|b| b["HostConfig"]["Memory"] = json!(1i64 << 31)));
+}
+
+fn limits_accepted(
+    policy: &cite_dockerproxy::policy::Policy,
+    role: &str,
+    mem: i64,
+    cpus: i64,
+) -> bool {
+    let s = specs("shop", "node", Slot::Blue, true);
+    let (name, mut body) = match role {
+        "manager" => (s.manager_name.clone(), s.manager.clone()),
+        _ => (s.executor_name.clone(), s.executor.clone()),
+    };
+    body["HostConfig"]["Memory"] = json!(mem);
+    body["HostConfig"]["MemorySwap"] = json!(mem);
+    body["HostConfig"]["NanoCpus"] = json!(cpus);
+    let target = normalise(&format!("/v1.45/containers/create?name={name}")).unwrap();
+    let route = policy.classify("POST", &target).unwrap();
+    policy.validate_body(&route, &body).is_ok()
+}
+
+#[test]
+fn memory_and_cpu_follow_the_operator_bounds() {
+    const MIB: i64 = 1 << 20;
+    const GIB: i64 = 1 << 30;
+    let default = common::policy();
+    let tuned = common::policy_with_limits("32g", "12");
+    for role in ["manager", "executor"] {
+        assert!(limits_accepted(&default, role, 256 * MIB, 250_000_000));
+        assert!(limits_accepted(&default, role, 3 * GIB, 7_500_000_000));
+        assert!(limits_accepted(&default, role, 16 * GIB, 8_000_000_000));
+        assert!(!limits_accepted(&default, role, 256 * MIB - 1, 250_000_000));
+        assert!(!limits_accepted(&default, role, 256 * MIB, 249_999_999));
+        assert!(!limits_accepted(
+            &default,
+            role,
+            16 * GIB + 1,
+            8_000_000_000
+        ));
+        assert!(!limits_accepted(&default, role, 16 * GIB, 8_000_000_001));
+        assert!(!limits_accepted(&default, role, 0, 250_000_000));
+        assert!(!limits_accepted(&default, role, 256 * MIB, 0));
+        assert!(limits_accepted(&tuned, role, 32 * GIB, 12_000_000_000));
+        assert!(!limits_accepted(&tuned, role, 32 * GIB + 1, 12_000_000_000));
+        assert!(!limits_accepted(&tuned, role, 32 * GIB, 12_000_000_001));
+    }
+}
+
+fn executor_with_env(extra: &[String]) -> Result<(), String> {
+    executor(|b| {
+        b["Env"]
+            .as_array_mut()
+            .unwrap()
+            .extend(extra.iter().map(|e| json!(e)))
+    })
+}
+
+#[test]
+fn runtime_environment_json_follows_the_build_environment_rules() {
+    let ok = |text: &str| executor_with_env(&[format!("CITE_RUNTIME_ENV_JSON={text}")]);
+    ok("{}").unwrap();
+    ok("{\"API_URL\":\"https://api.example.com\"}").unwrap();
+    for bad in [
+        "",
+        "[]",
+        "{\"A\":1}",
+        "{\"a\":\"1\"}",
+        "{\"CITE_X\":\"1\"}",
+        "{\"LD_PRELOAD\":\"/tmp/x.so\"}",
+        "{\"NODE_OPTIONS\":\"--require x\"}",
+        "{\"PATH\":\"/tmp\"}",
+        "{\"GIT_ASKPASS\":\"x\"}",
+        "{\"HTTP_PROXY\":\"http://evil\"}",
+        "{\"PORT\":\"1\"}",
+        "{\"NODE_ENV\":\"development\"}",
+        "{\"HOST\":\"x\"}",
+        "{\"HOSTNAME\":\"x\"}",
+        "{\"NITRO_HOST\":\"x\"}",
+        "{\"A\":\"1\",\"A\":\"2\"}",
+        "{\"A\":\"line\\nbreak\"}",
+        "{\"A\":\"nul\\u0000byte\"}",
+    ] {
+        assert!(ok(bad).is_err(), "{bad:?} was accepted");
+    }
+    let value = |n: usize| format!("{{\"A\":\"{}\"}}", "x".repeat(n));
+    ok(&value(4096)).unwrap();
+    assert!(ok(&value(4097)).is_err());
+    assert!(
+        executor_with_env(&[
+            "CITE_RUNTIME_ENV_JSON={}".to_string(),
+            "CITE_RUNTIME_ENV_JSON={}".to_string()
+        ])
+        .is_err()
+    );
+    denied(manager(|b| {
+        b["Env"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!("CITE_RUNTIME_ENV_JSON={}"))
+    }));
+}
+
+fn executor_with_runtime_json(text: &str) -> (usize, Result<(), String>) {
+    let s = specs("shop", "node", Slot::Blue, true);
+    let mut body = s.executor.clone();
+    body["Env"] = json!([
+        "CITE_LISTEN=0.0.0.0:8080",
+        "CITE_DATA_DIR=/var/lib/cite",
+        "CITE_RELEASES_DIR=/var/lib/cite/releases",
+        "CITE_CONTROL_DIR=/var/lib/cite/control",
+        "CITE_STATUS_DIR=/var/lib/cite/status",
+        "RUST_LOG=info",
+        "CITE_NODE_BIN=/nodejs/bin/node",
+        "CITE_NODE=24",
+        format!("CITE_RUNTIME_ENV_JSON={text}"),
+    ]);
+    let bytes = serde_json::to_vec(&body).unwrap();
+    let parsed = cite_dockerproxy::strict::parse(&bytes).unwrap();
+    let target = normalise(&format!(
+        "/v1.45/containers/create?name={}",
+        s.executor_name
+    ))
+    .unwrap();
+    let policy = common::policy();
+    let route = policy.classify("POST", &target).unwrap();
+    (bytes.len(), policy.validate_body(&route, &parsed))
+}
+
+#[test]
+fn the_largest_legal_executor_body_fits_the_body_cap() {
+    let (size, result) = executor_with_runtime_json(&build_env_json_of(12 * 1024));
+    result.unwrap();
+    assert!(size < MAX_BODY, "{size} bytes");
+    assert!(size > 20_000, "{size} bytes is not the worst case");
+    let (_, result) = executor_with_runtime_json(&build_env_json_of(12 * 1024 + 1));
+    assert!(result.is_err());
+}
+
+#[test]
+fn executor_and_manager_limits_share_the_configured_bounds() {
+    const GIB: i64 = 1 << 30;
+    let tuned = common::policy_with_limits("32g", "12");
+    for (mem, cpus) in [(4 * GIB, 2_000_000_000), (2 * GIB, 2_000_000_000)] {
+        assert!(limits_accepted(&common::policy(), "manager", mem, cpus));
+        assert!(limits_accepted(&common::policy(), "executor", mem, cpus));
+    }
+    assert!(limits_accepted(
+        &tuned,
+        "executor",
+        32 * GIB,
+        12_000_000_000
+    ));
+    assert!(!limits_accepted(
+        &tuned,
+        "executor",
+        32 * GIB + 1,
+        12_000_000_000
+    ));
+    assert!(!limits_accepted(
+        &common::policy(),
+        "executor",
+        17 * GIB,
+        2_000_000_000
+    ));
+    denied(executor(|b| b["HostConfig"]["PidsLimit"] = json!(1025)));
+    assert!(executor(|b| b["HostConfig"]["PidsLimit"] = json!(1024)).is_ok());
+}
+
+#[test]
+fn forge_keys_are_accepted_only_when_equal_to_the_operator_setting() {
+    let url = "https://gitlab.example.com/api/v4";
+    let entries = |kind: &str, api: &str| {
+        vec![
+            format!("CITE_FORGE={kind}"),
+            format!("CITE_FORGE_API_URL={api}"),
+        ]
+    };
+    let check = |policy: &cite_dockerproxy::policy::Policy, extra: &[String]| {
+        let s = specs("shop", "node", Slot::Blue, true);
+        let mut body = s.manager.clone();
+        body["Env"]
+            .as_array_mut()
+            .unwrap()
+            .extend(extra.iter().map(|e| json!(e)));
+        let target =
+            normalise(&format!("/v1.45/containers/create?name={}", s.manager_name)).unwrap();
+        let route = policy.classify("POST", &target).unwrap();
+        policy.validate_body(&route, &body)
+    };
+    let set = common::policy_with(&[
+        ("CITE_STACK_FORGE", "gitlab"),
+        ("CITE_STACK_FORGE_API_URL", url),
+    ]);
+    check(&set, &entries("gitlab", url)).unwrap();
+    check(&set, &[]).unwrap();
+    for (kind, api) in [
+        ("github", url),
+        ("gitea", url),
+        ("bitbucket", url),
+        ("GitLab", url),
+        ("gitlab ", url),
+        ("", url),
+        ("gitlab", "https://evil.example.com/api/v4"),
+        ("gitlab", "https://gitlab.example.com/api/v4/"),
+        ("gitlab", "http://gitlab.example.com/api/v4"),
+        ("gitlab", "https://gitlab.example.com/api/v4\n"),
+        ("gitlab", ""),
+    ] {
+        assert!(
+            check(&set, &entries(kind, api)).is_err(),
+            "{kind:?} {api:?} was accepted"
+        );
+    }
+    assert!(
+        check(
+            &set,
+            &[
+                "CITE_FORGE=gitlab".to_string(),
+                "CITE_FORGE=gitlab".to_string()
+            ]
+        )
+        .is_err()
+    );
+    let unset = common::policy();
+    for entry in [
+        "CITE_FORGE=gitlab".to_string(),
+        format!("CITE_FORGE_API_URL={url}"),
+    ] {
+        assert!(
+            check(&unset, std::slice::from_ref(&entry)).is_err(),
+            "{entry}"
+        );
+    }
+    denied(executor(|b| {
+        b["Env"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!("CITE_FORGE=gitlab"))
+    }));
+}
+
+#[test]
+fn memory_swap_must_still_equal_memory() {
+    denied(executor(|b| {
+        b["HostConfig"]["Memory"] = json!(2i64 << 30);
+        b["HostConfig"]["MemorySwap"] = json!(4i64 << 30);
+    }));
+    denied(manager(|b| {
+        b["HostConfig"]["Memory"] = json!(2i64 << 30);
+        b["HostConfig"]["MemorySwap"] = json!(-1);
+    }));
 }
 
 #[test]

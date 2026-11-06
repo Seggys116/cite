@@ -260,13 +260,15 @@ mock_endpoint() {
 
 # Pushes one commit to the mock; the files form a complete static site that builds with node build.js and a vite dependency resolved from the repo itself.
 mock_push() {
-  local branch=$1 marker=$2 payload
-  payload=$(jq -nc --arg branch "$branch" --arg marker "$marker" '{
+  local branch=$1 marker=$2 build_js=${3:-} payload
+  # An optional third argument replaces build.js, to push a build that fails on purpose.
+  [ -n "$build_js" ] || build_js=$'const fs = require("fs");\nfs.mkdirSync("dist", { recursive: true });\nfs.copyFileSync("index.html", "dist/index.html");\n'
+  payload=$(jq -nc --arg branch "$branch" --arg marker "$marker" --arg build "$build_js" '{
     branch: $branch, message: ("e2e " + $marker), author: "e2e",
     files: {
       "package.json": "{\"name\":\"live\",\"scripts\":{\"build\":\"node build.js\"},\"dependencies\":{\"vite\":\"file:./stub\"}}",
       "stub/package.json": "{\"name\":\"vite\",\"version\":\"6.0.0\"}",
-      "build.js": "const fs = require(\"fs\");\nfs.mkdirSync(\"dist\", { recursive: true });\nfs.copyFileSync(\"index.html\", \"dist/index.html\");\n",
+      "build.js": $build,
       "index.html": ("<html>" + $marker + "</html>\n")
     }}')
   curl -fsS --max-time 15 -H "Authorization: Bearer $MOCK_TOKEN" -H 'Content-Type: application/json' \
@@ -279,6 +281,11 @@ live_get() {
 
 live_serves() {
   live_get | grep -q "$1"
+}
+
+# Reads one file from the connector config volume.
+conf_file() {
+  docker run --rm --entrypoint cat -v "${PROJECT}_cite_conf:/conf:ro" "$REGISTRY/cite-connector:$CITE_VERSION" "/conf/$1"
 }
 
 container_stopped() {
@@ -454,7 +461,7 @@ denied "unsupported API version" GET /v1.10/containers/json
 AFTER=$(docker_state)
 expect "docker state is unchanged by every denied request" "$BEFORE" "$AFTER"
 
-# The manager cannot reach GitHub, so the idle slot never gets a release: a 409 with active unchanged is the documented outcome.
+# This site's manager never gets its repository (the token is refused or GitHub is out of reach), so the connector fails the deploy early: a 409 with active unchanged is the documented outcome.
 echo "== deploy of a ref to the idle slot"
 API_TIMEOUT=240 api POST "/api/v1/sites/$SITE/deploy" '{"git_ref":"release","note":"e2e ref deploy"}'
 case $CODE in
@@ -604,6 +611,139 @@ jq_ok "rollback recorded" '.action == "rollback" and .slot == "blue"'
 wait_for "rolled back site serves the v1 build again" 120 live_serves e2e-live-v1
 BODY=$(docker inspect "$LIVE_MANAGER")
 jq_ok "blue manager still builds main" '.[0].Config.Env | any(. == "CITE_BRANCH=main")'
+
+echo "== live: node capabilities"
+api GET /api/v1/node
+jq_ok "GET /node reports capabilities" 'has("capabilities") and (.capabilities != null)'
+
+# Green still holds the v2 release from the earlier deploy. A deploy of a broken build must not promote that stale release, and the fixed rebuild must never serve it either.
+echo "== live: a failing build reports its reason and keeps the old site"
+BOOM_JS=$'process.stderr.write("e2e-build-boom\\n");\nprocess.exit(3);\n'
+mock_push main e2e-live-bad "$BOOM_JS"
+API_TIMEOUT=240 api POST "/api/v1/sites/$LIVE_SITE/deploy" '{"git_ref":"main","note":"e2e failing build","wait":true}'
+[ "$CODE" != 200 ] || fail "a deploy whose build exits non-zero was reported as success: $BODY"
+pass "failing deploy is refused (HTTP $CODE)"
+live_serves e2e-live-v1 || fail "the failed deploy changed what the live site serves"
+if live_serves e2e-live-v2; then fail "the stale v2 release was promoted by a failed deploy"; fi
+pass "the live site still serves v1 after the failed build"
+api GET "/api/v1/sites/$LIVE_SITE/status"
+code_is "status of the failed build" 200
+jq_ok "status names the failed build and keeps the live slot healthy" '(.error // "" | contains("exit status")) and .last_failure.slot == "green" and ((.slots[] | select(.slot == "blue") | .health) == "healthy")'
+jq_ok "the failed slot reports phase failed for our deploy" '(.slots[] | select(.slot == "green") | .report.phase) == "failed" and (.slots[] | select(.slot == "green") | .report.deploy.result) == "failed"'
+api GET "/api/v1/sites/$LIVE_SITE/logs?source=manager&tail=500"
+code_is "logs of the failed build" 200
+case $BODY in
+  *e2e-build-boom*) pass "logs output carries the build failure" ;;
+  *) fail "logs output does not show the build failure: $BODY" ;;
+esac
+api GET "/api/v1/sites/$LIVE_SITE"
+jq_ok "deployment history records the failure with the reason" '(.history | last) as $h | $h.action == "failed" and (($h.note // "") | contains("exit status"))'
+jq_ok "blue stays active after the failed build" '.active == "blue"'
+
+echo "== live: fixing the build command brings the site live"
+FIX_CMD="mkdir -p dist && printf '<html>e2e-live-v3</html>\\n' > dist/index.html"
+fixed=$(printf '%s' "$BODY" | jq -c --arg cmd "$FIX_CMD" 'del(.live) | .source.build_command = $cmd')
+api PUT "/api/v1/sites/$LIVE_SITE" "$fixed"
+code_is "set build_command on the site" 200
+expect "build_command is stored" "$FIX_CMD" "$(printf '%s' "$BODY" | jq -r .source.build_command)"
+live_serves e2e-live-v1 || fail "saving the build command changed the live site before any deploy"
+pass "saving the build command alone does not change the served site"
+API_TIMEOUT=240 api POST "/api/v1/sites/$LIVE_SITE/deploy" '{"git_ref":"main","note":"e2e fixed build","wait":false}'
+case $CODE in
+  200 | 202) pass "redeploy accepted (HTTP $CODE)" ;;
+  *) fail "redeploy: unexpected HTTP $CODE: $BODY" ;;
+esac
+# Served content must go from v1 straight to v3; seeing v2 means the idle slot was promoted before its rebuild.
+SEEN_V3=0
+for _ in $(seq 1 240); do
+  page=$(live_get || true)
+  case $page in
+    *e2e-live-v2*) fail "the stale v2 release was served during the rebuild" ;;
+    *e2e-live-v3*) SEEN_V3=1; break ;;
+  esac
+  sleep 1
+done
+expect "the rebuilt site is served" 1 "$SEEN_V3"
+api GET "/api/v1/sites/$LIVE_SITE"
+jq_ok "the fixed deploy was promoted to green" '.active == "green" and (.history | last | .action) == "promote"'
+api GET "/api/v1/sites/$LIVE_SITE/status"
+code_is "status after the fixed build" 200
+jq_ok "status phase is no longer failed" '.phase != "failed"'
+
+# The mock has no HTTP switch for its set_authorized flag, so a token it does not know stands in for a revoked one.
+echo "== live: per-site token"
+export CITE_GITHUB_TOKEN=$MOCK_TOKEN
+compose up -d >"$WORK/up.log" 2>&1 || fail "compose up with a node token failed: $(<"$WORK/up.log")"
+wait_api
+wait_for "HAProxy stopped restarting" 90 haproxy_settled
+login
+wait_for "site still serves v3 after the connector restart" 60 live_serves e2e-live-v3
+api GET "/api/v1/sites/$LIVE_SITE/github-token"
+code_is "read the site token state" 200
+jq_ok "the site token is in use" '.source == "site"'
+jq_ok "the token value is not returned" "tostring | contains(\"$MOCK_TOKEN\") | not"
+api PUT "/api/v1/sites/$LIVE_SITE/github-token" "$(jq -nc --arg t "$MOCK_TOKEN" '{token:$t}')"
+code_is "set a valid per-site token" 200
+api GET "/api/v1/sites/$LIVE_SITE/github-token"
+jq_ok "source is site after the set" '.source == "site"'
+BAD_TOKEN=ghp_e2eRevokedTokenNotReal000000001
+API_TIMEOUT=60 api PUT "/api/v1/sites/$LIVE_SITE/github-token" "$(jq -nc --arg t "$BAD_TOKEN" '{token:$t}')"
+case $CODE in
+  4*) pass "a token the host rejects is refused (HTTP $CODE)" ;;
+  *) fail "rejected token: expected a 4xx, got HTTP $CODE: $BODY" ;;
+esac
+printf '%s' "$BODY" | grep -qi "refused" || fail "the refusal does not say GitHub refused the token: $BODY"
+pass "the refusal says GitHub refused the token"
+api GET "/api/v1/sites/$LIVE_SITE/github-token"
+jq_ok "the rejected token was rolled back" '.source == "site"'
+expect "the rejected token was not stored" 0 "$(conf_file secrets.json | grep -c "$BAD_TOKEN" || true)"
+conf_file secrets.json | grep -q "$MOCK_TOKEN" || fail "the previous token is no longer stored after the rolled back set"
+pass "the previous token is still stored"
+api DELETE "/api/v1/sites/$LIVE_SITE/github-token"
+code_is "clear the per-site token" 200
+api GET "/api/v1/sites/$LIVE_SITE/github-token"
+jq_ok "the site falls back to the node token" '.source == "node"'
+
+echo "== live: build environment variables"
+ENV_NAME=E2E_BUILD_MARK
+ENV_VALUE=e2e-mark-7781
+api PATCH "/api/v1/sites/$LIVE_SITE/build-env" "$(jq -nc --arg n "$ENV_NAME" --arg v "$ENV_VALUE" '{set:{($n):$v}}')"
+code_is "set a build variable" 200
+api GET "/api/v1/sites/$LIVE_SITE/build-env"
+code_is "list build variables" 200
+case $BODY in
+  *"$ENV_NAME"*) pass "the variable name is listed" ;;
+  *) fail "the variable name is missing: $BODY" ;;
+esac
+case $BODY in
+  *"$ENV_VALUE"*) fail "GET build-env returned the value: $BODY" ;;
+  *) pass "GET build-env shows names only" ;;
+esac
+api GET "/api/v1/sites/$LIVE_SITE"
+ENV_CMD="echo mark-is-\$$ENV_NAME; mkdir -p dist && printf '<html>e2e-live-v4 %s</html>\\n' \"\$$ENV_NAME\" > dist/index.html"
+withenv=$(printf '%s' "$BODY" | jq -c --arg cmd "$ENV_CMD" 'del(.live) | .source.build_command = $cmd')
+api PUT "/api/v1/sites/$LIVE_SITE" "$withenv"
+code_is "set a build command that reads the variable" 200
+API_TIMEOUT=240 api POST "/api/v1/sites/$LIVE_SITE/deploy" '{"git_ref":"main","note":"e2e build env","wait":true}'
+code_is "redeploy with the variable" 200
+jq_ok "the deploy was promoted" '.action == "promote"'
+wait_for "the build output contains the variable" 60 live_serves "e2e-live-v4 $ENV_VALUE"
+api GET "/api/v1/sites/$LIVE_SITE/logs?source=manager&tail=500"
+code_is "logs of the build that used the variable" 200
+case $BODY in
+  *mark-is-*) pass "logs show the build ran with the variable" ;;
+  *) fail "logs do not show the build output: $BODY" ;;
+esac
+case $BODY in
+  *"$ENV_VALUE"*) fail "the variable value appears unredacted in the logs output" ;;
+  *) pass "the variable value is redacted in the logs output" ;;
+esac
+api GET "/api/v1/sites/$LIVE_SITE/build-env"
+case $BODY in
+  *"$ENV_VALUE"*) fail "GET build-env returned the value after a deploy: $BODY" ;;
+  *) pass "GET build-env still shows names only after a deploy" ;;
+esac
+expect "the value is not in edge.json" 0 "$(conf_file edge.json | grep -c "$ENV_VALUE" || true)"
 
 echo "== live: delete"
 api DELETE "/api/v1/sites/$LIVE_SITE"

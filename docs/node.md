@@ -6,9 +6,9 @@ This page covers installing, configuring and operating one Cite node: HAProxy pl
 
 | Service | Image | Role |
 |---|---|---|
-| `init` | `ghcr.io/seggys116/cite-connector:${CITE_VERSION:-0.3.1}` | One-shot. Creates `/conf/haproxy`, `/conf/certs` and `/conf/state` in the `cite_conf` volume owned by uid 10001, and sets the owner and mode of the `cite_run` volume at `/run/cite`, then exits. No network. |
+| `init` | `ghcr.io/seggys116/cite-connector:${CITE_VERSION:-0.4.0}` | One-shot. Creates `/conf/haproxy`, `/conf/certs` and `/conf/state` in the `cite_conf` volume owned by uid 10001, and sets the owner and mode of the `cite_run` volume at `/run/cite`, then exits. No network. |
 | `haproxy` | `docker.io/library/haproxy:3.2-bookworm` | Public listener on ports 80 and 443. Reads its config from the `haproxy` and `certs` subpaths of `cite_conf`, mounted read-only. It cannot see the connector's credentials, tokens, secrets or TLS keys. |
-| `connector` | `ghcr.io/seggys116/cite-connector:${CITE_VERSION:-0.3.1}` | Authenticated API on 7443, renders the HAProxy config, receives HAProxy's logs, runs the optional orchestrator. |
+| `connector` | `ghcr.io/seggys116/cite-connector:${CITE_VERSION:-0.4.0}` | Authenticated API on 7443, renders the HAProxy config, receives HAProxy's logs, runs the optional orchestrator. |
 
 The two containers do not share a process namespace. They share one small volume, `cite_run`, mounted at `/run/cite` in both, which holds three unix sockets: HAProxy's admin socket (`admin.sock`), the master CLI (`master.sock`, from `-S /run/cite/master.sock,level,admin` on the HAProxy command) and the log datagram socket the connector binds (`log.sock`). The directory is owned by uid 10001 with mode 0750, the admin and log sockets are mode 0600, and no admin listener exists on any network. The connector reloads HAProxy by connecting to the master socket, sending `reload` and reading the reply: `Success=1` or `Success=0` followed by the loader output. It then checks that `show info` on the admin socket reports a new pid. A config counts as applied only after that check passes, so a refused or unconfirmed reload is retried on the next apply and fails the change that caused it. If the master CLI is unreachable (HAProxy is not up yet at first boot), applying a config still succeeds with `reloaded` false and the reason in the status `last_error`. Both containers run as uid 10001 with a read-only root filesystem, `no-new-privileges` and all capabilities dropped.
 
@@ -97,7 +97,7 @@ Boolean values accept `1`, `true`, `yes`, `on`, `0`, `false`, `no`, `off`. The c
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `CITE_VERSION` | `0.3.1` | Connector image tag. |
+| `CITE_VERSION` | `0.4.0` | Connector image tag. |
 | `CITE_HTTP_PORT` | `80` | Host port for HTTP. |
 | `CITE_HTTPS_PORT` | `443` | Host port for HTTPS. |
 | `CITE_PUBLIC_BIND` | `0.0.0.0` | Host IP for the two public ports. |
@@ -115,9 +115,54 @@ Upload the certificates for your sites through the API (`/api/v1/certificates`, 
 2. Turn HTTPS on by setting `https_port` in the node settings: `PUT /api/v1/settings` with the settings object from `GET /api/v1/settings` and `"https_port": 443`. The container listens on 443 whatever the host port is (`CITE_HTTPS_PORT` only maps the host side). Uploading a certificate never changes settings; when `https_port` is unset the upload answers with a `warning` saying so.
 3. Renew with `PUT /api/v1/certificates/{id}`: the same id and name stay, the files and HAProxy are updated together, and no site config changes.
 
+You do not have to make or upload certificates by hand: the node can issue them itself, see [Issuing certificates on the node](#issuing-certificates-on-the-node).
+
 HAProxy picks the certificate for a connection by the SNI name the client sends, comparing it with each certificate's subject and alternative names, wildcards included. A client that sends no SNI, or a name no certificate matches, gets the first certificate in the directory (sorted by file name, which is the order of upload) and will usually see a name mismatch. `GET /api/v1/certificates` shows which configured site hosts are covered by some certificate so a gap is visible before a browser finds it. Each site host needs a certificate whose names match it; one certificate can cover many hosts.
 
 If you delete every certificate the connector stops rendering the HTTPS bind, because HAProxy refuses `ssl crt` on an empty directory. HTTP keeps working, `https_port` stays set, and the bind comes back with the next upload.
+
+### Automatic certificates and Cloudflare
+
+Cloudflare reaches your node in one of three ways, set in its SSL/TLS mode for the zone:
+
+| Cloudflare mode | Cloudflare to node | What the node needs |
+|---|---|---|
+| Flexible | http on port 80 | Nothing. Mark the site `access.tls: "flexible"`. |
+| Full | https on port 443, any certificate accepted (self-signed included) | Something listening on 443. The node makes a self-signed certificate for you (or make one for chosen names with `POST /api/v1/certificates/generate`). |
+| Full (strict) | https on port 443, a certificate Cloudflare trusts | A Cloudflare Origin CA or Let's Encrypt certificate. The node issues and renews either one itself (`POST /api/v1/certificates/origin-ca` or `/acme`), or you upload one. The automatic and generated self-signed ones fail here. |
+
+Without a certificate and a TLS bind, Full mode ends in a Cloudflare 521 because nothing answers on 443. To prevent that, a node with at least one site that has `access.cloudflare_only` or `access.tls: "flexible"` binds the TLS port by itself and keeps an automatic certificate for every site host that no uploaded or hand-placed certificate covers:
+
+- Port: `settings.https_port` if you set it, otherwise 443. `GET /api/v1/certificates` shows the configured value as `https_port` and the one in use as `https_effective_port`. The setting in `edge.json` is never changed by this.
+- Certificate: self-signed ECDSA P-256, valid ten years, named by the uncovered hosts of one site (the first is the common name). It is stored like an upload, as `auto-<site id>.pem` in `/conf/certs` (mode `CITE_CERTS_MODE`), and listed with `source: "auto"`, the id `auto:<site id>` and a `warning` that explains it. Browsers do not trust it.
+- It is rewritten only when the site's host set or the coverage by other certificates changes (or 30 days before it expires), and removed when the site is deleted, no longer needs it, or an uploaded certificate covers all its hosts. Uploaded certificates always take precedence. It does not count toward the limit of 64 certificates, cannot be replaced or deleted through the API (400, "automatic certificates are managed by the node"), and its key is never returned or logged.
+- A file you place by hand under an `auto-` name without the node's marker is left alone; no automatic certificate is made for that site.
+- Only Cloudflare-aware sites are affected. Automatic certificates are made for their hosts alone, never for other sites on the node. While the TLS port is the automatic one, a redirect to the node's own HTTPS (force-https and the www or apex helpers) applies only to those sites, so visitors of other sites are not sent to a self-signed certificate. Set `https_port` yourself to have such redirects apply to every site.
+- To turn the automatic listener off (for example with host networking, where another service already holds 443 and every reload would fail), set `"https_port": 0` in the node settings. The node then never binds a TLS port on its own and makes no automatic certificates; an Origin CA or uploaded certificate is not served until you set a real `https_port`. `https_effective_port` reads `null`.
+- A node with no such site and no `https_port` is unchanged: HTTP only, no automatic certificates. An explicit `https_port` on such a node binds as before and needs an uploaded certificate.
+- A change that makes HAProxy refuse the config (a failed `haproxy -c`, or a reload that cannot bind the port) is rolled back, the automatic files with it, and port 80 keeps serving the previous configuration. A bind failure is reported as "HAProxy could not bind the HTTPS port".
+
+For Flexible sites, requests that arrive over TLS on 443 are served like any other; Cloudflare still decides the scheme (`X-Forwarded-Proto` is handled as before) and no redirect is added.
+
+### Issuing certificates on the node
+
+Three routes make a certificate on the node and store it exactly like an upload (same checks, same `<id>.pem` file, `haproxy -c` and reload with rollback, replaceable and deletable). The private key is ECDSA P-256, generated on the node, and never leaves it. Details and JSON shapes are in [Connector API](node-api.md#issuing-certificates).
+
+| Route | Gives you | Cloudflare token needs | Renewed by the node |
+|---|---|---|---|
+| `POST /api/v1/certificates/generate` | Self-signed, for any names and IPs. Fine for Cloudflare Full (not strict). | No token | No (default 825 days, at most 3650) |
+| `POST /api/v1/certificates/origin-ca` | Cloudflare Origin CA certificate, trusted by Cloudflare only. Right for Full (strict) behind the proxy. | Zone, SSL and Certificates, Edit (or a legacy Origin CA key, `v1.0-...`) | Yes, when the token is stored (`remember_token: true`) |
+| `POST /api/v1/certificates/acme` | Let's Encrypt certificate, trusted by browsers, wildcards included, via a DNS-01 challenge in Cloudflare DNS. | Zone, DNS, Edit and Zone, Zone, Read on the zones of the hosts | Yes, always |
+
+Create the token in the Cloudflare dashboard under My Profile, API Tokens, with only those permissions and only the zones you need.
+
+**The token is stored on the node when renewal needs it.** An ACME certificate always stores it (renewal needs a new DNS challenge), and an Origin CA certificate stores it when you ask with `remember_token`. It goes into `secrets.json` (mode 0600) as the secret `cloudflare-token:<certificate id>`, one per certificate, so issuing a second certificate with a differently scoped token never replaces the first one's and each certificate renews with its own; certificates marked before this change fall back to the old single `cloudflare-token` secret. The API only ever reports whether a token is stored, never its value, and it is kept out of logs, errors and the audit log. Anyone who can read the `cite_conf` volume can read it, so scope the token narrowly. To stop renewals, delete the certificate (which also removes its token). A renewal never overwrites a certificate you replaced by hand while it ran; it is dropped and audited as `certificates.renew_skipped`.
+
+ACME orders run in the background because they take up to a few minutes: the route answers 202 with a job id, and `GET /api/v1/certificates/acme` lists the jobs and the managed certificates. The challenge TXT records the node creates are removed afterwards, also when the order fails. The ACME account key is made on first use and kept in `/conf/acme-account.pem` (mode 0600). Use `"staging": true` to try the flow against the Let's Encrypt staging CA first; its certificates are not trusted by browsers.
+
+Managed certificates (Origin CA and ACME) are renewed by the node 30 days before they expire (at two thirds of the lifetime for certificates shorter than 90 days), in place under the same id and name, with the usual reload and rollback. Failures are retried with a growing delay (one hour, doubling, at most a day) and shown in the job list. Uploading a certificate over a managed one with `PUT` turns renewal off for it.
+
+At most one Origin CA or ACME operation runs at a time and at most 10 start per hour; more answers 429. The node only connects to `api.cloudflare.com` and the Let's Encrypt ACME hosts, over https, without following redirects.
 
 ### Files and permissions
 

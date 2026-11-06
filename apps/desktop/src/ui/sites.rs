@@ -20,6 +20,8 @@ pub struct Row {
 pub struct Data {
     pub rows: Vec<Row>,
     pub failed: Vec<String>,
+    // True until the health pass has answered, so a dot that has not arrived is not read as "no data".
+    pub health_pending: bool,
 }
 
 pub struct State {
@@ -58,41 +60,44 @@ pub fn matches_filter(row: &Row, needle: &str) -> bool {
         || row.site.hosts.iter().any(|h| h.to_lowercase().contains(&q))
 }
 
-// Health comes from a per-site detail call because the list route omits live state.
+// Rows come from the list route alone; health arrives afterwards from one stats call per node.
 async fn node_rows(h: NodeHandle) -> (String, Result<Vec<Row>, String>) {
     let name = h.name().to_string();
-    let sites = match h.list_sites().await {
-        Ok(s) => s,
-        Err(e) => return (name, Err(e.to_string())),
-    };
-    let mut rows = Vec::new();
-    for site in sites {
-        let health = match h.get_site(&site.id).await {
-            Ok(detail) => live_for(&detail.live, &site),
-            Err(_) => Vec::new(),
-        };
-        rows.push(Row {
-            node: name.clone(),
-            site,
-            health,
-        });
+    match h.list_sites().await {
+        Ok(sites) => {
+            let rows = sites
+                .into_iter()
+                .map(|site| Row {
+                    node: name.clone(),
+                    site,
+                    health: Vec::new(),
+                })
+                .collect();
+            (name, Ok(rows))
+        }
+        Err(e) => (name, Err(e.to_string())),
     }
-    (name, Ok(rows))
 }
 
-// The live block maps each slot to its targets, so only the active slot is reported.
-pub fn live_for(live: &Option<serde_json::Value>, site: &Site) -> Vec<(String, String)> {
-    let slot = site.active.as_str();
-    live.as_ref()
-        .and_then(|l| l.get(slot))
-        .and_then(|v| v.as_array())
-        .map(|list| {
-            list.iter()
-                .map(|e| {
-                    let text =
-                        |k: &str| e.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    (text("addr"), text("status"))
-                })
+// The stats list every backend as be_<site>_<slot>; only the active slot's servers are reported, as (server, status).
+pub fn health_from_stats(stats: &serde_json::Value, site: &Site) -> Vec<(String, String)> {
+    let want = format!("be_{}_{}", site.id, site.active.as_str());
+    let text = |v: &serde_json::Value, k: &str| {
+        v.get(k)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    };
+    stats
+        .get("backends")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|list| list.iter().find(|b| text(b, "name") == want))
+        .and_then(|b| b.get("servers"))
+        .and_then(serde_json::Value::as_array)
+        .map(|servers| {
+            servers
+                .iter()
+                .map(|s| (text(s, "name"), text(s, "status")))
                 .collect()
         })
         .unwrap_or_default()
@@ -120,10 +125,45 @@ impl Console {
                     first_err.unwrap_or_default(),
                 ));
             }
-            Ok(Data { rows, failed })
+            Ok(Data {
+                rows,
+                failed,
+                health_pending: true,
+            })
         };
         self.fetch_scoped(cx, fut, |this, res, cx| {
+            let loaded = res.is_ok();
             this.sites.data = Load::from_result(res);
+            cx.notify();
+            if loaded {
+                this.load_site_health(cx);
+            }
+        });
+    }
+
+    // One stats call per node fills in every health dot; the table is already on screen by then.
+    fn load_site_health(&mut self, cx: &mut Context<Self>) {
+        let handles = self.selected_handles();
+        let fut = async move {
+            let all = join_all(
+                handles
+                    .into_iter()
+                    .map(|h| async move { (h.name().to_string(), h.haproxy_stats().await.ok()) })
+                    .collect(),
+            )
+            .await;
+            Ok::<_, cite_client::ClientError>(all.into_iter().flatten().collect::<Vec<_>>())
+        };
+        self.fetch_scoped(cx, fut, |this, res, cx| {
+            if let (Load::Ready(data), Ok(stats)) = (&mut this.sites.data, res) {
+                for row in &mut data.rows {
+                    let found = stats.iter().find(|(n, _)| *n == row.node);
+                    if let Some((_, Some(s))) = found {
+                        row.health = health_from_stats(s, &row.site);
+                    }
+                }
+                data.health_pending = false;
+            }
             cx.notify();
         });
     }
@@ -184,7 +224,12 @@ impl Console {
                     hosts
                 };
                 let dots = if r.health.is_empty() {
-                    text_dim("no data").into_any_element()
+                    text_dim(if data.health_pending {
+                        "checking"
+                    } else {
+                        "no data"
+                    })
+                    .into_any_element()
                 } else {
                     div()
                         .flex()
@@ -262,5 +307,55 @@ impl Console {
             empty_state("No sites match", "Try a different name or host.")
         };
         card(None, None, table(&cols, rows, Some(empty))).into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cite_edge::model::Slot;
+    use serde_json::json;
+
+    fn site(id: &str, active: Slot) -> Site {
+        Site {
+            id: id.into(),
+            name: id.into(),
+            hosts: Vec::new(),
+            path_prefixes: Vec::new(),
+            path_regexes: Vec::new(),
+            kind: SiteKind::Site,
+            blue: Default::default(),
+            green: Default::default(),
+            active,
+            maintenance: Default::default(),
+            health: Default::default(),
+            source: None,
+            history: Vec::new(),
+            access: Default::default(),
+        }
+    }
+
+    #[test]
+    fn health_dots_come_from_the_active_slots_backend() {
+        let stats = json!({"backends": [
+            {"name": "be_shop_blue", "servers": [{"name": "t1", "status": "UP"}, {"name": "t2", "status": "DOWN"}]},
+            {"name": "be_shop_green", "servers": [{"name": "t1", "status": "MAINT"}]},
+            {"name": "be_shop-2_blue", "servers": [{"name": "t1", "status": "UP"}]},
+        ]});
+        let blue = health_from_stats(&stats, &site("shop", Slot::Blue));
+        assert_eq!(
+            blue,
+            vec![
+                ("t1".to_string(), "UP".to_string()),
+                ("t2".to_string(), "DOWN".to_string())
+            ]
+        );
+        let green = health_from_stats(&stats, &site("shop", Slot::Green));
+        assert_eq!(green.len(), 1);
+        assert_eq!(green[0].1, "MAINT");
+        assert!(health_from_stats(&stats, &site("other", Slot::Blue)).is_empty());
+        assert!(health_from_stats(&json!({}), &site("shop", Slot::Blue)).is_empty());
+        let bare = json!({"backends": [{"name": "be_shop_blue"}]});
+        assert!(health_from_stats(&bare, &site("shop", Slot::Blue)).is_empty());
     }
 }

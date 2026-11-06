@@ -6,8 +6,10 @@ import {
 } from '../ui.js';
 import { noNodes, listOf } from './common.js';
 import {
-  RUNTIMES, NODE_MAJORS, TOKEN_TOGGLE, tokenPlan, tokenState, cleanToken,
+  TOKEN_TOGGLE, tokenPlan, tokenState, cleanToken,
 } from '../siteCheck.js';
+import { nodeInfoCached } from '../caplib.js';
+import { sourceFields } from './sourceFields.js';
 import { createVerdict, rotationFailureLines } from '../accesslib.js';
 import { PATH_TYPES } from '../conditionlib.js';
 import {
@@ -83,6 +85,7 @@ export function newSiteView(ctx) {
   let idTouched = false;
   let tokenOpen = false;
   const nodeStates = new Map();
+  const nodeInfos = new Map();
   const token = h('input', {
     class: 'input mono', type: 'password', autocomplete: 'new-password', spellcheck: 'false', 'aria-label': 'GitHub token',
     'data-lpignore': 'true', 'data-1p-ignore': 'true', 'data-bwignore': 'true',
@@ -93,7 +96,7 @@ export function newSiteView(ctx) {
   });
   const blue = targetEditor({ onChange: () => { syncTargets(); refresh(); } });
   const green = targetEditor({ onChange: () => { syncTargets(); refresh(); } });
-  const access = accessCard({ node: preferred[0] || onlineNames[0], site: null, onChange: (value) => { form.access = value; } });
+  const access = accessCard({ node: preferred[0] || onlineNames[0], site: null, siteId: () => form.id, onChange: (value) => { form.access = value; } });
   form.access = access.get();
   const err = h('p', { class: 'form-error', role: 'alert', hidden: true });
   let flow = null;
@@ -135,24 +138,11 @@ export function newSiteView(ctx) {
     return h('div', { class: 'stack-sm' }, plan.show ? null : h('p', { class: 'muted' }, plan.help), open, box);
   }
 
+  // The same field set the site page uses, built once and moved into the step each time it is shown
+  let sourceUi = null;
   function githubDetails() {
-    const runtime = h('select', { class: 'select', 'aria-label': 'Runtime', value: form.runtime }, RUNTIMES.map((r) => h('option', { value: r }, r)));
-    const major = h('select', { class: 'select', 'aria-label': 'Node major version', value: form.nodeMajor }, NODE_MAJORS.map((m) => h('option', { value: String(m) }, 'Node ' + m)));
-    const majorField = field('Node version', major);
-    majorField.hidden = form.runtime === 'rust';
-    runtime.addEventListener('change', () => {
-      form.runtime = runtime.value;
-      majorField.hidden = runtime.value === 'rust';
-      refresh();
-    });
-    major.addEventListener('change', () => { form.nodeMajor = major.value; });
-    return h('div', { class: 'form' },
-      h('div', { class: 'two-col' },
-        field('Repository', input('GitHub repository', 'repo', { placeholder: 'owner/name' }), 'GitHub owner/name, for example acme/storefront.'),
-        field('Branch', input('Branch', 'branch'))),
-      h('div', { class: 'two-col' }, field('Runtime', runtime, 'Picks the build and run images.'), majorField),
-      field('Check for new commits every', input('Poll interval', 'poll'), 'Such as 30s, 5m or 1h.'),
-      tokenPane());
+    if (!sourceUi) sourceUi = sourceFields({ form: form.src, info: nodeInfos.get(selectedNodes()[0]) || null, onChange: refresh });
+    return h('div', { class: 'form' }, sourceUi.el, tokenPane());
   }
 
   function serverDetails() {
@@ -175,7 +165,7 @@ export function newSiteView(ctx) {
     name.addEventListener('input', () => {
       // Stop deriving the id once the user edits it, since it cannot change after creation.
       if (!idTouched) {
-        id.value = slugify(name.value);
+        id.value = slugify(name.value).slice(0, 40).replace(/-+$/, '');
         form.id = id.value;
         refresh();
       }
@@ -244,6 +234,7 @@ export function newSiteView(ctx) {
     form.access = access.get();
     const bad = firstProblem(form, checkCtx());
     if (bad) {
+      if (bad.step === 1 && sourceUi) sourceUi.touchAll();
       flow.go(bad.step);
       return;
     }
@@ -285,7 +276,11 @@ export function newSiteView(ctx) {
 
   // Each node reports whether it holds a GitHub token; until it answers (or if it is an older connector) the state is unknown
   for (const name of onlineNames) {
-    nodeApi(name).get('/node').then((info) => nodeStates.set(name, tokenState(info)), () => nodeStates.set(name, 'unknown')).then(refresh);
+    nodeInfoCached(name, () => nodeApi(name).get('/node')).then((info) => {
+      nodeStates.set(name, tokenState(info));
+      nodeInfos.set(name, info);
+      if (sourceUi && name === selectedNodes()[0]) sourceUi.setInfo(info);
+    }, () => nodeStates.set(name, 'unknown')).then(refresh);
   }
 
   ctx.root.append(

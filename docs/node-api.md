@@ -89,8 +89,8 @@ TLS certificates for the node's HTTPS listener. How HAProxy uses them is in [Run
 
 | Route | Body | Response |
 |---|---|---|
-| `GET /certificates` | none | `{items:[Cert],https_port,dir_ready,uncovered_hosts}` |
-| `GET /certificates/{id}` | none | `Cert` |
+| `GET /certificates` | none | `{items:[Cert],https_port,https_effective_port,automatic,dir_ready,uncovered_hosts}` |
+| `GET /certificates/{id}` | none | `Cert` (an automatic one has the id `auto:<site id>`) |
 | `POST /certificates` | `{name,certificate,private_key}` | 201 `Cert` plus `warning` when HTTPS is off |
 | `PUT /certificates/{id}` | `{name?,certificate,private_key}` | `Cert` plus `warning` when HTTPS is off |
 | `DELETE /certificates/{id}` | none | 204 |
@@ -121,21 +121,114 @@ Checks, each failing with 400 and a message that names the problem: the body is 
 
 Every change is applied before it is acknowledged: the connector writes the file, renders the config, runs `haproxy -c` on it and reloads HAProxy. If HAProxy rejects the config (400) or does not load it (503) the file is put back as it was and the error says the change was rolled back. When HAProxy cannot be reached at all the change is kept and applied on the next reload, as for any other config change; the response then carries a `warning` and the audit entry ends in `haproxy=unreachable`.
 
-When `settings.https_port` is unset the upload succeeds and the response carries a `warning`: the certificate is stored but nothing serves it. The connector does not change settings on its own; set the port with `PUT /settings`.
+When `settings.https_port` is unset and no site has `access.cloudflare_only` or `access.tls: "flexible"`, the upload succeeds and the response carries a `warning`: the certificate is stored but nothing serves it. The connector does not change settings on its own; set the port with `PUT /settings`. When such a site exists the node binds 443 itself (`https_effective_port`) and keeps an automatic self-signed certificate (`source: "auto"`, `warning` explaining it) for each site's hosts that no other certificate covers. Those entries are read-only: `PUT` and `DELETE` on an `auto:` id answer 400 "automatic certificates are managed by the node", they are not counted in the 64 certificate limit, and `uncovered_hosts` ignores them. See [Automatic certificates and Cloudflare](node.md#automatic-certificates-and-cloudflare).
+
+A certificate the node issued itself through Cloudflare's Origin CA or Let's Encrypt also carries `managed` (`"origin-ca"` or `"acme"`) and `renew_at` (when the node renews it). Replacing it with an upload through `PUT` makes it an ordinary uploaded certificate again: `managed` disappears and the node no longer renews it.
+
+### Issuing certificates
+
+The node can make the certificate itself instead of receiving one. Every route ends in the same store path as an upload: the certificate and the key the node generated are checked like an upload, written as one `<id>.pem` file, `haproxy -c` runs and HAProxy reloads, with the same rollback, the same 64 certificate limit and the same `Cert` response. The result has `source: "api"` and a normal id, so it can be replaced and deleted like any other. Keys are ECDSA P-256, generated on the node, and never leave it or appear in a response, log or audit entry.
+
+| Route | Body | Response |
+|---|---|---|
+| `POST /certificates/generate` | `{hosts,name?,days?}` | 201 `Cert` with `warning` |
+| `POST /certificates/origin-ca` | `{hosts,name?,cloudflare_token,validity_days?,remember_token?}` | 201 `Cert` with `warning` |
+| `POST /certificates/acme` | `{hosts,email,cloudflare_token,agree_tos,name?,staging?}` | 202 `{job_id,status,staging,note}` |
+| `GET /certificates/acme` | none | `{jobs:[Job],certificates:[Managed],token_stored}` (`token_stored` is true when any token, per certificate or legacy, is stored) |
+| `GET /certificates/acme/{job_id}` | none | `Job` |
+
+`hosts` lists 1 to 32 hostnames or `*.` wildcards with the same rules as site hosts (letters, digits and `-`, labels of at most 63 characters, at most 253 in all); they are lowercased and duplicates dropped. A wildcard needs at least two labels under it (`*.example.com`, not `*.com`). `name` follows the upload name rules; without it the name is built from the first host, for example `letsencrypt shop.example.com`. Bodies are capped at 16 KiB (413 above that) and unknown fields are refused.
+
+- `generate` signs a self-signed certificate on the node. `hosts` may also hold IP addresses and single-label names here. `days` is 1 to 3650 (default 825). The `warning` starts with "Self-signed: browsers do not trust it; fine behind Cloudflare Full (not strict)."
+- `origin-ca` sends a signing request for the node's new key to Cloudflare's Origin CA (`POST https://api.cloudflare.com/client/v4/certificates`, `request_type` `origin-ecc`) and stores the certificate it returns. `validity_days` is one of 7, 30, 90, 365, 730, 1095 or 5475 (default 5475). `cloudflare_token` is an API token with the permission Zone, SSL and Certificates, Edit, sent as `Authorization: Bearer`; a legacy Origin CA key (it starts with `v1.0-`) is sent as `X-Auth-User-Service-Key` instead. The token is used for this request only unless `remember_token` is true; then it is stored on the node and used for renewals. The `warning` says which happened. Cloudflare's own error message is passed on with any copy of the token replaced by `[redacted]`; a rejected token is 400.
+- `acme` orders a Let's Encrypt certificate (`staging: true` uses the staging CA, whose certificates browsers do not trust) and proves each name with a DNS-01 challenge through the Cloudflare DNS API. `agree_tos` must be `true` (it accepts the Let's Encrypt Subscriber Agreement) and `email` is the account contact. IP addresses are refused; wildcards work because the challenge is DNS-01. The token needs Zone, Zone, Read and Zone, DNS, Edit on every zone the hosts belong to. For each name the node finds the zone (`GET /zones?name=`, most specific first), creates the `_acme-challenge` TXT record, polls the Cloudflare API until the record is listed, then asks Let's Encrypt to validate. The TXT records are deleted afterwards whether the order succeeds or fails. This takes up to a few minutes, so the route answers 202 with a `job_id` at once and the work continues in the background; poll `GET /certificates/acme/{job_id}`.
+
+**The ACME route stores the Cloudflare token.** Renewing a Let's Encrypt certificate needs a new DNS challenge, so when the certificate is issued the token is saved on the node as the secret `cloudflare-token:<certificate id>` in `secrets.json` (mode 0600, the same file as the GitHub tokens). The 202 `note` says so. Every certificate keeps its own token, so issuing another certificate with a differently scoped token never overwrites the first one's. Only names are ever reported (`token_stored`); the value is never returned, logged, put in an audit entry or shown in an error. Origin CA certificates are renewed with their own stored token, which is why `remember_token` matters there. Certificates marked as managed before tokens were kept per certificate renew with the old single secret `cloudflare-token` until they are issued again. Deleting a certificate, or replacing it by hand, removes its token.
+
+`Job` is `{id,kind,hosts,status,error?,staging,certificate_id?,not_after?,renew_at?,created_at,finished_at?}`. `kind` is `acme` for an order and `renew` for a renewal; `status` is `pending`, `issued` or `failed`. `error` explains a failure in plain text. The node keeps the last 50 jobs in memory; they are gone after a restart, the certificates are not. `Managed` is `{id,name,kind,hosts,status,not_after,renew_at,staging,error?,next_attempt?}` for every stored certificate with a `managed` marker (`kind` `acme` or `origin-ca`), where `error` and `next_attempt` describe the last failed renewal.
+
+The ACME account key is ECDSA P-256, made on first use and kept in `acme-account.pem` in the data directory (mode 0600). It is reused for every later order and renewal.
+
+**Renewal.** A background task checks once an hour (first one minute after start) and renews each managed certificate 30 days before it expires, or at two thirds of its lifetime when it is shorter than 90 days. A renewal issues a new certificate for the same names, from the same issuer (and the same CA environment for ACME), and swaps it in under the same id and name through the replace path, so HAProxy reloads with rollback and the change is audited as `certificates.renew` by `system`. A failed renewal is audited as `certificates.renew_failed`, listed as a failed `renew` job and retried after one hour, then two, four and so on up to once a day. Without a stored token the renewal fails with an error saying so.
+
+**Limits.** At most one Origin CA or ACME operation runs at a time on a node, and at most 10 start per hour; anything beyond answers 429 (the hourly limit also sets `retry_after` and the `Retry-After` header). Renewals wait for a running operation and do not count toward the hourly limit. `generate` is local and not limited.
+
+**Outbound requests.** The node only connects to `https://api.cloudflare.com` and the two Let's Encrypt ACME hosts (`acme-v02.api.letsencrypt.org`, `acme-staging-v02.api.letsencrypt.org`). Every URL, including the ones an ACME server hands back, is checked against that list before a connection opens; redirects are not followed; each request times out after 20 seconds and a response larger than 1 MiB is refused.
+
+The issuing routes are audited as `certificates.generate`, `certificates.origin_ca` and `certificates.acme` (same detail as `certificates.create`), a failed order as `certificates.acme_failed` with the job id and the error, and storing the token as `certificates.token_stored` with the secret name only.
 
 `create`, `replace` and `delete` are audited as `certificates.create`, `certificates.replace` and `certificates.delete` with the id, name, SHA-256 fingerprint and subject. A change that had to be rolled back adds `certificates.rollback` with the id. When the undo itself could not be written the entry is `certificates.rollback_failed`, and when the undo was written but HAProxy did not confirm loading it again the entry is `certificates.rollback_unconfirmed`. Rotating a zone secret is audited as `zone_secret.rotate` (site and fingerprint, never the secret) with the same three rollback outcomes as `zone_secret.rollback`, `zone_secret.rollback_failed` and `zone_secret.rollback_unconfirmed`. Firewall and site changes that were rolled back are audited as `config.rollback`, `config.rollback_failed` or `config.rollback_unconfirmed`, and a change saved while HAProxy could not be reached is `config.pending`. Start-up writes `config.migrated` when it rewrote `edge.json` (see the upgrade section in node.md).
 
+## Alerts
+
+The node watches its sites and can send a message to webhooks (Discord, Slack or a generic JSON endpoint) and to one SMTP account.
+
+| Route | Body | Response |
+|---|---|---|
+| `GET /alerts` | none | `AlertSettings` with secrets masked |
+| `PUT /alerts` | `AlertSettings` | the stored settings, masked |
+| `POST /alerts/test` | `{target}` where target is a webhook id or `email` | `{ok}` or `{ok:false,error}`; 404 for an unknown target |
+
+```json
+{
+  "enabled": true,
+  "cooldown_secs": 900,
+  "webhooks": [
+    {"id": "ops", "name": "Ops channel", "kind": "slack", "url": "https://hooks.slack.com/...", "events": ["site_unhealthy", "build_failed"]}
+  ],
+  "email": {
+    "host": "smtp.example.com", "port": 587, "tls": "starttls", "username": "alerts",
+    "password_set": true, "from": "alerts@example.com", "to": ["ops@example.com"], "events": []
+  }
+}
+```
+
+`kind` is `generic`, `discord` or `slack`. `events` is any of `site_unhealthy`, `site_recovered`, `build_failed`, `deploy_succeeded`, `cert_expiring` and `node_error`; an empty list means all of them. `tls` is `starttls` (default, port 587), `tls` (implicit TLS, usually port 465) or `none`; `none` cannot be combined with a username, so credentials never travel in the clear. `cooldown_secs` (default 900, at most 7 days) is the minimum gap between two messages for the same site and event. At most 10 webhooks and 5 recipients; ids are 1 to 32 characters from `a-z`, `0-9` and `-` (and not `email`); names are 1 to 64 characters. The body is limited to 16 KiB, and unknown fields are ignored.
+
+Secrets are write-only. Webhook URLs are returned as `https://host/...` and the SMTP password is never returned, only `password_set`. On `PUT`, a webhook whose `url` is blank or equal to the masked value keeps the URL stored for the same `id`, and a blank `password` keeps the stored one only while `host`, `port`, `tls` and `username` are unchanged (otherwise the `PUT` is refused and the password must be entered again, so a stored password is never sent to another server); a webhook with a new id needs a URL. Removing `email` deletes the stored password. Setting `username` to blank also clears the password. The settings live in `alerts.json` in the data directory (mode 0600). If that file cannot be read at start, alerts stay off, the file is left untouched and `PUT` answers 500 until it is fixed.
+
+A webhook URL must be `https://`, have no credentials and name a public host. Every send resolves the name, refuses the message if any answer is a private, loopback, link-local, carrier-grade NAT, multicast or otherwise reserved address (this includes the cloud metadata address), connects to the one address it checked, and does not follow redirects or use proxies. The same check applies to the SMTP host, so a mail relay on a private network cannot be used; point the node at a relay with a public address. Test sends and real sends share these rules.
+
+What is watched, every 30 seconds: a site must look unhealthy (or healthy again) on two checks in a row before `site_unhealthy` or `site_recovered` is sent, and a running deploy never counts as unhealthy; `build_failed` is sent when a new failed build appears and `deploy_succeeded` when a new promotion appears (history that already exists when the node starts, or when alerts are switched on, is not announced); `cert_expiring` is sent for an uploaded certificate with 14 days or fewer left, at most once per 24 hours per certificate; `node_error` is sent once when the node cannot read site status for three checks in a row. Deliveries run in the background, at most four at a time, and are retried twice with a growing delay on connection errors, timeouts, 429 and 5xx answers. Failures are logged by target id without the URL or any secret. Webhook bodies: Slack `{"text"}`, Discord `{"content"}` (cut to 1900 characters), generic `{"event","site","message","detail","at"}`. Email is plain text, base64 encoded.
+
+`PUT` is audited as `alerts.update` (whether alerts are enabled, the webhook ids and whether email is set) and a test as `alerts.test` (the target id and the result); neither entry holds a URL, a host or a password.
+
 ## Analytics
 
-`summary`, `timeseries`, `bots` and `top` accept `window` (`15m`, `1h`, `24h`, `7d`, `30d`; the default is `1h`) and optional `site`. Every route needs the bearer token, and a session token and an API token are both accepted. Storage, retention, bot scoring and the export format are described in [Analytics](analytics.md).
+`summary`, `timeseries`, `bots`, `top`, `requests`, `facets` and `compare` take one shared filter: a time range (`window` of `15m`, `1h`, `24h`, `7d` or `30d`, default `1h`, or `from` and `to`) plus any of the filters in the table below. Every route needs the bearer token, and a session token and an API token are both accepted. Storage, retention, bot scoring and the export format are described in [Analytics](analytics.md). A node that has these filters lists the capability `analytics-filters`.
 
 | Route | Response |
 |---|---|
-| `GET /analytics/summary` | `{requests,bytes_in,bytes_out,blocked,errors_4xx,errors_5xx,avg_ms,p50_ms,p95_ms,p99_ms,status:{"2xx":n,...},methods:{GET:n},content_types:{...},sizes:[{le,count}],top_paths:[{key,count,bytes}],top_ips:[...],top_user_agents:[...],top_hosts:[...],top_blocked:[...]}` |
-| `GET /analytics/timeseries` | `{step_secs,points:[{ts,requests,bytes_out,errors,blocked,avg_ms}]}` |
-| `GET /analytics/requests?limit=&status=&method=&path=&ip=&blocked=&site=` | `[LogEvent]` newest first, `limit` 1 to 1000 (default 100) |
-| `GET /analytics/bots?window=&site=` | `{total_requests,bot_requests,bot_share_pct,classes:[{key,count,bytes}],signals:[...],agents:[...],score_buckets:[...]}`. `classes` keys are `human`, `suspect`, `crawler`, `tool`, `bot`; `score_buckets` keys are `0-19`, `20-39`, `40-59`, `60-79`, `80-100`. |
-| `GET /analytics/top?kind=&window=&site=&limit=` | `{items:[{key,count,bytes}]}`. `kind` is required: `paths`, `hosts`, `referers`, `agents`, `content_types`, `statuses`, `ips` or `languages`. `limit` 1 to 1000 (default 100). An unknown `kind` is a 400. |
+| `GET /analytics/summary` | `{requests,bytes_in,bytes_out,blocked,errors_4xx,errors_5xx,avg_ms,p50_ms,p95_ms,p99_ms,status:{"2xx":n,...},methods:{GET:n},content_types:{...},sizes:[{le,count}],top_paths:[{key,count,bytes}],top_ips:[...],top_user_agents:[...],top_hosts:[...],top_blocked:[...]}` plus the fields in "Filter echo" below |
+| `GET /analytics/timeseries` | `{step_secs,points:[{ts,requests,bytes_out,errors,blocked,avg_ms}]}` plus the echo. `ts` is in seconds. With only a window and one site the step is 60 seconds up to 48 hours and 3600 beyond; any other query picks 1, 5 or 15 minutes, or 1, 6 or 24 hours, so a chart has at most about 360 points. |
+| `GET /analytics/requests?limit=&offset=&before_ts=&before_id=&envelope=` and the filter | `[LogEvent]` newest first, `limit` 1 to 1000 (default 100). The original names `status`, `method`, `path` (substring of the path), `ip`, `blocked` and `site` still work. Without `envelope=true` the answer is the bare array and `window` is ignored, as before; with it the answer is `{items,next_cursor:{before_ts,before_id}\|null,partial,scanned?,filters,from_ms?,to_ms?}`. `offset` is at most 100000; `before_ts` and `before_id` (both, from `next_cursor`) return rows strictly older and cannot be combined with `offset`. |
+| `GET /analytics/bots` | `{total_requests,bot_requests,bot_share_pct,classes:[{key,count,bytes}],signals:[...],agents:[...],score_buckets:[...]}` plus the echo. `classes` keys are `human`, `suspect`, `crawler`, `tool`, `bot`; `score_buckets` keys are `0-19`, `20-39`, `40-59`, `60-79`, `80-100`. |
+| `GET /analytics/top?kind=&sort=&limit=` and the filter | `{items:[{key,count,bytes}]}` plus the echo. `kind` is required: `paths`, `hosts`, `referers`, `agents`, `content_types`, `statuses`, `ips` or `languages`. `sort` is `count` (default) or `bytes`. `limit` 1 to 1000 (default 100). An unknown `kind` or `sort` is a 400. |
+| `GET /analytics/facets` | `{site,host,method,status_class,bot_class}`, each `[{key,count}]` with at most 50 values, biggest first, plus the echo. The counts respect every filter given, so a client can fill its pickers from the same query it charts. |
+| `GET /analytics/compare?against=previous` and the filter | `{against:"previous",current:Summary,previous:Summary,delta:{requests,bytes_in,bytes_out,blocked,errors_4xx,errors_5xx,avg_ms,p50_ms,p95_ms,p99_ms}}`. Each summary carries the echo; `previous` covers the range of equal length that ends where `current` starts (`from_ms` and `to_ms` say exactly which). Each delta is `{current,previous,abs,pct?}`, and `pct` is absent when the previous value was 0. |
+
+**Filter.** Parameters are ANDed. A list takes a comma list or a repeated parameter. An unknown parameter, a bad value or a repeated single-value parameter is a 400 that names the parameter. An empty value counts as not given (except `window` and `status`, which are 400s as before).
+
+| Parameter | Values |
+|---|---|
+| `window` | `15m`, `1h`, `24h`, `7d`, `30d`. Exclusive with `from` and `to`. |
+| `from`, `to` | Milliseconds since the epoch or RFC 3339, `from` inclusive and `to` exclusive. `to` defaults to now; `to` needs `from`; `from` must be earlier; at most 400 days. |
+| `site` | Up to 20 site ids. |
+| `host`, `path_prefix`, `path_exact` | Exact host (255 bytes), path prefix and exact path (2048 bytes). |
+| `method` | List of method tokens, case-insensitive. |
+| `status`, `status_min`, `status_max` | One status code, or an inclusive range, 100 to 599. |
+| `status_class` | List of `1xx` to `5xx`. |
+| `blocked` | `true` (blocked by any rule), `unblocked`, `rule:<id>` (one rule), or `false`, which is accepted and does not filter. |
+| `bot_class` | List of `human`, `suspect`, `crawler`, `tool`, `bot`. |
+| `min_bot_score`, `max_bot_score` | 0 to 100. |
+| `client_ip` | An address or a network such as `10.0.0.0/8` or `2001:db8::/32`. |
+| `user_agent`, `referer` | Case-insensitive substring, 3 to 64 characters; `%` and `_` match themselves. |
+| `min_duration_ms` | Total time of at least this many milliseconds. |
+| `content_type` | Case-insensitive prefix of the response content type, 2 to 64 characters. |
+
+There is no `country` filter because the node does not record one; it is a 400 like any unknown name.
+
+**Filter echo.** Every answer except the bare request list adds `filters` (the filter as applied, with lists as arrays and a network in its masked form), `partial`, `scanned` (raw rows examined; absent when rollups answered), `from_ms` and `to_ms` (the range actually used; rollup answers cover whole minutes or hours, so they can be wider than asked), and `source` (`rollup_minute`, `rollup_hour` or `raw`). A query with only a time range and at most one site is answered from the rollups. Anything else reads raw rows, examines at most 5,000,000 of them newest first, and reports `partial: true` with the cut `from_ms` when the range held more; for the request list, `next_cursor` then resumes below that cut.
 | `GET /analytics/stats` | `{rows,db_bytes,oldest_ts_ms,newest_ts_ms,write_batches,write_errors,retention_days,archive_before_delete,max_bytes,ingest_stalls}`. The two timestamps are `null` for an empty database, and `max_bytes` is `null` when no size cap is set. `retention_days` 0 means rows are kept forever. `ingest_stalls` counts the times the log receiver waited on the database writer. |
 | `GET /analytics/archives` | `{items:[{name,kind,bytes,created_ms,sha256,rows,from_ms,to_ms}],dir_bytes}`, newest first. `kind` is `archive` or `backup`; `from_ms` and `to_ms` are the oldest and newest request in the file, `null` for an empty backup. `dir_bytes` is everything in the archive directory. |
 | `POST /analytics/backup` | No body. Writes a consistent copy of the database and returns its item. |

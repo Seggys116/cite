@@ -1,3 +1,4 @@
+pub mod alerts;
 pub mod allow;
 pub mod analytics;
 pub mod auth;
@@ -12,5 +13,6 @@ pub mod presets;
 pub mod ratelimit;
 pub mod render;
 pub mod runtime;
+pub mod status;
 pub mod totp;
 pub mod validate;

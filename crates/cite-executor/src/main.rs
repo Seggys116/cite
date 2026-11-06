@@ -6,7 +6,7 @@ use std::net::SocketAddr;
 use std::process::ExitCode;
 
 use cite_core::{ExecutorConfig, Result};
-use cite_executor::{RunningExecutor, init_logging, spawn};
+use cite_executor::{RunningExecutor, init_logging, spawn_with_env};
 use tokio::signal::unix::{SignalKind, signal};
 
 #[tokio::main]
@@ -41,13 +41,15 @@ async fn main() -> ExitCode {
 
 async fn run_daemon() -> Result<()> {
     let config = ExecutorConfig::load()?;
-    let redactor = cite_executor::runtime_redactor(&config);
+    let user_env = cite_executor::load_user_env(&config)?;
+    let mut redactor = cite_executor::runtime_redactor(&config);
+    cite_executor::add_user_secrets(&mut redactor, &user_env);
     init_logging(redactor);
     if let Some(limit) = cite_executor::raise_nofile_limit() {
         tracing::debug!(limit, "open file limit");
     }
 
-    let mut running: RunningExecutor = spawn(config).await?;
+    let mut running: RunningExecutor = spawn_with_env(config, user_env).await?;
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut sigint = signal(SignalKind::interrupt())?;
     tokio::select! {

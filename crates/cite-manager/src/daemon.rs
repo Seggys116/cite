@@ -52,7 +52,9 @@ pub async fn run_daemon(cfg: ManagerConfig) -> Result<()> {
         tokio::spawn(async move {
             d.validate_github_with_backoff().await;
             let _guard = gate.lock().await;
-            d.maybe_first_boot_deploy().await;
+            if d.run_pending_deploy_id().await.is_none() {
+                d.maybe_first_boot_deploy().await;
+            }
         });
     }
 

@@ -70,6 +70,8 @@ Below the traffic charts, the Traffic view adds the panels below. All of them fo
 | Analytics storage | Rows stored, database size, oldest and newest request, the retention in force and the write counters. A non-zero write error count is flagged. A node that predates these statistics shows a note instead. |
 | Live requests | Each row gains a bot class badge and a score. Opening a request shows the bot analysis (class, score, signals as chips) and every captured header: HTTP and TLS version, Accept, Accept-Language, Accept-Encoding, Sec-Fetch-Site, Sec-Fetch-Mode, Sec-Fetch-Dest, Sec-CH-UA and the backend response time. |
 
+The dashboard server relays only these analytics reads to a node: `summary`, `timeseries`, `requests`, `bots`, `top`, `facets`, `compare`, `stats` and `export`, all as `GET`. The query string, including long filter lists, is passed to the node unchanged, so every filter in [Analytics](analytics.md#filtering) works through the console.
+
 Bot detection reads the request headers first and the user agent second, and the score from 0 to 100 is a heuristic. A bot that copies a browser's headers can score low, and an unusual browser can score high, so treat the classes as a guide and not as proof. Each class keeps one colour across the badge, the bars and the chart, in both the light and dark themes, and the class name is always written out.
 
 Export opens a dialog with the following choices.
@@ -117,10 +119,11 @@ GitHub fields:
 
 | Field | Notes |
 |---|---|
-| Repository | `owner/name`: two parts of letters, digits, dot, underscore or dash, none starting with a dot. |
-| Branch | Defaults to `main`. |
+| Repository | `owner/name`, or a pasted address: `https://github.com/owner/name`, with `.git` or a trailing slash, `https://www.github.com/...`, `.../tree/<branch>`, `git@github.com:owner/name.git`, `ssh://git@github.com/owner/name.git` or `github.com/owner/name`. It is reduced to `owner/name` when the field loses focus and a line below shows what will be stored. A `/tree/<branch>` address offers a button to use that branch and never changes the branch silently. An address with a user name and password or token is refused, without repeating it. For a host other than GitHub the note depends on the node: with the `forges` capability it says the node fetches from its configured forge API (the host `GET /node` reports as `github.api_host`), otherwise that the node only fetches from GitHub. |
+| Branch | Defaults to `main`. Checked like a git branch name: no `..`, `//`, `@{`, `~^:?*[` or backslash, no leading `-` or `/`, no trailing `/`, `.` or `.lock`. |
 | Runtime | `node`, `bun`, `static` or `rust`. Every runtime except `rust` also takes a Node version, 22 or 24. |
-| Poll interval | Defaults to `5m`. A number followed by `s`, `m` or `h`. |
+| Poll interval | Defaults to `5m`. `off` (or `0`) checks only when you deploy; otherwise a number and a unit (`ms`, `s`, `m`, `h`, `d`) from 60 seconds to 366 days. |
+| Build settings | Folded behind "Show build settings", the same fields as the Build tab of the site page (below), all optional and on Auto. |
 
 The GitHub path never mentions upstreams, blue or green. The console sends empty slots, because the connector provisions the stack for the live slot, and sets `source` from the fields above.
 
@@ -140,17 +143,39 @@ The connector accepts `github_token` only for a site with a `source`. In `each` 
 
 On a site with a `source`, the overview tab lists the repository, branch, runtime and poll interval, and the Deploy new version panel asks for a Git ref (a branch, tag or commit sha, up to 100 characters of letters, digits, dot, underscore, dash and slash, not starting with a dash or containing `..`) instead of targets. It posts `{git_ref, note}` to the node's `/sites/{id}/deploy`.
 
+## The site page
+
+A site page has these tabs: Overview, Deployments, Build, Logs, Settings, Maintenance and Danger zone. Build and Logs are for sites the node builds from a repository, and each appears only when the node lists the matching capability in `GET /node` (`source-build`, `site-logs`). Other controls are gated the same way (`site-status`, `site-github-token`, `site-build-env`, `site-runtime-env`, `deploy-async`, `cert-generate`, `cert-origin-ca`, `cert-acme`, `alerts`, `forges`). A node that lists nothing, such as an older connector, simply shows fewer controls. The full guide is [Site status, logs and build settings](site-status.md).
+
+**Status panel.** On Overview and Build. A chip shows the phase: fetching, building, packing, promoting, idle, failed, or unhealthy (idle, but the live slot is not passing its health check). While the manager works the chip pulses and the panel refreshes every 2 seconds; otherwise every 10 seconds. A failed or unhealthy site shows a red banner with the node's reason and a Copy reason button, and a Redeploy button. A "Changes not built yet" badge shows when the node reports `settings_current: false`. A table lists each slot with its container, health, phase, commit, last build time and restarts, with out-of-memory and exit codes when present. Polling runs only while the panel is on the page and the browser tab is visible, and an overlapping request is never started.
+
+**Logs.** Manager (build) and Executor (running site) tabs, a slot picker, and a Follow switch. The first request asks for the last 300 lines; later requests send the `since` cursor from the previous answer, so only new lines are fetched, every 2 seconds, and only while the tab is visible and Follow is on. The viewer keeps the newest 5000 lines, removes terminal colour codes, colours error, warning and debug lines, searches as you type (matches are marked with elements, never markup built from log text), filters by level, and copies what is shown. The node masks secrets before they reach the log.
+
+**Build settings (Build tab).** Every field the node accepts in `source`: repository (pasted addresses are normalised), branch, runtime, Node version, poll interval, root directory, package manager, install command, build command, output directory, rendering, start command, SPA fallback file, framework and prune. There is no per-site forge field: the forge is set for the whole node by the operator (`CITE_STACK_FORGE`), and the node refuses a site that names one. A field left empty is Auto and shows what the manager detected, for example "Auto (detected: pnpm)". Each field is checked with the node's rules as you type (relative paths without `..`, one-line commands up to 1024 bytes, a start command without shell characters that does not begin with a package manager, shell or env, and not with static rendering). Unsaved changes are flagged and Save stays off until the form is valid. After a save that changes how the site is built (anything but the poll interval) the console asks every time: "This change needs a rebuild", with Redeploy now and Later.
+
+**Environment variables.** Build and runtime variables list names only. A value can be typed for a new variable or to replace one, is kept in the page until you save, and is dropped when the node has it, when you discard, and when you leave the page. Names are capital letters, digits and underscores; the names the node reserves (`PATH`, `HOME`, `NODE_OPTIONS`, `LD_*`, `GIT_*`, `NPM_CONFIG_*`, `XDG_*`, `CITE_*`, proxy settings and a few more) are refused, a value is one line up to 4096 bytes, a site holds at most 64 and a change is at most 12 KiB. Saved variables apply on the next build.
+
+**GitHub token.** The card says whether the site uses its own token, the node token or none, and whether the git host accepted it. A token is typed into a write-only box, sent once and the box is emptied at once; the node tests it before storing it. "Use the node token" removes the site token.
+
+**Deployments.** Each history row shows its note (a failure's reason in red, in full), commit and actions: Redeploy for the live release and for failed attempts, Deploy this commit for an earlier release whose commit is known, and Roll back (disabled when there is no earlier release on the other slot). With the `deploy-async` capability a deploy returns at once with a `deployment_id` and is followed in the Status panel; a failed deploy shows the node's whole message in a toast and under the form.
+
+**Settings.** Everything the node accepts in `PUT /sites/{id}` besides the source: name, kind, hosts, path prefixes and regexes, the health check (path, interval 100 to 60000 ms, timeout 100 to 10000 ms and not above the interval, rise and fall 1 to 10), and the Access card. Each field shows its own error, an "Unsaved changes" badge appears, and Save stays off until the form is valid and changed. The create wizard uses the same field components as the Build tab.
+
+**Sites list.** A site that failed its last deploy, or whose live targets fail their health check, shows "Needs attention" and the reason under its name (the full text is the tooltip). Details are fetched once per site and reused while you filter.
+
+Alerts are under Settings, Alerts, shown only for a node with the `alerts` capability.
+
 ## Access
 
 The Access card appears in the create form and on the Routing tab of a site. It stores `access` on the site as `{"cloudflare_only": bool, "tls": "full" | "flexible"}`. The console leaves `access` out of the request while it holds the default (off, Full) and the site has none, so a node that predates the field never receives it.
 
 | Setting | Meaning |
 |---|---|
-| Only allow traffic through the Cloudflare proxy | `cloudflare_only`. Visitors must come through Cloudflare (orange cloud on); direct requests to your server address are refused. You do not need to create any Cloudflare rule for this, and turning it on alone never asks for a rule, a secret or a header. The addresses come from the node's Cloudflare ranges, shown below the toggle with their source (built-in or custom) and date. |
-| Certificate on the node | `tls` of `full`. Visitors and Cloudflare connect over HTTPS, so the node needs a certificate that covers the host. |
-| Cloudflare handles HTTPS (no certificate on the node) | `tls` of `flexible`. Cloudflare serves the certificate to visitors and talks plain http to your server, so no certificate is needed on the node. Pair it with the option above. |
+| Only allow traffic through the Cloudflare proxy | `cloudflare_only`. "When on, requests that do not arrive from Cloudflare's network are refused. Turn it on only for sites that are proxied by Cloudflare (orange cloud)." The text does not suggest that every site is routed through Cloudflare, and turning the option on alone never asks for a rule, a secret or a header. The addresses come from the node's Cloudflare ranges, shown below the toggle with their source (built-in or custom) and date. |
+| Full (the node serves its own certificate) | `tls` of `full`. Visitors, or Cloudflare, connect over HTTPS and the node answers with its own certificate. Create or upload one under Settings, Certificates. |
+| Flexible SSL (Cloudflare serves HTTPS to visitors and talks to your server over plain http) | `tls` of `flexible`. No certificate is needed on the node. It can be chosen without the option above. |
 
-Choosing Cloudflare handles HTTPS without the first option only shows a warning on the card: anyone who reaches the node directly is then served over plain http. The warning does not block saving.
+Choosing Flexible SSL without the proxy option shows a note on the card and does not block saving: without that option anyone can reach the server directly over plain http, with no encryption.
 
 Settings, Cloudflare shows the active list for the selected node, with its source, date and count. The override box takes one CIDR range per line, IPv4 or IPv6. A bare address counts as a single host (`/32` or `/128`). The console applies the node's width rules before saving: IPv4 ranges must be `/12` or narrower, IPv6 ranges `/28` or narrower, `/0` is refused as trusting every address, and an IPv6 range that overlaps `::ffff:0:0/96`, `::/96`, `2002::/16` or `64:ff9b::/96` is refused because it would also match IPv4 clients (an IPv4-mapped address such as `::ffff:198.51.100.0/120` is read as the IPv4 range). Octets and prefix lengths with leading zeros (`010.0.0.1`, `/08`) are refused, as the node refuses them. Lines that are not addresses or ranges are refused, and up to 256 ranges are allowed. Save ranges writes `cloudflare_ranges` through `PUT /settings`; an empty box, or Use built-in list, saves an empty list so the node falls back to its built-in one. A wrong custom list locks real visitors out of sites that only accept Cloudflare traffic, so use it only when Cloudflare publishes ranges the node does not know yet.
 
@@ -161,6 +186,8 @@ The Access card also holds two settings that are stored in the same `access` obj
 | Setting | Meaning |
 |---|---|
 | Bot policy | `bots`: Allow all bots (default), Block scraper and tool bots (`block_bad`) or Block all bots including search engines (`block_all`). The last choice shows a warning that search engines, link previews and uptime monitors are blocked too. A note on the card says user-agent matching can be faked and that blocked requests still appear in analytics. |
+
+With Allow, the card says "No bot blocking is active for this site" instead of presenting the choice as protection. It then lists every firewall rule of the node that looks at user agents and applies to the site, whether it is for all sites or scoped to this one, with its action and patterns, and marks a rule that is switched off. That is where a bot could still be blocked, for example the Scanners preset.
 | Also require that requests come from MY Cloudflare account (advanced) | `zone_lock`. It sits in a folded "advanced" section that opens by itself only when the site already uses it, so the plain option above never mentions rules or secrets. The checkbox is enabled only while Only allow traffic through the Cloudflare proxy is on, and turning that off clears it. The edge then refuses requests that lack the site's secret header `X-Cite-Origin-Secret`. |
 
 The node generates the zone secret and returns it only from `POST /sites/{id}/zone-secret`. After you save a site whose zone lock was off and is now on (in the create form, once per node the site was created on, even when other nodes failed: the error then lists the failed nodes and says the secret for the others is shown in the dialog), the console calls that route and shows the secret in a dialog: the header name, the secret with a copy button, the secret's fingerprint and date, and numbered Cloudflare steps (Rules, Transform Rules, Modify Request Header, Set static header). The dialog warns that the secret is not shown again. It has no close icon and ignores Escape and clicks outside; it closes only with the I have saved it button, which asks for confirmation first if Copy was never pressed. Closing it empties the text and drops the copies held by the page. The secret is not written to storage, the address or any log.
@@ -217,5 +244,20 @@ A note above the table lists site hosts that no certificate covers. Visitors to 
 ## How the console talks to connectors
 
 The browser only ever talks to the dashboard server's `/api/v1`. The server holds each node's token and forwards `/nodes/{node}/...` to the matching connector route. Other routes handle login (`POST /session`), first-run setup (`POST /setup`, `POST /setup/confirm`), a summary across nodes (`GET /nodes/summary`) and placing a site on several nodes (`POST /deployments` with `mode` of `each` or `replicate`). Details and request shapes are in [Connector API](node-api.md).
+
+Beyond the generic prefixes, these routes are exact (method, route) pairs, need the session's CSRF token for writes, and have their own body caps:
+
+| Route | Methods | Cap |
+|---|---|---|
+| `sites/{id}/status`, `sites/{id}/logs` | GET | |
+| `sites/{id}/github-token` | GET, PUT, DELETE | PUT 1 KiB |
+| `sites/{id}/build-env`, `sites/{id}/runtime-env` | GET, PATCH | PATCH 64 KiB |
+| `sites/{id}/deploy` | POST (`wait: false` answers at once) | usual |
+| `certificates/generate`, `certificates/origin-ca`, `certificates/acme` | POST | 16 KiB |
+| `certificates/acme`, `certificates/acme/{job}` | GET | |
+| `alerts` | GET, PUT | PUT 64 KiB |
+| `alerts/test` | POST | 1 KiB |
+
+The site id and the ACME job id are checked, the answers for status, logs, token, certificate issuing and alerts are sent with `Cache-Control: no-store`, and the long timeout used for deploys also applies to the token and ACME writes. `PATCH` is refused everywhere except the two environment routes.
 
 Connectors still enforce their own rules: the source allowlist, TLS and token check apply to the dashboard server as they would to any client. See [Security model](security-model.md).

@@ -12,6 +12,10 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
+use crate::analytics::{
+    AnalyticsQuery, BotReport, Compare, Facets, RequestCursor, RequestsPage, SummaryReport,
+    TimeseriesReport, TopReport, TopSort, limit_pair, page_pairs,
+};
 use crate::archive::{
     ArchiveEntry, ArchiveList, CutReport, CutRequest, RestoreReport, archive_download_name,
     archive_kind_from_name, validate_archive_name,
@@ -26,6 +30,10 @@ use crate::export::{
     AnalyticsStats, EXPORT_TIMEOUT, ExportQuery, ExportReport, ExportStream, validate_top_kind,
 };
 use crate::firewall::{BulkResult, FirewallBulk};
+use crate::site_ops::{
+    CloudflareToken, DeployAccepted, EnvKind, EnvNames, EnvPatch, GithubTokenBody, LogsQuery,
+    TokenStatus, validate_job_id,
+};
 use crate::zone::{ZoneSecret, ZoneSecretStatus, validate_site_id};
 
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -63,6 +71,9 @@ pub struct GithubInfo {
     /// "env", "file" or "none".
     #[serde(default)]
     pub source: String,
+    /// The forge API host the node fetches from, when it reports one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_host: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -71,6 +82,9 @@ pub struct NodeInfo {
     pub name: String,
     #[serde(default)]
     pub version: String,
+    /// Feature names the connector supports; empty on connectors that predate the list.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
     /// Absent on connectors that predate the node-level token.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub github: Option<GithubInfo>,
@@ -694,6 +708,58 @@ impl NodeClient {
         Ok(wrapped.items)
     }
 
+    pub async fn analytics_summary_q(&self, q: &AnalyticsQuery) -> Res<SummaryReport> {
+        self.json(Method::GET, "/analytics/summary", &q.pairs()?, None)
+            .await
+    }
+
+    pub async fn analytics_timeseries_q(&self, q: &AnalyticsQuery) -> Res<TimeseriesReport> {
+        self.json(Method::GET, "/analytics/timeseries", &q.pairs()?, None)
+            .await
+    }
+
+    pub async fn analytics_bots_q(&self, q: &AnalyticsQuery) -> Res<BotReport> {
+        self.json(Method::GET, "/analytics/bots", &q.pairs()?, None)
+            .await
+    }
+
+    pub async fn analytics_top_q(
+        &self,
+        kind: &str,
+        q: &AnalyticsQuery,
+        limit: Option<usize>,
+        sort: TopSort,
+    ) -> Res<TopReport> {
+        let mut query = q.pairs()?;
+        query.push(("kind", validate_top_kind(kind)?.to_string()));
+        query.extend(limit_pair(limit)?);
+        query.push(("sort", sort.as_str().to_string()));
+        self.json(Method::GET, "/analytics/top", &query, None).await
+    }
+
+    // Always asks for the envelope so the page carries its cursor and the partial flag.
+    pub async fn analytics_requests_q(
+        &self,
+        q: &AnalyticsQuery,
+        limit: Option<usize>,
+        cursor: Option<&RequestCursor>,
+    ) -> Res<RequestsPage> {
+        let mut query = q.pairs()?;
+        query.extend(page_pairs(limit, cursor)?);
+        self.json(Method::GET, "/analytics/requests", &query, None)
+            .await
+    }
+
+    pub async fn analytics_facets(&self, q: &AnalyticsQuery) -> Res<Facets> {
+        self.json(Method::GET, "/analytics/facets", &q.pairs()?, None)
+            .await
+    }
+
+    pub async fn analytics_compare(&self, q: &AnalyticsQuery) -> Res<Compare> {
+        self.json(Method::GET, "/analytics/compare", &q.pairs()?, None)
+            .await
+    }
+
     pub async fn analytics_stats(&self) -> Res<AnalyticsStats> {
         self.json(Method::GET, "/analytics/stats", &[], None).await
     }
@@ -882,6 +948,225 @@ impl NodeClient {
             .await?;
         serde_json::from_slice(&bytes)
             .map_err(|_| ClientError::Decode("malformed zone secret response".into()))
+    }
+
+    pub async fn site_status(&self, site_id: &str) -> Res<Value> {
+        let id = validate_site_id(site_id)?;
+        self.json(
+            Method::GET,
+            &format!("/sites/{}/status", enc(id)),
+            &[],
+            None,
+        )
+        .await
+    }
+
+    pub async fn site_logs(&self, site_id: &str, query: &LogsQuery) -> Res<Value> {
+        let id = validate_site_id(site_id)?;
+        let params = query.to_query()?;
+        self.json(
+            Method::GET,
+            &format!("/sites/{}/logs", enc(id)),
+            &params,
+            None,
+        )
+        .await
+    }
+
+    pub async fn github_token_status(&self, site_id: &str) -> Res<TokenStatus> {
+        let id = validate_site_id(site_id)?;
+        self.json(
+            Method::GET,
+            &format!("/sites/{}/github-token", enc(id)),
+            &[],
+            None,
+        )
+        .await
+    }
+
+    pub async fn github_token_set(
+        &self,
+        site_id: &str,
+        token: &GithubTokenBody,
+    ) -> Res<TokenStatus> {
+        let id = validate_site_id(site_id)?;
+        let bytes = self
+            .exec(
+                Method::PUT,
+                &format!("/sites/{}/github-token", enc(id)),
+                &[],
+                body_of(token)?,
+                ACTION_OPTS,
+            )
+            .await?;
+        decode(&bytes)
+    }
+
+    pub async fn github_token_clear(&self, site_id: &str) -> Res<()> {
+        let id = validate_site_id(site_id)?;
+        self.unit(Method::DELETE, &format!("/sites/{}/github-token", enc(id)))
+            .await
+    }
+
+    pub async fn build_env_names(&self, site_id: &str) -> Res<EnvNames> {
+        self.env_names(site_id, "build-env").await
+    }
+
+    pub async fn build_env_patch(&self, site_id: &str, patch: &EnvPatch) -> Res<EnvNames> {
+        self.env_patch(site_id, "build-env", EnvKind::Build, patch)
+            .await
+    }
+
+    pub async fn runtime_env_names(&self, site_id: &str) -> Res<EnvNames> {
+        self.env_names(site_id, "runtime-env").await
+    }
+
+    pub async fn runtime_env_patch(&self, site_id: &str, patch: &EnvPatch) -> Res<EnvNames> {
+        self.env_patch(site_id, "runtime-env", EnvKind::Runtime, patch)
+            .await
+    }
+
+    async fn env_names(&self, site_id: &str, which: &str) -> Res<EnvNames> {
+        let id = validate_site_id(site_id)?;
+        self.json(
+            Method::GET,
+            &format!("/sites/{}/{which}", enc(id)),
+            &[],
+            None,
+        )
+        .await
+    }
+
+    async fn env_patch(
+        &self,
+        site_id: &str,
+        which: &str,
+        kind: EnvKind,
+        patch: &EnvPatch,
+    ) -> Res<EnvNames> {
+        let id = validate_site_id(site_id)?;
+        patch.validate(kind)?;
+        let bytes = self
+            .exec(
+                Method::PATCH,
+                &format!("/sites/{}/{which}", enc(id)),
+                &[],
+                body_of(patch)?,
+                ACTION_OPTS,
+            )
+            .await?;
+        decode(&bytes)
+    }
+
+    /// Starts a source deploy without waiting for the build; poll `site_status` for the outcome.
+    pub async fn deploy_source_async(
+        &self,
+        site_id: &str,
+        git_ref: Option<&str>,
+        note: Option<&str>,
+    ) -> Res<DeployAccepted> {
+        let id = validate_site_id(site_id)?;
+        let mut body = json!({ "wait": false });
+        if let Some(git_ref) = git_ref {
+            body["git_ref"] = json!(git_ref);
+        }
+        if let Some(note) = note {
+            body["note"] = json!(note);
+        }
+        let bytes = self
+            .exec(
+                Method::POST,
+                &format!("/sites/{}/deploy", enc(id)),
+                &[],
+                Some(body),
+                ACTION_OPTS,
+            )
+            .await?;
+        decode(&bytes)
+    }
+
+    /// Issues a certificate on the node; `kind` is `generate`, `origin-ca` or `acme`.
+    pub async fn certificate_issue(&self, kind: &str, request: &Value) -> Res<Value> {
+        if !matches!(kind, "generate" | "origin-ca" | "acme") {
+            return Err(ClientError::Config(
+                "kind is generate, origin-ca or acme".into(),
+            ));
+        }
+        let bytes = self
+            .exec(
+                Method::POST,
+                &format!("/certificates/{kind}"),
+                &[],
+                Some(request.clone()),
+                ACTION_OPTS,
+            )
+            .await?;
+        decode(&bytes)
+    }
+
+    /// Issues an origin certificate with a Cloudflare token that is sent once and wiped afterwards.
+    pub async fn certificate_origin_ca(
+        &self,
+        token: &CloudflareToken,
+        request: &Value,
+    ) -> Res<Value> {
+        let mut body = request.clone();
+        let Some(map) = body.as_object_mut() else {
+            return Err(ClientError::Config("the request is an object".into()));
+        };
+        let mut sent = serde_json::to_value(token)
+            .map_err(|_| ClientError::Config("cannot encode request".into()))?;
+        if let Some(extra) = sent.as_object_mut() {
+            map.append(extra);
+        }
+        let bytes = self
+            .exec(
+                Method::POST,
+                "/certificates/origin-ca",
+                &[],
+                Some(body),
+                ACTION_OPTS,
+            )
+            .await?;
+        decode(&bytes)
+    }
+
+    pub async fn acme_jobs(&self) -> Res<Value> {
+        self.json(Method::GET, "/certificates/acme", &[], None)
+            .await
+    }
+
+    pub async fn acme_job(&self, job_id: &str) -> Res<Value> {
+        let id = validate_job_id(job_id)?;
+        self.json(
+            Method::GET,
+            &format!("/certificates/acme/{}", enc(id)),
+            &[],
+            None,
+        )
+        .await
+    }
+
+    pub async fn alerts_get(&self) -> Res<Value> {
+        self.json(Method::GET, "/alerts", &[], None).await
+    }
+
+    pub async fn alerts_put(&self, config: &Value) -> Res<Value> {
+        self.json(Method::PUT, "/alerts", &[], Some(config.clone()))
+            .await
+    }
+
+    pub async fn alerts_test(&self) -> Res<Value> {
+        let bytes = self
+            .exec(
+                Method::POST,
+                "/alerts/test",
+                &[],
+                Some(json!({})),
+                ACTION_OPTS,
+            )
+            .await?;
+        decode(&bytes)
     }
 
     pub async fn cloudflare_ranges(&self) -> Res<CloudflareRanges> {

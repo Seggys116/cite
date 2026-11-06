@@ -17,10 +17,11 @@ pub struct EdgeConfig {
     pub settings: EdgeSettings,
 }
 
-// Each site has two upstream slots; `active` names the one that serves traffic and the other is free for the next deploy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+// Default exists only so tolerant wire types can derive it; a missing slot reads as blue.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Slot {
+    #[default]
     Blue,
     Green,
 }
@@ -46,7 +47,6 @@ pub struct Site {
     pub id: String,
     pub name: String,
     pub hosts: Vec<String>,
-    // Fields marked default may be omitted by API clients and are filled in on load.
     /// A site takes a request when the host matches and either no path restriction is set or any prefix or any regex matches.
     #[serde(
         default,
@@ -186,7 +186,7 @@ impl Default for HealthCheck {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Source {
     pub repo: String,
@@ -200,6 +200,68 @@ pub struct Source {
     pub poll_interval: Option<String>,
     #[serde(default)]
     pub secret: Option<String>,
+    // The fields below are left out of the JSON while unset so sites saved by 0.3.x load and re-save unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package_manager: Option<PackageManager>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install_command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rendering: Option<RenderMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub framework: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spa_fallback: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prune: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forge: Option<String>,
+    /// Serving container memory in MiB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_mb: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpus: Option<Cpus>,
+    /// Memory in MiB and CPUs for the manager (build) container.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_memory_mb: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_cpus: Option<Cpus>,
+}
+
+// A plain f32 would stop Source, Site and EdgeConfig from deriving Eq; comparing bits keeps them hashable-equal and the JSON is still a number.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Cpus(pub f32);
+
+impl PartialEq for Cpus {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.to_bits() == other.0.to_bits()
+    }
+}
+
+impl Eq for Cpus {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PackageManager {
+    Npm,
+    Pnpm,
+    Yarn,
+    Bun,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RenderMode {
+    Static,
+    Ssr,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
