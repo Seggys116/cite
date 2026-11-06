@@ -618,6 +618,18 @@ impl CertBusy {
         *self == CertBusy::Idle
     }
 
+    // What a toast calls the operation when its result arrives after the user has moved elsewhere.
+    pub fn noun(&self) -> String {
+        match self {
+            CertBusy::Idle => "Operation".to_string(),
+            CertBusy::Upload => "Certificate upload".to_string(),
+            CertBusy::Replace(n) => format!("Certificate {n} replacement"),
+            CertBusy::Delete(n) => format!("Certificate {n} deletion"),
+            CertBusy::Port => "HTTPS port change".to_string(),
+            CertBusy::Ranges => "Cloudflare ranges change".to_string(),
+        }
+    }
+
     pub fn label(&self) -> Option<String> {
         match self {
             CertBusy::Idle => None,
@@ -1197,6 +1209,9 @@ mod tests {
                 .contains("api")
         );
         assert!(CertBusy::Port.label().is_some() && CertBusy::Ranges.label().is_some());
+        assert_eq!(CertBusy::Upload.noun(), "Certificate upload");
+        assert!(CertBusy::Delete("api".into()).noun().contains("api"));
+        assert!(!CertBusy::Idle.noun().is_empty());
         assert_eq!(uploaded_text("shop", false), "Certificate shop uploaded.");
         assert_eq!(uploaded_text("shop", true), "Certificate shop replaced.");
     }

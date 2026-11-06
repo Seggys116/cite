@@ -9,7 +9,7 @@ use crate::app::{Confirm, Console, Load, View, new_input};
 use crate::certs::{AccessDraft, zone_newly_enabled};
 use crate::demo::now_ms;
 use crate::model::{fmt_targets, parse_rfc3339_ms, parse_targets, rel_time};
-use crate::scope::error_survives;
+use crate::scope::{error_survives, foreign_notice};
 use crate::theme::{DIM, Tone, c};
 use crate::ui::certs::{access_body, access_controls};
 use crate::ui::input::TextInput;
@@ -21,7 +21,7 @@ use crate::ui::widgets::{
 };
 use crate::zone::{
     CLOUDFLARE_STEPS, NOT_SHOWN_AGAIN, ROTATE_WARNING, ZoneReveal, ZoneStatus, reveal_meta,
-    rotation_failed, status_text,
+    reveal_nodes_elsewhere, reveals_for, rotation_failed, status_text,
 };
 
 pub struct Data {
@@ -100,9 +100,11 @@ impl Console {
     }
 
     // Runs a mutation, then reloads the site so the page always shows the node's own state.
+    // If the user has moved to another site or node by the time the node answers, the outcome is a toast naming the place and the page is left alone.
     fn site_action<T, F>(
         &mut self,
         cx: &mut Context<Self>,
+        what: &'static str,
         fut: F,
         outcome: impl FnOnce(&T) -> Result<String, String> + 'static,
     ) where
@@ -111,15 +113,23 @@ impl Console {
     {
         self.detail.busy = true;
         self.detail.error = None;
-        self.fetch(cx, fut, move |this, res, cx| {
+        self.fetch_origin(cx, fut, move |this, res, here, origin, cx| {
+            let result = res.map_err(|e| e.to_string()).and_then(|v| outcome(&v));
+            if !here {
+                let (msg, tone) = match result {
+                    Ok(m) => (m, Tone::Ok),
+                    Err(m) => (m, Tone::Bad),
+                };
+                this.say(foreign_notice(what, origin, &msg), tone);
+                cx.notify();
+                return;
+            }
             this.detail.busy = false;
-            match res.map_err(|e| e.to_string()).and_then(|v| outcome(&v)) {
+            match result {
                 Ok(msg) => this.say(msg, Tone::Ok),
                 Err(msg) => this.detail.error = Some(msg),
             }
-            if let View::SiteDetail { node, id } = this.view.clone() {
-                this.load_detail(node, id, cx);
-            }
+            this.reload_detail(cx);
             cx.notify();
         });
     }
@@ -136,7 +146,7 @@ impl Console {
         };
         let target = site.active.other();
         let fut = async move { h.switch(&site.id, target).await };
-        self.site_action(cx, fut, move |_| {
+        self.site_action(cx, "Switch", fut, move |_| {
             Ok(format!("{} is now active", target.as_str()))
         });
     }
@@ -146,7 +156,7 @@ impl Console {
             return;
         };
         let fut = async move { h.rollback(&site.id).await };
-        self.site_action(cx, fut, |_| Ok("Rolled back".into()));
+        self.site_action(cx, "Rollback", fut, |_| Ok("Rolled back".into()));
     }
 
     // Deploy waits on health checks, so the busy notice stays up until the node answers.
@@ -172,7 +182,7 @@ impl Console {
             note: Some(note).filter(|n| !n.is_empty()),
         };
         let fut = async move { h.deploy(&site.id, &req).await };
-        self.site_action(cx, fut, move |dep| {
+        self.site_action(cx, "Deploy", fut, move |dep| {
             if dep.action == cite_edge::model::DeployAction::Failed {
                 Err("Health checks did not pass. The active slot was left untouched.".into())
             } else {
@@ -205,10 +215,33 @@ impl Console {
             };
             Ok(reveal)
         };
-        self.fetch(
+        self.fetch_origin(
             cx,
             fut,
-            |this, res: Result<Option<Result<ZoneReveal, String>>, ClientError>, cx| {
+            |this,
+             res: Result<Option<Result<ZoneReveal, String>>, ClientError>,
+             here,
+             origin,
+             cx| {
+                const WHAT: &str = "Access settings";
+                if !here {
+                    // A secret for another place is kept under its own node and site and shown only there.
+                    let (text, tone) = match res {
+                        Ok(Some(Ok(reveal))) => {
+                            this.keep_reveal(reveal);
+                            (
+                                "saved; open the site to copy its new zone secret".to_string(),
+                                Tone::Ok,
+                            )
+                        }
+                        Ok(Some(Err(e))) => (rotation_failed(&e), Tone::Warn),
+                        Ok(None) => ("saved".to_string(), Tone::Ok),
+                        Err(e) => (e.to_string(), Tone::Bad),
+                    };
+                    this.say(foreign_notice(WHAT, origin, &text), tone);
+                    cx.notify();
+                    return;
+                }
                 this.detail.busy = false;
                 match res {
                     Ok(Some(Err(e))) => this.detail.error = Some(rotation_failed(&e)),
@@ -245,10 +278,25 @@ impl Console {
         };
         self.detail.busy = true;
         self.detail.error = None;
-        self.fetch(
+        self.fetch_origin(
             cx,
             async move { h.rotate_zone_secret(&site.id).await },
-            |this, res, cx| {
+            |this, res, here, origin, cx| {
+                if !here {
+                    let (text, tone) = match res {
+                        Ok(reveal) => {
+                            this.keep_reveal(reveal);
+                            (
+                                "rotated; open the site to copy the new secret".to_string(),
+                                Tone::Ok,
+                            )
+                        }
+                        Err(e) => (e.to_string(), Tone::Bad),
+                    };
+                    this.say(foreign_notice("Zone secret", origin, &text), tone);
+                    cx.notify();
+                    return;
+                }
                 this.detail.busy = false;
                 match res {
                     Ok(reveal) => {
@@ -269,7 +317,7 @@ impl Console {
         };
         let (enabled, page) = (self.detail.maint_enabled, self.detail.maint_page.clone());
         let fut = async move { h.maintenance(&site.id, enabled, page.as_deref()).await };
-        self.site_action(cx, fut, move |_| {
+        self.site_action(cx, "Maintenance change", fut, move |_| {
             Ok(if enabled {
                 "Maintenance mode enabled".into()
             } else {
@@ -285,10 +333,19 @@ impl Console {
         };
         let name = site.name.clone();
         self.detail.busy = true;
-        self.fetch(
+        self.fetch_origin(
             cx,
             async move { h.delete_site(&site.id).await },
-            move |this, res, cx| {
+            move |this, res, here, origin, cx| {
+                if !here {
+                    let (text, tone) = match res {
+                        Ok(()) => (format!("Site {name} deleted"), Tone::Ok),
+                        Err(e) => (e.to_string(), Tone::Bad),
+                    };
+                    this.say(foreign_notice("Delete", origin, &text), tone);
+                    cx.notify();
+                    return;
+                }
                 this.detail.busy = false;
                 match res {
                     Ok(()) => {
@@ -628,7 +685,7 @@ impl Console {
     // One panel per rotated secret; dismissing it drops the stored value, which zeroes that copy.
     fn reveal_panels(&self, site_id: &str, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let mut panels = Vec::new();
-        for reveal in self.detail.reveals.iter().filter(|r| r.site == site_id) {
+        for reveal in reveals_for(&self.detail.reveals, &self.detail.node, site_id) {
             let (node, site) = (reveal.node.clone(), reveal.site.clone());
             let (copy_node, copy_site) = (node.clone(), site.clone());
             let steps = CLOUDFLARE_STEPS.iter().enumerate().fold(
@@ -699,6 +756,35 @@ impl Console {
                     body,
                 )
                 .into_any_element(),
+            );
+        }
+        for other in reveal_nodes_elsewhere(&self.detail.reveals, &self.detail.node, site_id) {
+            let (node, site) = (other.clone(), site_id.to_string());
+            panels.push(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .child(
+                        text_dim(format!(
+                            "A new zone secret for this site is waiting on {other}."
+                        ))
+                        .text_size(px(12.)),
+                    )
+                    .child(
+                        btn(id("zone-open", &other), "Open", BtnKind::Plain).on_click(cx.listener(
+                            move |this, _, _, cx| {
+                                this.navigate(
+                                    View::SiteDetail {
+                                        node: node.clone(),
+                                        id: site.clone(),
+                                    },
+                                    cx,
+                                );
+                            },
+                        )),
+                    )
+                    .into_any_element(),
             );
         }
         panels

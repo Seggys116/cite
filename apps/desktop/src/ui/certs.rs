@@ -13,7 +13,7 @@ use crate::certs::{
     flexible_warning, is_custom_source, parse_port, parse_range_list, ranges_summary, ranges_text,
     sans_text, short_fingerprint, uncovered_note, uploaded_text, validity_text, zone_lock_help,
 };
-use crate::scope::Sequence;
+use crate::scope::{Sequence, foreign_notice};
 use crate::theme::{BORDER, DIM, MONO, ROW_RADIUS, Tone, c};
 use crate::ui::input::TextInput;
 use crate::ui::widgets::{
@@ -208,14 +208,20 @@ impl Console {
         if !self.certs.busy.is_idle() {
             return;
         }
+        let noun = busy.noun();
         self.certs.busy = busy;
         self.certs.note = None;
         self.certs.ranges_note = None;
-        self.fetch(cx, fut, move |this, res, cx| {
+        self.fetch_origin(cx, fut, move |this, res, here, origin, cx| {
+            // Only one operation runs at a time, so the lock is released wherever the user is now.
             this.certs.busy = CertBusy::Idle;
-            match res {
-                Ok(v) => done(this, v, cx),
-                Err(e) => this.cert_note(card, op_error(&e), Tone::Bad),
+            match (res, here) {
+                (Ok(v), true) => done(this, v, cx),
+                (Err(e), true) => this.cert_note(card, op_error(&e), Tone::Bad),
+                (Ok(_), false) => this.say(foreign_notice(&noun, origin, "done"), Tone::Ok),
+                (Err(e), false) => {
+                    this.say(foreign_notice(&noun, origin, &op_error(&e)), Tone::Bad)
+                }
             }
             cx.notify();
         });

@@ -13,7 +13,7 @@ use crate::api::{NodeHandle, spawn_io};
 use crate::config::{DesktopConfig, DesktopNode};
 use crate::demo::{demo_config, demo_nodes};
 use crate::keychain::KeychainTokenStore;
-use crate::scope::{Scope, apply_if_current};
+use crate::scope::{Origin, Scope, apply_if_current, foreign_notice};
 use crate::theme::{
     ACCENT, BG, BLUE, BORDER, CARD_RADIUS, CHIP_RADIUS, DIM, DIVIDER, GREEN, INPUT, RED,
     ROW_RADIUS, SIDEBAR, SURFACE, TEXT, TOPBAR, Tone, c, chip_fill, chip_stroke, tint,
@@ -24,6 +24,7 @@ use crate::ui::{
     bots, certs, create, detail, firewall, maintenance, nodes, overview, settings, sites, storage,
     traffic,
 };
+use crate::zone::keep_for_site;
 
 const TICK: Duration = Duration::from_millis(500);
 const LOGO_FLIP_TICKS: u64 = 5;
@@ -320,6 +321,42 @@ impl Console {
         .detach();
     }
 
+    // Where the user is right now, in the terms an action is tagged with.
+    pub fn origin(&self) -> Origin {
+        match &self.view {
+            View::SiteDetail { .. } => {
+                Origin::new(&self.detail.node, Some(&self.detail.site_id), &self.view)
+            }
+            _ => Origin::new(
+                self.active_name().as_deref().unwrap_or(""),
+                None,
+                &self.view,
+            ),
+        }
+    }
+
+    pub fn still_here(&self, origin: &Origin) -> bool {
+        self.origin() == *origin
+    }
+
+    // Actions use this: the completion learns whether the user is still where the action was issued.
+    pub fn fetch_origin<T, F>(
+        &mut self,
+        cx: &mut Context<Self>,
+        fut: F,
+        apply: impl FnOnce(&mut Self, Result<T, ClientError>, bool, &Origin, &mut Context<Self>)
+        + 'static,
+    ) where
+        T: Send + 'static,
+        F: Future<Output = Result<T, ClientError>> + Send + 'static,
+    {
+        let origin = self.origin();
+        self.fetch(cx, fut, move |this, res, cx| {
+            let here = this.still_here(&origin);
+            apply(this, res, here, &origin, cx);
+        });
+    }
+
     // Loaders use this: a result that finishes after a node or view change belongs to the old scope and is dropped.
     pub fn fetch_scoped<T, F>(
         &mut self,
@@ -340,7 +377,9 @@ impl Console {
     pub fn reset_node_data(&mut self) {
         self.settings.data = Load::Idle;
         self.settings.data_node.clear();
-        self.settings.created = None;
+        self.settings.error = None;
+        self.certs.note = None;
+        self.certs.ranges_note = None;
         self.certs.list = Load::Idle;
         self.certs.ranges = Load::Idle;
         self.certs.unsupported = false;
@@ -368,9 +407,8 @@ impl Console {
             View::SiteDetail { id, .. } => Some(id.clone()),
             _ => None,
         };
-        self.detail
-            .reveals
-            .retain(|r| keep.as_deref() == Some(r.site.as_str()));
+        keep_for_site(&mut self.detail.reveals, keep.as_deref());
+        self.detail.busy = false;
         // A key typed on the certificate panel must not outlive the visit to Settings.
         self.close_panel(cx);
         // Arriving on a site page starts without the error of an earlier visit.
@@ -387,6 +425,7 @@ impl Console {
         self.selected = name;
         self.close_panel(cx);
         self.detail.error = None;
+        self.detail.busy = false;
         self.detail.site_id.clear();
         self.scope.advance();
         self.reset_node_data();
@@ -890,12 +929,18 @@ impl Console {
         T: Send + 'static,
         F: Future<Output = Result<T, ClientError>> + Send + 'static,
     {
-        self.fetch(cx, fut, move |this, res, cx| {
-            match res {
-                Ok(_) => this.say(done, Tone::Ok),
-                Err(e) => this.say(e.to_string(), Tone::Bad),
+        self.fetch_origin(cx, fut, move |this, res, here, origin, cx| {
+            match (res, here) {
+                (Ok(_), true) => this.say(done, Tone::Ok),
+                (Err(e), true) => this.say(e.to_string(), Tone::Bad),
+                (Ok(_), false) => this.say(foreign_notice(&done, origin, ""), Tone::Ok),
+                (Err(e), false) => {
+                    this.say(foreign_notice("Change", origin, &e.to_string()), Tone::Bad)
+                }
             }
-            this.load_current(cx);
+            if here {
+                this.load_current(cx);
+            }
             cx.notify();
         });
     }

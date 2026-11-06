@@ -12,7 +12,7 @@ use crate::archive::{
 use crate::bots::{downloads_dir, fmt_stamp, is_unsupported};
 use crate::demo::now_ms;
 use crate::model::{fmt_bytes, fmt_int};
-use crate::scope::Sequence;
+use crate::scope::{Sequence, foreign_notice};
 use crate::theme::{DIM, Tone, c};
 use crate::ui::input::TextInput;
 use crate::ui::widgets::{
@@ -110,8 +110,20 @@ impl Console {
         }
         self.archives.busy = busy;
         self.archives.note = None;
-        self.fetch(cx, fut, move |this, res, cx| {
+        self.fetch_origin(cx, fut, move |this, res, here, origin, cx| {
             this.archives.busy = Busy::Idle;
+            if !here {
+                let (text, tone) = match res {
+                    Ok(_) => ("done".to_string(), Tone::Ok),
+                    Err(e) => (op_error(&e), Tone::Bad),
+                };
+                this.say(
+                    foreign_notice("Backup or archive task", origin, &text),
+                    tone,
+                );
+                cx.notify();
+                return;
+            }
             match res {
                 Ok(v) => done(this, v, cx),
                 Err(e) => this.archives.note = Some((op_error(&e), Tone::Bad)),

@@ -187,10 +187,10 @@ impl Console {
             Ok((outcomes, reveals, problems))
         };
         let reveal_site = site.id.clone();
-        self.fetch(
+        self.fetch_origin(
             cx,
             fut,
-            move |this, res: Result<CreateDone, ClientError>, cx| {
+            move |this, res: Result<CreateDone, ClientError>, here, _origin, cx| {
                 this.create.busy = false;
                 match res {
                     Ok((outcomes, reveals, problems)) => {
@@ -208,7 +208,22 @@ impl Console {
                         let created = outcomes.iter().filter(|o| o.ok).count();
                         let nodes: Vec<String> = reveals.iter().map(|r| r.node.clone()).collect();
                         let verdict = create_verdict(&name, created, &failed, &problems, &nodes);
+                        let has_secrets = !reveals.is_empty();
                         this.detail.reveals.extend(reveals);
+                        if !here {
+                            // The user moved on: the outcome is a toast, and secrets wait on their own site page.
+                            let mut text = verdict
+                                .toast
+                                .map(|(t, _)| t)
+                                .or(verdict.error)
+                                .unwrap_or_default();
+                            if has_secrets {
+                                text.push_str(" Open the site to copy its zone secret.");
+                            }
+                            this.say(text, Tone::Warn);
+                            cx.notify();
+                            return;
+                        }
                         if let Some((text, ok)) = verdict.toast {
                             this.say(text, if ok { Tone::Ok } else { Tone::Warn });
                         }
@@ -226,7 +241,8 @@ impl Console {
                             }
                         }
                     }
-                    Err(e) => this.create.error = Some(e.to_string()),
+                    Err(e) if here => this.create.error = Some(e.to_string()),
+                    Err(e) => this.say(format!("Create site {name}: {e}"), Tone::Bad),
                 }
                 cx.notify();
             },

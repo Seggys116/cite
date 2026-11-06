@@ -8,6 +8,7 @@ use crate::certs::ensure_same_node;
 use crate::config::KEYCHAIN_SERVICE;
 use crate::demo::now_ms;
 use crate::model::{SettingsDraft, parse_rfc3339_ms, rel_time};
+use crate::scope::{TokenShelf, foreign_notice};
 use crate::theme::{DIM, Tone, c};
 use crate::ui::input::TextInput;
 use crate::ui::nodes::hostname;
@@ -30,8 +31,8 @@ pub struct State {
     pub store_ip: bool,
     pub keep_forever: bool,
     pub archive_before_delete: bool,
-    // A new API token with the node it belongs to; it is shown only while that node is selected.
-    pub created: Option<(String, String)>,
+    // New API tokens by node; each is shown only while its node is selected and stays until dismissed.
+    pub created: TokenShelf,
     pub recent: Entity<TextInput>,
     pub minutes: Entity<TextInput>,
     pub hours: Entity<TextInput>,
@@ -51,7 +52,7 @@ impl State {
             store_ip: true,
             keep_forever: true,
             archive_before_delete: true,
-            created: None,
+            created: TokenShelf::default(),
             recent: new_input(cx, "5000", |i| i.mono()),
             minutes: new_input(cx, "48", |i| i.mono()),
             hours: new_input(cx, "365", |i| i.mono()),
@@ -162,16 +163,29 @@ impl Console {
             .token_name
             .update(cx, |i, cx| i.set_text("", cx));
         let node = h.name().to_string();
-        self.fetch(
+        self.fetch_origin(
             cx,
             async move { h.create_token(&name).await },
-            move |this, res, cx| {
+            move |this, res, here, origin, cx| {
                 match res {
                     Ok(created) => {
-                        this.settings.created = Some((node, created.token));
-                        this.load_settings(cx);
+                        this.settings.created.put(&node, created.token);
+                        if here {
+                            this.load_settings(cx);
+                        } else {
+                            this.say(
+                                format!(
+                                    "API token created on {node}: open its Settings page to copy it"
+                                ),
+                                Tone::Ok,
+                            );
+                        }
                     }
-                    Err(e) => this.say(e.to_string(), Tone::Bad),
+                    Err(e) if here => this.say(e.to_string(), Tone::Bad),
+                    Err(e) => this.say(
+                        foreign_notice("Create token", origin, &e.to_string()),
+                        Tone::Bad,
+                    ),
                 }
                 cx.notify();
             },
@@ -437,15 +451,10 @@ impl Console {
             Col::fixed("", 90.),
         ];
         let mut body = div().flex().flex_col().gap(px(12.));
-        let active = self.active_name();
-        let shown = self
-            .settings
-            .created
-            .as_ref()
-            .filter(|(node, _)| ensure_same_node(node, active.as_deref()).is_ok())
-            .map(|(_, token)| token.clone());
+        let active = self.active_name().unwrap_or_default();
+        let shown = self.settings.created.for_node(&active).map(str::to_string);
         if let Some(token) = shown {
-            let copy_value = token.clone();
+            let (copy_node, done_node) = (active.clone(), active.clone());
             body = body.child(
                 div()
                     .flex()
@@ -472,15 +481,20 @@ impl Console {
                             .flex()
                             .gap(px(8.))
                             .child(btn(id("tok", "copy"), "Copy", BtnKind::Primary).on_click(
-                                cx.listener(move |_, _, _, cx| {
-                                    cx.write_to_clipboard(ClipboardItem::new_string(
-                                        copy_value.clone(),
-                                    ));
+                                cx.listener(move |this, _, _, cx| {
+                                    let found = this
+                                        .settings
+                                        .created
+                                        .for_node(&copy_node)
+                                        .map(str::to_string);
+                                    if let Some(token) = found {
+                                        cx.write_to_clipboard(ClipboardItem::new_string(token));
+                                    }
                                 }),
                             ))
                             .child(btn(id("tok", "dismiss"), "Done", BtnKind::Plain).on_click(
-                                cx.listener(|this, _, _, cx| {
-                                    this.settings.created = None;
+                                cx.listener(move |this, _, _, cx| {
+                                    this.settings.created.dismiss(&done_node);
                                     cx.notify();
                                 }),
                             )),

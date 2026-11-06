@@ -131,6 +131,25 @@ pub fn rotation_failed(error: &str) -> String {
     )
 }
 
+// A reveal is shown only by the page of its own node and site.
+pub fn reveals_for<'a>(reveals: &'a [ZoneReveal], node: &str, site: &str) -> Vec<&'a ZoneReveal> {
+    reveals.iter().filter(|r| r.is_for(node, site)).collect()
+}
+
+// Nodes other than this one that still hold a secret for the same site, so the page can point to them.
+pub fn reveal_nodes_elsewhere(reveals: &[ZoneReveal], node: &str, site: &str) -> Vec<String> {
+    reveals
+        .iter()
+        .filter(|r| r.site == site && r.node != node)
+        .map(|r| r.node.clone())
+        .collect()
+}
+
+// Leaving a site page drops every secret except those of the site being opened, whatever node they belong to.
+pub fn keep_for_site(reveals: &mut Vec<ZoneReveal>, opening: Option<&str>) {
+    reveals.retain(|r| opening == Some(r.site.as_str()));
+}
+
 // What the create form does once every node has answered: a toast, an error that keeps the form, or a jump to the site page.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CreateVerdict {
@@ -257,6 +276,44 @@ mod tests {
         assert!(shown.contains("[redacted]") && shown.contains("edge-fra"));
         let batch = format!("{:?}", vec![r.clone(), r]);
         assert!(!batch.contains(value.as_str()));
+    }
+
+    fn on(node: &str, site: &str) -> ZoneReveal {
+        ZoneReveal::new(node, site, zone_value(), "", None, None)
+    }
+
+    #[test]
+    fn the_same_site_on_two_nodes_keeps_separate_secrets() {
+        let all = vec![
+            on("edge-fra", "shop"),
+            on("edge-iad", "shop"),
+            on("edge-fra", "api"),
+        ];
+        let fra = reveals_for(&all, "edge-fra", "shop");
+        assert_eq!(fra.len(), 1);
+        assert!(fra[0].is_for("edge-fra", "shop"));
+        assert_eq!(reveals_for(&all, "edge-iad", "shop").len(), 1);
+        assert!(reveals_for(&all, "edge-sin", "shop").is_empty());
+        assert!(reveals_for(&all, "edge-iad", "api").is_empty());
+        assert_eq!(
+            reveal_nodes_elsewhere(&all, "edge-fra", "shop"),
+            vec!["edge-iad"]
+        );
+        assert!(reveal_nodes_elsewhere(&all, "edge-fra", "api").is_empty());
+    }
+
+    #[test]
+    fn leaving_for_another_site_drops_every_secret() {
+        let mut all = vec![
+            on("edge-fra", "shop"),
+            on("edge-iad", "shop"),
+            on("edge-fra", "api"),
+        ];
+        keep_for_site(&mut all, Some("shop"));
+        assert_eq!(all.len(), 2);
+        assert!(all.iter().all(|r| r.site == "shop"));
+        keep_for_site(&mut all, None);
+        assert!(all.is_empty());
     }
 
     #[test]
