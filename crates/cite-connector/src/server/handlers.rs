@@ -721,6 +721,20 @@ pub(super) fn keep_stored_secret(
             .iter()
             .filter(|h| h.secret && h.name.eq_ignore_ascii_case(&header.name))
             .count();
+        // a blank row only stands for a stored value when that is unambiguous: with repeated names the request cannot say which one it means
+        let same_name = |r: &FirewallRule| {
+            r.matchers
+                .headers
+                .iter()
+                .filter(|h| h.secret && h.name.eq_ignore_ascii_case(&header.name))
+                .count()
+        };
+        if stored.is_some_and(|r| same_name(r) > 1) {
+            return Err(ConnectorError::BadRequest(format!(
+                "rule {rule_id}: header {} has several secret values, so a blank one cannot be matched to a stored value: enter each value again",
+                header.name
+            )));
+        }
         let old = stored.and_then(|r| {
             r.matchers
                 .headers
