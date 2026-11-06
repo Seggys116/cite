@@ -1,5 +1,5 @@
 ARG RUST_IMAGE=docker.io/library/rust:1.98-bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
-ARG HAPROXY_IMAGE=docker.io/library/haproxy:3.0-bookworm
+ARG HAPROXY_IMAGE=docker.io/library/haproxy:3.2-bookworm
 
 FROM ${RUST_IMAGE} AS build
 

@@ -1,4 +1,4 @@
-// Needs docker and the haproxy:3.0-bookworm, nginx:alpine and curlimages/curl images; run with --ignored.
+// Needs docker and the haproxy:3.2-bookworm, nginx:alpine and curlimages/curl images; run with --ignored.
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -232,7 +232,7 @@ fn rules_see_the_canonical_path_on_real_haproxy() {
         &net,
         "-v",
         &format!("{d}:/conf/haproxy:ro"),
-        "haproxy:3.0-bookworm",
+        "haproxy:3.2-bookworm",
         "haproxy",
         "-c",
         "-f",
@@ -248,7 +248,7 @@ fn rules_see_the_canonical_path_on_real_haproxy() {
         &net,
         "-v",
         &format!("{d}:/conf/haproxy:ro"),
-        "haproxy:3.0-bookworm",
+        "haproxy:3.2-bookworm",
         "haproxy",
         "-db",
         "-f",

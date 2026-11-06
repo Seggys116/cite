@@ -282,4 +282,4 @@ jobs:
       # Only HAProxy's own parser can say whether the rendered config is loadable.
       - name: Validate it with the real HAProxy binary
         run: |
-          docker run --rm -v "${{ runner.temp }}/haproxy:/conf/haproxy:ro" docker.io/library/haproxy:3.0-bookworm haproxy -c -f /conf/haproxy/haproxy.cfg
+          docker run --rm -v "${{ runner.temp }}/haproxy:/conf/haproxy:ro" docker.io/library/haproxy:3.2-bookworm haproxy -c -f /conf/haproxy/haproxy.cfg
