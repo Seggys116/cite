@@ -1,37 +1,48 @@
 use std::future::Future;
 
 use cite_client::{ClientError, DeployRequest};
-use cite_edge::model::{MaintenancePage, Site, SiteKind, Slot};
-use gpui::{AnyElement, Context, Entity, div, prelude::*, px};
+use cite_edge::model::{MaintenancePage, Site, SiteKind, Slot, TlsMode};
+use gpui::{AnyElement, Context, Div, Entity, div, prelude::*, px};
 use serde_json::Value;
 
 use crate::app::{Confirm, Console, Load, View, new_input};
+use crate::certs::{AccessDraft, zone_newly_enabled};
 use crate::demo::now_ms;
 use crate::model::{fmt_targets, parse_rfc3339_ms, parse_targets, rel_time};
+use crate::scope::error_survives;
 use crate::theme::{DIM, Tone, c};
+use crate::ui::certs::{access_body, access_controls};
 use crate::ui::input::TextInput;
 use crate::ui::overview::{action_pill, slot_pill};
 use crate::ui::sites::health_tone;
 use crate::ui::widgets::{
-    BtnKind, Col, btn, card, dot, empty_state, field, id, mono, notice, page_header, pill,
+    BtnKind, Col, btn, btn_off, card, dot, empty_state, field, id, mono, notice, page_header, pill,
     seg_item, seg_row, skeleton, strong, table, text_dim, toggle,
+};
+use crate::zone::{
+    CLOUDFLARE_STEPS, NOT_SHOWN_AGAIN, ROTATE_WARNING, ZoneReveal, ZoneStatus, reveal_meta,
+    rotation_failed, status_text,
 };
 
 pub struct Data {
     pub site: Site,
     pub live: Option<Value>,
     pub pages: Vec<MaintenancePage>,
+    pub zone: Option<ZoneStatus>,
 }
 
 pub struct State {
     pub data: Load<Data>,
     pub node: String,
+    pub site_id: String,
     pub targets: Entity<TextInput>,
     pub note: Entity<TextInput>,
     pub busy: bool,
     pub error: Option<String>,
     pub maint_enabled: bool,
     pub maint_page: Option<String>,
+    pub access: AccessDraft,
+    pub reveals: Vec<ZoneReveal>,
 }
 
 impl State {
@@ -39,12 +50,15 @@ impl State {
         Self {
             data: Load::Idle,
             node: String::new(),
+            site_id: String::new(),
             targets: new_input(cx, "10.0.0.12:8080, 10.0.0.13:8080 50", |i| i.mono()),
             note: new_input(cx, "Release notes (optional)", |i| i),
             busy: false,
             error: None,
             maint_enabled: false,
             maint_page: None,
+            access: AccessDraft::default(),
+            reveals: Vec::new(),
         }
     }
 }
@@ -53,8 +67,12 @@ impl Console {
     // The site and its maintenance pages load together so the form is complete on first paint.
     pub fn load_detail(&mut self, node: String, site_id: String, cx: &mut Context<Self>) {
         self.detail.data = Load::Loading;
+        // An action's error must still be on screen after the reload that follows it, so it is cleared only for another site.
+        if !error_survives(&self.detail.node, &self.detail.site_id, &node, &site_id) {
+            self.detail.error = None;
+        }
         self.detail.node = node.clone();
-        self.detail.error = None;
+        self.detail.site_id = site_id.clone();
         let Some(h) = self.handle_named(&node) else {
             self.detail.data = Load::Failed(format!("Node {node} is not connected."));
             return;
@@ -62,16 +80,19 @@ impl Console {
         let fut = async move {
             let detail = h.get_site(&site_id).await?;
             let pages = h.list_pages().await.unwrap_or_default();
+            let zone = h.zone_secret(&site_id).await.ok();
             Ok(Data {
                 site: detail.site,
                 live: detail.live,
                 pages,
+                zone,
             })
         };
-        self.fetch(cx, fut, |this, res, cx| {
+        self.fetch_scoped(cx, fut, |this, res, cx| {
             if let Ok(data) = &res {
                 this.detail.maint_enabled = data.site.maintenance.enabled;
                 this.detail.maint_page = data.site.maintenance.page_id.clone();
+                this.detail.access = AccessDraft::from_access(&data.site.access);
             }
             this.detail.data = Load::from_result(res);
             cx.notify();
@@ -158,6 +179,88 @@ impl Console {
                 Ok(format!("Deployed. {} is now active.", idle.as_str()))
             }
         });
+    }
+
+    // The whole site goes back through the normal update, so an older node rejecting the access field shows its own error.
+    // Turning the zone lock on rotates in a secret right after the save, because the node only shows it when asked.
+    fn do_access(&mut self, cx: &mut Context<Self>) {
+        let Some((h, mut site)) = self.site_handle() else {
+            return;
+        };
+        let next = self.detail.access.to_access();
+        let rotate = zone_newly_enabled(&site.access, &next);
+        site.access = next;
+        self.detail.busy = true;
+        self.detail.error = None;
+        let fut = async move {
+            h.update_site(&site.id, &site).await?;
+            let reveal = if rotate {
+                Some(
+                    h.rotate_zone_secret(&site.id)
+                        .await
+                        .map_err(|e| e.to_string()),
+                )
+            } else {
+                None
+            };
+            Ok(reveal)
+        };
+        self.fetch(
+            cx,
+            fut,
+            |this, res: Result<Option<Result<ZoneReveal, String>>, ClientError>, cx| {
+                this.detail.busy = false;
+                match res {
+                    Ok(Some(Err(e))) => this.detail.error = Some(rotation_failed(&e)),
+                    Ok(Some(Ok(reveal))) => {
+                        this.keep_reveal(reveal);
+                        this.say("Access settings saved", Tone::Ok);
+                    }
+                    Ok(None) => this.say("Access settings saved", Tone::Ok),
+                    Err(e) => this.detail.error = Some(e.to_string()),
+                }
+                this.reload_detail(cx);
+                cx.notify();
+            },
+        );
+    }
+
+    // A newer secret for the same node and site replaces the older one, so only the valid value is ever on screen.
+    fn keep_reveal(&mut self, reveal: ZoneReveal) {
+        self.detail
+            .reveals
+            .retain(|r| !r.is_for(&reveal.node, &reveal.site));
+        self.detail.reveals.push(reveal);
+    }
+
+    fn reload_detail(&mut self, cx: &mut Context<Self>) {
+        if let View::SiteDetail { node, id } = self.view.clone() {
+            self.load_detail(node, id, cx);
+        }
+    }
+
+    fn do_rotate_zone(&mut self, cx: &mut Context<Self>) {
+        let Some((h, site)) = self.site_handle() else {
+            return;
+        };
+        self.detail.busy = true;
+        self.detail.error = None;
+        self.fetch(
+            cx,
+            async move { h.rotate_zone_secret(&site.id).await },
+            |this, res, cx| {
+                this.detail.busy = false;
+                match res {
+                    Ok(reveal) => {
+                        this.keep_reveal(reveal);
+                        this.say("Zone secret rotated", Tone::Ok);
+                    }
+                    Err(e) => this.detail.error = Some(e.to_string()),
+                }
+                this.reload_detail(cx);
+                cx.notify();
+            },
+        );
     }
 
     fn do_maintenance(&mut self, cx: &mut Context<Self>) {
@@ -284,6 +387,14 @@ impl Console {
             } else {
                 pill("Serving", Tone::Ok)
             })
+            .children(
+                site.access
+                    .cloudflare_only
+                    .then(|| pill("Cloudflare only", Tone::Info)),
+            )
+            .children(
+                (site.access.tls == TlsMode::Flexible).then(|| pill("Flexible SSL", Tone::Warn)),
+            )
             .child(mono(format!("{} on {}", site.id, self.detail.node)).text_color(c(DIM)));
         let header = div()
             .flex()
@@ -305,6 +416,7 @@ impl Console {
         if let Some(err) = &self.detail.error {
             col = col.child(notice(err, Tone::Bad));
         }
+        col = col.children(self.reveal_panels(&site.id, cx));
         col = col
             .child(
                 div()
@@ -314,6 +426,7 @@ impl Console {
                     .child(self.slot_card(data, Slot::Green)),
             )
             .child(self.deploy_card(site, cx))
+            .child(self.access_card(data, cx))
             .child(self.maintenance_card(data, cx))
             .child(self.history_card(site, cx))
             .child(self.danger_card(site, cx));
@@ -439,6 +552,156 @@ impl Console {
             body,
         )
         .into_any_element()
+    }
+
+    // Both choices are staged locally and only sent by Save.
+    fn access_card(&self, data: &Data, cx: &mut Context<Self>) -> AnyElement {
+        let draft = self.detail.access;
+        let mut body = access_body(
+            access_controls(cx, "access", draft, |c| &mut c.detail.access),
+            draft,
+        );
+        if data.site.access.zone_lock {
+            body = body.child(self.zone_status_line(data.zone.as_ref()));
+        }
+        let busy = self.detail.busy;
+        let save = if busy {
+            btn_off("Save access").into_any_element()
+        } else {
+            btn(id("detail", "save-access"), "Save access", BtnKind::Primary)
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.do_access(cx);
+                    cx.notify();
+                }))
+                .into_any_element()
+        };
+        let rotate = if data.site.access.zone_lock && !busy {
+            btn(
+                id("detail", "rotate-zone"),
+                "Rotate zone secret",
+                BtnKind::Plain,
+            )
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.ask(Confirm {
+                    title: "Rotate zone secret".into(),
+                    message: ROTATE_WARNING.into(),
+                    label: "Rotate".into(),
+                    danger: true,
+                    action: Box::new(|this, cx| this.do_rotate_zone(cx)),
+                });
+                cx.notify();
+            }))
+            .into_any_element()
+        } else {
+            btn_off("Rotate zone secret").into_any_element()
+        };
+        body = body.child(div().flex().gap(px(8.)).child(save).child(rotate));
+        card(
+            Some("Access"),
+            Some("Older nodes reject these fields: if saving fails, update the node."),
+            body,
+        )
+        .into_any_element()
+    }
+
+    // What the node says about the saved secret; the value itself is only ever shown right after a rotation.
+    fn zone_status_line(&self, zone: Option<&ZoneStatus>) -> Div {
+        let text = match zone {
+            Some(z) => status_text(z),
+            None => "This node does not report zone secrets.".to_string(),
+        };
+        let mut line = div()
+            .flex()
+            .flex_col()
+            .gap(px(2.))
+            .child(text_dim(text).text_size(px(12.)));
+        if let Some(z) = zone.filter(|z| !z.header.is_empty()) {
+            line = line.child(
+                text_dim("Header")
+                    .text_size(px(11.))
+                    .child(mono(format!(" {}", z.header))),
+            );
+        }
+        line
+    }
+
+    // One panel per rotated secret; dismissing it drops the stored value, which zeroes that copy.
+    fn reveal_panels(&self, site_id: &str, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let mut panels = Vec::new();
+        for reveal in self.detail.reveals.iter().filter(|r| r.site == site_id) {
+            let (node, site) = (reveal.node.clone(), reveal.site.clone());
+            let (copy_node, copy_site) = (node.clone(), site.clone());
+            let steps = CLOUDFLARE_STEPS.iter().enumerate().fold(
+                div().flex().flex_col().gap(px(2.)),
+                |col, (i, step)| {
+                    col.child(text_dim(format!("{}. {step}", i + 1)).text_size(px(12.)))
+                },
+            );
+            let body = div()
+                .flex()
+                .flex_col()
+                .gap(px(10.))
+                .child(notice(NOT_SHOWN_AGAIN, Tone::Warn))
+                .child(field("Header name", None, mono(reveal.header.clone())))
+                .child(field(
+                    "Secret value",
+                    None,
+                    mono(reveal.secret().to_string()),
+                ))
+                .child(steps)
+                .child(
+                    div()
+                        .flex()
+                        .gap(px(8.))
+                        .child(
+                            btn(
+                                id("zone-copy", &reveal.node),
+                                "Copy secret",
+                                BtnKind::Primary,
+                            )
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    // The value is read from the panel's state at click time, so no closure holds a copy.
+                                    let found = this
+                                        .detail
+                                        .reveals
+                                        .iter()
+                                        .find(|r| r.is_for(&copy_node, &copy_site))
+                                        .map(|r| r.secret().to_string());
+                                    if let Some(secret) = found {
+                                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                            secret,
+                                        ));
+                                        this.say("Zone secret copied", Tone::Ok);
+                                    }
+                                    cx.notify();
+                                },
+                            )),
+                        )
+                        .child(
+                            btn(
+                                id("zone-done", &reveal.node),
+                                "I have saved it",
+                                BtnKind::Plain,
+                            )
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    this.detail.reveals.retain(|r| !r.is_for(&node, &site));
+                                    cx.notify();
+                                },
+                            )),
+                        ),
+                );
+            panels.push(
+                card(
+                    Some("New zone secret"),
+                    Some(reveal_meta(reveal).as_str()),
+                    body,
+                )
+                .into_any_element(),
+            );
+        }
+        panels
     }
 
     // The toggle and page choice are staged locally and only sent by Apply.

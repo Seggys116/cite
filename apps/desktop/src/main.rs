@@ -2,13 +2,19 @@ mod api;
 mod app;
 mod archive;
 mod bots;
+mod certs;
 mod cli;
 mod config;
 mod demo;
 mod keychain;
 mod model;
+mod rules;
+mod scope;
+#[cfg(test)]
+mod testkit;
 mod theme;
 mod ui;
+mod zone;
 
 use gpui::{
     App, AppContext, Application, Bounds, KeyBinding, TitlebarOptions, WindowBounds, WindowOptions,

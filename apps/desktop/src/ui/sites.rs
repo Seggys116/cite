@@ -122,7 +122,7 @@ impl Console {
             }
             Ok(Data { rows, failed })
         };
-        self.fetch(cx, fut, |this, res, cx| {
+        self.fetch_scoped(cx, fut, |this, res, cx| {
             this.sites.data = Load::from_result(res);
             cx.notify();
         });

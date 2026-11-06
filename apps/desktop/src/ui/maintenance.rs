@@ -81,7 +81,7 @@ impl Console {
             let sites = h.list_sites().await.unwrap_or_default();
             Ok(Data { pages, sites })
         };
-        self.fetch(cx, fut, |this, res, cx| {
+        self.fetch_scoped(cx, fut, |this, res, cx| {
             this.maintenance.data = Load::from_result(res);
             cx.notify();
         });

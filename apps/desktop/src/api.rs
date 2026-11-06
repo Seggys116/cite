@@ -15,7 +15,9 @@ use cite_edge::model::{
 };
 
 use crate::archive::CutSpec;
+use crate::certs::{CertItem, CertListing, RangesListing, UploadOutcome, UploadRequest};
 use crate::demo::DemoNode;
+use crate::zone::{ZoneReveal, ZoneStatus};
 
 pub type Res<T> = Result<T, ClientError>;
 
@@ -359,6 +361,82 @@ impl NodeHandle {
         }
     }
 
+    pub async fn certificates(&self) -> Res<CertListing> {
+        match self {
+            Self::Live(c) => c.certificates().await.map(cert_listing),
+            Self::Demo(_, d) => d.certificates(),
+        }
+    }
+
+    pub async fn certificate_upload(&self, req: &UploadRequest) -> Res<UploadOutcome> {
+        match self {
+            Self::Live(c) => c
+                .certificate_create(&create_upload(req))
+                .await
+                .map(uploaded),
+            Self::Demo(_, d) => d.certificate_upload(req),
+        }
+    }
+
+    pub async fn certificate_replace(&self, id: &str, req: &UploadRequest) -> Res<UploadOutcome> {
+        match self {
+            Self::Live(c) => c
+                .certificate_replace(id, &replace_upload(req))
+                .await
+                .map(uploaded),
+            Self::Demo(_, d) => d.certificate_replace(id, req),
+        }
+    }
+
+    pub async fn certificate_delete(&self, id: &str) -> Res<()> {
+        match self {
+            Self::Live(c) => c.certificate_delete(id).await,
+            Self::Demo(_, d) => d.certificate_delete(id),
+        }
+    }
+
+    pub async fn zone_secret(&self, site: &str) -> Res<ZoneStatus> {
+        match self {
+            Self::Live(c) => c.zone_secret(site).await.map(|s| ZoneStatus {
+                configured: s.configured,
+                readable: s.readable,
+                header: s.header,
+                created_at: s.created_at,
+                fingerprint: s.fingerprint,
+            }),
+            Self::Demo(_, d) => d.zone_secret(site),
+        }
+    }
+
+    // The secret is copied out of the client type, which wipes its own copy when it drops.
+    pub async fn rotate_zone_secret(&self, site: &str) -> Res<ZoneReveal> {
+        match self {
+            Self::Live(c) => {
+                let z = c.rotate_zone_secret(site).await?;
+                Ok(ZoneReveal::new(
+                    c.name(),
+                    site,
+                    z.secret(),
+                    z.header.clone(),
+                    z.created_at.clone(),
+                    z.fingerprint.clone(),
+                ))
+            }
+            Self::Demo(name, d) => d.rotate_zone_secret(name, site),
+        }
+    }
+
+    pub async fn cloudflare_ranges(&self) -> Res<RangesListing> {
+        match self {
+            Self::Live(c) => c.cloudflare_ranges().await.map(|r| RangesListing {
+                source: r.source,
+                updated: r.updated,
+                ranges: r.ranges,
+            }),
+            Self::Demo(_, d) => d.cloudflare_ranges(),
+        }
+    }
+
     pub async fn list_tokens(&self) -> Res<Vec<TokenMeta>> {
         match self {
             Self::Live(c) => c.list_tokens().await,
@@ -378,6 +456,50 @@ impl NodeHandle {
             Self::Live(c) => c.delete_token(id).await,
             Self::Demo(_, d) => d.delete_token(id),
         }
+    }
+}
+
+// The only place that reads the client's certificate types, so a signature change stays local.
+fn cert_item(info: cite_client::CertificateInfo) -> CertItem {
+    CertItem {
+        id: info.id,
+        name: info.name,
+        subject: info.subject,
+        sans: info.sans,
+        issuer: info.issuer,
+        not_before: info.not_before,
+        not_after: info.not_after,
+        days_left: info.days_left,
+        fingerprint: info.fingerprint_sha256,
+        key_type: info.key_type,
+        created_at: info.created_at,
+        covers: info.covers,
+        source: info.source,
+        warning: info.warning,
+    }
+}
+
+fn cert_listing(list: cite_client::CertificateList) -> CertListing {
+    CertListing {
+        items: list.items.into_iter().map(cert_item).collect(),
+        https_port: list.https_port,
+        dir_ready: list.dir_ready,
+        uncovered_hosts: list.uncovered_hosts,
+    }
+}
+
+fn create_upload(req: &UploadRequest) -> cite_client::CertificateUpload {
+    cite_client::CertificateUpload::new(&req.name, &req.certificate, &req.private_key)
+}
+
+fn replace_upload(req: &UploadRequest) -> cite_client::CertificateUpload {
+    cite_client::CertificateUpload::replacement(&req.certificate, &req.private_key).named(&req.name)
+}
+
+fn uploaded(saved: cite_client::CertificateSaved) -> UploadOutcome {
+    UploadOutcome {
+        cert: cert_item(saved.certificate),
+        warning: saved.warning,
     }
 }
 

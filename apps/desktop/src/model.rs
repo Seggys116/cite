@@ -108,12 +108,12 @@ pub fn regex_problem(pattern: &str) -> Option<String> {
         id: "probe".into(),
         name: "probe".into(),
         enabled: true,
-        action: FirewallAction::Deny,
+        action: Some(FirewallAction::Deny),
         matchers: Matchers {
             path_regex: Some(pattern.to_string()),
             ..Matchers::default()
         },
-        site: None,
+        ..FirewallRule::default()
     };
     validate_rule(&probe).err().map(|e| {
         let text = e.to_string();
@@ -475,6 +475,7 @@ pub struct SiteDraft {
     pub repo: String,
     pub branch: String,
     pub github_token: String,
+    pub access: crate::certs::AccessDraft,
 }
 
 impl std::fmt::Debug for SiteDraft {
@@ -491,6 +492,7 @@ impl std::fmt::Debug for SiteDraft {
             .field("repo", &self.repo)
             .field("branch", &self.branch)
             .field("github_token", &"[redacted]")
+            .field("access", &self.access)
             .finish()
     }
 }
@@ -543,6 +545,7 @@ pub fn build_site(draft: &SiteDraft) -> Result<Site, String> {
         },
         source,
         history: Vec::new(),
+        access: draft.access.to_access(),
     };
     cite_edge::validate::validate_site(&site).map_err(|e| e.to_string())?;
     Ok(site)
@@ -585,55 +588,7 @@ pub fn plan_placement(
     Ok((nodes, plan))
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct RuleDraft {
-    pub name: String,
-    pub action: Option<FirewallAction>,
-    pub path_regex: String,
-    pub path_prefix: String,
-    pub methods: String,
-    pub user_agent_regex: String,
-    pub cidrs: String,
-    pub host: String,
-    pub site: String,
-}
-
-fn some_trimmed(text: &str) -> Option<String> {
-    Some(text.trim().to_string()).filter(|t| !t.is_empty())
-}
-
-pub fn build_rule(draft: &RuleDraft, suffix: &str) -> Result<FirewallRule, String> {
-    if draft.name.trim().is_empty() {
-        return Err("Give the rule a name.".into());
-    }
-    let list = |t: &str| -> Vec<String> {
-        t.split(|c: char| c == ',' || c.is_whitespace())
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-            .collect()
-    };
-    let rule = FirewallRule {
-        id: format!("{}-{}", slugify(&draft.name), suffix.to_lowercase()),
-        name: draft.name.trim().to_string(),
-        enabled: true,
-        action: draft.action.unwrap_or(FirewallAction::Deny),
-        matchers: Matchers {
-            path_regex: some_trimmed(&draft.path_regex),
-            path_prefix: some_trimmed(&draft.path_prefix),
-            methods: list(&draft.methods)
-                .into_iter()
-                .map(|m| m.to_uppercase())
-                .collect(),
-            user_agent_regex: some_trimmed(&draft.user_agent_regex),
-            cidrs: list(&draft.cidrs),
-            host: some_trimmed(&draft.host),
-        },
-        site: some_trimmed(&draft.site),
-    };
-    validate_rule(&rule).map_err(|e| e.to_string())?;
-    Ok(rule)
-}
-
+// A secret header value is never part of the summary, so the list cannot show it back.
 pub fn matcher_summary(m: &Matchers) -> Vec<String> {
     let mut out = Vec::new();
     if let Some(v) = &m.path_regex {
@@ -651,6 +606,21 @@ pub fn matcher_summary(m: &Matchers) -> Vec<String> {
     out.extend(m.cidrs.iter().cloned());
     if let Some(v) = &m.host {
         out.push(format!("host {v}"));
+    }
+    if let Some(h) = &m.header {
+        let (op, value) = match (&h.regex, &h.equals) {
+            _ if h.secret => (if h.negate { "!=" } else { "=" }, "(hidden)".to_string()),
+            (Some(re), _) => (if h.negate { "!~" } else { "~" }, re.clone()),
+            (_, Some(eq)) => (if h.negate { "!=" } else { "=" }, eq.clone()),
+            _ => ("=", String::new()),
+        };
+        out.push(format!("header {} {op} {value}", h.name));
+    }
+    if let Some(v) = &m.scheme {
+        out.push(format!("scheme {v}"));
+    }
+    if let Some(v) = &m.referer_regex {
+        out.push(format!("referer ~ {v}"));
     }
     out
 }
@@ -965,16 +935,38 @@ mod tests {
     }
 
     #[test]
+    fn site_drafts_carry_access() {
+        let open = build_site(&draft()).expect("valid");
+        assert_eq!(open.access, cite_edge::model::SiteAccess::default());
+        let mut d = draft();
+        d.access.set_cloudflare_only(true);
+        d.access.flexible = true;
+        d.access.bots = cite_edge::model::BotPolicy::BlockBad;
+        d.access.set_zone_lock(true);
+        let site = build_site(&d).expect("valid");
+        assert!(site.access.cloudflare_only && site.access.zone_lock);
+        assert_eq!(site.access.tls, cite_edge::model::TlsMode::Flexible);
+        assert_eq!(site.access.bots, cite_edge::model::BotPolicy::BlockBad);
+        let mut lone = draft();
+        lone.access.zone_lock = true;
+        assert!(!build_site(&lone).expect("valid").access.zone_lock);
+    }
+
+    #[test]
     fn site_drafts_carry_source() {
         let mut d = draft();
         d.repo = "https://github.com/acme/shop".into();
         d.branch = "main".into();
-        d.github_token = "ghp_secret".into();
+        let token = crate::testkit::joined(&["gh", "-fixture", "-token"]);
+        d.github_token = token.clone();
         let site = build_site(&d).expect("valid");
         let source = site.source.expect("source");
         assert_eq!(source.branch.as_deref(), Some("main"));
-        assert_eq!(source.secret, None);
-        assert_eq!(draft_github_token(&d).as_deref(), Some("ghp_secret"));
+        assert!(source.secret.is_none());
+        assert!(
+            draft_github_token(&d).as_deref() == Some(token.as_str()),
+            "values differ"
+        );
         let site = build_site(&d).expect("valid");
         let all = vec!["a".to_string()];
         let (_, plan) = plan_placement(
@@ -986,18 +978,22 @@ mod tests {
             draft_github_token(&d),
         )
         .expect("plan");
-        assert_eq!(plan.github_token.as_deref(), Some("ghp_secret"));
-        assert!(!format!("{plan:?}").contains("ghp_secret"));
+        assert!(
+            plan.github_token.as_deref() == Some(token.as_str()),
+            "values differ"
+        );
+        assert!(!format!("{plan:?}").contains(token.as_str()));
         d.repo.clear();
-        assert_eq!(draft_github_token(&d), None);
+        assert!(draft_github_token(&d).is_none());
     }
 
     #[test]
     fn site_draft_debug_hides_the_github_token() {
         let mut d = draft();
-        d.github_token = "ghp_secret".into();
+        let token = crate::testkit::joined(&["gh", "-fixture", "-token"]);
+        d.github_token = token.clone();
         let shown = format!("{d:?}");
-        assert!(!shown.contains("ghp_secret"));
+        assert!(!shown.contains(token.as_str()));
         assert!(shown.contains(&d.name));
     }
 
@@ -1070,26 +1066,6 @@ mod tests {
         let (_, rep) =
             plan_placement(&site, &Placement::ReplicateAll, &[], &all, &over, None).expect("plan");
         assert_eq!(rep.site_for("a").blue.targets, site.blue.targets);
-    }
-
-    #[test]
-    fn rule_drafts_validate() {
-        let d = RuleDraft {
-            name: "Block WP".into(),
-            action: Some(FirewallAction::Drop),
-            path_regex: "^/wp-".into(),
-            methods: "get, post".into(),
-            ..RuleDraft::default()
-        };
-        let rule = build_rule(&d, "AB12").expect("valid");
-        assert_eq!(rule.id, "block-wp-ab12");
-        assert_eq!(rule.matchers.methods, vec!["GET", "POST"]);
-        assert!(build_rule(&RuleDraft::default(), "x").is_err());
-        let empty = RuleDraft {
-            name: "Nothing".into(),
-            ..RuleDraft::default()
-        };
-        assert!(build_rule(&empty, "x").is_err());
     }
 
     #[test]
@@ -1247,6 +1223,33 @@ mod tests {
             matcher_summary(&m),
             vec!["path /admin*", "POST", "10.0.0.0/8"]
         );
+        let extra = Matchers {
+            header: Some(cite_edge::model::HeaderMatch {
+                name: "X-Beta".into(),
+                equals: Some(crate::testkit::joined(&["hidden", "-gate", "-value"])),
+                negate: true,
+                secret: true,
+                ..Default::default()
+            }),
+            scheme: Some("http".into()),
+            referer_regex: Some("spam".into()),
+            ..Matchers::default()
+        };
+        let shown = matcher_summary(&extra);
+        assert_eq!(
+            shown,
+            vec!["header X-Beta != (hidden)", "scheme http", "referer ~ spam"]
+        );
+        assert!(!shown.join(" ").contains("hidden-gate-value"));
+        let open = Matchers {
+            header: Some(cite_edge::model::HeaderMatch {
+                name: "X-A".into(),
+                regex: Some("^a".into()),
+                ..Default::default()
+            }),
+            ..Matchers::default()
+        };
+        assert_eq!(matcher_summary(&open), vec!["header X-A ~ ^a"]);
         assert_eq!(
             token_name("Zak's MacBook.local"),
             "desktop-zak-s-macbook-local"

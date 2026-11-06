@@ -4,6 +4,7 @@ use gpui::{AnyElement, ClipboardItem, Context, Entity, div, prelude::*, px};
 
 use crate::app::{Confirm, Console, Load, new_input};
 use crate::archive::retention_warning;
+use crate::certs::ensure_same_node;
 use crate::config::KEYCHAIN_SERVICE;
 use crate::demo::now_ms;
 use crate::model::{SettingsDraft, parse_rfc3339_ms, rel_time};
@@ -22,12 +23,15 @@ pub struct Data {
 
 pub struct State {
     pub data: Load<Data>,
+    // The node the loaded data came from; saves are refused for any other node.
+    pub data_node: String,
     pub error: Option<String>,
     pub store_ua: bool,
     pub store_ip: bool,
     pub keep_forever: bool,
     pub archive_before_delete: bool,
-    pub created: Option<String>,
+    // A new API token with the node it belongs to; it is shown only while that node is selected.
+    pub created: Option<(String, String)>,
     pub recent: Entity<TextInput>,
     pub minutes: Entity<TextInput>,
     pub hours: Entity<TextInput>,
@@ -41,6 +45,7 @@ impl State {
     pub fn new(cx: &mut Context<Console>) -> Self {
         Self {
             data: Load::Idle,
+            data_node: String::new(),
             error: None,
             store_ua: true,
             store_ip: true,
@@ -65,18 +70,21 @@ impl Console {
             self.settings.data = Load::Idle;
             return;
         };
+        let node = h.name().to_string();
         let fut = async move {
             let settings = h.get_settings().await?;
             let tokens = h.list_tokens().await.unwrap_or_default();
             Ok(Data { settings, tokens })
         };
-        self.fetch(cx, fut, |this, res, cx| {
+        self.fetch_scoped(cx, fut, move |this, res, cx| {
             if let Ok(data) = &res {
                 this.fill_settings(&SettingsDraft::from_settings(&data.settings), cx);
+                this.settings.data_node = node;
             }
             this.settings.data = Load::from_result(res);
             cx.notify();
         });
+        self.load_certs(cx);
     }
 
     // Inputs mirror the node's values so unchanged fields round trip untouched.
@@ -121,6 +129,11 @@ impl Console {
         let (Some(h), Some(data)) = (self.active_handle(), self.settings.data.ready()) else {
             return;
         };
+        if let Err(msg) = ensure_same_node(&self.settings.data_node, self.active_name().as_deref())
+        {
+            self.settings.error = Some(msg);
+            return;
+        }
         match self.current_draft(cx).apply(&data.settings) {
             Ok(next) => {
                 self.settings.error = None;
@@ -148,13 +161,14 @@ impl Console {
         self.settings
             .token_name
             .update(cx, |i, cx| i.set_text("", cx));
+        let node = h.name().to_string();
         self.fetch(
             cx,
             async move { h.create_token(&name).await },
-            |this, res, cx| {
+            move |this, res, cx| {
                 match res {
                     Ok(created) => {
-                        this.settings.created = Some(created.token);
+                        this.settings.created = Some((node, created.token));
                         this.load_settings(cx);
                     }
                     Err(e) => this.say(e.to_string(), Tone::Bad),
@@ -188,6 +202,8 @@ impl Console {
             Load::Ready(data) => {
                 col = col
                     .child(self.retention_card(cx))
+                    .child(self.certs_card(cx))
+                    .child(self.ranges_card(cx))
                     .child(self.tokens_card(data, cx));
             }
         }
@@ -421,7 +437,14 @@ impl Console {
             Col::fixed("", 90.),
         ];
         let mut body = div().flex().flex_col().gap(px(12.));
-        if let Some(token) = self.settings.created.clone() {
+        let active = self.active_name();
+        let shown = self
+            .settings
+            .created
+            .as_ref()
+            .filter(|(node, _)| ensure_same_node(node, active.as_deref()).is_ok())
+            .map(|(_, token)| token.clone());
+        if let Some(token) = shown {
             let copy_value = token.clone();
             body = body.child(
                 div()
