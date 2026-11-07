@@ -58,7 +58,11 @@ pub fn egress_cidr(entry: &str) -> bool {
     };
     let max = if strict_v4(ip) {
         32
-    } else if ip.contains(':') && ip.parse::<std::net::Ipv6Addr>().is_ok() {
+    } else if ip.contains(':')
+        && ip
+            .parse::<std::net::Ipv6Addr>()
+            .is_ok_and(|a| a.to_ipv4_mapped().is_none())
+    {
         128
     } else {
         return false;
@@ -309,7 +313,7 @@ mod tests {
         }
         for bad in [
             "010.0.0.1", "10.0.0.0/33", "10.0.0.0/08", "10.0.0/8", "fd00::/129", "example.com", "",
-            "1.2.3.4/", " 10.0.0.1",
+            "1.2.3.4/", " 10.0.0.1", "::ffff:127.0.0.1", "::ffff:0:0/96",
         ] {
             assert!(!egress_cidr(bad), "{bad:?}");
         }

@@ -132,7 +132,6 @@ impl Console {
                 return;
             }
         };
-        self.ops.env.rows(runtime).reset(cx);
         let count = patch.set.len();
         let label = if runtime {
             "Runtime variables"
@@ -140,13 +139,20 @@ impl Console {
             "Build variables"
         };
         let fut = async move { h.env_patch(&site, runtime, &patch).await };
-        self.ops_action(cx, label, fut, move |_| {
-            if count == 1 {
-                "1 variable saved. It applies on the next redeploy.".to_string()
-            } else {
-                format!("{count} variables saved. They apply on the next redeploy.")
-            }
-        });
+        // The typed rows stay until the node has the values, so a failed save can be retried as typed.
+        self.ops_action_then(
+            cx,
+            label,
+            fut,
+            move |_| {
+                if count == 1 {
+                    "1 variable saved. It applies on the next redeploy.".to_string()
+                } else {
+                    format!("{count} variables saved. They apply on the next redeploy.")
+                }
+            },
+            move |this, cx| this.ops.env.rows(runtime).reset(cx),
+        );
     }
 
     fn remove_env(&mut self, runtime: bool, name: String, cx: &mut Context<Self>) {

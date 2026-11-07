@@ -6,7 +6,9 @@ use std::time::{Duration, Instant};
 use cite_edge::model::{
     DeployAction, Deployment, EdgeConfig, Maintenance, Site, Slot, Target, Upstream,
 };
-use cite_edge::validate::{normalise_outbound_rules, validate_site_strict};
+use cite_edge::validate::{
+    normalise_outbound_rules, validate_outbound_breadth, validate_site_strict,
+};
 use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
@@ -53,6 +55,7 @@ pub struct Deployer {
     pub(crate) orchestrator: Option<Arc<Orchestrator>>,
     pub(crate) probe: Option<Arc<dyn SlotProbe>>,
     locks: StdMutex<HashMap<String, Arc<Mutex<()>>>>,
+    doppler_gates: StdMutex<HashMap<String, Arc<Mutex<()>>>>,
     // Bumped by every drain schedule so an older timer can tell a later switch happened.
     drain_gen: Arc<StdMutex<HashMap<String, u64>>>,
     config_lock: Mutex<()>,
@@ -312,6 +315,7 @@ impl Deployer {
             orchestrator,
             probe,
             locks: StdMutex::new(HashMap::new()),
+            doppler_gates: StdMutex::new(HashMap::new()),
             drain_gen: Arc::default(),
             config_lock: Mutex::new(()),
             timing: Timing {
@@ -392,6 +396,27 @@ impl Deployer {
     pub(crate) fn site_lock(&self, id: &str) -> Arc<Mutex<()>> {
         let mut locks = self.locks.lock().unwrap_or_else(|p| p.into_inner());
         locks.entry(id.to_string()).or_default().clone()
+    }
+
+    /// Serialises Doppler syncs, binds and unbinds of one site with its delete; always taken before the site lock.
+    pub(crate) fn doppler_gate(&self, id: &str) -> Arc<Mutex<()>> {
+        let mut gates = self.doppler_gates.lock().unwrap_or_else(|p| p.into_inner());
+        gates.entry(id.to_string()).or_default().clone()
+    }
+
+    pub(crate) fn retain_doppler_gates(&self, keep: impl Fn(&str) -> bool) {
+        let mut gates = self.doppler_gates.lock().unwrap_or_else(|p| p.into_inner());
+        gates.retain(|id, _| keep(id));
+    }
+
+    fn check_outbound_breadth(&self, site: &Site) -> Result<()> {
+        let node = self
+            .orchestrator
+            .as_ref()
+            .map(|o| o.egress().node_allow_cidrs())
+            .unwrap_or_default();
+        validate_outbound_breadth(site, &node)?;
+        Ok(())
     }
 
     pub(crate) fn orchestrator(&self) -> Result<&Arc<Orchestrator>> {
@@ -665,6 +690,7 @@ impl Deployer {
         site.history.clear();
         normalise_outbound_rules(&mut site.outbound_rules);
         validate_site_strict(&site)?;
+        self.check_outbound_breadth(&site)?;
         let id = site.id.clone();
         let lock = self.site_lock(&id);
         let _guard = lock.lock().await;
@@ -775,6 +801,9 @@ impl Deployer {
         let lock = self.site_lock(&id);
         let _guard = lock.lock().await;
         let existing = self.get_site(&id)?;
+        if site.outbound_rules != existing.outbound_rules {
+            self.check_outbound_breadth(&site)?;
+        }
         if let Some(source) = &site.source {
             self.orchestrator()?.limits().check_source(source)?;
         }
@@ -843,6 +872,9 @@ impl Deployer {
     }
 
     async fn delete_site_inner(&self, actor: &str, id: &str, purge_volumes: bool) -> Result<()> {
+        // A Doppler sync in flight finishes first, so it cannot write a snapshot after the secrets below are gone.
+        let doppler_gate = self.doppler_gate(id);
+        let _doppler_held = doppler_gate.lock().await;
         let lock = self.site_lock(id);
         let guard = lock.lock().await;
         let site = self.get_site(id)?;

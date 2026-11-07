@@ -1,7 +1,7 @@
 use cite_edge::model::{OutboundMode, OutboundRules, Site};
 use cite_edge::validate::{
-    MAX_EGRESS_ENTRIES, is_egress_cidr, is_egress_host, normalise_outbound_rules, validate_site,
-    validate_site_strict,
+    MAX_EGRESS_ENTRIES, is_egress_cidr, is_egress_host, normalise_outbound_rules,
+    validate_outbound_breadth, validate_site, validate_site_strict,
 };
 use serde_json::json;
 
@@ -46,7 +46,16 @@ fn entry_shapes() {
     for ok in ["10.0.0.0/8", "192.168.1.5", "fd00::/8", "2001:db8::1", "0.0.0.0/0"] {
         assert!(is_egress_cidr(ok), "{ok}");
     }
-    for bad in ["010.0.0.1", "10.0.0.0/33", "10.1/8", "10.0.0.0/08", "example.com", "fd00::/200"] {
+    for bad in [
+        "010.0.0.1",
+        "10.0.0.0/33",
+        "10.1/8",
+        "10.0.0.0/08",
+        "example.com",
+        "fd00::/200",
+        "::ffff:127.0.0.1",
+        "::ffff:10.0.0.0/104",
+    ] {
         assert!(!is_egress_cidr(bad), "{bad}");
     }
     for ok in ["api.github.com", ".apple.com", "db.lan", "localhost"] {
@@ -83,6 +92,38 @@ fn strict_validation_table() {
     assert!(err.contains("more than 64"), "{err}");
     let bad = site(json!({ "mode": "allowlist" }));
     validate_site(&bad).expect("loading a stored config stays lenient");
+}
+
+#[test]
+fn wide_or_sensitive_allow_cidrs_need_the_node_to_list_them() {
+    for ok in [
+        json!({ "allow": ["10.0.0.0/8", "192.168.1.0/24", "fd00::/16", "api.github.com"] }),
+        json!({ "deny": ["0.0.0.0/0", "127.0.0.1"] }),
+    ] {
+        validate_outbound_breadth(&site(ok.clone()), &[]).unwrap_or_else(|e| panic!("{ok}: {e}"));
+    }
+    for (allow, needle) in [
+        ("0.0.0.0/0", "wider than /8"),
+        ("8.0.0.0/7", "wider than /8"),
+        ("fd00::/8", "wider than /16"),
+        ("127.0.0.1", "loopback"),
+        ("169.254.169.254", "loopback"),
+        ("0.0.0.0", "loopback"),
+        ("::1", "loopback"),
+        ("fe80::/64", "loopback"),
+        ("64:ff9b::/96", "loopback"),
+        ("2002:7f00::/24", "loopback"),
+    ] {
+        let s = site(json!({ "allow": [allow] }));
+        let err = validate_outbound_breadth(&s, &[]).expect_err(allow).0;
+        assert!(err.contains(needle), "{allow}: {err}");
+    }
+    let node = vec!["127.0.0.0/8".to_string(), "fd00::/8".to_string()];
+    for allow in ["127.0.0.1", "127.0.0.0/8", "fd00::/8", "fd12::/16"] {
+        validate_outbound_breadth(&site(json!({ "allow": [allow] })), &node).expect(allow);
+    }
+    let s = site(json!({ "allow": ["169.254.169.254"] }));
+    assert!(validate_outbound_breadth(&s, &node).is_err());
 }
 
 #[test]

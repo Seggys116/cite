@@ -136,6 +136,10 @@ pub fn open_url(hosts: &[String]) -> Option<String> {
         .map(|h| format!("https://{h}"))
 }
 
+fn keeps_page(same_place: bool, shown_site: Option<&str>, next_site: &str) -> bool {
+    same_place && shown_site == Some(next_site)
+}
+
 // The form as typed, checked, and compared with the stored site.
 struct FormState {
     problems: FieldProblems,
@@ -146,9 +150,13 @@ struct FormState {
 impl Console {
     // The site and its maintenance pages load together so the form is complete on first paint.
     pub fn load_detail(&mut self, node: String, site_id: String, cx: &mut Context<Self>) {
-        self.detail.data = Load::Loading;
+        let same = error_survives(&self.detail.node, &self.detail.site_id, &node, &site_id);
+        // A reload of the site on screen keeps it there until the reply, so the page neither blanks nor jumps to the top.
+        if !keeps_page(same, self.detail.data.ready().map(|d| d.site.id.as_str()), &site_id) {
+            self.detail.data = Load::Loading;
+        }
         // An action's error must still be on screen after the reload that follows it, so it is cleared only for another site.
-        if !error_survives(&self.detail.node, &self.detail.site_id, &node, &site_id) {
+        if !same {
             self.clear_error();
         }
         self.detail.node = node.clone();
@@ -1668,5 +1676,13 @@ mod tests {
         );
         assert_eq!(open_url(&hosts(&["*.example.com"])), None);
         assert_eq!(open_url(&[]), None);
+    }
+
+    #[test]
+    fn a_reload_of_the_shown_site_keeps_the_page() {
+        assert!(keeps_page(true, Some("blog"), "blog"));
+        assert!(!keeps_page(true, None, "blog"));
+        assert!(!keeps_page(false, Some("blog"), "blog"));
+        assert!(!keeps_page(true, Some("shop"), "blog"));
     }
 }

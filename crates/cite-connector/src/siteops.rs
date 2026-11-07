@@ -502,7 +502,17 @@ impl Deployer {
         };
         let mut settings_current = !orchestrated;
         let mut slots = Vec::with_capacity(2);
-        for slot in [Slot::Blue, Slot::Green] {
+        let inspected = match &probe {
+            Some(probe) => {
+                let (blue, green) = tokio::join!(
+                    probe.inspect(&site.id, Slot::Blue),
+                    probe.inspect(&site.id, Slot::Green)
+                );
+                [Some(blue), Some(green)]
+            }
+            None => [None, None],
+        };
+        for (slot, inspected) in [Slot::Blue, Slot::Green].into_iter().zip(inspected) {
             let (haproxy, haproxy_check) = haproxy_view(stats.as_deref(), site, slot, orchestrated);
             let mut status = SlotStatus {
                 slot,
@@ -510,8 +520,8 @@ impl Deployer {
                 haproxy_check,
                 ..SlotStatus::default()
             };
-            if let Some(probe) = &probe {
-                match probe.inspect(&site.id, slot).await {
+            if let Some(inspected) = inspected {
+                match inspected {
                     Ok(seen) => {
                         if slot == site.active
                             && let Some(orch) = &self.orchestrator

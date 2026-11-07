@@ -91,6 +91,11 @@ impl Detected {
 
 /// What a terminal would show for one output line: the text after the last carriage return, without ANSI escapes or control characters, capped at 300 characters.
 pub fn clean_output_line(line: &str) -> String {
+    cap_output_line(&strip_terminal(line))
+}
+
+/// The visible text of a line, uncapped, so a secret split by colour codes reads whole before redaction.
+fn strip_terminal(line: &str) -> String {
     let visible = line
         .rsplit('\r')
         .find(|segment| !segment.trim().is_empty())
@@ -126,6 +131,10 @@ pub fn clean_output_line(line: &str) -> String {
             out.push(c);
         }
     }
+    out
+}
+
+fn cap_output_line(out: &str) -> String {
     let trimmed = out.trim_end();
     if trimmed.chars().count() <= FAILURE_LINE_CHARS {
         return trimmed.to_string();
@@ -135,17 +144,18 @@ pub fn clean_output_line(line: &str) -> String {
     clipped
 }
 
-/// `first` names what failed; the last 40 non-blank output lines follow it, redacted line by line before they are cleaned and capped.
+/// `first` names what failed; the last 40 non-blank output lines follow it, each stripped of terminal codes, then redacted, then capped.
 pub fn failure_reason(first: &str, output: &[String], redactor: &Redactor, max_bytes: usize) -> String {
+    let shown = |line: &str| cap_output_line(&redactor.redact_line(&strip_terminal(line)));
     let mut lines: Vec<String> = output
         .iter()
-        .map(|line| clean_output_line(&redactor.redact_line(line)))
+        .map(|line| shown(line.as_str()))
         .filter(|line| !line.trim().is_empty())
         .collect();
     if lines.len() > FAILURE_TAIL_LINES {
         lines.drain(..lines.len() - FAILURE_TAIL_LINES);
     }
-    let mut text = clean_output_line(&redactor.redact_line(first));
+    let mut text = shown(first);
     for line in &lines {
         text.push('\n');
         text.push_str(line);
@@ -822,6 +832,21 @@ mod tests {
             assert!(line.chars().count() <= 300, "{line}");
         }
         assert!(shown[6].ends_with("..."));
+    }
+
+    #[test]
+    fn secrets_split_by_colour_codes_or_glued_to_text_are_redacted() {
+        let mut redactor = Redactor::new();
+        redactor.push_secret("SECRET");
+        let lines = vec![
+            "\u{1b}[31mSECRET\u{1b}[0m".to_string(),
+            "SEC\u{1b}[1mRET".to_string(),
+            "abcSECRET_9".to_string(),
+        ];
+        let reason = failure_reason("build failed: exit status 1", &lines, &redactor, 8192);
+        assert!(!reason.contains("SECRET") && !reason.contains("SEC"), "{reason}");
+        let shown: Vec<&str> = reason.lines().collect();
+        assert_eq!(shown[1..], ["[REDACTED]", "[REDACTED]", "abc[REDACTED]_9"]);
     }
 
     #[test]

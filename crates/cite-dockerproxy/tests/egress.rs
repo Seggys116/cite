@@ -246,18 +246,33 @@ fn stack_xnets_are_internal_and_the_bridge_is_the_only_extra_network() {
     open_xnet["Internal"] = json!(false);
     assert!(policy.validate_body(&Route::NetworkCreate, &open_xnet).is_err());
     let bridge_labels = json!({ "cite.managed": "true", "cite.role": "egress-bridge" });
-    let bridge = json!({ "Name": "cite-egress", "Driver": "bridge", "Internal": false, "Labels": bridge_labels });
+    let icc_off = json!({ "com.docker.network.bridge.enable_icc": "false" });
+    let bridge = json!({
+        "Name": "cite-egress", "Driver": "bridge", "Internal": false, "Options": icc_off.clone(), "Labels": bridge_labels,
+    });
     policy.validate_body(&Route::NetworkCreate, &bridge).unwrap();
     for (key, value) in [
         ("Internal", json!(true)),
         ("Name", json!("other-egress")),
         ("Labels", json!({ "cite.managed": "true" })),
         ("Driver", json!("macvlan")),
+        ("Options", json!({ "com.docker.network.bridge.enable_icc": "true" })),
+        ("Options", json!({})),
+        (
+            "Options",
+            json!({ "com.docker.network.bridge.enable_icc": "false", "com.docker.network.bridge.enable_ip_masquerade": "false" }),
+        ),
     ] {
         let mut bad = bridge.clone();
         bad[key] = value;
         assert!(policy.validate_body(&Route::NetworkCreate, &bad).is_err(), "{key}");
     }
+    let mut no_options = bridge.clone();
+    no_options.as_object_mut().unwrap().remove("Options");
+    assert!(policy.validate_body(&Route::NetworkCreate, &no_options).is_err(), "ICC must be off");
+    let mut xnet_options = xnet.clone();
+    xnet_options["Options"] = icc_off.clone();
+    assert!(policy.validate_body(&Route::NetworkCreate, &xnet_options).is_err(), "only the bridge takes options");
     let route = |method: &str, raw: &str| policy.classify(method, &normalise(raw).unwrap());
     assert!(route("GET", "/v1.45/networks/cite-egress").is_ok());
     assert!(route("DELETE", "/v1.45/networks/cite-egress").is_err());

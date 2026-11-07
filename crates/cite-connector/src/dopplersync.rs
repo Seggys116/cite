@@ -1,6 +1,7 @@
 //! Keeps the synced variables of Doppler-bound sites current and redeploys a site when they change.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard};
 use std::time::Duration;
 
@@ -168,13 +169,17 @@ fn redeployed_since(site: &Site, since: u64) -> bool {
     })
 }
 
-fn jitter(every: u64) -> Duration {
+fn jitter_secs(every: u64) -> u64 {
     let span = (every / 10).min(MAX_JITTER_SECS);
     let mut raw = [0u8; 8];
     if span == 0 || getrandom::fill(&mut raw).is_err() {
-        return Duration::ZERO;
+        return 0;
     }
-    Duration::from_secs(u64::from_le_bytes(raw) % (span + 1))
+    u64::from_le_bytes(raw) % (span + 1)
+}
+
+fn jitter(every: u64) -> Duration {
+    Duration::from_secs(jitter_secs(every))
 }
 
 fn lock<T>(m: &StdMutex<T>) -> MutexGuard<'_, T> {
@@ -213,7 +218,10 @@ pub struct DopplerSync {
     every: u64,
     clock: Arc<dyn Clock>,
     states: StdMutex<HashMap<String, SyncState>>,
-    gates: StdMutex<HashMap<String, Arc<Mutex<()>>>>,
+    // Added to every next_due so sites bound together drift apart instead of syncing in step.
+    spread: fn(u64) -> u64,
+    // Unix time before which nothing is sent with the node token, after Doppler rate limited it.
+    node_not_before: AtomicU64,
 }
 
 impl DopplerSync {
@@ -243,7 +251,8 @@ impl DopplerSync {
             every,
             clock,
             states: StdMutex::default(),
-            gates: StdMutex::default(),
+            spread: jitter_secs,
+            node_not_before: AtomicU64::new(0),
         })
     }
 
@@ -257,7 +266,25 @@ impl DopplerSync {
     }
 
     fn gate(&self, id: &str) -> Arc<Mutex<()>> {
-        Arc::clone(lock(&self.gates).entry(id.to_string()).or_default())
+        self.deployer.doppler_gate(id)
+    }
+
+    fn node_token_wait(&self) -> std::result::Result<(), DopplerError> {
+        let (now, until) = (self.clock.now(), self.node_not_before.load(Ordering::SeqCst));
+        if now < until {
+            return Err(DopplerError::RateLimited {
+                retry_after: Some(until - now),
+            });
+        }
+        Ok(())
+    }
+
+    fn note_node_result<T>(&self, result: &std::result::Result<T, DopplerError>) {
+        if let Err(err @ DopplerError::RateLimited { .. }) = result {
+            let wait = err.retry_after().unwrap_or(MIN_BACKOFF_SECS).clamp(1, MAX_BACKOFF_SECS);
+            let until = self.clock.now().saturating_add(wait);
+            self.node_not_before.fetch_max(until, Ordering::SeqCst);
+        }
     }
 
     fn state(&self, id: &str) -> Option<SyncState> {
@@ -278,21 +305,35 @@ impl DopplerSync {
         DopplerToken::parse(&stored).ok()
     }
 
-    async fn effective_token(&self, id: &str) -> std::result::Result<DopplerToken, DopplerError> {
+    /// The site's own token, or the node token (the flag says which).
+    async fn effective_token(
+        &self,
+        id: &str,
+    ) -> std::result::Result<(DopplerToken, bool), DopplerError> {
         match self.site_token(id).await {
-            Some(token) => Ok(token),
-            None => self.node_token.clone().ok_or(DopplerError::NoToken),
+            Some(token) => Ok((token, false)),
+            None => self
+                .node_token
+                .clone()
+                .map(|t| (t, true))
+                .ok_or(DopplerError::NoToken),
         }
     }
 
     pub async fn projects(&self) -> Result<Vec<DopplerProject>> {
         let token = self.node_token.clone().ok_or(DopplerError::NoToken)?;
-        Ok(self.source().projects(&token).await?)
+        self.node_token_wait()?;
+        let result = self.source().projects(&token).await;
+        self.note_node_result(&result);
+        Ok(result?)
     }
 
     pub async fn configs(&self, project: &str) -> Result<Vec<DopplerConfig>> {
         let token = self.node_token.clone().ok_or(DopplerError::NoToken)?;
-        Ok(self.source().configs(&token, project).await?)
+        self.node_token_wait()?;
+        let result = self.source().configs(&token, project).await;
+        self.note_node_result(&result);
+        Ok(result?)
     }
 
     pub async fn view(&self, id: &str) -> Result<DopplerView> {
@@ -379,6 +420,7 @@ impl DopplerSync {
         self.update(id, SyncState::begin);
         let outcome = self.fetch_and_store(&site, &binding).await;
         let (now, every) = (self.clock.now(), self.every);
+        let spread = (self.spread)(every);
         match outcome {
             Ok(done) => {
                 let detail = format!(
@@ -387,7 +429,7 @@ impl DopplerSync {
                     done.counts[1],
                     done.skipped.len()
                 );
-                self.update(id, |s| s.succeed(now, every, done.skipped));
+                self.update(id, |s| s.succeed(now, every.saturating_add(spread), done.skipped));
                 if done.changed {
                     self.deployer
                         .store
@@ -401,7 +443,10 @@ impl DopplerSync {
             }
             Err(err) => {
                 tracing::warn!(site = %id, error = %err, "doppler sync failed");
-                self.update(id, |s| s.fail(now, every, &err));
+                self.update(id, |s| {
+                    s.fail(now, every, &err);
+                    s.next_due = s.next_due.saturating_add(spread);
+                });
                 Err(err.into())
             }
         }
@@ -414,11 +459,18 @@ impl DopplerSync {
         binding: &DopplerBinding,
     ) -> std::result::Result<Fetched, DopplerError> {
         let id = site.id.as_str();
-        let token = self.effective_token(id).await?;
-        let raw = self
+        let (token, node) = self.effective_token(id).await?;
+        if node {
+            self.node_token_wait()?;
+        }
+        let downloaded = self
             .source()
             .download(&token, &binding.project, &binding.config)
-            .await?;
+            .await;
+        if node {
+            self.note_node_result(&downloaded);
+        }
+        let raw = downloaded?;
         let mut out = Fetched::default();
         let mut next: Vec<(EnvKind, Option<BTreeMap<String, String>>)> = Vec::with_capacity(2);
         for (i, kind) in [EnvKind::Build, EnvKind::Runtime].into_iter().enumerate() {
@@ -439,6 +491,12 @@ impl DopplerSync {
             out.counts[i] = filtered.vars.len();
             out.skipped.extend(filtered.skipped);
             next.push((kind, Some(filtered.vars)));
+        }
+        let current = self.deployer.get_site(id).ok().and_then(|s| binding_of(&s));
+        if current.as_ref() != Some(binding) {
+            return Err(DopplerError::Local(format!(
+                "site {id} was deleted or its Doppler binding changed during the sync"
+            )));
         }
         let store = &self.deployer.store;
         for (kind, vars) in next {
@@ -525,14 +583,17 @@ impl DopplerSync {
     fn claim_due(&self, now: u64) -> Vec<String> {
         let sites = self.deployer.sites();
         let existing: HashSet<&str> = sites.iter().map(|s| s.id.as_str()).collect();
-        lock(&self.gates).retain(|id, _| existing.contains(id.as_str()));
+        self.deployer
+            .retain_doppler_gates(|id| existing.contains(id));
         let mut states = lock(&self.states);
         states.retain(|id, _| existing.contains(id.as_str()));
         let mut due = Vec::new();
         for site in sites.iter().filter(|s| binding_of(s).is_some()) {
             let state = states.entry(site.id.clone()).or_default();
             if state.is_due(now) {
-                state.next_due = now.saturating_add(self.every);
+                state.next_due = now
+                    .saturating_add(self.every)
+                    .saturating_add((self.spread)(self.every));
                 due.push(site.id.clone());
             }
         }
@@ -871,13 +932,14 @@ mod tests {
         });
         let clock = Arc::new(FakeClock(AtomicU64::new(1_800_000_000)));
         let token = node_token.then(|| DopplerToken::parse(NODE_TOKEN).unwrap());
-        let sync = DopplerSync::with_parts(
+        let mut sync = DopplerSync::with_parts(
             Arc::clone(&deployer),
             Arc::clone(&source) as Arc<dyn DopplerSource>,
             token,
             300,
             Arc::clone(&clock) as Arc<dyn Clock>,
         );
+        Arc::get_mut(&mut sync).expect("sole owner").spread = |_| 0;
         Rig {
             _dir: dir,
             deployer,
@@ -1218,6 +1280,63 @@ mod tests {
         r.clock.advance(600);
         assert!(r.sync.claim_due(r.clock.now()).is_empty());
         assert!(r.sync.state("shop").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_rate_limited_node_token_pauses_every_node_token_request() {
+        let r = rig(true).await;
+        r.source.set(&[("A", "1")]);
+        r.sync
+            .bind("admin", "shop", binding(true, false), None)
+            .await
+            .expect("bind");
+        r.source.fail(DopplerError::RateLimited { retry_after: Some(120) });
+        assert!(r.sync.sync_site(ACTOR, "shop", false).await.is_err());
+        let calls = r.source.calls.load(Ordering::SeqCst);
+        r.source.set(&[("A", "2")]);
+        let err = r.sync.sync_site(ACTOR, "shop", false).await.unwrap_err();
+        assert_eq!(err.status(), 429);
+        assert!(r.sync.projects().await.is_err());
+        assert_eq!(r.source.calls.load(Ordering::SeqCst), calls, "nothing was sent while paused");
+        r.clock.advance(120);
+        r.sync.sync_site(ACTOR, "shop", false).await.expect("the pause is over");
+        assert_eq!(r.deployer.doppler_snapshot("shop", EnvKind::Build).await["A"], "2");
+    }
+
+    #[test]
+    fn next_due_spreads_by_at_most_a_tenth_of_the_interval() {
+        for _ in 0..50 {
+            assert!(jitter_secs(300) <= 30);
+            assert!(jitter_secs(86_400) <= MAX_JITTER_SECS);
+        }
+        assert_eq!(jitter_secs(5), 0);
+    }
+
+    #[tokio::test]
+    async fn a_sync_does_not_write_a_snapshot_for_a_binding_that_changed() {
+        let r = rig(true).await;
+        r.source.set(&[("A", "1")]);
+        let mut stale = r.deployer.get_site("shop").unwrap();
+        stale.source.as_mut().unwrap().doppler = Some(binding(true, false));
+        let err = r.sync.fetch_and_store(&stale, &binding(true, false)).await.err().unwrap();
+        assert!(err.to_string().contains("binding changed"), "{err}");
+        assert!(r.deployer.doppler_snapshot("shop", EnvKind::Build).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn deleting_a_site_waits_for_its_running_sync() {
+        let r = rig(true).await;
+        let gate = r.deployer.doppler_gate("shop");
+        let held = gate.lock().await;
+        let deployer = Arc::clone(&r.deployer);
+        let delete = tokio::spawn(async move { deployer.delete_site("admin", "shop").await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!delete.is_finished(), "the delete waits for the sync gate");
+        assert!(r.deployer.get_site("shop").is_ok());
+        drop(held);
+        let _ = tokio::time::timeout(Duration::from_secs(10), delete)
+            .await
+            .expect("the delete goes ahead once the sync is done");
     }
 
     #[test]

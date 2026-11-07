@@ -3,7 +3,19 @@ use std::sync::Arc;
 
 use cite_egress::policy::Policy;
 use cite_egress::proxy::{LISTEN, Timeouts, serve};
+use cite_egress::routes;
+use tokio::net::{TcpListener, TcpSocket};
 use tracing_subscriber::EnvFilter;
+
+// Accepted sockets inherit SO_KEEPALIVE from the listener on Linux.
+fn listen() -> std::io::Result<TcpListener> {
+    let addr: std::net::SocketAddr = LISTEN.parse().map_err(std::io::Error::other)?;
+    let socket = TcpSocket::new_v4()?;
+    socket.set_reuseaddr(true)?;
+    socket.set_keepalive(true)?;
+    socket.bind(addr)?;
+    socket.listen(1024)
+}
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -18,7 +30,10 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let listener = match tokio::net::TcpListener::bind(LISTEN).await {
+    let local = routes::local_networks();
+    tracing::info!(count = local.len(), "own networks and gateways added to the deny ceiling");
+    let policy = policy.with_local_networks(local);
+    let listener = match listen() {
         Ok(l) => l,
         Err(e) => {
             tracing::error!(error = %e, "cannot listen on {LISTEN}");

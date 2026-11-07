@@ -369,12 +369,15 @@ pub fn clip_tip_full(
 
 // Lets a table keep its column widths on narrow windows by scrolling sideways instead of overlapping.
 pub fn wide(key: ElementId, min_width: f32, body: impl IntoElement) -> Stateful<Div> {
-    div()
+    let mut table = div()
         .id(key)
         .w_full()
         .min_w_0()
         .overflow_x_scroll()
-        .child(div().min_w(px(min_width)).w_full().child(body))
+        .child(div().min_w(px(min_width)).w_full().child(body));
+    // A vertical wheel must reach the page scroller instead of panning the table sideways.
+    table.style().restrict_scroll_to_axis = Some(true);
+    table
 }
 
 #[cfg(test)]

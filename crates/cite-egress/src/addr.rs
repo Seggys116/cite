@@ -60,21 +60,28 @@ fn low_v4(ip: Ipv6Addr) -> Ipv4Addr {
     Ipv4Addr::from((u128::from(ip) & 0xffff_ffff) as u32)
 }
 
+/// The IPv4 address carried by a mapped, IPv4-compatible, NAT64 (64:ff9b::/96) or 6to4 (2002::/16) address.
+pub fn embedded_v4(ip: Ipv6Addr) -> Option<Ipv4Addr> {
+    let s = ip.segments();
+    if ip.is_unspecified() || ip.is_loopback() {
+        return None;
+    }
+    if (s[..5] == [0; 5] && (s[5] == 0xffff || s[5] == 0)) || v6_in(ip, v6("64:ff9b::"), 96) {
+        return Some(low_v4(ip));
+    }
+    if s[0] == 0x2002 {
+        return Some(Ipv4Addr::new((s[1] >> 8) as u8, s[1] as u8, (s[2] >> 8) as u8, s[2] as u8));
+    }
+    None
+}
+
 // Forms that carry an IPv4 address inside are judged by that address, so a private v4 cannot hide in v6.
 pub fn classify_v6(ip: Ipv6Addr) -> Class {
-    let s = ip.segments();
     if ip.is_unspecified() || ip.is_loopback() {
         return Class::Reserved;
     }
-    if s[..5] == [0; 5] && (s[5] == 0xffff || s[5] == 0) {
-        return classify_v4(low_v4(ip));
-    }
-    if v6_in(ip, v6("64:ff9b::"), 96) {
-        return classify_v4(low_v4(ip));
-    }
-    if s[0] == 0x2002 {
-        let embedded = Ipv4Addr::new((s[1] >> 8) as u8, s[1] as u8, (s[2] >> 8) as u8, s[2] as u8);
-        return classify_v4(embedded);
+    if let Some(v4) = embedded_v4(ip) {
+        return classify_v4(v4);
     }
     if v6_in(ip, v6("fc00::"), 7) {
         return Class::Private;
@@ -113,7 +120,7 @@ pub struct Cidr {
 }
 
 impl Cidr {
-    /// `a.b.c.d`, `a.b.c.d/n`, `v6` or `v6/n`, with the same strict IPv4 form as host names.
+    /// `a.b.c.d`, `a.b.c.d/n`, `v6` or `v6/n`, with the same strict IPv4 form as host names; `::ffff:` ranges must be written as IPv4.
     pub fn parse(text: &str) -> Option<Cidr> {
         let (ip, len) = match text.split_once('/') {
             Some((ip, len)) => (ip, Some(len)),
@@ -121,7 +128,13 @@ impl Cidr {
         };
         let ip = match parse_v4_strict(ip) {
             Some(a) => IpAddr::V4(a),
-            None if ip.contains(':') => IpAddr::V6(ip.parse().ok()?),
+            None if ip.contains(':') => {
+                let a: Ipv6Addr = ip.parse().ok()?;
+                if a.to_ipv4_mapped().is_some() {
+                    return None;
+                }
+                IpAddr::V6(a)
+            }
             None => return None,
         };
         let max = if ip.is_ipv4() { 32 } else { 128 };
@@ -423,8 +436,28 @@ mod tests {
             "example.com/8",
             "10.0.0.0/8/8",
             "",
+            "::ffff:127.0.0.1",
+            "::ffff:0:0/96",
+            "::ffff:10.0.0.0/104",
         ] {
             assert_eq!(Cidr::parse(bad), None, "{bad:?}");
+        }
+        assert!(Cidr::parse("::/0").is_some());
+    }
+
+    #[test]
+    fn embedded_ipv4_is_extracted_from_every_carrier_form() {
+        let v4 = |t: &str| Some(t.parse::<Ipv4Addr>().unwrap());
+        for (text, want) in [
+            ("::ffff:10.0.0.1", v4("10.0.0.1")),
+            ("::10.0.0.1", v4("10.0.0.1")),
+            ("64:ff9b::a00:1", v4("10.0.0.1")),
+            ("2002:a00:1::1", v4("10.0.0.1")),
+            ("2606:4700::1", None),
+            ("::1", None),
+            ("::", None),
+        ] {
+            assert_eq!(embedded_v4(text.parse().unwrap()), want, "{text}");
         }
     }
 }

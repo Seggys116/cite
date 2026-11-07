@@ -2,6 +2,7 @@ use std::net::IpAddr;
 
 use cite_client::{OutboundMode, OutboundRules};
 use cite_edge::model::Site;
+use cite_edge::validate::{is_egress_cidr, is_egress_host};
 use gpui::{AnyElement, Context, Entity, div, prelude::*, px};
 
 use crate::app::{Console, new_input};
@@ -11,7 +12,7 @@ use crate::ui::detail::Data;
 use crate::ui::detail::volumes::volumes_apply;
 use crate::ui::input::TextInput;
 use crate::ui::widgets::{
-    BtnKind, btn, card, id, mono, notice, seg_item, seg_row, strong, text_dim, toggle,
+    BtnKind, btn, btn_off, card, id, mono, notice, seg_item, seg_row, strong, text_dim, toggle,
 };
 
 pub const MAX_ENTRIES: usize = 64;
@@ -26,59 +27,56 @@ fn ip_problem(text: &str) -> String {
     format!("{text} is not a valid IP address.")
 }
 
-fn cidr(text: &str) -> Result<String, String> {
-    let Some((addr, bits)) = text.split_once('/') else {
-        return Err(ip_problem(text));
+// An entry the node accepted as an address, written the one way so duplicates are caught.
+fn canonical_ip(entry: &str) -> String {
+    let (addr, bits) = match entry.split_once('/') {
+        Some((addr, bits)) => (addr, Some(bits)),
+        None => (entry, None),
     };
-    let ip: IpAddr = addr.parse().map_err(|_| ip_problem(addr))?;
-    let max = if ip.is_ipv4() { 32 } else { 128 };
-    match bits.parse::<u8>() {
-        Ok(n) if n <= max => Ok(format!("{ip}/{n}")),
-        _ => Err(format!("The prefix length of {addr} is 0 to {max}.")),
+    let addr = addr
+        .parse::<IpAddr>()
+        .map_or_else(|_| addr.to_string(), |ip| ip.to_string());
+    match bits {
+        Some(bits) => format!("{addr}/{bits}"),
+        None => addr,
     }
 }
 
-// A leading *. means the same as a leading dot: the name and everything under it.
-fn host(text: &str) -> Result<String, String> {
-    let name = match text.strip_prefix("*.") {
-        Some(rest) => format!(".{rest}"),
-        None => text.to_string(),
-    };
-    let body = name.strip_prefix('.').unwrap_or(&name);
-    if body.is_empty() || name.len() > MAX_HOST {
-        return Err("A host name is 1 to 253 characters.".into());
+fn entry_problem(t: &str) -> String {
+    if t.contains('/') {
+        return format!("{t} is not a valid CIDR range.");
     }
-    if !name
-        .chars()
-        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '-')
-    {
-        return Err("Host names use letters, digits, . and - only.".into());
+    let digits_and_dots = t.bytes().all(|b| b.is_ascii_digit() || b == b'.');
+    if t.contains(':') || (digits_and_dots && t.bytes().any(|b| b.is_ascii_digit())) {
+        return ip_problem(t);
     }
-    if body
-        .split('.')
-        .any(|l| l.is_empty() || l.starts_with('-') || l.ends_with('-'))
-    {
-        return Err(format!("{name} is not a valid host name."));
+    let name = t.strip_prefix('.').unwrap_or(t);
+    if name.is_empty() || name.len() > MAX_HOST {
+        return "A host name is 1 to 253 characters.".into();
     }
-    Ok(name)
+    format!(
+        "{t} is not a valid host name: use letters, digits, - and _ in dot-separated parts of up to 63 characters, not ending in a number."
+    )
 }
 
-// An IP, a CIDR range or a host name or suffix, normalised to lower case with a leading dot for suffixes.
+// An IP, a CIDR range or a host name or suffix, checked by the node's own rules; a leading *. becomes a leading dot.
 pub fn normalize_entry(text: &str) -> Result<String, String> {
     let t = text.trim().to_ascii_lowercase();
     if t.is_empty() {
         return Err("Type an address, a CIDR range or a host name.".into());
     }
-    if t.contains('/') {
-        return cidr(&t);
+    let t = if t.starts_with("*.") {
+        t.replacen("*.", ".", 1)
+    } else {
+        t
+    };
+    if is_egress_cidr(&t) {
+        return Ok(canonical_ip(&t));
     }
-    if t.contains(':') || t.chars().all(|c| c.is_ascii_digit() || c == '.') {
-        return t
-            .parse::<IpAddr>()
-            .map(|ip| ip.to_string())
-            .map_err(|_| ip_problem(&t));
+    if is_egress_host(&t) {
+        return Ok(t);
     }
-    host(&t)
+    Err(entry_problem(&t))
 }
 
 pub fn add_entry(text: &str, list: &[String]) -> Result<String, String> {
@@ -234,6 +232,7 @@ impl Console {
         deny: bool,
         entries: &[String],
         allowlist: bool,
+        busy: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let (title, hint) = match (deny, allowlist) {
@@ -256,6 +255,16 @@ impl Console {
         }
         for entry in entries {
             let victim = entry.clone();
+            let remove = if busy {
+                btn_off("Remove").into_any_element()
+            } else {
+                btn(id(prefix, entry), "Remove", BtnKind::Plain)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.outbound_remove(deny, &victim);
+                        cx.notify();
+                    }))
+                    .into_any_element()
+            };
             col = col.child(
                 div()
                     .flex()
@@ -265,30 +274,28 @@ impl Console {
                     .border_b_1()
                     .border_color(c(DIVIDER))
                     .child(div().flex_1().min_w_0().child(mono(entry.clone())))
-                    .child(btn(id(prefix, entry), "Remove", BtnKind::Plain).on_click(
-                        cx.listener(move |this, _, _, cx| {
-                            this.outbound_remove(deny, &victim);
-                            cx.notify();
-                        }),
-                    )),
+                    .child(remove),
             );
         }
         let state = &self.ops.volumes.outbound;
         let input = if deny { state.deny_in.clone() } else { state.allow_in.clone() };
+        let add = if busy {
+            btn_off("Add").into_any_element()
+        } else {
+            btn(id(prefix, "add"), "Add", BtnKind::Primary)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.outbound_add(deny, cx);
+                    cx.notify();
+                }))
+                .into_any_element()
+        };
         col = col.child(
             div()
                 .flex()
                 .items_center()
                 .gap(px(8.))
                 .child(div().flex_1().min_w_0().child(input))
-                .child(
-                    btn(id(prefix, "add"), "Add", BtnKind::Primary).on_click(cx.listener(
-                        move |this, _, _, cx| {
-                            this.outbound_add(deny, cx);
-                            cx.notify();
-                        },
-                    )),
-                ),
+                .child(add),
         );
         col.into_any_element()
     }
@@ -306,8 +313,10 @@ impl Console {
             .rules
             .clone()
             .unwrap_or_else(|| data.site.outbound_rules.clone());
+        // Like the volume buttons, nothing here changes while a save or action is on the wire.
+        let busy = self.detail.busy || self.ops.busy;
         let mut switch = toggle(id("outbound", "switch"), on);
-        if !blocked {
+        if !blocked && !busy {
             switch = switch.on_click(cx.listener(|this, _, _, cx| {
                 let saved = this.detail.data.ready().is_some_and(|d| d.site.outbound);
                 let now = outbound_shown(saved, this.ops.volumes.outbound.on);
@@ -341,35 +350,34 @@ impl Console {
         }
         if on && !blocked {
             let allowlist = is_allowlist(&rules);
-            let modes = seg_row(vec![
-                seg_item(id("ob-mode", "public"), "Public internet only", !allowlist)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.outbound_edit(|r| r.mode = OutboundMode::Public);
-                        cx.notify();
-                    }))
-                    .into_any_element(),
-                seg_item(id("ob-mode", "allowlist"), "Only my allow list", allowlist)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.outbound_edit(|r| r.mode = OutboundMode::Allowlist);
-                        cx.notify();
-                    }))
-                    .into_any_element(),
-            ]);
+            let mut public = seg_item(id("ob-mode", "public"), "Public internet only", !allowlist);
+            let mut only = seg_item(id("ob-mode", "allowlist"), "Only my allow list", allowlist);
+            let mut mail = toggle(id("ob", "mail"), rules.block_mail);
+            if !busy {
+                public = public.on_click(cx.listener(|this, _, _, cx| {
+                    this.outbound_edit(|r| r.mode = OutboundMode::Public);
+                    cx.notify();
+                }));
+                only = only.on_click(cx.listener(|this, _, _, cx| {
+                    this.outbound_edit(|r| r.mode = OutboundMode::Allowlist);
+                    cx.notify();
+                }));
+                mail = mail.on_click(cx.listener(|this, _, _, cx| {
+                    this.outbound_edit(|r| r.block_mail = !r.block_mail);
+                    cx.notify();
+                }));
+            }
+            let modes = seg_row(vec![public.into_any_element(), only.into_any_element()]);
             body = body
                 .child(div().flex().child(modes))
-                .child(self.outbound_list(false, &rules.allow, allowlist, cx))
-                .child(self.outbound_list(true, &rules.deny, allowlist, cx))
+                .child(self.outbound_list(false, &rules.allow, allowlist, busy, cx))
+                .child(self.outbound_list(true, &rules.deny, allowlist, busy, cx))
                 .child(
                     div()
                         .flex()
                         .items_center()
                         .gap(px(10.))
-                        .child(toggle(id("ob", "mail"), rules.block_mail).on_click(cx.listener(
-                            |this, _, _, cx| {
-                                this.outbound_edit(|r| r.block_mail = !r.block_mail);
-                                cx.notify();
-                            },
-                        )))
+                        .child(mail)
                         .child(div().text_size(px(12.)).child("Block mail ports (25, 465, 587)")),
                 );
             if let Some(e) = &state.error {
@@ -417,19 +425,38 @@ mod tests {
             (".apple.com", ".apple.com"),
             ("*.apple.com", ".apple.com"),
             ("my-host", "my-host"),
+            ("under_score.com", "under_score.com"),
+            ("FD00:0:0::/64", "fd00::/64"),
         ];
         for (typed, want) in ok {
             assert_eq!(normalize_entry(typed).as_deref(), Ok(want), "{typed}");
         }
         for bad in [
             "", "  ", "10.0.0.0/33", "10.0.0.0/x", "300.1.1.1", "1.2.3", "fd00::/129", "a b.com",
-            "under_score.com", "*", "*.", ".", "a..b.com", "-bad.com", "bad-.com", "http://x.com",
-            "ex*ample.com",
+            "*", "*.", ".", "a..b.com", "-bad.com", "bad-.com", "http://x.com", "ex*ample.com",
+            "010.0.0.1", "10.0.0.0/08", "example.123", "example.0x1f", "*.10.0.0.1",
         ] {
             assert!(normalize_entry(bad).is_err(), "{bad:?}");
         }
         assert!(normalize_entry(&"a".repeat(254)).is_err());
-        assert!(normalize_entry(&format!("{}.com", "a".repeat(60))).is_ok());
+        assert!(normalize_entry(&format!("{}.com", "a".repeat(63))).is_ok());
+        assert!(normalize_entry(&format!("{}.com", "a".repeat(64))).is_err());
+    }
+
+    #[test]
+    fn a_refused_entry_says_what_kind_it_was_read_as() {
+        assert!(normalize_entry("10.0.0.0/33").unwrap_err().contains("CIDR"));
+        assert!(normalize_entry("300.1.1.1").unwrap_err().contains("IP address"));
+        assert!(normalize_entry("*.").unwrap_err().contains("1 to 253"));
+        assert!(normalize_entry("example.123").unwrap_err().contains("host name"));
+    }
+
+    #[test]
+    fn accepted_entries_pass_the_nodes_own_check() {
+        for typed in ["API.GitHub.com", "*.apple.com", "fd00:0::/64", "192.168.1.20", "a_b.c-d"] {
+            let entry = normalize_entry(typed).unwrap();
+            assert!(is_egress_cidr(&entry) || is_egress_host(&entry), "{entry}");
+        }
     }
 
     #[test]

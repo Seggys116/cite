@@ -67,6 +67,26 @@ pub fn egress_setting(key: &str, raw: &str, entry_ok: fn(&str) -> bool) -> Resul
     }
 }
 
+/// The node's own public addresses, appended to CITE_EGRESS_DENY_CIDRS exactly as the connector does.
+pub const NODE_IPS_KEY: &str = "CITE_NODE_PUBLIC_IPS";
+
+fn with_node_ips(key: &str, deny: &str, own: &str) -> Result<String, String> {
+    let mut entries: Vec<&str> = deny.split(',').filter(|e| !e.is_empty()).collect();
+    for ip in own.split(',').filter(|e| !e.is_empty()) {
+        if !entries.contains(&ip) {
+            entries.push(ip);
+        }
+    }
+    let joined = entries.join(",");
+    if joined.is_empty() || envval::egress_list(&joined, envval::egress_cidr) {
+        Ok(joined)
+    } else {
+        Err(format!(
+            "{key} and {NODE_IPS_KEY} together must have at most 64 entries"
+        ))
+    }
+}
+
 fn egress_mode(optional: impl Fn(&str) -> Option<String>) -> Result<EgressMode, String> {
     if let Some(mode) = optional("CITE_STACK_EGRESS_MODE") {
         return match mode.as_str() {
@@ -296,9 +316,17 @@ impl Config {
                 "CITE_STACK_EGRESS_BRIDGE {egress_bridge:?} is not valid"
             ));
         }
+        let own = egress_setting(
+            NODE_IPS_KEY,
+            &get(NODE_IPS_KEY).unwrap_or_default(),
+            envval::egress_cidr,
+        )?;
         let mut egress_env = Vec::new();
         for (key, env_key, entry_ok) in EGRESS_NODE_KEYS {
-            let value = egress_setting(key, &get(key).unwrap_or_default(), entry_ok)?;
+            let mut value = egress_setting(key, &get(key).unwrap_or_default(), entry_ok)?;
+            if env_key == "CITE_EGRESS_DENY_CIDRS" {
+                value = with_node_ips(key, &value, &own)?;
+            }
             if !value.is_empty() {
                 egress_env.push(format!("{env_key}={value}"));
             }
@@ -410,6 +438,31 @@ mod tests {
         ] {
             assert!(cfg(&pairs).is_err(), "{pairs:?}");
         }
+    }
+
+    #[test]
+    fn node_public_ips_join_the_deny_list_like_the_connector() {
+        let c = cfg(&[
+            ("CITE_STACK_EGRESS_DENY_CIDRS", "198.51.100.0/24,203.0.113.10"),
+            ("CITE_NODE_PUBLIC_IPS", " 203.0.113.10 , 203.0.113.11"),
+        ])
+        .unwrap();
+        assert_eq!(
+            c.egress_env,
+            vec!["CITE_EGRESS_DENY_CIDRS=198.51.100.0/24,203.0.113.10,203.0.113.11"]
+        );
+        let alone = cfg(&[("CITE_NODE_PUBLIC_IPS", "2001:db8::10")]).unwrap();
+        assert_eq!(alone.egress_env, vec!["CITE_EGRESS_DENY_CIDRS=2001:db8::10"]);
+        for bad in ["example.com", "::ffff:1.2.3.4", "1.2.3.4,1.2.3.4"] {
+            assert!(cfg(&[("CITE_NODE_PUBLIC_IPS", bad)]).is_err(), "{bad}");
+        }
+        let many = (0..40).map(|i| format!("10.0.{i}.1")).collect::<Vec<_>>().join(",");
+        let more = (0..40).map(|i| format!("10.1.{i}.1")).collect::<Vec<_>>().join(",");
+        assert!(cfg(&[
+            ("CITE_STACK_EGRESS_DENY_CIDRS", many.as_str()),
+            ("CITE_NODE_PUBLIC_IPS", more.as_str())
+        ])
+        .is_err());
     }
 
     #[test]

@@ -39,10 +39,13 @@ impl Redactor {
         }
     }
 
+    // Exact values are replaced wherever they appear, even glued to other text; only the token shapes need word boundaries.
     pub fn redact_line(&self, line: &str) -> String {
         let mut out = line.to_string();
         for secret in &self.secrets {
-            out = replace_bounded(&out, secret, "[REDACTED]");
+            if out.contains(secret.as_str()) {
+                out = out.replace(secret.as_str(), "[REDACTED]");
+            }
         }
         redact_token_patterns(&out)
     }
@@ -61,26 +64,6 @@ pub fn secrets_equal(a: &[u8], b: &[u8]) -> bool {
     let ha = Sha256::digest(a);
     let hb = Sha256::digest(b);
     bool::from(ha.ct_eq(hb.as_slice()))
-}
-
-fn replace_bounded(hay: &str, needle: &str, repl: &str) -> String {
-    if needle.is_empty() {
-        return hay.to_string();
-    }
-    let mut out = String::with_capacity(hay.len());
-    let bytes = hay.as_bytes();
-    let mut i = 0;
-    while i < hay.len() {
-        if hay[i..].starts_with(needle) && bounded(bytes, i, i + needle.len()) {
-            out.push_str(repl);
-            i += needle.len();
-        } else {
-            let ch = hay[i..].chars().next().unwrap();
-            out.push(ch);
-            i += ch.len_utf8();
-        }
-    }
-    out
 }
 
 fn replace_regex_bounded(hay: &str, re: &Regex, repl: &str) -> String {
@@ -143,6 +126,15 @@ mod tests {
         let line = format!("pre {token} post");
         let got = redact_token_patterns(&line);
         assert_eq!(got, "pre [REDACTED] post");
+    }
+
+    #[test]
+    fn exact_secrets_are_redacted_when_glued_or_coloured() {
+        let mut redactor = Redactor::new();
+        redactor.push_secret("SECRET");
+        assert_eq!(redactor.redact_line("\u{1b}[31mSECRET\u{1b}[0m"), "\u{1b}[31m[REDACTED]\u{1b}[0m");
+        assert_eq!(redactor.redact_line("abcSECRET_1 SECRET9"), "abc[REDACTED]_1 [REDACTED]9");
+        assert_eq!(redactor.redact_line("KEY=SECRETSECRET"), "KEY=[REDACTED][REDACTED]");
     }
 
     #[test]

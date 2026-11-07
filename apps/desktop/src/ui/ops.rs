@@ -42,6 +42,8 @@ pub struct OpsState {
     pub rebuild_prompt: bool,
     pub status_in_flight: bool,
     pub seq: Sequence,
+    // Status polls are numbered apart so a poll never makes a full load's reply look stale.
+    pub status_seq: Sequence,
     pub logs: LogView,
     pub token: Entity<TextInput>,
     pub git_ref: Entity<TextInput>,
@@ -61,6 +63,7 @@ impl OpsState {
             rebuild_prompt: false,
             status_in_flight: false,
             seq: Sequence::default(),
+            status_seq: Sequence::default(),
             logs: LogView::new(cx),
             token: new_input(cx, "GitHub token for this site", |i| i.masked().mono()),
             git_ref: new_input(cx, "main, a tag or a commit", |i| i.mono()),
@@ -272,13 +275,13 @@ impl Console {
         }
         self.ops.status_in_flight = true;
         let key = (node, site.clone());
-        let seq = self.ops.seq.issue();
+        let seq = self.ops.status_seq.issue();
         self.fetch(
             cx,
             async move { h.site_status(&site).await },
             move |this, res, cx| {
                 this.ops.status_in_flight = false;
-                if this.ops.for_site != key || !this.ops.seq.accept(seq) {
+                if this.ops.for_site != key || !this.ops.status_seq.accept(seq) {
                     return;
                 }
                 let was_busy = this
@@ -340,6 +343,21 @@ impl Console {
         T: Send + 'static,
         F: Future<Output = Result<T, ClientError>> + Send + 'static,
     {
+        self.ops_action_then(cx, what, fut, outcome, |_, _| {});
+    }
+
+    // As ops_action, with a step that runs only when the node accepted the change for the page on screen.
+    pub(crate) fn ops_action_then<T, F>(
+        &mut self,
+        cx: &mut Context<Self>,
+        what: &'static str,
+        fut: F,
+        outcome: impl FnOnce(&T) -> String + 'static,
+        on_success: impl FnOnce(&mut Self, &mut Context<Self>) + 'static,
+    ) where
+        T: Send + 'static,
+        F: Future<Output = Result<T, ClientError>> + Send + 'static,
+    {
         self.ops.busy = true;
         self.ops.error = None;
         self.fetch_origin(cx, fut, move |this, res, here, origin, cx| {
@@ -356,7 +374,10 @@ impl Console {
             }
             this.ops.busy = false;
             match result {
-                Ok(msg) => this.say(msg, Tone::Ok),
+                Ok(msg) => {
+                    this.say(msg, Tone::Ok);
+                    on_success(this, cx);
+                }
                 Err(msg) => this.ops.error = Some(msg),
             }
             this.reload_ops(cx);

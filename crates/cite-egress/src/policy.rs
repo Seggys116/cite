@@ -1,6 +1,6 @@
 use std::net::IpAddr;
 
-use crate::addr::{Cidr, Class, Host, classify};
+use crate::addr::{Cidr, Class, Host, classify, embedded_v4};
 
 const MAX_ENTRIES: usize = 64;
 /// Mail submission and relay ports, refused by default so a site cannot be turned into a spam relay.
@@ -64,6 +64,15 @@ struct Rules {
 impl Rules {
     fn cidr_hit(&self, ip: IpAddr) -> bool {
         self.cidrs.iter().any(|c| c.contains(ip))
+    }
+
+    // A deny also matches the IPv4 address a NAT64, 6to4 or IPv4-compatible address carries.
+    fn deny_hit(&self, ip: IpAddr) -> bool {
+        let embedded = match ip {
+            IpAddr::V6(a) => embedded_v4(a).map(IpAddr::V4),
+            IpAddr::V4(_) => None,
+        };
+        self.cidr_hit(ip) || embedded.is_some_and(|v4| self.cidr_hit(v4))
     }
 
     fn host_hit(&self, host: Option<&str>, always_suffix: bool) -> bool {
@@ -201,6 +210,16 @@ impl Policy {
         })
     }
 
+    /// Adds the proxy's own networks and gateways to the node deny ceiling, so no rule opens the host or a neighbour.
+    pub fn with_local_networks(mut self, local: impl IntoIterator<Item = Cidr>) -> Policy {
+        for c in local {
+            if !self.node_deny.cidrs.contains(&c) {
+                self.node_deny.cidrs.push(c);
+            }
+        }
+        self
+    }
+
     pub fn check_port(&self, port: u16) -> Result<(), Reason> {
         let listed = self
             .ports
@@ -226,10 +245,10 @@ impl Policy {
     // Node deny is a ceiling no site rule lifts; site deny beats site allow; private ranges need an explicit allow.
     pub fn check_addr(&self, name: Option<&str>, ip: IpAddr) -> Result<(), Reason> {
         let ip = crate::addr::canonical(ip);
-        if self.node_deny.cidr_hit(ip) || self.node_deny.host_hit(name, true) {
+        if self.node_deny.deny_hit(ip) || self.node_deny.host_hit(name, true) {
             return Err(Reason::NodeDenied);
         }
-        if self.site_deny.cidr_hit(ip) || self.site_deny.host_hit(name, true) {
+        if self.site_deny.deny_hit(ip) || self.site_deny.host_hit(name, true) {
             return Err(Reason::SiteDenied);
         }
         let site_cidr = self.site_allow.cidr_hit(ip);
@@ -318,6 +337,29 @@ mod tests {
         assert_eq!(p.check_addr(Some("app.corp.example"), ip("172.20.0.4")), Ok(()));
         assert_eq!(p.check_addr(Some("db.lan"), ip("127.0.0.1")), Err(Reason::Internal), "names never open loopback");
         assert_eq!(p.check_addr(Some("db.lan"), ip("169.254.169.254")), Err(Reason::Internal));
+    }
+
+    #[test]
+    fn denies_match_ipv4_carried_inside_ipv6() {
+        let p = policy(&[
+            ("CITE_EGRESS_DENY_CIDRS", "198.51.100.0/24"),
+            ("CITE_EGRESS_ALLOW", "198.51.100.0/24,203.0.113.0/24"),
+            ("CITE_EGRESS_DENY", "203.0.113.7"),
+        ]);
+        for carrier in ["64:ff9b::c633:6405", "2002:c633:6405::1", "::198.51.100.5", "::ffff:198.51.100.5"] {
+            assert_eq!(p.check_addr(None, ip(carrier)), Err(Reason::NodeDenied), "{carrier}");
+        }
+        assert_eq!(p.check_addr(None, ip("64:ff9b::cb00:7107")), Err(Reason::SiteDenied));
+        assert_eq!(p.check_addr(None, ip("203.0.113.8")), Ok(()));
+    }
+
+    #[test]
+    fn local_networks_join_the_node_ceiling() {
+        let p = policy(&[("CITE_EGRESS_ALLOW_CIDRS", "172.16.0.0/12")])
+            .with_local_networks([Cidr::parse("172.18.0.0/16").unwrap(), Cidr::parse("172.18.0.1").unwrap()]);
+        assert_eq!(p.check_addr(None, ip("172.18.0.1")), Err(Reason::NodeDenied));
+        assert_eq!(p.check_addr(None, ip("172.18.0.9")), Err(Reason::NodeDenied));
+        assert_eq!(p.check_addr(None, ip("172.20.0.9")), Ok(()));
     }
 
     #[test]

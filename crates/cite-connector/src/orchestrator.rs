@@ -864,6 +864,10 @@ impl Orchestrator {
         self.egress.mode
     }
 
+    pub fn egress(&self) -> &Egress {
+        &self.egress
+    }
+
     pub fn with_limits(mut self, limits: Limits) -> Orchestrator {
         self.limits = limits;
         self
@@ -1067,12 +1071,21 @@ impl Orchestrator {
     /// Reads the slot's manager and executor from Docker; a missing manager reports state "missing".
     pub async fn inspect_slot(&self, site_id: &str, slot: Slot) -> Result<SlotInspect> {
         let names = StackNames::new(site_id, slot)?;
-        let manager = self.inspect_owned(&names.manager).await?;
-        let executor = self.inspect_owned(&names.executor).await?;
-        let egress_proxy = self
-            .inspect_owned(&names.egress_proxy)
-            .await?
-            .map(|p| EgressProxyState {
+        let (manager, executor) = tokio::join!(
+            self.inspect_owned(&names.manager),
+            self.inspect_owned(&names.executor)
+        );
+        let (manager, executor) = (manager?, executor?);
+        // An executor on neither outbound network has no proxy to report; a missing one still gets a look for a stray proxy.
+        let routed = executor
+            .as_ref()
+            .is_none_or(|e| e.networks.contains(&names.xnet) || e.networks.contains(&names.egress));
+        let proxy = if routed {
+            self.inspect_owned(&names.egress_proxy).await?
+        } else {
+            None
+        };
+        let egress_proxy = proxy.map(|p| EgressProxyState {
                 running: p.running,
                 image: p.image,
                 env: p
@@ -1727,13 +1740,14 @@ impl Orchestrator {
         Ok(())
     }
 
-    // One normal bridge per node that only egress proxies join; it is never removed with a stack.
+    // One normal bridge per node that only egress proxies join, with inter-container traffic off; never removed with a stack.
     async fn ensure_egress_bridge(&self) -> Result<()> {
         let name = self.egress.bridge.as_str();
         let body = json!({
             "Name": name,
             "Driver": "bridge",
             "Internal": false,
+            "Options": { "com.docker.network.bridge.enable_icc": "false" },
             "Labels": { "cite.managed": "true", "cite.role": "egress-bridge" },
         });
         let reply = self

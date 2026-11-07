@@ -1,5 +1,6 @@
 use cite_client::VolumeInfo;
 use cite_edge::model::{RenderMode, Site, Source, Volume};
+use cite_edge::validate::{MAX_VOLUMES, is_valid_volume_name, mount_path_problem};
 use gpui::{AnyElement, Context, Entity, div, prelude::*, px};
 
 use crate::api::{NodeHandle, Res};
@@ -13,14 +14,6 @@ use crate::ui::widgets::{
     BtnKind, Col, btn, btn_off, card, empty_state, field, id, mono, notice, pill, table, text_dim,
 };
 use crate::ui::detail::outbound::OutboundState;
-
-const MAX_NAME: usize = 31;
-const MIN_PATH: usize = 2;
-const MAX_PATH: usize = 255;
-const RESERVED: [&str; 12] = [
-    "/proc", "/sys", "/dev", "/etc", "/run", "/usr", "/bin", "/sbin", "/lib", "/root", "/app",
-    "/tmp",
-];
 
 // The node wrappers live here because the volume routes are used by this tab only.
 impl NodeHandle {
@@ -50,20 +43,12 @@ pub fn volumes_apply(site: &Site) -> bool {
     source_serves(site.source.as_ref())
 }
 
-fn is_name_char(c: char) -> bool {
-    c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'
-}
-
 // The node's own rule: [a-z0-9][a-z0-9-]{0,30}, and unique within the site.
 pub fn name_problem(name: &str, taken: &[String]) -> Option<String> {
     if name.is_empty() {
         return Some("Type a volume name.".into());
     }
-    let starts_ok = name
-        .chars()
-        .next()
-        .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit());
-    if name.chars().count() > MAX_NAME || !starts_ok || !name.chars().all(is_name_char) {
+    if !is_valid_volume_name(name) {
         return Some(
             "A volume name is 1 to 31 characters: lower case letters, digits and -, starting with a letter or digit."
                 .into(),
@@ -89,27 +74,8 @@ pub fn overlaps(a: &str, b: &str) -> bool {
 
 // The node's own rule for a mount path, plus a check against the paths already used.
 pub fn path_problem(path: &str, others: &[String]) -> Option<String> {
-    if !path.starts_with('/') {
-        return Some("The mount path must be absolute and start with /.".into());
-    }
-    let len = path.chars().count();
-    if !(MIN_PATH..=MAX_PATH).contains(&len) {
-        return Some("The mount path is 2 to 255 characters.".into());
-    }
-    if !path
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '-'))
-    {
-        return Some("The mount path may use letters, digits and . _ / - only.".into());
-    }
-    if path.contains("..") {
-        return Some("The mount path cannot contain ..".into());
-    }
-    if path.ends_with('/') {
-        return Some("The mount path cannot end with /.".into());
-    }
-    if let Some(root) = RESERVED.iter().find(|r| under(path, r)) {
-        return Some(format!("{root} is reserved: choose another folder."));
+    if let Some(why) = mount_path_problem(path) {
+        return Some(format!("The mount path {why}."));
     }
     others
         .iter()
@@ -118,6 +84,9 @@ pub fn path_problem(path: &str, others: &[String]) -> Option<String> {
 }
 
 pub fn add_problem(name: &str, path: &str, declared: &[Volume]) -> Option<String> {
+    if declared.len() >= MAX_VOLUMES {
+        return Some(format!("A site can have at most {MAX_VOLUMES} volumes."));
+    }
     let names: Vec<String> = declared.iter().map(|v| v.name.clone()).collect();
     let paths: Vec<String> = declared.iter().map(|v| v.mount_path.clone()).collect();
     name_problem(name, &names).or_else(|| path_problem(path, &paths))
@@ -457,7 +426,18 @@ mod tests {
     #[test]
     fn mount_paths_follow_the_nodes_rule() {
         let none: Vec<String> = Vec::new();
-        for ok in ["/data", "/srv/uploads", "/var/lib/app.db", "/a_b-c.d", "/ab"] {
+        let oks = [
+            "/data",
+            "/srv/uploads",
+            "/var/lib/app.db",
+            "/a_b-c.d",
+            "/ab",
+            "/app",
+            "/app/uploads",
+            "/a..b",
+            "/data/..x",
+        ];
+        for ok in oks {
             assert_eq!(path_problem(ok, &none), None, "{ok}");
         }
         let long = format!("/{}", "a".repeat(255));
@@ -468,13 +448,24 @@ mod tests {
             (long.as_str(), "2 to 255"),
             ("/da ta", "letters"),
             ("/data*", "letters"),
-            ("/a/../b", ".."),
-            ("/data/", "end with /"),
-            ("/proc", "reserved"),
-            ("/etc/conf", "reserved"),
-            ("/tmp/x/y", "reserved"),
-            ("/app", "reserved"),
-            ("/lib", "reserved"),
+            ("/a/../b", "'..'"),
+            ("/a/..", "'..'"),
+            ("/a//b", "empty"),
+            ("/a/./b", "'.'"),
+            ("/data/", "trailing slash"),
+            ("/proc", "system uses"),
+            ("/etc/conf", "system uses"),
+            ("/tmp/x/y", "system uses"),
+            ("/lib", "system uses"),
+            ("/lib64", "system uses"),
+            ("/libx32/x", "system uses"),
+            ("/boot", "system uses"),
+            ("/nodejs/bin", "system uses"),
+            ("/cite-executor", "system uses"),
+            ("/var/lib/cite/x", "system uses"),
+            ("/var/run/app", "system uses"),
+            ("/var", "system uses"),
+            ("/var/lib", "system uses"),
         ];
         for (path, word) in table {
             let problem = path_problem(path, &none).unwrap_or_else(|| panic!("{path} passed"));
@@ -483,6 +474,29 @@ mod tests {
         assert_eq!(path_problem("/library", &none), None);
         assert_eq!(path_problem("/application", &none), None);
         assert_eq!(path_problem("/tmpfiles", &none), None);
+        assert_eq!(path_problem("/variable", &none), None);
+    }
+
+    #[test]
+    fn the_desktop_and_the_node_agree_on_mount_paths() {
+        let none: Vec<String> = Vec::new();
+        let paths = ["/data", "/app", "/a..b", "/var", "/a//b", "/x/./y", "/x/../y", "/"];
+        for path in paths {
+            assert_eq!(
+                path_problem(path, &none).is_none(),
+                mount_path_problem(path).is_none(),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_site_takes_at_most_the_nodes_volume_count() {
+        let full: Vec<Volume> = (0..MAX_VOLUMES)
+            .map(|i| vol(&format!("v{i}"), &format!("/v{i}")))
+            .collect();
+        assert!(add_problem("more", "/more", &full).unwrap().contains("at most"));
+        assert_eq!(add_problem("more", "/more", &full[..MAX_VOLUMES - 1]), None);
     }
 
     #[test]

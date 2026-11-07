@@ -720,19 +720,30 @@ pub fn validate_network(policy: &Policy, body: &Value) -> Result<(), String> {
     {
         return Err("Driver is not allowed".to_string());
     }
+    let egress_bridge = obj
+        .get("Name")
+        .and_then(Value::as_str)
+        .is_some_and(|n| policy.is_egress_bridge(n));
     let mut keys = vec!["Name", "Internal", "Labels"];
     if obj.contains_key("Driver") {
         keys.push("Driver");
+    }
+    if egress_bridge {
+        keys.push("Options");
     }
     exact_keys(obj, &keys)?;
     let name = obj["Name"].as_str().ok_or("Name is not a string")?;
     let internal = obj["Internal"]
         .as_bool()
         .ok_or("Internal is not a boolean")?;
-    // The node's egress bridge is a normal bridge that only egress proxies join.
-    if policy.is_egress_bridge(name) {
+    // The node's egress bridge is a normal bridge that only egress proxies join, with ICC off so proxies cannot reach each other.
+    if egress_bridge {
         if internal {
             return Err("the egress bridge must not be internal".to_string());
+        }
+        let options = json!({ "com.docker.network.bridge.enable_icc": "false" });
+        if let Some(reason) = first_difference("Options", &options, &obj["Options"]) {
+            return Err(reason);
         }
         let want = json!({ "cite.managed": "true", "cite.role": "egress-bridge" });
         return match first_difference("Labels", &want, &obj["Labels"]) {

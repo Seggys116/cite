@@ -50,6 +50,11 @@ fn toast_until(tone: Tone, tick: u64) -> u64 {
     }
 }
 
+// The root view repaints whole on any notify, so the logo flips only while it is on screen in an active window.
+fn logo_flip_due(tick: u64, window_active: bool, sidebar_collapsed: bool) -> bool {
+    window_active && !sidebar_collapsed && tick.is_multiple_of(LOGO_FLIP_TICKS)
+}
+
 // A hovered toast is held until a moment after the pointer leaves it.
 fn expire_toasts(toasts: &mut Vec<Toast>, hovered: Option<u64>, tick: u64) -> bool {
     let before = toasts.len();
@@ -93,6 +98,14 @@ mod toast_tests {
         assert!(!expire_toasts(&mut list, None, 6));
         assert!(expire_toasts(&mut list, None, 7));
         assert_eq!(list.iter().map(|t| t.id).collect::<Vec<_>>(), vec![3]);
+    }
+
+    #[test]
+    fn the_logo_repaints_only_when_it_can_be_seen() {
+        assert!(logo_flip_due(LOGO_FLIP_TICKS, true, false));
+        assert!(!logo_flip_due(LOGO_FLIP_TICKS + 1, true, false));
+        assert!(!logo_flip_due(LOGO_FLIP_TICKS, false, false));
+        assert!(!logo_flip_due(LOGO_FLIP_TICKS, true, true));
     }
 }
 
@@ -656,8 +669,7 @@ impl Console {
     // Runs every half second: flips the logo colours, expires toasts and refreshes live data.
     fn on_tick(&mut self, cx: &mut Context<Self>) {
         self.tick += 1;
-        // A window in the background is not repainted for the logo.
-        let mut dirty = self.window_active && self.tick.is_multiple_of(LOGO_FLIP_TICKS);
+        let mut dirty = logo_flip_due(self.tick, self.window_active, self.sidebar_collapsed);
         self.ops_tick(cx);
         self.analytics_tick(cx);
         if expire_toasts(&mut self.toasts, self.hovered_toast, self.tick) {

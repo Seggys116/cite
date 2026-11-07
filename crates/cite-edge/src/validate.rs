@@ -461,7 +461,7 @@ fn strict_v4(text: &str) -> bool {
         })
 }
 
-/// An IP address or CIDR in the strict form the egress proxy accepts.
+/// An IP address or CIDR in the strict form the egress proxy accepts; IPv4-mapped (`::ffff:`) ranges must be written as IPv4.
 pub fn is_egress_cidr(entry: &str) -> bool {
     let (ip, len) = match entry.split_once('/') {
         Some((ip, len)) => (ip, Some(len)),
@@ -469,7 +469,7 @@ pub fn is_egress_cidr(entry: &str) -> bool {
     };
     let max = if strict_v4(ip) {
         32
-    } else if ip.contains(':') && ip.parse::<Ipv6Addr>().is_ok() {
+    } else if ip.contains(':') && ip.parse::<Ipv6Addr>().is_ok_and(|a| a.to_ipv4_mapped().is_none()) {
         128
     } else {
         return false;
@@ -540,6 +540,61 @@ pub fn validate_outbound_rules(site: &Site) -> Result<(), ValidationError> {
     }
     if rules.mode == crate::model::OutboundMode::Allowlist && rules.allow.is_empty() {
         return invalid(format!("{what}: allowlist mode needs at least one allow entry"));
+    }
+    Ok(())
+}
+
+// Loopback, link-local, unspecified, and IPv6 forms that carry an IPv4 address the proxy judges by.
+const SENSITIVE_EGRESS_NETS: [&str; 7] = [
+    "0.0.0.0/8",
+    "127.0.0.0/8",
+    "169.254.0.0/16",
+    "::/96",
+    "fe80::/10",
+    "64:ff9b::/96",
+    "2002::/16",
+];
+
+fn egress_net(entry: &str) -> Option<IpNet> {
+    if !is_egress_cidr(entry) {
+        return None;
+    }
+    match entry.split_once('/') {
+        Some(_) => IpNet::from_str(entry).ok().map(|n| n.trunc()),
+        None => IpAddr::from_str(entry).ok().map(IpNet::from),
+    }
+}
+
+/// Strict only: a site allow CIDR wider than /8 (IPv4) or /16 (IPv6), or touching loopback, link-local or
+/// unspecified ranges, is refused unless a node `CITE_STACK_EGRESS_ALLOW_CIDRS` entry already covers it.
+pub fn validate_outbound_breadth(site: &Site, node_allow: &[String]) -> Result<(), ValidationError> {
+    let node: Vec<IpNet> = node_allow.iter().filter_map(|e| egress_net(e)).collect();
+    let sensitive: Vec<IpNet> = SENSITIVE_EGRESS_NETS
+        .iter()
+        .filter_map(|s| IpNet::from_str(s).ok())
+        .collect();
+    let what = format!("site {} outbound_rules", site.id);
+    for entry in &site.outbound_rules.allow {
+        let Some(net) = egress_net(entry) else {
+            continue;
+        };
+        if node.iter().any(|n| n.contains(&net)) {
+            continue;
+        }
+        let widest = if net.addr().is_ipv4() { 8 } else { 16 };
+        if net.prefix_len() < widest {
+            return invalid(format!(
+                "{what}: allow entry {entry:?} is wider than /{widest}; the node must list it in CITE_STACK_EGRESS_ALLOW_CIDRS"
+            ));
+        }
+        if sensitive
+            .iter()
+            .any(|s| s.contains(&net.network()) || net.contains(&s.network()))
+        {
+            return invalid(format!(
+                "{what}: allow entry {entry:?} reaches loopback, link-local, unspecified or IPv4-in-IPv6 addresses; the node must list it in CITE_STACK_EGRESS_ALLOW_CIDRS"
+            ));
+        }
     }
     Ok(())
 }

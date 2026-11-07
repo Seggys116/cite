@@ -10,6 +10,10 @@ pub const DEFAULT_EGRESS_BRIDGE: &str = "cite-egress";
 const MODE_KEY: &str = "CITE_STACK_EGRESS_MODE";
 const LEGACY_KEY: &str = "CITE_STACK_EXECUTOR_EGRESS";
 const BRIDGE_KEY: &str = "CITE_STACK_EGRESS_BRIDGE";
+/// The node's own public addresses; they join the deny ceiling of every egress proxy.
+pub const NODE_IPS_KEY: &str = "CITE_NODE_PUBLIC_IPS";
+const DENY_CIDRS_ENV: &str = "CITE_EGRESS_DENY_CIDRS";
+const ALLOW_CIDRS_ENV: &str = "CITE_EGRESS_ALLOW_CIDRS";
 
 /// Node setting, key in the egress proxy and the rule each entry must pass.
 type NodeKey = (&'static str, &'static str, fn(&str) -> bool);
@@ -96,6 +100,22 @@ fn setting(key: &str, raw: &str, entry_ok: fn(&str) -> bool) -> Result<String> {
     Ok(entries.join(","))
 }
 
+// The Docker proxy appends CITE_NODE_PUBLIC_IPS the same way, so both sides build the same deny list.
+fn with_node_ips(key: &str, deny: &str, own: &str) -> Result<String> {
+    let mut entries: Vec<&str> = deny.split(',').filter(|e| !e.is_empty()).collect();
+    for ip in own.split(',').filter(|e| !e.is_empty()) {
+        if !entries.contains(&ip) {
+            entries.push(ip);
+        }
+    }
+    if entries.len() > MAX_EGRESS_ENTRIES {
+        return Err(bad(format!(
+            "{key} and {NODE_IPS_KEY} together have more than {MAX_EGRESS_ENTRIES} entries"
+        )));
+    }
+    Ok(entries.join(","))
+}
+
 // `*.name` and `.name` mean the same, so both forms collapse to one entry.
 fn site_list(entries: &[String]) -> String {
     let mut out: Vec<String> = Vec::new();
@@ -152,9 +172,13 @@ impl Egress {
         if !bridge_ok {
             return Err(bad(format!("{BRIDGE_KEY} {bridge:?} is not valid")));
         }
+        let own = setting(NODE_IPS_KEY, &get(NODE_IPS_KEY).unwrap_or_default(), is_egress_cidr)?;
         let mut node_env = Vec::new();
         for (key, env_key, entry_ok) in NODE_KEYS {
-            let value = setting(key, &get(key).unwrap_or_default(), entry_ok)?;
+            let mut value = setting(key, &get(key).unwrap_or_default(), entry_ok)?;
+            if env_key == DENY_CIDRS_ENV {
+                value = with_node_ips(key, &value, &own)?;
+            }
             if !value.is_empty() {
                 node_env.push(format!("{env_key}={value}"));
             }
@@ -164,6 +188,16 @@ impl Egress {
             bridge,
             node_env,
         })
+    }
+
+    /// The node's CITE_STACK_EGRESS_ALLOW_CIDRS entries, which may open ranges a site alone cannot.
+    pub fn node_allow_cidrs(&self) -> Vec<String> {
+        self.node_env
+            .iter()
+            .filter_map(|e| e.strip_prefix(ALLOW_CIDRS_ENV)?.strip_prefix('='))
+            .flat_map(|v| v.split(','))
+            .map(str::to_string)
+            .collect()
     }
 
     /// The egress proxy env for one site: the node's entries, then the site's rules.
@@ -247,6 +281,29 @@ mod tests {
         ] {
             assert!(lookup(&pairs).is_err(), "{pairs:?}");
         }
+    }
+
+    #[test]
+    fn node_public_ips_join_the_deny_list() {
+        let alone = lookup(&[(NODE_IPS_KEY, " 203.0.113.10, 2001:db8::10 ")]).unwrap();
+        assert_eq!(alone.node_env, vec!["CITE_EGRESS_DENY_CIDRS=203.0.113.10,2001:db8::10"]);
+        let merged = lookup(&[
+            ("CITE_STACK_EGRESS_DENY_CIDRS", "198.51.100.0/24,203.0.113.10"),
+            (NODE_IPS_KEY, "203.0.113.10,203.0.113.11"),
+            ("CITE_STACK_EGRESS_ALLOW_CIDRS", "192.168.10.0/24,fd00::/8"),
+        ])
+        .unwrap();
+        assert_eq!(
+            merged.node_env[1],
+            "CITE_EGRESS_DENY_CIDRS=198.51.100.0/24,203.0.113.10,203.0.113.11"
+        );
+        assert_eq!(merged.node_allow_cidrs(), vec!["192.168.10.0/24", "fd00::/8"]);
+        for bad in ["example.com", "::ffff:1.2.3.4", "1.2.3.4,1.2.3.4"] {
+            assert!(lookup(&[(NODE_IPS_KEY, bad)]).is_err(), "{bad}");
+        }
+        let many = (0..40).map(|i| format!("10.0.{i}.1")).collect::<Vec<_>>().join(",");
+        let more = (0..40).map(|i| format!("10.1.{i}.1")).collect::<Vec<_>>().join(",");
+        assert!(lookup(&[("CITE_STACK_EGRESS_DENY_CIDRS", many.as_str()), (NODE_IPS_KEY, more.as_str())]).is_err());
     }
 
     #[test]

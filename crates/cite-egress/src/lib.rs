@@ -3,3 +3,4 @@
 pub mod addr;
 pub mod policy;
 pub mod proxy;
+pub mod routes;

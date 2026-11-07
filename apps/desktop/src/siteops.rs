@@ -160,6 +160,8 @@ pub struct LogRow {
     pub level: LogLevel,
     pub phase: String,
     pub text: String,
+    // Lower-cased text and phase, made once so a search does not redo it for every row on every paint.
+    folded: (String, String),
 }
 
 pub const LOG_CAP: usize = 5000;
@@ -179,11 +181,14 @@ impl LogBuffer {
     pub fn push(&mut self, reply: LogsResponse) -> usize {
         let added = reply.lines.len();
         for line in &reply.lines {
+            let phase = line.phase.clone().unwrap_or_default();
+            let text = strip_ansi(&line.text);
             self.rows.push_back(LogRow {
                 ts: line.ts.clone().unwrap_or_default(),
                 level: level_of(line),
-                phase: line.phase.clone().unwrap_or_default(),
-                text: strip_ansi(&line.text),
+                folded: (text.to_lowercase(), phase.to_lowercase()),
+                phase,
+                text,
             });
         }
         while self.rows.len() > LOG_CAP {
@@ -213,11 +218,7 @@ impl LogBuffer {
         let n = needle.trim().to_lowercase();
         self.rows
             .iter()
-            .filter(|r| {
-                n.is_empty()
-                    || r.text.to_lowercase().contains(&n)
-                    || r.phase.to_lowercase().contains(&n)
-            })
+            .filter(|r| n.is_empty() || r.folded.0.contains(&n) || r.folded.1.contains(&n))
             .collect()
     }
 

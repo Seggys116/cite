@@ -8,6 +8,7 @@ use crate::model::{
     WINDOWS, fmt_bytes, fmt_clock, fmt_int, fmt_ms, fmt_num, fmt_pct, merge_series,
     merge_summaries, per_bucket_sizes,
 };
+use crate::scope::apply_if_current;
 use crate::theme::{BLUE, DIM, GREEN, RED, Tone, YELLOW, c};
 use crate::ui::bots::{bot_badge, request_detail};
 use crate::ui::chart::{Line, STAT_MIN, clip_tip, hbar, line_chart, wide, x_axis};
@@ -130,13 +131,16 @@ impl Console {
             recent.truncate(RECENT_LIMIT);
             Ok(recent)
         };
-        // Unscoped on purpose: the guard must clear even when the scope moved on while this was running.
-        self.fetch(cx, fut, |this, res, cx| {
+        let issued = self.scope;
+        // The guard clears whatever the scope, but the list only lands on the window and nodes it was asked for.
+        self.fetch(cx, fut, move |this, res, cx| {
             this.traffic.refreshing = false;
-            if let (Ok(recent), Load::Ready(data)) = (res, &mut this.traffic.data) {
-                data.recent = recent;
-                cx.notify();
-            }
+            apply_if_current(this.scope, issued, res, |res| {
+                if let (Ok(recent), Load::Ready(data)) = (res, &mut this.traffic.data) {
+                    data.recent = recent;
+                    cx.notify();
+                }
+            });
         });
     }
 

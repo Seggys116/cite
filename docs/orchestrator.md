@@ -92,6 +92,7 @@ Proxy settings, all on the `dockerproxy` service:
 | `CITE_STACK_EGRESS_BRIDGE` | `cite-egress` | The normal bridge network the connector creates once per node and attaches every egress proxy to. Nothing else joins it. |
 | `CITE_STACK_EGRESS_ALLOW_CIDRS` | empty | Filtered mode: comma list of IPs or CIDRs every site may reach even though they are private or reserved, for example a LAN database at `192.168.10.0/24`. |
 | `CITE_STACK_EGRESS_DENY_CIDRS` | empty | Filtered mode: public ranges no site may reach. A site allow entry never overrides it. |
+| `CITE_NODE_PUBLIC_IPS` | empty | Filtered mode: the node's own public IPs, added to the deny list of every egress proxy so sites cannot reach host services through the public address. Set it on every internet-facing node; set it on both the connector and the Docker proxy (the orchestrator overlay passes it to both). |
 | `CITE_STACK_EGRESS_DENY_HOSTS` | empty | Filtered mode: host names no site may reach, each also covering its subdomains. A site allow entry never overrides it. |
 | `CITE_STACK_EGRESS_ALLOW_PORTS` | empty (every port) | Filtered mode: comma list of ports or ranges (`80,443,8000-8100`) a site may connect to. Mail ports 25, 465 and 587 stay refused for sites whose `block_mail` is on (the default) even when listed. |
 

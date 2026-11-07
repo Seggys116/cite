@@ -31,6 +31,14 @@ use crate::ui::widgets::{
     tone_for_status,
 };
 const AUTO_TICKS: u64 = 20;
+const LOG_ROWS_KEPT: usize = 500;
+
+// Keeps the request list bounded: a page that pushes it past the cap replaces the newest rows; returns how many went.
+fn trim_log(rows: &mut Vec<(String, LogEvent)>) -> usize {
+    let over = rows.len().saturating_sub(LOG_ROWS_KEPT);
+    rows.drain(..over);
+    over
+}
 
 pub struct FieldInput {
     pub field: Field,
@@ -47,6 +55,8 @@ pub struct LogState {
     pub error: Option<String>,
     pub inspect: Option<(String, LogEvent)>,
     pub seq: Sequence,
+    // Newer rows dropped by trim_log since the last fresh load.
+    pub dropped: usize,
 }
 
 pub struct State {
@@ -347,6 +357,7 @@ impl Console {
             log.error = None;
             if reset {
                 log.rows.clear();
+                log.dropped = 0;
             }
             let mut pages = Vec::new();
             for (name, page) in res.unwrap_or_default() {
@@ -367,6 +378,7 @@ impl Console {
                 }
             }
             merge_pages(&mut log.rows, pages);
+            log.dropped += trim_log(&mut log.rows);
             cx.notify();
         });
     }
@@ -1314,6 +1326,15 @@ impl Console {
             );
             body = body.child(request_detail(event, close.into_any_element()));
         }
+        if log.dropped > 0 {
+            body = body.child(notice(
+                &format!(
+                    "Only {LOG_ROWS_KEPT} requests are kept in the list: the {} newest were dropped to make room for older pages. Apply the filter again to start from the newest.",
+                    fmt_int(log.dropped as u64)
+                ),
+                Tone::Info,
+            ));
+        }
         let min_width = cols.iter().filter_map(|col| col.width).sum::<f32>() + 220.;
         body = body.child(scroll_area("an-log").max_h(px(560.)).child(wide(
             id("an", "log-table"),
@@ -1498,4 +1519,38 @@ fn latency_bars(data: &Data) -> gpui::Div {
         col = col.child(hbar(label, v as u64, max, BLUE, fmt_ms(v)));
     }
     col
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rows(count: usize) -> Vec<(String, LogEvent)> {
+        (0..count)
+            .map(|i| {
+                let event = LogEvent {
+                    ts_ms: (count - i) as i64,
+                    ..Default::default()
+                };
+                ("edge".to_string(), event)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_short_request_list_is_left_alone() {
+        let mut list = rows(LOG_ROWS_KEPT);
+        assert_eq!(trim_log(&mut list), 0);
+        assert_eq!(list.len(), LOG_ROWS_KEPT);
+    }
+
+    #[test]
+    fn a_long_request_list_keeps_the_older_pages_just_loaded() {
+        let mut list = rows(LOG_ROWS_KEPT + 50);
+        let oldest = list.last().unwrap().1.ts_ms;
+        assert_eq!(trim_log(&mut list), 50);
+        assert_eq!(list.len(), LOG_ROWS_KEPT);
+        assert_eq!(list.last().unwrap().1.ts_ms, oldest);
+        assert_eq!(list[0].1.ts_ms, LOG_ROWS_KEPT as i64);
+    }
 }
