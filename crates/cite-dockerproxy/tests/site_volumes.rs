@@ -55,7 +55,12 @@ fn check(policy: &Policy, name: &str, body: &Value) -> Result<(), String> {
 
 fn volumed() -> SpecSet {
     specs_for(
-        &site("shop", "node", &[("data", "/data"), ("up", "/srv/up")], true),
+        &site(
+            "shop",
+            "node",
+            &[("data", "/data"), ("up", "/srv/up")],
+            true,
+        ),
         Slot::Blue,
         true,
     )
@@ -86,8 +91,11 @@ fn every_volume_and_outbound_variant_the_orchestrator_emits_is_accepted() {
         for outbound in [true, false] {
             for isolate in [true, false] {
                 for slot in [Slot::Blue, Slot::Green] {
-                    let vols: [(&str, &str); 3] =
-                        [("data", "/data"), ("cache-2", "/home/nonroot/.cache"), ("x", "/var/lib/app")];
+                    let vols: [(&str, &str); 3] = [
+                        ("data", "/data"),
+                        ("cache-2", "/home/nonroot/.cache"),
+                        ("x", "/var/lib/app"),
+                    ];
                     let s = specs_for(&site("shop-2", runtime, &vols, outbound), slot, isolate);
                     for (name, body) in [
                         (&s.manager_name, &s.manager),
@@ -132,8 +140,13 @@ fn site_volume_mounts_are_volumes_of_this_site_only() {
 
 #[test]
 fn at_most_eight_site_volumes_are_accepted() {
-    let names: Vec<(String, String)> = (0..8).map(|i| (format!("v{i}"), format!("/d{i}"))).collect();
-    let refs: Vec<(&str, &str)> = names.iter().map(|(n, p)| (n.as_str(), p.as_str())).collect();
+    let names: Vec<(String, String)> = (0..8)
+        .map(|i| (format!("v{i}"), format!("/d{i}")))
+        .collect();
+    let refs: Vec<(&str, &str)> = names
+        .iter()
+        .map(|(n, p)| (n.as_str(), p.as_str()))
+        .collect();
     let s = specs_for(&site("shop", "node", &refs, true), Slot::Blue, true);
     check(&common::policy(), &s.executor_name, &s.executor).unwrap();
     let mut body = s.executor.clone();
@@ -146,15 +159,23 @@ fn the_init_container_only_chowns_this_sites_volumes_at_fixed_targets() {
     assert!(init(|b| mounts(b)[1]["Target"] = json!("/data/x")).is_err());
     assert!(init(|b| mounts(b)[1]["Target"] = json!("/vols/up")).is_err());
     assert!(init(|b| mounts(b)[1]["Source"] = json!("cite-vol-other_data")).is_err());
-    assert!(init(|b| {
-        let script = b["Cmd"][0].as_str().unwrap().replace("chown -R", "chmod -R 777");
-        b["Cmd"] = json!([script]);
-    })
-    .is_err());
-    assert!(init(|b| {
-        mounts(b).pop();
-    })
-    .is_err(), "the script must match the mounts");
+    assert!(
+        init(|b| {
+            let script = b["Cmd"][0]
+                .as_str()
+                .unwrap()
+                .replace("chown -R", "chmod -R 777");
+            b["Cmd"] = json!([script]);
+        })
+        .is_err()
+    );
+    assert!(
+        init(|b| {
+            mounts(b).pop();
+        })
+        .is_err(),
+        "the script must match the mounts"
+    );
     assert!(init(|b| b["HostConfig"]["NetworkMode"] = json!("cite-shop-blue-egress")).is_err());
 }
 
@@ -173,7 +194,10 @@ fn site_volume_bodies_and_routes_are_pinned() {
         json!({ "Name": "cite-vol-shop-data", "Labels": ok["Labels"] }),
         json!({ "Name": "other", "Labels": ok["Labels"] }),
     ] {
-        assert!(policy.validate_body(&Route::VolumeCreate, &bad).is_err(), "{bad}");
+        assert!(
+            policy.validate_body(&Route::VolumeCreate, &bad).is_err(),
+            "{bad}"
+        );
     }
     let route = |method: &str, raw: &str| policy.classify(method, &normalise(raw).unwrap());
     assert_eq!(
@@ -188,7 +212,10 @@ fn site_volume_bodies_and_routes_are_pinned() {
     assert!(route("DELETE", "/v1.45/volumes/cite-vol-shop_data?force=true").is_err());
     let pinned = "/v1.45/volumes?filters=%7B%22label%22%3A%5B%22cite.managed%3Dtrue%22%2C%22cite.site%3Dshop%22%5D%7D";
     assert_eq!(route("GET", pinned).unwrap(), Route::VolumeList);
-    assert!(route("GET", "/v1.45/volumes").is_err(), "a listing needs the label filter");
+    assert!(
+        route("GET", "/v1.45/volumes").is_err(),
+        "a listing needs the label filter"
+    );
     let unpinned = "/v1.45/volumes?filters=%7B%22label%22%3A%5B%22cite.site%3Dshop%22%5D%7D";
     assert!(route("GET", unpinned).is_err());
     let dangling = "/v1.45/volumes?filters=%7B%22dangling%22%3A%5B%22true%22%5D%7D";
@@ -203,7 +230,10 @@ fn executor_outbound_follows_the_node_egress_mode() {
     let open = specs_with(&s, Slot::Blue, true, &Egress::with_mode(EgressMode::Open));
     let closed = specs_for(&site("shop", "node", &[], false), Slot::Blue, true);
     let eps = &open.executor["NetworkingConfig"]["EndpointsConfig"];
-    assert_eq!(eps["cite-shop-blue-net"]["Aliases"], json!(["cite-shop-blue-executor"]));
+    assert_eq!(
+        eps["cite-shop-blue-net"]["Aliases"],
+        json!(["cite-shop-blue-executor"])
+    );
     assert_eq!(eps["cite-shop-blue-egress"], json!({}));
     assert_eq!(
         filtered.executor["NetworkingConfig"]["EndpointsConfig"]["cite-shop-blue-xnet"],

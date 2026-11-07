@@ -17,8 +17,8 @@ use crate::keychain::KeychainTokenStore;
 use crate::scope::{Origin, Scope, apply_if_current, foreign_notice};
 use crate::theme::{
     ACCENT, BG, BLUE, BORDER, CARD_RADIUS, CHIP_RADIUS, DIM, DIVIDER, GREEN, INPUT, PANEL_RADIUS,
-    RED, ROW_RADIUS, SIDEBAR, SURFACE, TEXT, Tone, WINDOW, c, chip_fill, chip_stroke, font,
-    layout, space, tint,
+    RED, ROW_RADIUS, SIDEBAR, SURFACE, TEXT, Tone, WINDOW, c, chip_fill, chip_stroke, font, layout,
+    space, tint,
 };
 use crate::ui::input::TextInput;
 use crate::ui::widgets::{BtnKind, btn, id, strong, text_dim};
@@ -91,7 +91,11 @@ mod toast_tests {
 
     #[test]
     fn expired_toasts_go_and_a_hovered_one_stays() {
-        let mut list = vec![toast(1, Tone::Ok, 5), toast(2, Tone::Bad, 5), toast(3, Tone::Ok, 9)];
+        let mut list = vec![
+            toast(1, Tone::Ok, 5),
+            toast(2, Tone::Bad, 5),
+            toast(3, Tone::Ok, 9),
+        ];
         assert!(expire_toasts(&mut list, Some(2), 5));
         assert_eq!(list.iter().map(|t| t.id).collect::<Vec<_>>(), vec![2, 3]);
         assert_eq!(list[0].until, 7);
@@ -357,9 +361,11 @@ impl Console {
         console.load_current(cx);
         // Demo runs never write the window state, so screenshots cannot change a real user's layout.
         if !console.demo {
-            console._subs.push(cx.observe_window_bounds(window, |this, window, _| {
-                this.record_bounds(window);
-            }));
+            console
+                ._subs
+                .push(cx.observe_window_bounds(window, |this, window, _| {
+                    this.record_bounds(window);
+                }));
             console._subs.push(cx.on_app_quit(|this, _| {
                 if this.window_state_changed.is_some() {
                     this.save_window_state();
@@ -1025,12 +1031,7 @@ impl Console {
             }))
             .on_click(cx.listener(move |this, _, _, cx| this.dismiss_toast(toast_id, cx)))
             .child(div().mt(px(5.)).child(crate::ui::widgets::dot(toast.tone)))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .child(toast.text.clone()),
-            )
+            .child(div().flex_1().min_w_0().child(toast.text.clone()))
             .child(text_dim("\u{00d7}").text_size(px(font::MD)))
     }
 }

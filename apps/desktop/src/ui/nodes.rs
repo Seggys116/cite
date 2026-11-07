@@ -417,7 +417,12 @@ impl Console {
             .flex_col()
             .gap(px(SPACE))
             .child(step(1, "Connector", "Where the node listens.", step_one))
-            .child(step(2, "Sign in", "How this console proves who it is.", step_two));
+            .child(step(
+                2,
+                "Sign in",
+                "How this console proves who it is.",
+                step_two,
+            ));
         if let Some(err) = &n.error {
             form = form.child(notice(err, Tone::Bad));
         }
@@ -476,19 +481,14 @@ pub(crate) fn step(n: usize, title: &str, detail: &str, body: impl IntoElement) 
         .gap(px(GAP))
         .min_w_0()
         .child(
-            div()
-                .flex()
-                .items_center()
-                .gap(px(10.))
-                .child(badge)
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .min_w_0()
-                        .child(strong(title.to_string()).text_size(px(13.)))
-                        .child(text_dim(detail.to_string()).text_size(px(11.))),
-                ),
+            div().flex().items_center().gap(px(10.)).child(badge).child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .min_w_0()
+                    .child(strong(title.to_string()).text_size(px(13.)))
+                    .child(text_dim(detail.to_string()).text_size(px(11.))),
+            ),
         )
         .child(div().pl(px(32.)).min_w_0().child(body))
         .into_any_element()

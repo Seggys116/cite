@@ -9,11 +9,11 @@ use crate::demo::now_ms;
 use crate::model::{fmt_bytes, parse_rfc3339_ms, rel_time};
 use crate::theme::Tone;
 use crate::ui::detail::Data;
+use crate::ui::detail::outbound::OutboundState;
 use crate::ui::input::TextInput;
 use crate::ui::widgets::{
     BtnKind, Col, btn, btn_off, card, empty_state, field, id, mono, notice, pill, table, text_dim,
 };
-use crate::ui::detail::outbound::OutboundState;
 
 // The node wrappers live here because the volume routes are used by this tab only.
 impl NodeHandle {
@@ -262,8 +262,11 @@ impl Console {
                 mono(vol.mount_path.clone()).into_any_element(),
                 text_dim(size_text(info.and_then(|i| i.size_bytes))).into_any_element(),
                 state.into_any_element(),
-                text_dim(created_text(info.and_then(|i| i.created_at.as_deref()), now))
-                    .into_any_element(),
+                text_dim(created_text(
+                    info.and_then(|i| i.created_at.as_deref()),
+                    now,
+                ))
+                .into_any_element(),
                 remove,
             ]);
         }
@@ -318,9 +321,11 @@ impl Console {
                 .child(div().pb(px(18.)).child(add)),
         );
         if let Some(e) = &v.error {
-            list = list.child(text_dim(e.clone()).text_size(px(12.)).text_color(
-                crate::theme::c(Tone::Bad.color()),
-            ));
+            list = list.child(
+                text_dim(e.clone())
+                    .text_size(px(12.))
+                    .text_color(crate::theme::c(Tone::Bad.color())),
+            );
         }
         list = list.child(
             text_dim("Data in a volume survives redeploys and rollbacks. Both slots mount the same volumes, so the idle slot sees what the live one wrote. Changes apply on the next deploy.")
@@ -341,7 +346,9 @@ impl Console {
                 let pending = data.site.volumes.iter().any(|s| s.name == info.name);
                 let name = info.name.clone();
                 let action = if pending {
-                    text_dim("Kept after you save").text_size(px(11.)).into_any_element()
+                    text_dim("Kept after you save")
+                        .text_size(px(11.))
+                        .into_any_element()
                 } else if busy {
                     btn_off("Delete data").into_any_element()
                 } else {
@@ -417,10 +424,22 @@ mod tests {
         for ok in ["uploads", "a", "9lives", "my-vol-2", &"a".repeat(31)] {
             assert_eq!(name_problem(ok, &taken), None, "{ok}");
         }
-        for bad in ["", "-x", "Upper", "has_underscore", "sp ace", "dot.name", &long] {
+        for bad in [
+            "",
+            "-x",
+            "Upper",
+            "has_underscore",
+            "sp ace",
+            "dot.name",
+            &long,
+        ] {
             assert!(name_problem(bad, &taken).is_some(), "{bad}");
         }
-        assert!(name_problem("data", &taken).unwrap().contains("already exists"));
+        assert!(
+            name_problem("data", &taken)
+                .unwrap()
+                .contains("already exists")
+        );
     }
 
     #[test]
@@ -480,7 +499,9 @@ mod tests {
     #[test]
     fn the_desktop_and_the_node_agree_on_mount_paths() {
         let none: Vec<String> = Vec::new();
-        let paths = ["/data", "/app", "/a..b", "/var", "/a//b", "/x/./y", "/x/../y", "/"];
+        let paths = [
+            "/data", "/app", "/a..b", "/var", "/a//b", "/x/./y", "/x/../y", "/",
+        ];
         for path in paths {
             assert_eq!(
                 path_problem(path, &none).is_none(),
@@ -495,7 +516,11 @@ mod tests {
         let full: Vec<Volume> = (0..MAX_VOLUMES)
             .map(|i| vol(&format!("v{i}"), &format!("/v{i}")))
             .collect();
-        assert!(add_problem("more", "/more", &full).unwrap().contains("at most"));
+        assert!(
+            add_problem("more", "/more", &full)
+                .unwrap()
+                .contains("at most")
+        );
         assert_eq!(add_problem("more", "/more", &full[..MAX_VOLUMES - 1]), None);
     }
 
@@ -507,7 +532,11 @@ mod tests {
         assert!(!overlaps("/data", "/data2"));
         assert!(!overlaps("/data/a", "/data/b"));
         let used = vec!["/data".to_string(), "/srv/cache".to_string()];
-        assert!(path_problem("/data/more", &used).unwrap().contains("overlaps"));
+        assert!(
+            path_problem("/data/more", &used)
+                .unwrap()
+                .contains("overlaps")
+        );
         assert!(path_problem("/srv", &used).unwrap().contains("/srv/cache"));
         assert_eq!(path_problem("/database", &used), None);
     }
@@ -515,9 +544,21 @@ mod tests {
     #[test]
     fn adding_checks_the_name_before_the_path() {
         let declared = vec![vol("data", "/data")];
-        assert!(add_problem("data", "/other", &declared).unwrap().contains("already exists"));
-        assert!(add_problem("cache", "/data/c", &declared).unwrap().contains("overlaps"));
-        assert!(add_problem("Bad", "/data/c", &declared).unwrap().contains("volume name"));
+        assert!(
+            add_problem("data", "/other", &declared)
+                .unwrap()
+                .contains("already exists")
+        );
+        assert!(
+            add_problem("cache", "/data/c", &declared)
+                .unwrap()
+                .contains("overlaps")
+        );
+        assert!(
+            add_problem("Bad", "/data/c", &declared)
+                .unwrap()
+                .contains("volume name")
+        );
         assert_eq!(add_problem("cache", "/cache", &declared), None);
         assert_eq!(add_problem("first", "/first", &[]), None);
     }
@@ -531,7 +572,13 @@ mod tests {
             .map(|v| v.name.as_str())
             .collect();
         assert_eq!(kept, vec!["old-cache", "logs"]);
-        assert!(undeclared(&existing, &[vol("data", "/d"), vol("old-cache", "/o"), vol("logs", "/l")]).is_empty());
+        assert!(
+            undeclared(
+                &existing,
+                &[vol("data", "/d"), vol("old-cache", "/o"), vol("logs", "/l")]
+            )
+            .is_empty()
+        );
         assert_eq!(undeclared(&existing, &[]).len(), 3);
         assert!(undeclared(&[], &declared).is_empty());
     }
@@ -542,7 +589,10 @@ mod tests {
         assert_eq!(staged_or(&None, &saved).len(), 1);
         assert!(staged_or(&Some(Vec::new()), &saved).is_empty());
         let edited = staged_or(&Some(vec![vol("a", "/a"), vol("b", "/b")]), &saved);
-        assert_eq!(edited.iter().map(|v| v.name.as_str()).collect::<Vec<_>>(), vec!["a", "b"]);
+        assert_eq!(
+            edited.iter().map(|v| v.name.as_str()).collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
     }
 
     #[test]
@@ -553,9 +603,15 @@ mod tests {
             runtime: runtime.map(str::to_string),
             ..Default::default()
         };
-        assert!(source_serves(Some(&source(Some(RenderMode::Ssr), Some("node")))));
+        assert!(source_serves(Some(&source(
+            Some(RenderMode::Ssr),
+            Some("node")
+        ))));
         assert!(source_serves(Some(&source(None, Some("node")))));
-        assert!(!source_serves(Some(&source(Some(RenderMode::Static), Some("node")))));
+        assert!(!source_serves(Some(&source(
+            Some(RenderMode::Static),
+            Some("node")
+        ))));
         assert!(!source_serves(Some(&source(None, Some("static")))));
         assert!(!source_serves(None));
     }

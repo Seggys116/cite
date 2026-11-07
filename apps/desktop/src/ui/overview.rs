@@ -227,9 +227,7 @@ fn overview_body(data: &Data, cx: &mut Context<Console>) -> AnyElement {
             .map(|t| t.min_w_0().h_full().into_any_element())
             .collect(),
     );
-    let cards = grid(
-        data.snaps.iter().map(|snap| node_card(snap, cx)).collect(),
-    );
+    let cards = grid(data.snaps.iter().map(|snap| node_card(snap, cx)).collect());
     let rows: Vec<Vec<AnyElement>> = data
         .deploys
         .iter()

@@ -1000,7 +1000,10 @@ fi
         let reason = format!("{exited} before it listened on port 21012");
         mgr.note_start_failure(Slot::Blue, reason.clone()).await;
         let tail = mgr.log_tail(Slot::Blue).await;
-        assert!(tail.iter().any(|line| line.contains("err: Error: Cannot find module express")));
+        assert!(
+            tail.iter()
+                .any(|line| line.contains("err: Error: Cannot find module express"))
+        );
         assert_eq!(tail.last(), Some(&reason));
         assert!(!tail.iter().any(|line| line == &exited), "{tail:?}");
         assert_eq!(mgr.take_start_failure(Slot::Blue).await, Some(reason));

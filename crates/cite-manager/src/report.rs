@@ -145,7 +145,12 @@ fn cap_output_line(out: &str) -> String {
 }
 
 /// `first` names what failed; the last 40 non-blank output lines follow it, each stripped of terminal codes, then redacted, then capped.
-pub fn failure_reason(first: &str, output: &[String], redactor: &Redactor, max_bytes: usize) -> String {
+pub fn failure_reason(
+    first: &str,
+    output: &[String],
+    redactor: &Redactor,
+    max_bytes: usize,
+) -> String {
     let shown = |line: &str| cap_output_line(&redactor.redact_line(&strip_terminal(line)));
     let mut lines: Vec<String> = output
         .iter()
@@ -797,7 +802,10 @@ mod tests {
         assert!(lines[1].starts_with("line-060"), "{}", lines[1]);
         assert!(lines.last().unwrap().starts_with("line-099"));
         assert_eq!(failure_phase(&reason), "build");
-        assert_eq!(failure_phase("install failed: exit status 1 (npm ci)"), "install");
+        assert_eq!(
+            failure_phase("install failed: exit status 1 (npm ci)"),
+            "install"
+        );
         assert_eq!(failure_phase("pack failed: too large"), "pack");
         assert_eq!(failure_phase("start failed: exited"), "start");
         assert_eq!(failure_phase("static output not found"), "build");
@@ -818,7 +826,12 @@ mod tests {
             "\u{7}\u{8}".to_string(),
             "caf\u{e9} \u{4e16}\u{754c} ".repeat(200),
         ];
-        let reason = failure_reason("install failed: exit status 1 (npm ci)", &lines, &redactor, 8192);
+        let reason = failure_reason(
+            "install failed: exit status 1 (npm ci)",
+            &lines,
+            &redactor,
+            8192,
+        );
         assert!(!reason.contains('\u{1b}') && !reason.contains('\r') && !reason.contains('\t'));
         assert!(!reason.contains(&token), "{reason}");
         assert!(!reason.contains("hunter2"), "{reason}");
@@ -827,7 +840,11 @@ mod tests {
         assert_eq!(shown[2], "using [REDACTED]");
         assert_eq!(shown[3], "progress 100%");
         assert_eq!(shown[4], "link text after");
-        assert_eq!(shown.len(), 7, "the control-only line is dropped: {shown:?}");
+        assert_eq!(
+            shown.len(),
+            7,
+            "the control-only line is dropped: {shown:?}"
+        );
         for line in &shown {
             assert!(line.chars().count() <= 300, "{line}");
         }
@@ -844,7 +861,10 @@ mod tests {
             "abcSECRET_9".to_string(),
         ];
         let reason = failure_reason("build failed: exit status 1", &lines, &redactor, 8192);
-        assert!(!reason.contains("SECRET") && !reason.contains("SEC"), "{reason}");
+        assert!(
+            !reason.contains("SECRET") && !reason.contains("SEC"),
+            "{reason}"
+        );
         let shown: Vec<&str> = reason.lines().collect();
         assert_eq!(shown[1..], ["[REDACTED]", "[REDACTED]", "abc[REDACTED]_9"]);
     }
@@ -875,8 +895,14 @@ mod tests {
             assert!(line.len() <= REPORT_MAX_BYTES, "{}", line.len());
             let v: Value = serde_json::from_str(&line).unwrap();
             let kept = v["last_error"].as_str().unwrap();
-            assert!(kept.starts_with("build failed: exit status 1 (npm run build)\n"), "{kept}");
-            assert!(kept.lines().last().unwrap().starts_with("line-059"), "{kept}");
+            assert!(
+                kept.starts_with("build failed: exit status 1 (npm run build)\n"),
+                "{kept}"
+            );
+            assert!(
+                kept.lines().last().unwrap().starts_with("line-059"),
+                "{kept}"
+            );
             assert!(kept.contains("\n...\n") || kept.len() == reason.len());
             assert_eq!(v["failed_phase"], "build");
             assert_eq!(v["deploy"]["phase"], "build");
@@ -885,7 +911,10 @@ mod tests {
 
     #[test]
     fn ellipsize_lines_is_utf8_safe_and_within_budget() {
-        let text = format!("first \u{4e16}\u{754c}\n{}", "\u{e9}\u{4e16}x\n".repeat(500));
+        let text = format!(
+            "first \u{4e16}\u{754c}\n{}",
+            "\u{e9}\u{4e16}x\n".repeat(500)
+        );
         for max in [0usize, 5, 31, 32, 33, 64, 100, 777, 3000] {
             let cut = ellipsize_lines(&text, max);
             assert!(cut.len() <= max, "max {max}: {}", cut.len());
@@ -909,7 +938,12 @@ mod tests {
         assert_eq!(detected.confidence, "low");
         assert_eq!(detected.start.as_deref(), Some("node build/index.js"));
         assert!(detected.notes.iter().any(|n| n.contains("adapter")));
-        assert!(detected.notes.iter().all(|n| n.len() <= DETECTED_NOTE_BYTES));
+        assert!(
+            detected
+                .notes
+                .iter()
+                .all(|n| n.len() <= DETECTED_NOTE_BYTES)
+        );
         let json = serde_json::to_value(&detected).unwrap();
         assert_eq!(json["confidence"], "low");
         assert!(json.get("output_dir").is_none());

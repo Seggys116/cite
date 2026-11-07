@@ -410,36 +410,32 @@ fn traffic_body(
         size_bars = size_bars.child(hbar(&label, b.count, sizes_max, BLUE, fmt_int(b.count)));
     }
     let half = |card: gpui::Div| card.flex_1().min_w_0().into_any_element();
-    let row_a = grid(
-        vec![
-            half(card(Some("Status classes"), None, status)),
-            half(card(
-                Some("Latency"),
-                Some("Total time per request"),
-                latency,
-            )),
-            half(card(Some("Response sizes"), None, size_bars)),
-        ],
-    );
-    let row_b = grid(
-        vec![
-            half(card(
-                Some("Top paths"),
-                None,
-                top_table(&sm.top_paths, true),
-            )),
-            half(card(
-                Some("Top client IPs"),
-                None,
-                top_table(&sm.top_ips, false),
-            )),
-            half(card(
-                Some("Top user agents"),
-                None,
-                top_table(&sm.top_user_agents, false),
-            )),
-        ],
-    );
+    let row_a = grid(vec![
+        half(card(Some("Status classes"), None, status)),
+        half(card(
+            Some("Latency"),
+            Some("Total time per request"),
+            latency,
+        )),
+        half(card(Some("Response sizes"), None, size_bars)),
+    ]);
+    let row_b = grid(vec![
+        half(card(
+            Some("Top paths"),
+            None,
+            top_table(&sm.top_paths, true),
+        )),
+        half(card(
+            Some("Top client IPs"),
+            None,
+            top_table(&sm.top_ips, false),
+        )),
+        half(card(
+            Some("Top user agents"),
+            None,
+            top_table(&sm.top_user_agents, false),
+        )),
+    ]);
     let mut page = div()
         .flex()
         .flex_col()

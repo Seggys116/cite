@@ -799,11 +799,17 @@ fn a_doppler_binding_round_trips_and_is_left_out_while_unset() {
     );
     let bound = with(|s| s.doppler = Some(binding("shop", "prd", true, false)));
     let text = serde_json::to_string(&bound).expect("ser");
-    assert!(text.contains(r#""doppler":{"project":"shop","config":"prd","build":true,"runtime":false}"#));
+    assert!(
+        text.contains(
+            r#""doppler":{"project":"shop","config":"prd","build":true,"runtime":false}"#
+        )
+    );
     let back: Source = serde_json::from_str(&text).expect("de");
     assert_eq!(back, bound);
     let defaults: DopplerBinding =
         serde_json::from_str(r#"{"project":"p","config":"c"}"#).expect("defaults");
     assert!(!defaults.build && !defaults.runtime);
-    assert!(serde_json::from_str::<DopplerBinding>(r#"{"project":"p","config":"c","x":1}"#).is_err());
+    assert!(
+        serde_json::from_str::<DopplerBinding>(r#"{"project":"p","config":"c","x":1}"#).is_err()
+    );
 }

@@ -31,7 +31,12 @@ const NODE: [(&str, &str); 3] = [
 ];
 
 fn lookup<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
-    move |k| pairs.iter().find(|(key, _)| *key == k).map(|(_, v)| v.to_string())
+    move |k| {
+        pairs
+            .iter()
+            .find(|(key, _)| *key == k)
+            .map(|(_, v)| v.to_string())
+    }
 }
 
 type Mutation = Box<dyn Fn(&mut Value)>;
@@ -61,7 +66,11 @@ fn check(policy: &Policy, name: &str, body: &Value) -> Result<(), String> {
 fn rules() -> OutboundRules {
     OutboundRules {
         mode: OutboundMode::Allowlist,
-        allow: vec!["api.github.com".into(), "*.apple.com".into(), "10.0.0.0/8".into()],
+        allow: vec![
+            "api.github.com".into(),
+            "*.apple.com".into(),
+            "10.0.0.0/8".into(),
+        ],
         deny: vec!["10.0.0.66".into()],
         block_mail: false,
     }
@@ -106,7 +115,10 @@ fn the_node_lists_must_equal_the_proxy_settings() {
         unlisted.egress_proxy.as_ref().unwrap(),
     )
     .unwrap_err();
-    assert!(err.contains("missing"), "a node deny list cannot be dropped: {err}");
+    assert!(
+        err.contains("missing"),
+        "a node deny list cannot be dropped: {err}"
+    );
 }
 
 #[test]
@@ -121,20 +133,47 @@ fn the_egress_proxy_body_is_pinned() {
         check(&policy, &s.egress_proxy_name, &b)
     };
     let refused: Vec<(&str, Mutation)> = vec![
-        ("privileged", m(|b| b["HostConfig"]["Privileged"] = json!(true))),
-        ("caps", m(|b| b["HostConfig"]["CapAdd"] = json!(["NET_ADMIN"]))),
-        ("rootfs", m(|b| b["HostConfig"]["ReadonlyRootfs"] = json!(false))),
+        (
+            "privileged",
+            m(|b| b["HostConfig"]["Privileged"] = json!(true)),
+        ),
+        (
+            "caps",
+            m(|b| b["HostConfig"]["CapAdd"] = json!(["NET_ADMIN"])),
+        ),
+        (
+            "rootfs",
+            m(|b| b["HostConfig"]["ReadonlyRootfs"] = json!(false)),
+        ),
         ("memory", m(|b| b["HostConfig"]["Memory"] = json!(1 << 30))),
-        ("cpus", m(|b| b["HostConfig"]["NanoCpus"] = json!(4_000_000_000i64))),
+        (
+            "cpus",
+            m(|b| b["HostConfig"]["NanoCpus"] = json!(4_000_000_000i64)),
+        ),
         ("pids", m(|b| b["HostConfig"]["PidsLimit"] = json!(4096))),
         ("root", m(|b| b["User"] = json!("0:0"))),
         ("bind", m(|b| b["HostConfig"]["Binds"] = json!(["/:/host"]))),
-        ("image", m(|b| b["Image"] = json!("ghcr.io/seggys116/cite-manager:0.2.0-node22"))),
-        ("foreign image", m(|b| b["Image"] = json!("docker.io/library/squid:6"))),
+        (
+            "image",
+            m(|b| b["Image"] = json!("ghcr.io/seggys116/cite-manager:0.2.0-node22")),
+        ),
+        (
+            "foreign image",
+            m(|b| b["Image"] = json!("docker.io/library/squid:6")),
+        ),
         ("cmd", m(|b| b["Cmd"] = json!(["sh"]))),
-        ("host net", m(|b| b["HostConfig"]["NetworkMode"] = json!("host"))),
-        ("edge net", m(|b| b["HostConfig"]["NetworkMode"] = json!("cite_edge"))),
-        ("manager net", m(|b| b["HostConfig"]["NetworkMode"] = json!("cite-shop-blue-egress"))),
+        (
+            "host net",
+            m(|b| b["HostConfig"]["NetworkMode"] = json!("host")),
+        ),
+        (
+            "edge net",
+            m(|b| b["HostConfig"]["NetworkMode"] = json!("cite_edge")),
+        ),
+        (
+            "manager net",
+            m(|b| b["HostConfig"]["NetworkMode"] = json!("cite-shop-blue-egress")),
+        ),
         (
             "extra network",
             m(|b| b["NetworkingConfig"]["EndpointsConfig"]["cite-shop-blue-net"] = json!({})),
@@ -142,7 +181,9 @@ fn the_egress_proxy_body_is_pinned() {
         (
             "other bridge",
             m(|b| {
-                let eps = b["NetworkingConfig"]["EndpointsConfig"].as_object_mut().unwrap();
+                let eps = b["NetworkingConfig"]["EndpointsConfig"]
+                    .as_object_mut()
+                    .unwrap();
                 eps.remove("cite-egress");
                 eps.insert("bridge".into(), json!({}));
             }),
@@ -154,7 +195,15 @@ fn the_egress_proxy_body_is_pinned() {
                     json!({ "Aliases": ["github.com"] })
             }),
         ),
-        ("unknown env", m(|b| b["Env"].as_array_mut().unwrap().push(json!("RUST_LOG=trace")))),
+        (
+            "unknown env",
+            m(|b| {
+                b["Env"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!("RUST_LOG=trace"))
+            }),
+        ),
         (
             "bad mode",
             m(|b| {
@@ -167,15 +216,30 @@ fn the_egress_proxy_body_is_pinned() {
         ),
         (
             "numeric host trick",
-            m(|b| b["Env"].as_array_mut().unwrap().push(json!("CITE_EGRESS_DENY=2130706433"))),
+            m(|b| {
+                b["Env"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!("CITE_EGRESS_DENY=2130706433"))
+            }),
         ),
         (
             "no mode",
-            m(|b| b["Env"].as_array_mut().unwrap().retain(|e| !e.as_str().unwrap().starts_with("CITE_EGRESS_MODE="))),
+            m(|b| {
+                b["Env"]
+                    .as_array_mut()
+                    .unwrap()
+                    .retain(|e| !e.as_str().unwrap().starts_with("CITE_EGRESS_MODE="))
+            }),
         ),
         (
             "allowlist without allow",
-            m(|b| b["Env"].as_array_mut().unwrap().retain(|e| !e.as_str().unwrap().starts_with("CITE_EGRESS_ALLOW="))),
+            m(|b| {
+                b["Env"]
+                    .as_array_mut()
+                    .unwrap()
+                    .retain(|e| !e.as_str().unwrap().starts_with("CITE_EGRESS_ALLOW="))
+            }),
         ),
         (
             "widened node list",
@@ -204,8 +268,14 @@ fn only_filtered_nodes_create_egress_proxies_and_proxy_env_is_tied_to_the_stack(
         assert!(err.contains("filtered"), "{mode}: {err}");
     }
     let policy = common::policy();
-    assert!(check(&policy, "cite-shop-green-egress-proxy", proxy).is_err(), "another slot's name");
-    assert!(check(&policy, "cite-other-blue-egress-proxy", proxy).is_err(), "another site's name");
+    assert!(
+        check(&policy, "cite-shop-green-egress-proxy", proxy).is_err(),
+        "another slot's name"
+    );
+    assert!(
+        check(&policy, "cite-other-blue-egress-proxy", proxy).is_err(),
+        "another site's name"
+    );
     let swap = |from: &str, to: &str| {
         let mut b = s.executor.clone();
         for e in b["Env"].as_array_mut().unwrap() {
@@ -217,23 +287,44 @@ fn only_filtered_nodes_create_egress_proxies_and_proxy_env_is_tied_to_the_stack(
     };
     let url = "http://cite-shop-blue-egress-proxy:3128";
     swap("", "").unwrap();
-    assert!(swap(&format!("HTTPS_PROXY={url}"), "HTTPS_PROXY=http://cite-other-blue-egress-proxy:3128").is_err());
-    assert!(swap(&format!("http_proxy={url}"), "http_proxy=http://evil.example:3128").is_err());
+    assert!(
+        swap(
+            &format!("HTTPS_PROXY={url}"),
+            "HTTPS_PROXY=http://cite-other-blue-egress-proxy:3128"
+        )
+        .is_err()
+    );
+    assert!(
+        swap(
+            &format!("http_proxy={url}"),
+            "http_proxy=http://evil.example:3128"
+        )
+        .is_err()
+    );
     assert!(swap("NO_PROXY=localhost,127.0.0.1", "NO_PROXY=*").is_err());
     assert!(swap("NODE_USE_ENV_PROXY=1", "NODE_USE_ENV_PROXY=0").is_err());
     let mut missing = s.executor.clone();
-    missing["Env"].as_array_mut().unwrap().retain(|e| e.as_str() != Some("NODE_USE_ENV_PROXY=1"));
+    missing["Env"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|e| e.as_str() != Some("NODE_USE_ENV_PROXY=1"));
     assert!(check(&policy, &s.executor_name, &missing).is_err());
     let open = specs_open();
     let mut smuggled = open.executor.clone();
-    smuggled["Env"].as_array_mut().unwrap().push(json!(format!("HTTP_PROXY={}", "http://cite-shop-blue-egress-proxy:3128")));
+    smuggled["Env"].as_array_mut().unwrap().push(json!(format!(
+        "HTTP_PROXY={}",
+        "http://cite-shop-blue-egress-proxy:3128"
+    )));
     let open_policy = common::policy_with(&[("CITE_STACK_EGRESS_MODE", "open")]);
     check(&open_policy, &open.executor_name, &open.executor).unwrap();
     assert!(check(&open_policy, &open.executor_name, &smuggled).is_err());
 }
 
 fn specs_open() -> SpecSet {
-    specs(OutboundRules::default(), &Egress::with_mode(cite_connector::egress::EgressMode::Open))
+    specs(
+        OutboundRules::default(),
+        &Egress::with_mode(cite_connector::egress::EgressMode::Open),
+    )
 }
 
 #[test]
@@ -244,19 +335,28 @@ fn stack_xnets_are_internal_and_the_bridge_is_the_only_extra_network() {
     policy.validate_body(&Route::NetworkCreate, &xnet).unwrap();
     let mut open_xnet = xnet.clone();
     open_xnet["Internal"] = json!(false);
-    assert!(policy.validate_body(&Route::NetworkCreate, &open_xnet).is_err());
+    assert!(
+        policy
+            .validate_body(&Route::NetworkCreate, &open_xnet)
+            .is_err()
+    );
     let bridge_labels = json!({ "cite.managed": "true", "cite.role": "egress-bridge" });
     let icc_off = json!({ "com.docker.network.bridge.enable_icc": "false" });
     let bridge = json!({
         "Name": "cite-egress", "Driver": "bridge", "Internal": false, "Options": icc_off.clone(), "Labels": bridge_labels,
     });
-    policy.validate_body(&Route::NetworkCreate, &bridge).unwrap();
+    policy
+        .validate_body(&Route::NetworkCreate, &bridge)
+        .unwrap();
     for (key, value) in [
         ("Internal", json!(true)),
         ("Name", json!("other-egress")),
         ("Labels", json!({ "cite.managed": "true" })),
         ("Driver", json!("macvlan")),
-        ("Options", json!({ "com.docker.network.bridge.enable_icc": "true" })),
+        (
+            "Options",
+            json!({ "com.docker.network.bridge.enable_icc": "true" }),
+        ),
         ("Options", json!({})),
         (
             "Options",
@@ -265,14 +365,27 @@ fn stack_xnets_are_internal_and_the_bridge_is_the_only_extra_network() {
     ] {
         let mut bad = bridge.clone();
         bad[key] = value;
-        assert!(policy.validate_body(&Route::NetworkCreate, &bad).is_err(), "{key}");
+        assert!(
+            policy.validate_body(&Route::NetworkCreate, &bad).is_err(),
+            "{key}"
+        );
     }
     let mut no_options = bridge.clone();
     no_options.as_object_mut().unwrap().remove("Options");
-    assert!(policy.validate_body(&Route::NetworkCreate, &no_options).is_err(), "ICC must be off");
+    assert!(
+        policy
+            .validate_body(&Route::NetworkCreate, &no_options)
+            .is_err(),
+        "ICC must be off"
+    );
     let mut xnet_options = xnet.clone();
     xnet_options["Options"] = icc_off.clone();
-    assert!(policy.validate_body(&Route::NetworkCreate, &xnet_options).is_err(), "only the bridge takes options");
+    assert!(
+        policy
+            .validate_body(&Route::NetworkCreate, &xnet_options)
+            .is_err(),
+        "only the bridge takes options"
+    );
     let route = |method: &str, raw: &str| policy.classify(method, &normalise(raw).unwrap());
     assert!(route("GET", "/v1.45/networks/cite-egress").is_ok());
     assert!(route("DELETE", "/v1.45/networks/cite-egress").is_err());
@@ -280,9 +393,27 @@ fn stack_xnets_are_internal_and_the_bridge_is_the_only_extra_network() {
     assert!(route("POST", "/v1.45/networks/cite-shop-blue-xnet/connect").is_err());
     assert!(route("DELETE", "/v1.45/networks/cite-shop-blue-xnet").is_ok());
     for action in ["start", "stop", "wait"] {
-        assert!(route("POST", &format!("/v1.45/containers/cite-shop-blue-egress-proxy/{action}")).is_ok());
+        assert!(
+            route(
+                "POST",
+                &format!("/v1.45/containers/cite-shop-blue-egress-proxy/{action}")
+            )
+            .is_ok()
+        );
     }
     assert!(route("DELETE", "/v1.45/containers/cite-shop-blue-egress-proxy").is_ok());
-    assert!(route("POST", "/v1.45/images/create?fromImage=ghcr.io/seggys116/cite-egress&tag=0.2.0-node22").is_err());
-    assert!(route("POST", "/v1.45/images/create?fromImage=ghcr.io/seggys116/cite-egressx&tag=0.2.0").is_err());
+    assert!(
+        route(
+            "POST",
+            "/v1.45/images/create?fromImage=ghcr.io/seggys116/cite-egress&tag=0.2.0-node22"
+        )
+        .is_err()
+    );
+    assert!(
+        route(
+            "POST",
+            "/v1.45/images/create?fromImage=ghcr.io/seggys116/cite-egressx&tag=0.2.0"
+        )
+        .is_err()
+    );
 }

@@ -230,8 +230,7 @@ impl Console {
             );
         }
         if total == 0 {
-            let empty = if logs.in_flight || (logs.buf.cursor().is_none() && logs.error.is_none())
-            {
+            let empty = if logs.in_flight || (logs.buf.cursor().is_none() && logs.error.is_none()) {
                 "Loading the log..."
             } else if needle.trim().is_empty() {
                 "No log lines yet."

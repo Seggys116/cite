@@ -48,15 +48,35 @@ pub type EgressNodeKey = (&'static str, &'static str, fn(&str) -> bool);
 
 /// The node-level lists, in the order the connector emits them.
 pub const EGRESS_NODE_KEYS: [EgressNodeKey; 4] = [
-    ("CITE_STACK_EGRESS_ALLOW_CIDRS", "CITE_EGRESS_ALLOW_CIDRS", envval::egress_cidr),
-    ("CITE_STACK_EGRESS_DENY_CIDRS", "CITE_EGRESS_DENY_CIDRS", envval::egress_cidr),
-    ("CITE_STACK_EGRESS_DENY_HOSTS", "CITE_EGRESS_DENY_HOSTS", envval::egress_host),
-    ("CITE_STACK_EGRESS_ALLOW_PORTS", "CITE_EGRESS_ALLOW_PORTS", envval::egress_port_range),
+    (
+        "CITE_STACK_EGRESS_ALLOW_CIDRS",
+        "CITE_EGRESS_ALLOW_CIDRS",
+        envval::egress_cidr,
+    ),
+    (
+        "CITE_STACK_EGRESS_DENY_CIDRS",
+        "CITE_EGRESS_DENY_CIDRS",
+        envval::egress_cidr,
+    ),
+    (
+        "CITE_STACK_EGRESS_DENY_HOSTS",
+        "CITE_EGRESS_DENY_HOSTS",
+        envval::egress_host,
+    ),
+    (
+        "CITE_STACK_EGRESS_ALLOW_PORTS",
+        "CITE_EGRESS_ALLOW_PORTS",
+        envval::egress_port_range,
+    ),
 ];
 
 /// Trims entries and drops empty ones; the result is what both the connector and the proxy compare.
 pub fn egress_setting(key: &str, raw: &str, entry_ok: fn(&str) -> bool) -> Result<String, String> {
-    let entries: Vec<&str> = raw.split(',').map(str::trim).filter(|e| !e.is_empty()).collect();
+    let entries: Vec<&str> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+        .collect();
     let joined = entries.join(",");
     if joined.is_empty() || envval::egress_list(&joined, entry_ok) {
         Ok(joined)
@@ -385,7 +405,10 @@ mod tests {
             ("open", EgressMode::Open),
             ("off", EgressMode::Off),
         ] {
-            assert_eq!(cfg(&[("CITE_STACK_EGRESS_MODE", raw)]).unwrap().egress_mode, want);
+            assert_eq!(
+                cfg(&[("CITE_STACK_EGRESS_MODE", raw)]).unwrap().egress_mode,
+                want
+            );
         }
         for (raw, want) in [
             ("false", EgressMode::Off),
@@ -410,7 +433,10 @@ mod tests {
     #[test]
     fn egress_lists_are_normalised_and_validated() {
         let c = cfg(&[
-            ("CITE_STACK_EGRESS_ALLOW_CIDRS", " 192.168.10.0/24 , fd00::/8,"),
+            (
+                "CITE_STACK_EGRESS_ALLOW_CIDRS",
+                " 192.168.10.0/24 , fd00::/8,",
+            ),
             ("CITE_STACK_EGRESS_DENY_HOSTS", "evil.example,.ads.example"),
             ("CITE_STACK_EGRESS_ALLOW_PORTS", "80,443,8000-8100"),
             ("CITE_STACK_EGRESS_BRIDGE", "my-egress"),
@@ -443,7 +469,10 @@ mod tests {
     #[test]
     fn node_public_ips_join_the_deny_list_like_the_connector() {
         let c = cfg(&[
-            ("CITE_STACK_EGRESS_DENY_CIDRS", "198.51.100.0/24,203.0.113.10"),
+            (
+                "CITE_STACK_EGRESS_DENY_CIDRS",
+                "198.51.100.0/24,203.0.113.10",
+            ),
             ("CITE_NODE_PUBLIC_IPS", " 203.0.113.10 , 203.0.113.11"),
         ])
         .unwrap();
@@ -452,17 +481,28 @@ mod tests {
             vec!["CITE_EGRESS_DENY_CIDRS=198.51.100.0/24,203.0.113.10,203.0.113.11"]
         );
         let alone = cfg(&[("CITE_NODE_PUBLIC_IPS", "2001:db8::10")]).unwrap();
-        assert_eq!(alone.egress_env, vec!["CITE_EGRESS_DENY_CIDRS=2001:db8::10"]);
+        assert_eq!(
+            alone.egress_env,
+            vec!["CITE_EGRESS_DENY_CIDRS=2001:db8::10"]
+        );
         for bad in ["example.com", "::ffff:1.2.3.4", "1.2.3.4,1.2.3.4"] {
             assert!(cfg(&[("CITE_NODE_PUBLIC_IPS", bad)]).is_err(), "{bad}");
         }
-        let many = (0..40).map(|i| format!("10.0.{i}.1")).collect::<Vec<_>>().join(",");
-        let more = (0..40).map(|i| format!("10.1.{i}.1")).collect::<Vec<_>>().join(",");
-        assert!(cfg(&[
-            ("CITE_STACK_EGRESS_DENY_CIDRS", many.as_str()),
-            ("CITE_NODE_PUBLIC_IPS", more.as_str())
-        ])
-        .is_err());
+        let many = (0..40)
+            .map(|i| format!("10.0.{i}.1"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let more = (0..40)
+            .map(|i| format!("10.1.{i}.1"))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(
+            cfg(&[
+                ("CITE_STACK_EGRESS_DENY_CIDRS", many.as_str()),
+                ("CITE_NODE_PUBLIC_IPS", more.as_str())
+            ])
+            .is_err()
+        );
     }
 
     #[test]

@@ -155,10 +155,16 @@ fn nuxt_server_and_static_generation() {
     assert_eq!(server.start_argv, ["node", "server/index.mjs"]);
     assert_eq!(server.build_command, "npm run build");
 
-    let generated = detect(&[(
-        "package.json",
-        r#"{"dependencies":{"nuxt":"3"},"scripts":{"build":"nuxt build","generate":"nuxt generate"}}"#,
-    ), ("nuxt.config.ts", "export default defineNuxtConfig({ ssr: false })\n")]);
+    let generated = detect(&[
+        (
+            "package.json",
+            r#"{"dependencies":{"nuxt":"3"},"scripts":{"build":"nuxt build","generate":"nuxt generate"}}"#,
+        ),
+        (
+            "nuxt.config.ts",
+            "export default defineNuxtConfig({ ssr: false })\n",
+        ),
+    ]);
     assert_eq!(generated.rendering, Rendering::Static);
     assert_eq!(generated.output_dir, ".output/public");
     assert_eq!(generated.build_command, "npm run generate");
@@ -217,7 +223,10 @@ fn sveltekit_adapters() {
 fn astro_static_and_node_standalone() {
     let static_site = detect(&[
         ("package.json", r#"{"dependencies":{"astro":"5"}}"#),
-        ("astro.config.mjs", "export default defineConfig({ outDir: './public-out' });\n"),
+        (
+            "astro.config.mjs",
+            "export default defineConfig({ outDir: './public-out' });\n",
+        ),
     ]);
     assert_eq!(static_site.rendering, Rendering::Static);
     assert_eq!(static_site.output_dir, "public-out");
@@ -238,7 +247,10 @@ fn astro_static_and_node_standalone() {
     assert!(node.notes.is_empty(), "{:?}", node.notes);
 
     let middleware = detect(&[
-        ("package.json", r#"{"dependencies":{"astro":"5","@astrojs/node":"9"}}"#),
+        (
+            "package.json",
+            r#"{"dependencies":{"astro":"5","@astrojs/node":"9"}}"#,
+        ),
         (
             "astro.config.mjs",
             "import node from '@astrojs/node';\nexport default { adapter: node({ mode: 'middleware' }) };\n",
@@ -254,7 +266,10 @@ fn remix_and_react_router_servers() {
             "package.json",
             r#"{"dependencies":{"@remix-run/node":"2","@remix-run/serve":"2"},"devDependencies":{"@remix-run/dev":"2","vite":"5"},"scripts":{"build":"remix vite:build","start":"remix-serve ./build/server/index.js"}}"#,
         ),
-        ("vite.config.ts", "import { vitePlugin as remix } from '@remix-run/dev';\n"),
+        (
+            "vite.config.ts",
+            "import { vitePlugin as remix } from '@remix-run/dev';\n",
+        ),
     ]);
     assert_eq!(remix.framework, "remix");
     assert_eq!(
@@ -311,11 +326,36 @@ fn react_router_library_in_a_vite_spa_is_not_a_server() {
 #[test]
 fn static_frameworks_have_their_output_dirs() {
     let cases: [(&str, &str, &str, Option<&str>); 6] = [
-        (r#"{"dependencies":{"react-scripts":"5"}}"#, "create-react-app", "build", Some("index.html")),
-        (r#"{"dependencies":{"@docusaurus/core":"3"}}"#, "docusaurus", "build", None),
-        (r#"{"dependencies":{"gatsby":"5"}}"#, "gatsby", "public", None),
-        (r#"{"devDependencies":{"@11ty/eleventy":"3"}}"#, "eleventy", "_site", None),
-        (r#"{"devDependencies":{"@vue/cli-service":"5"}}"#, "vue-cli", "dist", Some("index.html")),
+        (
+            r#"{"dependencies":{"react-scripts":"5"}}"#,
+            "create-react-app",
+            "build",
+            Some("index.html"),
+        ),
+        (
+            r#"{"dependencies":{"@docusaurus/core":"3"}}"#,
+            "docusaurus",
+            "build",
+            None,
+        ),
+        (
+            r#"{"dependencies":{"gatsby":"5"}}"#,
+            "gatsby",
+            "public",
+            None,
+        ),
+        (
+            r#"{"devDependencies":{"@11ty/eleventy":"3"}}"#,
+            "eleventy",
+            "_site",
+            None,
+        ),
+        (
+            r#"{"devDependencies":{"@vue/cli-service":"5"}}"#,
+            "vue-cli",
+            "dist",
+            Some("index.html"),
+        ),
         (
             r#"{"devDependencies":{"vitepress":"1"},"scripts":{"build":"vitepress build docs"}}"#,
             "vitepress",
@@ -337,7 +377,10 @@ fn static_frameworks_have_their_output_dirs() {
 fn angular_static_and_ssr_follow_angular_json() {
     let angular_json = r#"{"projects":{"shop":{"projectType":"application","architect":{"build":{"options":{"outputPath":"dist/shop-web"}}}}}}"#;
     let spa = detect(&[
-        ("package.json", r#"{"dependencies":{"@angular/core":"18"},"scripts":{"build":"ng build"}}"#),
+        (
+            "package.json",
+            r#"{"dependencies":{"@angular/core":"18"},"scripts":{"build":"ng build"}}"#,
+        ),
         ("angular.json", angular_json),
     ]);
     assert_eq!(spa.rendering, Rendering::Static);
@@ -359,8 +402,14 @@ fn angular_static_and_ssr_follow_angular_json() {
 #[test]
 fn vite_out_dir_and_root_are_read_from_the_config() {
     let det = detect(&[
-        ("package.json", r#"{"devDependencies":{"vite":"6"},"scripts":{"build":"vite build"}}"#),
-        ("vite.config.ts", "export default { root: 'web', build: { outDir: 'public-build' } };\n"),
+        (
+            "package.json",
+            r#"{"devDependencies":{"vite":"6"},"scripts":{"build":"vite build"}}"#,
+        ),
+        (
+            "vite.config.ts",
+            "export default { root: 'web', build: { outDir: 'public-build' } };\n",
+        ),
     ]);
     assert_eq!(det.output_dir, "web/public-build");
     assert_eq!(det.alt_output_dirs, ["public-build"]);
@@ -377,7 +426,10 @@ fn plain_node_servers_parse_their_start_scripts() {
     ]);
     assert_eq!(express.framework, "express");
     assert_eq!(express.rendering, Rendering::Ssr);
-    assert_eq!(express.start_argv, ["node", "--enable-source-maps", "server.js"]);
+    assert_eq!(
+        express.start_argv,
+        ["node", "--enable-source-maps", "server.js"]
+    );
     assert_eq!(express.install_command, "npm ci");
     assert_eq!(express.build_command, "true");
     assert!(express.notes.iter().any(|n| n.contains("SECRET_MODE")));
@@ -441,13 +493,19 @@ fn bun_servers_start_the_file_directly_and_note_the_runtime() {
 
 #[test]
 fn static_sites_without_a_build_are_served_from_their_html_dir() {
-    let root = detect(&[("package.json", r#"{"name":"x"}"#), ("index.html", "<html>")]);
+    let root = detect(&[
+        ("package.json", r#"{"name":"x"}"#),
+        ("index.html", "<html>"),
+    ]);
     assert_eq!(root.rendering, Rendering::Static);
     assert_eq!(root.output_dir, ".");
     assert_eq!(root.install_command, "true");
     assert_eq!(root.build_command, "true");
 
-    let public = detect(&[("package.json", r#"{"name":"x"}"#), ("public/index.html", "<html>")]);
+    let public = detect(&[
+        ("package.json", r#"{"name":"x"}"#),
+        ("public/index.html", "<html>"),
+    ]);
     assert_eq!(public.output_dir, "public");
 
     let bare = detect(&[("dist/index.html", "<html>")]);
@@ -474,8 +532,14 @@ fn package_managers_choose_their_install_commands() {
         install(&[pkg, ("yarn.lock", "__metadata:\n  version: 8\n")]),
         "yarn install --immutable"
     );
-    assert_eq!(install(&[pkg, ("bun.lockb", "x")]), "bun install --frozen-lockfile");
-    assert_eq!(install(&[pkg, ("bun.lock", "{}")]), "bun install --frozen-lockfile");
+    assert_eq!(
+        install(&[pkg, ("bun.lockb", "x")]),
+        "bun install --frozen-lockfile"
+    );
+    assert_eq!(
+        install(&[pkg, ("bun.lock", "{}")]),
+        "bun install --frozen-lockfile"
+    );
 }
 
 #[test]
@@ -511,10 +575,17 @@ fn old_pnpm_lockfiles_and_unpinned_berry_are_noted() {
         ("package.json", r#"{"dependencies":{"vite":"5"}}"#),
         ("pnpm-lock.yaml", "lockfileVersion: '6.0'\n"),
     ]);
-    assert!(det.notes.iter().any(|n| n.contains("lockfile v6")), "{:?}", det.notes);
+    assert!(
+        det.notes.iter().any(|n| n.contains("lockfile v6")),
+        "{:?}",
+        det.notes
+    );
 
     let pinned = detect(&[
-        ("package.json", r#"{"packageManager":"pnpm@8.15.0","dependencies":{"vite":"5"}}"#),
+        (
+            "package.json",
+            r#"{"packageManager":"pnpm@8.15.0","dependencies":{"vite":"5"}}"#,
+        ),
         ("pnpm-lock.yaml", "lockfileVersion: '6.0'\n"),
     ]);
     assert!(pinned.notes.is_empty(), "{:?}", pinned.notes);
@@ -534,7 +605,10 @@ fn monorepo_root_dir_reads_workspace_lockfiles_and_version_files() {
             "apps/web/package.json",
             r#"{"dependencies":{"next":"15"},"scripts":{"build":"next build"}}"#,
         ),
-        ("apps/web/next.config.js", "module.exports = { output: 'standalone' };\n"),
+        (
+            "apps/web/next.config.js",
+            "module.exports = { output: 'standalone' };\n",
+        ),
     ]);
     let det = detect_site_in(repo.path(), "apps/web", None, None).unwrap();
     assert_eq!(det.package_manager, "pnpm");
@@ -597,10 +671,16 @@ fn standalone_server_dir_is_found_at_the_root_or_nested_for_monorepos() {
 
 #[test]
 fn package_bins_resolve_from_the_installed_package_json() {
-    let dir = site(&[(
-        "node_modules/@react-router/serve/package.json",
-        r#"{"bin":{"react-router-serve":"./bin.js"}}"#,
-    ), ("node_modules/next/package.json", r#"{"bin":{"next":"./dist/bin/next"}}"#)]);
+    let dir = site(&[
+        (
+            "node_modules/@react-router/serve/package.json",
+            r#"{"bin":{"react-router-serve":"./bin.js"}}"#,
+        ),
+        (
+            "node_modules/next/package.json",
+            r#"{"bin":{"next":"./dist/bin/next"}}"#,
+        ),
+    ]);
     let rr = StartBin {
         package: "@react-router/serve".into(),
         bin: "react-router-serve".into(),
@@ -676,7 +756,9 @@ fn explicit_package_manager_drives_non_next_presets() {
         ("npm", "npm exec -- vite build"),
     ] {
         assert_eq!(
-            detect_site_with(dir.path(), Some(pm)).unwrap().build_command,
+            detect_site_with(dir.path(), Some(pm))
+                .unwrap()
+                .build_command,
             build
         );
     }
@@ -895,8 +977,7 @@ fn detection_reads_do_not_follow_symlinks_out_of_the_repo() {
         ("version", "99\n"),
     ]);
     let repo = site(&[("package.json", r#"{"dependencies":{"vite":"^6"}}"#)]);
-    std::os::unix::fs::symlink(outside.path().join("version"), repo.path().join(".nvmrc"))
-        .unwrap();
+    std::os::unix::fs::symlink(outside.path().join("version"), repo.path().join(".nvmrc")).unwrap();
     let det = detect_site(repo.path()).unwrap();
     assert_eq!(det.node_major, None);
 

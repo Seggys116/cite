@@ -14,10 +14,10 @@ use crate::model::{
 use crate::scope::{Sequence, foreign_notice};
 use crate::siteops::{
     CAP_ASYNC_DEPLOY, CAP_BUILD_ENV, CAP_FORGES, CAP_LOGS, CAP_RUNTIME_ENV, CAP_SOURCE_BUILD,
-    CAP_STATUS, CAP_TOKEN, CAP_VOLUMES, NodeExtras, STATUS_TICKS, auto_placeholder, bot_trust, clock,
-    detected_value, forge_note, has_cap, is_busy_phase, outcome_rows, phase_label, phase_tone,
-    ref_problem, report_lines, should_poll_logs, slot_rows, status_reason, token_detail,
-    token_summary,
+    CAP_STATUS, CAP_TOKEN, CAP_VOLUMES, NodeExtras, STATUS_TICKS, auto_placeholder, bot_trust,
+    clock, detected_value, forge_note, has_cap, is_busy_phase, outcome_rows, phase_label,
+    phase_tone, ref_problem, report_lines, should_poll_logs, slot_rows, status_reason,
+    token_detail, token_summary,
 };
 use crate::theme::{CARD_RADIUS, Tone, c, tint};
 use crate::ui::detail::Data;
@@ -433,7 +433,12 @@ impl Console {
     }
 
     // The red box on the status panel: the node's reason, whole and copyable, with any build output under it.
-    fn reason_box(&self, reason: String, logs_slot: Option<cite_edge::model::Slot>, cx: &mut Context<Self>) -> AnyElement {
+    fn reason_box(
+        &self,
+        reason: String,
+        logs_slot: Option<cite_edge::model::Slot>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let red = Tone::Bad.color();
         let mut actions = div().flex().gap(px(8.));
         if let Some(slot) = logs_slot {
@@ -704,7 +709,12 @@ impl Console {
                 ),
             ))
             .child(pair(
-                text("Install command", None, "install_command", &b.install_command),
+                text(
+                    "Install command",
+                    None,
+                    "install_command",
+                    &b.install_command,
+                ),
                 text("Build command", None, "build_command", &b.build_command),
             ))
             .child(pair(
@@ -738,8 +748,11 @@ impl Console {
                 field(
                     "Prune dependencies",
                     Some(
-                        choice_help("prune", Some("Remove development packages after the build."))
-                            .as_str(),
+                        choice_help(
+                            "prune",
+                            Some("Remove development packages after the build."),
+                        )
+                        .as_str(),
                     ),
                     prune,
                 ),

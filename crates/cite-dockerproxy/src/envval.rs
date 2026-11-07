@@ -308,21 +308,53 @@ mod tests {
 
     #[test]
     fn egress_entries_are_strict() {
-        for ok in ["10.0.0.0/8", "192.168.1.5", "0.0.0.0/0", "fd00::/8", "::1", "2001:db8::/32"] {
+        for ok in [
+            "10.0.0.0/8",
+            "192.168.1.5",
+            "0.0.0.0/0",
+            "fd00::/8",
+            "::1",
+            "2001:db8::/32",
+        ] {
             assert!(egress_cidr(ok), "{ok}");
         }
         for bad in [
-            "010.0.0.1", "10.0.0.0/33", "10.0.0.0/08", "10.0.0/8", "fd00::/129", "example.com", "",
-            "1.2.3.4/", " 10.0.0.1", "::ffff:127.0.0.1", "::ffff:0:0/96",
+            "010.0.0.1",
+            "10.0.0.0/33",
+            "10.0.0.0/08",
+            "10.0.0/8",
+            "fd00::/129",
+            "example.com",
+            "",
+            "1.2.3.4/",
+            " 10.0.0.1",
+            "::ffff:127.0.0.1",
+            "::ffff:0:0/96",
         ] {
             assert!(!egress_cidr(bad), "{bad:?}");
         }
-        for ok in ["api.github.com", ".apple.com", "db.lan", "_x.example", "a-b.example"] {
+        for ok in [
+            "api.github.com",
+            ".apple.com",
+            "db.lan",
+            "_x.example",
+            "a-b.example",
+        ] {
             assert!(egress_host(ok), "{ok}");
         }
         for bad in [
-            "Api.github.com", "*.apple.com", "..apple.com", "a..b", "-a.com", "10.0.0.1", "2130706433",
-            "x.0x10", "", ".", "a b.com", "caf\u{e9}.com",
+            "Api.github.com",
+            "*.apple.com",
+            "..apple.com",
+            "a..b",
+            "-a.com",
+            "10.0.0.1",
+            "2130706433",
+            "x.0x10",
+            "",
+            ".",
+            "a b.com",
+            "caf\u{e9}.com",
         ] {
             assert!(!egress_host(bad), "{bad:?}");
         }
@@ -333,7 +365,13 @@ mod tests {
             assert!(!egress_port_range(bad), "{bad:?}");
         }
         assert!(egress_rules("api.github.com,10.0.0.0/8,.apple.com"));
-        for bad in ["", "a.com,a.com", "a.com, b.com", "a.com,,b.com", "a.com,Bad.com"] {
+        for bad in [
+            "",
+            "a.com,a.com",
+            "a.com, b.com",
+            "a.com,,b.com",
+            "a.com,Bad.com",
+        ] {
             assert!(!egress_rules(bad), "{bad:?}");
         }
         let many: Vec<String> = (0..65).map(|i| format!("h{i}.example")).collect();

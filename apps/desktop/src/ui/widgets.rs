@@ -317,7 +317,11 @@ pub fn empty_state(title: &str, text: &str) -> Div {
 }
 
 // Monospace text in an inset box that scrolls on its own and only hands the wheel to the page at its ends.
-pub fn code_block(key: impl Into<SharedString>, text: impl Into<SharedString>, max_height: f32) -> Div {
+pub fn code_block(
+    key: impl Into<SharedString>,
+    text: impl Into<SharedString>,
+    max_height: f32,
+) -> Div {
     div()
         .w_full()
         .min_w_0()

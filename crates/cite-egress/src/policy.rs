@@ -124,7 +124,10 @@ fn host_rule(entry: &str) -> Option<HostRule> {
         None => (entry, false),
     };
     match crate::addr::parse_host(name)? {
-        Host::Name(n) if n == name => Some(HostRule { name: n, subdomains }),
+        Host::Name(n) if n == name => Some(HostRule {
+            name: n,
+            subdomains,
+        }),
         _ => None,
     }
 }
@@ -181,23 +184,34 @@ impl Policy {
         };
         for e in items("CITE_EGRESS_DENY_HOSTS", &text("CITE_EGRESS_DENY_HOSTS"))? {
             node_deny.hosts.push(
-                host_rule(&e)
-                    .ok_or_else(|| format!("CITE_EGRESS_DENY_HOSTS entry {e:?} is not a host name"))?,
+                host_rule(&e).ok_or_else(|| {
+                    format!("CITE_EGRESS_DENY_HOSTS entry {e:?} is not a host name")
+                })?,
             );
         }
         let mode = match text("CITE_EGRESS_MODE").trim() {
             "" | "public" => Mode::Public,
             "allowlist" => Mode::Allowlist,
-            other => return Err(format!("CITE_EGRESS_MODE {other:?} must be public or allowlist")),
+            other => {
+                return Err(format!(
+                    "CITE_EGRESS_MODE {other:?} must be public or allowlist"
+                ));
+            }
         };
         let block_mail = match text("CITE_EGRESS_BLOCK_MAIL").trim() {
             "" | "true" => true,
             "false" => false,
-            other => return Err(format!("CITE_EGRESS_BLOCK_MAIL {other:?} must be true or false")),
+            other => {
+                return Err(format!(
+                    "CITE_EGRESS_BLOCK_MAIL {other:?} must be true or false"
+                ));
+            }
         };
         let site_allow = mixed_list("CITE_EGRESS_ALLOW", &text("CITE_EGRESS_ALLOW"))?;
         if mode == Mode::Allowlist && site_allow.cidrs.is_empty() && site_allow.hosts.is_empty() {
-            return Err("CITE_EGRESS_MODE=allowlist needs at least one CITE_EGRESS_ALLOW entry".to_string());
+            return Err(
+                "CITE_EGRESS_MODE=allowlist needs at least one CITE_EGRESS_ALLOW entry".to_string(),
+            );
         }
         Ok(Policy {
             node_allow: cidr_list("CITE_EGRESS_ALLOW_CIDRS", &text("CITE_EGRESS_ALLOW_CIDRS"))?,
@@ -271,8 +285,13 @@ mod tests {
     use super::*;
 
     fn policy(pairs: &[(&str, &str)]) -> Policy {
-        Policy::from_lookup(|k| pairs.iter().find(|(key, _)| *key == k).map(|(_, v)| v.to_string()))
-            .unwrap()
+        Policy::from_lookup(|k| {
+            pairs
+                .iter()
+                .find(|(key, _)| *key == k)
+                .map(|(_, v)| v.to_string())
+        })
+        .unwrap()
     }
 
     fn ip(text: &str) -> IpAddr {
@@ -283,12 +302,25 @@ mod tests {
     fn the_default_allows_public_addresses_only() {
         let p = Policy::default();
         assert_eq!(p, policy(&[]));
-        assert_eq!(p.check_addr(Some("example.com"), ip("93.184.215.14")), Ok(()));
+        assert_eq!(
+            p.check_addr(Some("example.com"), ip("93.184.215.14")),
+            Ok(())
+        );
         assert_eq!(p.check_addr(None, ip("2606:4700::1111")), Ok(()));
-        for bad in ["127.0.0.1", "10.0.0.5", "172.17.0.1", "169.254.169.254", "::1", "fd00::1"] {
+        for bad in [
+            "127.0.0.1",
+            "10.0.0.5",
+            "172.17.0.1",
+            "169.254.169.254",
+            "::1",
+            "fd00::1",
+        ] {
             assert_eq!(p.check_addr(None, ip(bad)), Err(Reason::Internal), "{bad}");
         }
-        assert_eq!(Reason::Internal.text(), "destination is a private or internal address");
+        assert_eq!(
+            Reason::Internal.text(),
+            "destination is a private or internal address"
+        );
     }
 
     #[test]
@@ -304,14 +336,21 @@ mod tests {
         let narrow = policy(&[("CITE_EGRESS_ALLOW_PORTS", "80, 443,8000-8100,25")]);
         assert_eq!(narrow.check_port(8050), Ok(()));
         assert_eq!(narrow.check_port(22), Err(Reason::Port));
-        assert_eq!(narrow.check_port(25), Err(Reason::Port), "block_mail still applies");
+        assert_eq!(
+            narrow.check_port(25),
+            Err(Reason::Port),
+            "block_mail still applies"
+        );
     }
 
     #[test]
     fn node_allow_cidrs_open_private_and_reserved_ranges() {
         let p = policy(&[("CITE_EGRESS_ALLOW_CIDRS", "192.168.10.0/24,127.0.0.0/8")]);
         assert_eq!(p.check_addr(None, ip("192.168.10.7")), Ok(()));
-        assert_eq!(p.check_addr(None, ip("192.168.11.7")), Err(Reason::Internal));
+        assert_eq!(
+            p.check_addr(None, ip("192.168.11.7")),
+            Err(Reason::Internal)
+        );
         assert_eq!(p.check_addr(None, ip("127.0.0.1")), Ok(()));
         assert_eq!(p.check_addr(None, ip("::ffff:127.0.0.1")), Ok(()));
     }
@@ -321,22 +360,53 @@ mod tests {
         let p = policy(&[
             ("CITE_EGRESS_DENY_CIDRS", "203.0.112.0/24"),
             ("CITE_EGRESS_DENY_HOSTS", "evil.example"),
-            ("CITE_EGRESS_ALLOW", "203.0.112.0/24,.evil.example,db.lan,10.0.0.0/8,.corp.example"),
+            (
+                "CITE_EGRESS_ALLOW",
+                "203.0.112.0/24,.evil.example,db.lan,10.0.0.0/8,.corp.example",
+            ),
             ("CITE_EGRESS_DENY", "10.0.0.66,secret.corp.example"),
         ]);
-        assert_eq!(p.check_addr(None, ip("203.0.112.5")), Err(Reason::NodeDenied));
+        assert_eq!(
+            p.check_addr(None, ip("203.0.112.5")),
+            Err(Reason::NodeDenied)
+        );
         assert_eq!(p.check_name("evil.example"), Err(Reason::NodeDenied));
-        assert_eq!(p.check_name("x.evil.example"), Err(Reason::NodeDenied), "node deny hosts are suffixes");
+        assert_eq!(
+            p.check_name("x.evil.example"),
+            Err(Reason::NodeDenied),
+            "node deny hosts are suffixes"
+        );
         assert_eq!(p.check_name("notevil.example"), Ok(()));
         assert_eq!(p.check_addr(None, ip("10.0.0.66")), Err(Reason::SiteDenied));
         assert_eq!(p.check_name("secret.corp.example"), Err(Reason::SiteDenied));
-        assert_eq!(p.check_addr(Some("a.secret.corp.example"), ip("8.8.8.8")), Err(Reason::SiteDenied));
+        assert_eq!(
+            p.check_addr(Some("a.secret.corp.example"), ip("8.8.8.8")),
+            Err(Reason::SiteDenied)
+        );
         assert_eq!(p.check_addr(None, ip("10.0.0.7")), Ok(()));
-        assert_eq!(p.check_addr(Some("db.lan"), ip("192.168.1.5")), Ok(()), "an allowed name may be private");
-        assert_eq!(p.check_addr(Some("x.db.lan"), ip("192.168.1.5")), Err(Reason::Internal), "no dot, exact only");
-        assert_eq!(p.check_addr(Some("app.corp.example"), ip("172.20.0.4")), Ok(()));
-        assert_eq!(p.check_addr(Some("db.lan"), ip("127.0.0.1")), Err(Reason::Internal), "names never open loopback");
-        assert_eq!(p.check_addr(Some("db.lan"), ip("169.254.169.254")), Err(Reason::Internal));
+        assert_eq!(
+            p.check_addr(Some("db.lan"), ip("192.168.1.5")),
+            Ok(()),
+            "an allowed name may be private"
+        );
+        assert_eq!(
+            p.check_addr(Some("x.db.lan"), ip("192.168.1.5")),
+            Err(Reason::Internal),
+            "no dot, exact only"
+        );
+        assert_eq!(
+            p.check_addr(Some("app.corp.example"), ip("172.20.0.4")),
+            Ok(())
+        );
+        assert_eq!(
+            p.check_addr(Some("db.lan"), ip("127.0.0.1")),
+            Err(Reason::Internal),
+            "names never open loopback"
+        );
+        assert_eq!(
+            p.check_addr(Some("db.lan"), ip("169.254.169.254")),
+            Err(Reason::Internal)
+        );
     }
 
     #[test]
@@ -346,19 +416,39 @@ mod tests {
             ("CITE_EGRESS_ALLOW", "198.51.100.0/24,203.0.113.0/24"),
             ("CITE_EGRESS_DENY", "203.0.113.7"),
         ]);
-        for carrier in ["64:ff9b::c633:6405", "2002:c633:6405::1", "::198.51.100.5", "::ffff:198.51.100.5"] {
-            assert_eq!(p.check_addr(None, ip(carrier)), Err(Reason::NodeDenied), "{carrier}");
+        for carrier in [
+            "64:ff9b::c633:6405",
+            "2002:c633:6405::1",
+            "::198.51.100.5",
+            "::ffff:198.51.100.5",
+        ] {
+            assert_eq!(
+                p.check_addr(None, ip(carrier)),
+                Err(Reason::NodeDenied),
+                "{carrier}"
+            );
         }
-        assert_eq!(p.check_addr(None, ip("64:ff9b::cb00:7107")), Err(Reason::SiteDenied));
+        assert_eq!(
+            p.check_addr(None, ip("64:ff9b::cb00:7107")),
+            Err(Reason::SiteDenied)
+        );
         assert_eq!(p.check_addr(None, ip("203.0.113.8")), Ok(()));
     }
 
     #[test]
     fn local_networks_join_the_node_ceiling() {
-        let p = policy(&[("CITE_EGRESS_ALLOW_CIDRS", "172.16.0.0/12")])
-            .with_local_networks([Cidr::parse("172.18.0.0/16").unwrap(), Cidr::parse("172.18.0.1").unwrap()]);
-        assert_eq!(p.check_addr(None, ip("172.18.0.1")), Err(Reason::NodeDenied));
-        assert_eq!(p.check_addr(None, ip("172.18.0.9")), Err(Reason::NodeDenied));
+        let p = policy(&[("CITE_EGRESS_ALLOW_CIDRS", "172.16.0.0/12")]).with_local_networks([
+            Cidr::parse("172.18.0.0/16").unwrap(),
+            Cidr::parse("172.18.0.1").unwrap(),
+        ]);
+        assert_eq!(
+            p.check_addr(None, ip("172.18.0.1")),
+            Err(Reason::NodeDenied)
+        );
+        assert_eq!(
+            p.check_addr(None, ip("172.18.0.9")),
+            Err(Reason::NodeDenied)
+        );
         assert_eq!(p.check_addr(None, ip("172.20.0.9")), Ok(()));
     }
 
@@ -366,21 +456,46 @@ mod tests {
     fn allowlist_mode_permits_only_listed_destinations() {
         let p = policy(&[
             ("CITE_EGRESS_MODE", "allowlist"),
-            ("CITE_EGRESS_ALLOW", "api.github.com,*.apple.com,198.51.100.0/24"),
+            (
+                "CITE_EGRESS_ALLOW",
+                "api.github.com,*.apple.com,198.51.100.0/24",
+            ),
         ]);
-        assert_eq!(p.check_addr(Some("api.github.com"), ip("140.82.112.6")), Ok(()));
-        assert_eq!(p.check_addr(Some("github.com"), ip("140.82.112.3")), Err(Reason::NotAllowlisted));
-        assert_eq!(p.check_addr(Some("www.apple.com"), ip("17.253.144.10")), Ok(()));
+        assert_eq!(
+            p.check_addr(Some("api.github.com"), ip("140.82.112.6")),
+            Ok(())
+        );
+        assert_eq!(
+            p.check_addr(Some("github.com"), ip("140.82.112.3")),
+            Err(Reason::NotAllowlisted)
+        );
+        assert_eq!(
+            p.check_addr(Some("www.apple.com"), ip("17.253.144.10")),
+            Ok(())
+        );
         assert_eq!(p.check_addr(Some("apple.com"), ip("17.253.144.10")), Ok(()));
-        assert_eq!(p.check_addr(None, ip("8.8.8.8")), Err(Reason::NotAllowlisted));
-        assert_eq!(p.check_addr(None, ip("198.51.100.4")), Ok(()), "an explicit CIDR opens a reserved range");
-        assert_eq!(p.check_addr(Some("api.github.com"), ip("127.0.0.1")), Err(Reason::Internal));
+        assert_eq!(
+            p.check_addr(None, ip("8.8.8.8")),
+            Err(Reason::NotAllowlisted)
+        );
+        assert_eq!(
+            p.check_addr(None, ip("198.51.100.4")),
+            Ok(()),
+            "an explicit CIDR opens a reserved range"
+        );
+        assert_eq!(
+            p.check_addr(Some("api.github.com"), ip("127.0.0.1")),
+            Err(Reason::Internal)
+        );
         let node_allowed = policy(&[
             ("CITE_EGRESS_MODE", "allowlist"),
             ("CITE_EGRESS_ALLOW", "api.github.com"),
             ("CITE_EGRESS_ALLOW_CIDRS", "10.0.0.0/8"),
         ]);
-        assert_eq!(node_allowed.check_addr(None, ip("10.1.1.1")), Err(Reason::NotAllowlisted));
+        assert_eq!(
+            node_allowed.check_addr(None, ip("10.1.1.1")),
+            Err(Reason::NotAllowlisted)
+        );
     }
 
     #[test]
@@ -402,11 +517,18 @@ mod tests {
             [("CITE_EGRESS_DENY", "2130706433")],
         ] {
             assert!(
-                Policy::from_lookup(|k| pairs.iter().find(|(key, _)| *key == k).map(|(_, v)| v.to_string())).is_err(),
+                Policy::from_lookup(|k| pairs
+                    .iter()
+                    .find(|(key, _)| *key == k)
+                    .map(|(_, v)| v.to_string()))
+                .is_err(),
                 "{pairs:?}"
             );
         }
-        let many = (0..65).map(|i| format!("10.0.{i}.0/24")).collect::<Vec<_>>().join(",");
+        let many = (0..65)
+            .map(|i| format!("10.0.{i}.0/24"))
+            .collect::<Vec<_>>()
+            .join(",");
         assert!(Policy::from_lookup(|k| (k == "CITE_EGRESS_ALLOW").then(|| many.clone())).is_err());
     }
 }

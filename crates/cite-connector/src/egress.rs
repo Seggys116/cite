@@ -20,10 +20,26 @@ type NodeKey = (&'static str, &'static str, fn(&str) -> bool);
 
 /// In the order the Docker proxy expects them.
 const NODE_KEYS: [NodeKey; 4] = [
-    ("CITE_STACK_EGRESS_ALLOW_CIDRS", "CITE_EGRESS_ALLOW_CIDRS", is_egress_cidr),
-    ("CITE_STACK_EGRESS_DENY_CIDRS", "CITE_EGRESS_DENY_CIDRS", is_egress_cidr),
-    ("CITE_STACK_EGRESS_DENY_HOSTS", "CITE_EGRESS_DENY_HOSTS", is_egress_host),
-    ("CITE_STACK_EGRESS_ALLOW_PORTS", "CITE_EGRESS_ALLOW_PORTS", is_port_range),
+    (
+        "CITE_STACK_EGRESS_ALLOW_CIDRS",
+        "CITE_EGRESS_ALLOW_CIDRS",
+        is_egress_cidr,
+    ),
+    (
+        "CITE_STACK_EGRESS_DENY_CIDRS",
+        "CITE_EGRESS_DENY_CIDRS",
+        is_egress_cidr,
+    ),
+    (
+        "CITE_STACK_EGRESS_DENY_HOSTS",
+        "CITE_EGRESS_DENY_HOSTS",
+        is_egress_host,
+    ),
+    (
+        "CITE_STACK_EGRESS_ALLOW_PORTS",
+        "CITE_EGRESS_ALLOW_PORTS",
+        is_port_range,
+    ),
 ];
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -85,9 +101,15 @@ fn bad(msg: String) -> ConnectorError {
 
 // Trimmed, empty entries dropped, joined with commas: the exact text the Docker proxy compares.
 fn setting(key: &str, raw: &str, entry_ok: fn(&str) -> bool) -> Result<String> {
-    let entries: Vec<&str> = raw.split(',').map(str::trim).filter(|e| !e.is_empty()).collect();
+    let entries: Vec<&str> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+        .collect();
     if entries.len() > MAX_EGRESS_ENTRIES {
-        return Err(bad(format!("{key} has more than {MAX_EGRESS_ENTRIES} entries")));
+        return Err(bad(format!(
+            "{key} has more than {MAX_EGRESS_ENTRIES} entries"
+        )));
     }
     for (i, e) in entries.iter().enumerate() {
         if !entry_ok(e) {
@@ -121,7 +143,10 @@ fn site_list(entries: &[String]) -> String {
     let mut out: Vec<String> = Vec::new();
     for e in entries {
         let e = e.trim();
-        let e = e.strip_prefix('*').filter(|r| r.starts_with('.')).unwrap_or(e);
+        let e = e
+            .strip_prefix('*')
+            .filter(|r| r.starts_with('.'))
+            .unwrap_or(e);
         if !e.is_empty() && !out.iter().any(|o| o == e) {
             out.push(e.to_string());
         }
@@ -172,7 +197,11 @@ impl Egress {
         if !bridge_ok {
             return Err(bad(format!("{BRIDGE_KEY} {bridge:?} is not valid")));
         }
-        let own = setting(NODE_IPS_KEY, &get(NODE_IPS_KEY).unwrap_or_default(), is_egress_cidr)?;
+        let own = setting(
+            NODE_IPS_KEY,
+            &get(NODE_IPS_KEY).unwrap_or_default(),
+            is_egress_cidr,
+        )?;
         let mut node_env = Vec::new();
         for (key, env_key, entry_ok) in NODE_KEYS {
             let mut value = setting(key, &get(key).unwrap_or_default(), entry_ok)?;
@@ -205,7 +234,10 @@ impl Egress {
         let mut env = self.node_env.clone();
         env.push(format!("CITE_EGRESS_MODE={}", rules.mode.as_str()));
         env.push(format!("CITE_EGRESS_BLOCK_MAIL={}", rules.block_mail));
-        for (key, list) in [("CITE_EGRESS_ALLOW", &rules.allow), ("CITE_EGRESS_DENY", &rules.deny)] {
+        for (key, list) in [
+            ("CITE_EGRESS_ALLOW", &rules.allow),
+            ("CITE_EGRESS_DENY", &rules.deny),
+        ] {
             let joined = site_list(list);
             if !joined.is_empty() {
                 env.push(format!("{key}={joined}"));
@@ -222,7 +254,12 @@ mod tests {
     use super::*;
 
     fn lookup(pairs: &[(&str, &str)]) -> Result<Egress> {
-        Egress::from_lookup(|k| pairs.iter().find(|(key, _)| *key == k).map(|(_, v)| v.to_string()))
+        Egress::from_lookup(|k| {
+            pairs
+                .iter()
+                .find(|(key, _)| *key == k)
+                .map(|(_, v)| v.to_string())
+        })
     }
 
     #[test]
@@ -246,7 +283,11 @@ mod tests {
         }
         let both = lookup(&[(MODE_KEY, "open"), (LEGACY_KEY, "false")]).unwrap();
         assert_eq!(both.mode, EgressMode::Open);
-        for pairs in [[(MODE_KEY, "Open")], [(MODE_KEY, "on")], [(LEGACY_KEY, "maybe")]] {
+        for pairs in [
+            [(MODE_KEY, "Open")],
+            [(MODE_KEY, "on")],
+            [(LEGACY_KEY, "maybe")],
+        ] {
             assert!(lookup(&pairs).is_err(), "{pairs:?}");
         }
     }
@@ -254,7 +295,10 @@ mod tests {
     #[test]
     fn node_lists_are_normalised_and_validated() {
         let e = lookup(&[
-            ("CITE_STACK_EGRESS_ALLOW_CIDRS", " 192.168.10.0/24 , fd00::/8,"),
+            (
+                "CITE_STACK_EGRESS_ALLOW_CIDRS",
+                " 192.168.10.0/24 , fd00::/8,",
+            ),
             ("CITE_STACK_EGRESS_DENY_HOSTS", "evil.example,.ads.example"),
             ("CITE_STACK_EGRESS_ALLOW_PORTS", "80,443,8000-8100"),
             (BRIDGE_KEY, "my-egress"),
@@ -286,9 +330,15 @@ mod tests {
     #[test]
     fn node_public_ips_join_the_deny_list() {
         let alone = lookup(&[(NODE_IPS_KEY, " 203.0.113.10, 2001:db8::10 ")]).unwrap();
-        assert_eq!(alone.node_env, vec!["CITE_EGRESS_DENY_CIDRS=203.0.113.10,2001:db8::10"]);
+        assert_eq!(
+            alone.node_env,
+            vec!["CITE_EGRESS_DENY_CIDRS=203.0.113.10,2001:db8::10"]
+        );
         let merged = lookup(&[
-            ("CITE_STACK_EGRESS_DENY_CIDRS", "198.51.100.0/24,203.0.113.10"),
+            (
+                "CITE_STACK_EGRESS_DENY_CIDRS",
+                "198.51.100.0/24,203.0.113.10",
+            ),
             (NODE_IPS_KEY, "203.0.113.10,203.0.113.11"),
             ("CITE_STACK_EGRESS_ALLOW_CIDRS", "192.168.10.0/24,fd00::/8"),
         ])
@@ -297,13 +347,28 @@ mod tests {
             merged.node_env[1],
             "CITE_EGRESS_DENY_CIDRS=198.51.100.0/24,203.0.113.10,203.0.113.11"
         );
-        assert_eq!(merged.node_allow_cidrs(), vec!["192.168.10.0/24", "fd00::/8"]);
+        assert_eq!(
+            merged.node_allow_cidrs(),
+            vec!["192.168.10.0/24", "fd00::/8"]
+        );
         for bad in ["example.com", "::ffff:1.2.3.4", "1.2.3.4,1.2.3.4"] {
             assert!(lookup(&[(NODE_IPS_KEY, bad)]).is_err(), "{bad}");
         }
-        let many = (0..40).map(|i| format!("10.0.{i}.1")).collect::<Vec<_>>().join(",");
-        let more = (0..40).map(|i| format!("10.1.{i}.1")).collect::<Vec<_>>().join(",");
-        assert!(lookup(&[("CITE_STACK_EGRESS_DENY_CIDRS", many.as_str()), (NODE_IPS_KEY, more.as_str())]).is_err());
+        let many = (0..40)
+            .map(|i| format!("10.0.{i}.1"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let more = (0..40)
+            .map(|i| format!("10.1.{i}.1"))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(
+            lookup(&[
+                ("CITE_STACK_EGRESS_DENY_CIDRS", many.as_str()),
+                (NODE_IPS_KEY, more.as_str())
+            ])
+            .is_err()
+        );
     }
 
     #[test]
@@ -319,7 +384,11 @@ mod tests {
         );
         let rules = OutboundRules {
             mode: OutboundMode::Allowlist,
-            allow: vec!["api.github.com".into(), "*.apple.com".into(), ".apple.com".into()],
+            allow: vec![
+                "api.github.com".into(),
+                "*.apple.com".into(),
+                ".apple.com".into(),
+            ],
             deny: vec!["10.0.0.66".into()],
             block_mail: false,
         };

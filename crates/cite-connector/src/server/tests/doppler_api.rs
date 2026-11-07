@@ -37,8 +37,7 @@ async fn with_mock(h: &Harness) -> MockDoppler {
 async fn start_with_node_token() -> Harness {
     start_with(|cfg| {
         cfg.doppler_token = Some(
-            crate::config::NodeToken::new(DOPPLER_TOKEN, crate::config::TokenSource::Env)
-                .unwrap(),
+            crate::config::NodeToken::new(DOPPLER_TOKEN, crate::config::TokenSource::Env).unwrap(),
         );
     })
     .await
@@ -66,10 +65,16 @@ async fn the_node_reports_the_doppler_token_source_but_never_the_token() {
     let t = h.token().await;
     let (status, node) = h.get(&t, "/node").await;
     assert_eq!(status, 200);
-    assert_eq!(node["doppler"], json!({ "configured": true, "source": "env" }));
+    assert_eq!(
+        node["doppler"],
+        json!({ "configured": true, "source": "env" })
+    );
     assert!(!node.to_string().contains("routesecretvalue"));
     let caps = node["capabilities"].to_string();
-    assert!(!caps.contains("doppler"), "doppler needs the orchestrator: {caps}");
+    assert!(
+        !caps.contains("doppler"),
+        "doppler needs the orchestrator: {caps}"
+    );
 }
 
 #[tokio::test]
@@ -129,7 +134,10 @@ async fn a_binding_syncs_reports_and_never_echoes_values_or_tokens() {
     assert_eq!(res.status().as_u16(), 200);
     assert_eq!(res.headers()["cache-control"], "no-store");
     let text = res.text().await.unwrap();
-    assert!(!text.contains(SECRET_VALUE) && !text.contains("routesecretvalue"), "{text}");
+    assert!(
+        !text.contains(SECRET_VALUE) && !text.contains("routesecretvalue"),
+        "{text}"
+    );
     let view: Value = serde_json::from_str(&text).unwrap();
     assert_eq!(view["bound"], true);
     assert_eq!(view["project"], "shop");
@@ -138,17 +146,31 @@ async fn a_binding_syncs_reports_and_never_echoes_values_or_tokens() {
     assert_eq!(view["token_source"], "site");
     assert_eq!(view["keys"], 2);
     assert!(view["last_sync_at"].is_string());
-    assert_eq!(view["redeploy_needed"], true, "no orchestrator in the harness");
-    assert!(view["last_error"].as_str().unwrap().contains("DOPPLER_CONFIG"));
+    assert_eq!(
+        view["redeploy_needed"], true,
+        "no orchestrator in the harness"
+    );
+    assert!(
+        view["last_error"]
+            .as_str()
+            .unwrap()
+            .contains("DOPPLER_CONFIG")
+    );
     assert_eq!(server.state.downloads(), 1);
 
     let (_, site) = h.get(&t, "/sites/app").await;
     assert_eq!(site["source"]["doppler"]["project"], "shop");
     assert!(!site.to_string().contains(SECRET_VALUE));
     let (_, names) = h.get(&t, "/sites/app/build-env").await;
-    assert_eq!(names, json!({ "names": [] }), "manual variables are separate");
+    assert_eq!(
+        names,
+        json!({ "names": [] }),
+        "manual variables are separate"
+    );
 
-    server.state.set("shop", "prd", json!({ "PUBLIC_URL": "https://shop2" }));
+    server
+        .state
+        .set("shop", "prd", json!({ "PUBLIC_URL": "https://shop2" }));
     let (status, view) = h.post(&t, "/sites/app/doppler/sync", json!({})).await;
     assert_eq!(status, 200, "{view}");
     assert_eq!(view["keys"], 1);
@@ -170,7 +192,10 @@ async fn a_binding_syncs_reports_and_never_echoes_values_or_tokens() {
     ] {
         assert!(audit.contains(action), "{action}: {audit}");
     }
-    assert!(!audit.contains(SECRET_VALUE) && !audit.contains("https://shop"), "{audit}");
+    assert!(
+        !audit.contains(SECRET_VALUE) && !audit.contains("https://shop"),
+        "{audit}"
+    );
     assert!(!audit.contains("routesecretvalue"), "{audit}");
 
     let (status, view) = h.delete(&t, "/sites/app/doppler").await;
@@ -197,7 +222,10 @@ async fn a_failed_first_sync_keeps_nothing() {
         )
         .await;
     assert_eq!(status, 400, "{body}");
-    assert!(body["error"].as_str().unwrap().contains("rejected"), "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("rejected"),
+        "{body}"
+    );
     assert!(!body.to_string().contains("routesecretvalue"));
     let (_, view) = h.get(&t, "/sites/app/doppler").await;
     assert_eq!(view["bound"], false);
@@ -237,7 +265,8 @@ async fn binding_requests_are_validated_strictly() {
         let (status, body) = h.put(&t, "/sites/app/doppler", bad.clone()).await;
         assert_eq!(status, 400, "{bad}: {body}");
     }
-    let big = json!({ "project": "shop", "config": "prd", "build": true, "token": "a".repeat(5000) });
+    let big =
+        json!({ "project": "shop", "config": "prd", "build": true, "token": "a".repeat(5000) });
     let res = h
         .http
         .put(h.url("/sites/app/doppler"))
@@ -262,9 +291,11 @@ async fn a_service_token_alone_binds_without_naming_a_project_or_config() {
     let t = h.token().await;
     seed_source_site(&h, "app").await;
     let server = with_mock(&h).await;
-    server
-        .state
-        .set("", "", json!({ "API_KEY": SECRET_VALUE, "PUBLIC_URL": "https://shop" }));
+    server.state.set(
+        "",
+        "",
+        json!({ "API_KEY": SECRET_VALUE, "PUBLIC_URL": "https://shop" }),
+    );
     let (status, view) = h
         .put(
             &t,
@@ -295,7 +326,10 @@ async fn a_service_token_alone_binds_without_naming_a_project_or_config() {
 
     let (status, view) = h.delete(&t, "/sites/app/doppler").await;
     assert_eq!(status, 200, "{view}");
-    assert_eq!(view["token_source"], "none", "clearing the binding deletes the site token");
+    assert_eq!(
+        view["token_source"], "none",
+        "clearing the binding deletes the site token"
+    );
 }
 
 #[tokio::test]
@@ -305,14 +339,26 @@ async fn a_token_only_binding_needs_a_site_service_token() {
     seed_source_site(&h, "app").await;
     let server = with_mock(&h).await;
     for (bad, why) in [
-        (json!({ "project": "", "config": "", "build": true }), "node token only"),
+        (
+            json!({ "project": "", "config": "", "build": true }),
+            "node token only",
+        ),
         (
             json!({ "project": "", "config": "", "build": true, "token": "dp.pt.personalsecret" }),
             "personal token",
         ),
-        (json!({ "project": "shop", "config": "", "build": true, "token": DOPPLER_TOKEN }), "half"),
-        (json!({ "project": "", "config": "prd", "build": true, "token": DOPPLER_TOKEN }), "half"),
-        (json!({ "project": "", "config": "", "token": DOPPLER_TOKEN }), "no target"),
+        (
+            json!({ "project": "shop", "config": "", "build": true, "token": DOPPLER_TOKEN }),
+            "half",
+        ),
+        (
+            json!({ "project": "", "config": "prd", "build": true, "token": DOPPLER_TOKEN }),
+            "half",
+        ),
+        (
+            json!({ "project": "", "config": "", "token": DOPPLER_TOKEN }),
+            "no target",
+        ),
     ] {
         let (status, body) = h.put(&t, "/sites/app/doppler", bad.clone()).await;
         assert_eq!(status, 400, "{why}: {bad}: {body}");
@@ -328,7 +374,10 @@ async fn a_token_only_binding_needs_a_site_service_token() {
             json!({ "project": "shop", "config": "prd", "build": true }),
         )
         .await;
-    assert_eq!(status, 200, "a named binding still works with the node token: {view}");
+    assert_eq!(
+        status, 200,
+        "a named binding still works with the node token: {view}"
+    );
     assert_eq!(view["token_source"], "node");
     assert_eq!(
         *server.state.download_params.lock().unwrap(),

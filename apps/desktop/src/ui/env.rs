@@ -195,7 +195,10 @@ impl Console {
         let key = if runtime { "runtime-env" } else { "build-env" };
         let mut list = div().flex().flex_col();
         match names {
-            None => list = list.child(text_dim("The node did not list these variables.").text_size(px(12.))),
+            None => {
+                list = list
+                    .child(text_dim("The node did not list these variables.").text_size(px(12.)))
+            }
             Some(n) if n.is_empty() => {
                 list = list.child(text_dim("No variables are set.").text_size(px(12.)))
             }
@@ -352,7 +355,10 @@ mod tests {
     #[test]
     fn a_name_typed_twice_is_found_whatever_its_case() {
         let names = |l: &[&str]| l.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        assert_eq!(duplicate_name(&names(&["API", " api "])), Some("API".into()));
+        assert_eq!(
+            duplicate_name(&names(&["API", " api "])),
+            Some("API".into())
+        );
         assert_eq!(duplicate_name(&names(&["A", "B", ""])), None);
         assert_eq!(duplicate_name(&names(&["", ""])), None);
         assert_eq!(named_rows(&names(&["A", " ", ""])), 1);

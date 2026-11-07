@@ -59,10 +59,16 @@ pub async fn serve(listener: TcpListener, policy: Arc<Policy>, timeouts: Timeout
         };
         let Ok(permit) = slots.clone().try_acquire_owned() else {
             if last_full_warn.is_none_or(|t| t.elapsed() >= FULL_WARN_EVERY) {
-                tracing::warn!(limit = MAX_CONNS, "connection limit reached, refusing new clients");
+                tracing::warn!(
+                    limit = MAX_CONNS,
+                    "connection limit reached, refusing new clients"
+                );
                 last_full_warn = Some(Instant::now());
             }
-            let _ = stream.try_write(&reply("503 Service Unavailable", "egress proxy is at its connection limit"));
+            let _ = stream.try_write(&reply(
+                "503 Service Unavailable",
+                "egress proxy is at its connection limit",
+            ));
             continue;
         };
         let (policy, resolver) = (policy.clone(), resolver.clone());
@@ -155,7 +161,9 @@ async fn read_head(stream: &mut TcpStream) -> Result<Head, HeadError> {
             return Err(HeadError::TooLarge);
         }
         let (name, value) = l.split_once(':').ok_or(HeadError::Malformed)?;
-        let value_ok = value.bytes().all(|b| b == b'\t' || (b' '..=b'~').contains(&b));
+        let value_ok = value
+            .bytes()
+            .all(|b| b == b'\t' || (b' '..=b'~').contains(&b));
         if !token(name) || !value_ok {
             return Err(HeadError::Malformed);
         }
@@ -170,7 +178,11 @@ async fn read_head(stream: &mut TcpStream) -> Result<Head, HeadError> {
 }
 
 async fn refuse(stream: &mut TcpStream, status: &str, body: &str) {
-    let _ = timed(Duration::from_secs(5), stream.write_all(&reply(status, body))).await;
+    let _ = timed(
+        Duration::from_secs(5),
+        stream.write_all(&reply(status, body)),
+    )
+    .await;
     let _ = timed(Duration::from_secs(5), stream.shutdown()).await;
 }
 
@@ -179,12 +191,19 @@ async fn handle(mut stream: TcpStream, policy: &Policy, resolver: &Resolver, tim
         Ok(Ok(head)) => head,
         Ok(Err(HeadError::Closed)) => return,
         Ok(Err(HeadError::TooLarge)) => {
-            return refuse(&mut stream, "431 Request Header Fields Too Large", "request head is too large").await;
+            return refuse(
+                &mut stream,
+                "431 Request Header Fields Too Large",
+                "request head is too large",
+            )
+            .await;
         }
         Ok(Err(HeadError::Malformed)) => {
             return refuse(&mut stream, "400 Bad Request", "malformed request").await;
         }
-        Err(_) => return refuse(&mut stream, "408 Request Timeout", "request head timed out").await,
+        Err(_) => {
+            return refuse(&mut stream, "408 Request Timeout", "request head timed out").await;
+        }
     };
     let connect = head.method == "CONNECT";
     let parsed = if connect {
@@ -216,7 +235,12 @@ async fn handle(mut stream: TcpStream, policy: &Policy, resolver: &Resolver, tim
         }
         Err(Failure::Unreachable) => {
             tracing::info!(dest = %shown, verdict = "unreachable");
-            return refuse(&mut stream, "502 Bad Gateway", "destination could not be reached").await;
+            return refuse(
+                &mut stream,
+                "502 Bad Gateway",
+                "destination could not be reached",
+            )
+            .await;
         }
     };
     let kind = if connect { "CONNECT" } else { "HTTP" };
@@ -238,7 +262,15 @@ async fn handle(mut stream: TcpStream, policy: &Policy, resolver: &Resolver, tim
             if timed(idle, upstream.write_all(&request)).await.is_err() {
                 return;
             }
-            exchange(stream, upstream, body, &head.rest, head.method == "HEAD", idle).await;
+            exchange(
+                stream,
+                upstream,
+                body,
+                &head.rest,
+                head.method == "HEAD",
+                idle,
+            )
+            .await;
         }
     }
 }
@@ -268,7 +300,10 @@ impl Resolver {
         if cache.len() >= DNS_ENTRIES && !cache.contains_key(name) {
             cache.retain(|_, (at, _)| at.elapsed() < DNS_TTL);
             if cache.len() >= DNS_ENTRIES
-                && let Some(oldest) = cache.iter().min_by_key(|(_, (at, _))| *at).map(|(k, _)| k.clone())
+                && let Some(oldest) = cache
+                    .iter()
+                    .min_by_key(|(_, (at, _))| *at)
+                    .map(|(k, _)| k.clone())
             {
                 cache.remove(&oldest);
             }
@@ -299,7 +334,11 @@ impl Resolver {
 }
 
 async fn connect_to(addr: SocketAddr) -> io::Result<TcpStream> {
-    let socket = if addr.is_ipv4() { TcpSocket::new_v4()? } else { TcpSocket::new_v6()? };
+    let socket = if addr.is_ipv4() {
+        TcpSocket::new_v4()?
+    } else {
+        TcpSocket::new_v6()?
+    };
     socket.set_keepalive(true)?;
     socket.connect(addr).await
 }
@@ -318,7 +357,10 @@ async fn open(
         Host::Ip(ip) => (None, vec![*ip]),
         Host::Name(n) => {
             policy.check_name(n).map_err(Failure::Denied)?;
-            let found = resolver.lookup(n, port, deadline).await.ok_or(Failure::Unreachable)?;
+            let found = resolver
+                .lookup(n, port, deadline)
+                .await
+                .ok_or(Failure::Unreachable)?;
             (Some(n.as_str()), found)
         }
     };
@@ -415,41 +457,86 @@ enum Body {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Chunked {
-    Size { value: u64, digits: usize, ext: bool, cr: bool, len: usize },
+    Size {
+        value: u64,
+        digits: usize,
+        ext: bool,
+        cr: bool,
+        len: usize,
+    },
     Data(u64),
     DataEnd(u8),
-    Trailer { len: usize, cr: bool },
+    Trailer {
+        len: usize,
+        cr: bool,
+    },
     Done,
 }
 
 impl Chunked {
     fn start() -> Chunked {
-        Chunked::Size { value: 0, digits: 0, ext: false, cr: false, len: 0 }
+        Chunked::Size {
+            value: 0,
+            digits: 0,
+            ext: false,
+            cr: false,
+            len: 0,
+        }
     }
 
     fn step(&mut self, b: u8) -> Result<(), ()> {
         *self = match std::mem::replace(self, Chunked::Done) {
-            Chunked::Size { value, digits, ext, cr, len } => {
+            Chunked::Size {
+                value,
+                digits,
+                ext,
+                cr,
+                len,
+            } => {
                 if len >= MAX_CHUNK_LINE {
                     return Err(());
                 }
                 let len = len + 1;
                 match b {
-                    b'\n' if cr && digits > 0 && value == 0 => Chunked::Trailer { len: 0, cr: false },
+                    b'\n' if cr && digits > 0 && value == 0 => {
+                        Chunked::Trailer { len: 0, cr: false }
+                    }
                     b'\n' if cr && digits > 0 => Chunked::Data(value),
                     _ if cr => return Err(()),
-                    b'\r' => Chunked::Size { value, digits, ext, cr: true, len },
+                    b'\r' => Chunked::Size {
+                        value,
+                        digits,
+                        ext,
+                        cr: true,
+                        len,
+                    },
                     _ if !ext && b.is_ascii_hexdigit() => {
                         if digits >= 16 {
                             return Err(());
                         }
                         let d = u64::from(char::from(b).to_digit(16).unwrap_or(0));
-                        Chunked::Size { value: value * 16 + d, digits: digits + 1, ext, cr, len }
+                        Chunked::Size {
+                            value: value * 16 + d,
+                            digits: digits + 1,
+                            ext,
+                            cr,
+                            len,
+                        }
                     }
-                    b';' | b' ' | b'\t' if digits > 0 => Chunked::Size { value, digits, ext: true, cr, len },
-                    _ if ext && (b == b'\t' || (b' '..=b'~').contains(&b)) => {
-                        Chunked::Size { value, digits, ext, cr, len }
-                    }
+                    b';' | b' ' | b'\t' if digits > 0 => Chunked::Size {
+                        value,
+                        digits,
+                        ext: true,
+                        cr,
+                        len,
+                    },
+                    _ if ext && (b == b'\t' || (b' '..=b'~').contains(&b)) => Chunked::Size {
+                        value,
+                        digits,
+                        ext,
+                        cr,
+                        len,
+                    },
                     _ => return Err(()),
                 }
             }
@@ -457,8 +544,13 @@ impl Chunked {
             Chunked::DataEnd(1) if b == b'\n' => Chunked::start(),
             Chunked::Trailer { len, cr: false } if b == b'\r' => Chunked::Trailer { len, cr: true },
             Chunked::Trailer { len: 0, cr: true } if b == b'\n' => Chunked::Done,
-            Chunked::Trailer { cr: true, .. } if b == b'\n' => Chunked::Trailer { len: 0, cr: false },
-            Chunked::Trailer { len, cr: false } if len < MAX_HEAD => Chunked::Trailer { len: len + 1, cr: false },
+            Chunked::Trailer { cr: true, .. } if b == b'\n' => {
+                Chunked::Trailer { len: 0, cr: false }
+            }
+            Chunked::Trailer { len, cr: false } if len < MAX_HEAD => Chunked::Trailer {
+                len: len + 1,
+                cr: false,
+            },
             _ => return Err(()),
         };
         Ok(())
@@ -483,7 +575,8 @@ impl Body {
                 let mut i = 0;
                 while i < data.len() && *state != Chunked::Done {
                     if let Chunked::Data(left) = state {
-                        let take = (data.len() - i).min(usize::try_from(*left).unwrap_or(usize::MAX));
+                        let take =
+                            (data.len() - i).min(usize::try_from(*left).unwrap_or(usize::MAX));
                         i += take;
                         *left -= take as u64;
                         if *left == 0 {
@@ -500,7 +593,10 @@ impl Body {
     }
 }
 
-fn header_values<'a>(headers: &'a [(String, String)], name: &'a str) -> impl Iterator<Item = &'a str> + 'a {
+fn header_values<'a>(
+    headers: &'a [(String, String)],
+    name: &'a str,
+) -> impl Iterator<Item = &'a str> + 'a {
     headers
         .iter()
         .filter(move |(n, _)| n.eq_ignore_ascii_case(name))
@@ -546,7 +642,11 @@ fn response_body(head_request: bool, status: u16, headers: &[(String, String)]) 
     }
     let te: Vec<&str> = header_values(headers, "transfer-encoding").collect();
     if !te.is_empty() {
-        let last = te.last().and_then(|v| v.rsplit(',').next()).unwrap_or_default().trim();
+        let last = te
+            .last()
+            .and_then(|v| v.rsplit(',').next())
+            .unwrap_or_default()
+            .trim();
         return if last.eq_ignore_ascii_case("chunked") {
             Body::Chunked(Chunked::start())
         } else {
@@ -567,13 +667,18 @@ struct ResponseHead {
 }
 
 fn parse_response_head(raw: &[u8]) -> Option<ResponseHead> {
-    let mut lines = raw.split(|b| *b == b'\n').map(|l| l.strip_suffix(b"\r").unwrap_or(l));
+    let mut lines = raw
+        .split(|b| *b == b'\n')
+        .map(|l| l.strip_suffix(b"\r").unwrap_or(l));
     let status_line = lines.next()?;
     let text = std::str::from_utf8(status_line).ok()?;
     let mut parts = text.splitn(3, ' ');
     let version = parts.next()?;
     let code = parts.next()?;
-    if !matches!(version, "HTTP/1.1" | "HTTP/1.0") || code.len() != 3 || !code.bytes().all(|b| b.is_ascii_digit()) {
+    if !matches!(version, "HTTP/1.1" | "HTTP/1.0")
+        || code.len() != 3
+        || !code.bytes().all(|b| b.is_ascii_digit())
+    {
         return None;
     }
     let status: u16 = code.parse().ok()?;
@@ -587,7 +692,10 @@ fn parse_response_head(raw: &[u8]) -> Option<ResponseHead> {
         raw_headers.push((name, value));
     }
     let lossy = |b: &[u8]| String::from_utf8_lossy(b).trim().to_string();
-    let headers: Vec<(String, String)> = raw_headers.iter().map(|&(n, v)| (lossy(n), lossy(v))).collect();
+    let headers: Vec<(String, String)> = raw_headers
+        .iter()
+        .map(|&(n, v)| (lossy(n), lossy(v)))
+        .collect();
     let named: Vec<String> = header_values(&headers, "connection")
         .flat_map(|v| v.split(','))
         .map(|s| s.trim().to_ascii_lowercase())
@@ -596,7 +704,11 @@ fn parse_response_head(raw: &[u8]) -> Option<ResponseHead> {
     bytes.extend_from_slice(b"\r\n");
     for (name, value) in &raw_headers {
         let lower = String::from_utf8_lossy(name).to_ascii_lowercase();
-        if matches!(lower.as_str(), "connection" | "keep-alive" | "proxy-connection") || named.contains(&lower) {
+        if matches!(
+            lower.as_str(),
+            "connection" | "keep-alive" | "proxy-connection"
+        ) || named.contains(&lower)
+        {
             continue;
         }
         bytes.extend_from_slice(name);
@@ -605,10 +717,19 @@ fn parse_response_head(raw: &[u8]) -> Option<ResponseHead> {
         bytes.extend_from_slice(b"\r\n");
     }
     bytes.extend_from_slice(b"Connection: close\r\n\r\n");
-    Some(ResponseHead { status, headers, bytes })
+    Some(ResponseHead {
+        status,
+        headers,
+        bytes,
+    })
 }
 
-async fn send_part<W: AsyncWrite + Unpin>(w: &mut W, body: &mut Body, data: &[u8], idle: Duration) -> io::Result<bool> {
+async fn send_part<W: AsyncWrite + Unpin>(
+    w: &mut W,
+    body: &mut Body,
+    data: &[u8],
+    idle: Duration,
+) -> io::Result<bool> {
     let (take, done) = body
         .feed(data)
         .map_err(|()| io::Error::new(io::ErrorKind::InvalidData, "bad chunked framing"))?;
@@ -617,7 +738,13 @@ async fn send_part<W: AsyncWrite + Unpin>(w: &mut W, body: &mut Body, data: &[u8
 }
 
 // Forwards exactly one request body; whatever the client sends after it is never relayed.
-async fn forward_body<R, W>(r: &mut R, w: &mut W, mut body: Body, first: &[u8], idle: Duration) -> io::Result<()>
+async fn forward_body<R, W>(
+    r: &mut R,
+    w: &mut W,
+    mut body: Body,
+    first: &[u8],
+    idle: Duration,
+) -> io::Result<()>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -635,7 +762,12 @@ where
 }
 
 // Relays interim responses as they are, then one final response with close semantics, then closes the client.
-async fn forward_response<R, W>(r: &mut R, w: &mut W, head_request: bool, idle: Duration) -> io::Result<()>
+async fn forward_response<R, W>(
+    r: &mut R,
+    w: &mut W,
+    head_request: bool,
+    idle: Duration,
+) -> io::Result<()>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -658,9 +790,17 @@ where
                 _ => break None,
             }
         };
-        let Some(head) = end.and_then(|end| parse_response_head(&buf[..end]).map(|h| (end, h))) else {
+        let Some(head) = end.and_then(|end| parse_response_head(&buf[..end]).map(|h| (end, h)))
+        else {
             if !wrote {
-                let _ = timed(idle, w.write_all(&reply("502 Bad Gateway", "destination sent no valid response"))).await;
+                let _ = timed(
+                    idle,
+                    w.write_all(&reply(
+                        "502 Bad Gateway",
+                        "destination sent no valid response",
+                    )),
+                )
+                .await;
             }
             let _ = timed(idle, w.shutdown()).await;
             return Ok(());
@@ -668,7 +808,11 @@ where
         let (end, head) = head;
         let rest = buf.split_off(end + 4);
         let interim = (100..200).contains(&head.status) && head.status != 101;
-        let out = if interim { std::mem::take(&mut buf) } else { head.bytes };
+        let out = if interim {
+            std::mem::take(&mut buf)
+        } else {
+            head.bytes
+        };
         timed(idle, w.write_all(&out)).await?;
         wrote = true;
         buf = rest;
@@ -684,7 +828,14 @@ where
     timed(idle, w.shutdown()).await
 }
 
-async fn exchange(mut client: TcpStream, mut upstream: TcpStream, body: Body, first: &[u8], head_request: bool, idle: Duration) {
+async fn exchange(
+    mut client: TcpStream,
+    mut upstream: TcpStream,
+    body: Body,
+    first: &[u8],
+    head_request: bool,
+    idle: Duration,
+) {
     let (mut cr, mut cw) = client.split();
     let (mut ur, mut uw) = upstream.split();
     let send = forward_body(&mut cr, &mut uw, body, first, idle);
@@ -737,7 +888,9 @@ async fn relay(mut client: TcpStream, mut upstream: TcpStream, idle: Duration) {
     let down = pump(ur, cw, &last, start, idle);
     let watchdog = async {
         loop {
-            let quiet = start.elapsed().saturating_sub(Duration::from_millis(last.load(Ordering::Relaxed)));
+            let quiet = start
+                .elapsed()
+                .saturating_sub(Duration::from_millis(last.load(Ordering::Relaxed)));
             if quiet >= idle {
                 return;
             }
@@ -860,27 +1013,41 @@ mod tests {
     }
 
     fn loopback_policy() -> Policy {
-        Policy::from_lookup(|k| (k == "CITE_EGRESS_ALLOW_CIDRS").then(|| "127.0.0.1".to_string())).unwrap()
+        Policy::from_lookup(|k| (k == "CITE_EGRESS_ALLOW_CIDRS").then(|| "127.0.0.1".to_string()))
+            .unwrap()
     }
 
     #[tokio::test]
     async fn a_loopback_target_is_refused() {
         let target = echo_server().await;
         let proxy = start(Policy::default()).await;
-        let (_, text) = ask(proxy, &format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n")).await;
+        let (_, text) = ask(
+            proxy,
+            &format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n"),
+        )
+        .await;
         assert!(text.starts_with("HTTP/1.1 403 Forbidden"), "{text}");
-        assert!(text.contains("destination is a private or internal address"), "{text}");
+        assert!(
+            text.contains("destination is a private or internal address"),
+            "{text}"
+        );
         let (_, text) = ask(proxy, "CONNECT localhost:80 HTTP/1.1\r\n\r\n").await;
         assert!(text.starts_with("HTTP/1.1 403"), "{text}");
-        let (_, text) = ask(proxy, &format!("GET http://{target}/x?secret=1 HTTP/1.1\r\n\r\n")).await;
+        let (_, text) = ask(
+            proxy,
+            &format!("GET http://{target}/x?secret=1 HTTP/1.1\r\n\r\n"),
+        )
+        .await;
         assert!(text.starts_with("HTTP/1.1 403"), "{text}");
     }
 
     #[tokio::test]
     async fn an_allowed_cidr_loopback_target_connects() {
         let target = echo_server().await;
-        let policy = Policy::from_lookup(|k| (k == "CITE_EGRESS_ALLOW_CIDRS").then(|| "127.0.0.0/8".to_string()))
-            .unwrap();
+        let policy = Policy::from_lookup(|k| {
+            (k == "CITE_EGRESS_ALLOW_CIDRS").then(|| "127.0.0.0/8".to_string())
+        })
+        .unwrap();
         let proxy = start(policy).await;
         let (mut s, text) = ask(proxy, &format!("CONNECT {target} HTTP/1.1\r\n\r\n")).await;
         assert_eq!(text, "HTTP/1.1 200 Connection established\r\n\r\n");
@@ -905,8 +1072,15 @@ mod tests {
         let text = String::from_utf8_lossy(&seen.lock().unwrap()).into_owned();
         assert!(text.starts_with("GET /a?b=1 HTTP/1.1\r\n"), "{text}");
         assert!(text.contains(&format!("Host: {target}\r\n")), "{text}");
-        assert!(text.contains("Accept: */*\r\n") && text.contains("Connection: close\r\n"), "{text}");
-        assert!(!text.contains("Proxy-Authorization") && !text.contains("X-Drop") && !text.contains("wrong"));
+        assert!(
+            text.contains("Accept: */*\r\n") && text.contains("Connection: close\r\n"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("Proxy-Authorization")
+                && !text.contains("X-Drop")
+                && !text.contains("wrong")
+        );
     }
 
     #[tokio::test]
@@ -921,11 +1095,17 @@ mod tests {
         let text = read_all(&mut s).await;
         assert!(text.starts_with("HTTP/1.1 200 OK\r\n"), "{text}");
         assert!(text.contains("Connection: close\r\n"), "{text}");
-        assert!(!text.contains("keep-alive") && !text.contains("Keep-Alive"), "{text}");
+        assert!(
+            !text.contains("keep-alive") && !text.contains("Keep-Alive"),
+            "{text}"
+        );
         assert!(text.ends_with("saw POST /one HTTP/1.1"), "{text}");
         let upstream = upstream_text(&seen, "\r\n\r\nabc").await;
         assert!(upstream.ends_with("\r\n\r\nabc"), "{upstream}");
-        assert!(!upstream.contains("/two"), "the second request never reached the first host: {upstream}");
+        assert!(
+            !upstream.contains("/two"),
+            "the second request never reached the first host: {upstream}"
+        );
     }
 
     #[tokio::test]
@@ -940,7 +1120,10 @@ mod tests {
         let text = read_all(&mut s).await;
         assert!(text.contains("saw POST /c HTTP/1.1"), "{text}");
         let upstream = upstream_text(&seen, "0\r\nT: 1\r\n\r\n").await;
-        assert!(upstream.ends_with("3;x=y\r\nabc\r\n0\r\nT: 1\r\n\r\n"), "{upstream}");
+        assert!(
+            upstream.ends_with("3;x=y\r\nabc\r\n0\r\nT: 1\r\n\r\n"),
+            "{upstream}"
+        );
         assert!(!upstream.contains("smuggled"), "{upstream}");
     }
 
@@ -963,7 +1146,12 @@ mod tests {
         let mut body = Body::Chunked(Chunked::start());
         assert_eq!(body.feed(b"4\r\nwi"), Ok((5, false)));
         assert_eq!(body.feed(b"ki\r\n0\r\n\r\nNEXT"), Ok((9, true)));
-        for bad in [&b"x\r\n"[..], b"4\r\nwikiXX", b"\r\n", b"11111111111111111\r\n"] {
+        for bad in [
+            &b"x\r\n"[..],
+            b"4\r\nwikiXX",
+            b"\r\n",
+            b"11111111111111111\r\n",
+        ] {
             let mut body = Body::Chunked(Chunked::start());
             assert!(body.feed(bad).is_err(), "{bad:?}");
         }
@@ -1004,7 +1192,10 @@ mod tests {
             r.remember(&format!("h{i}.example"), &[ip]);
         }
         assert!(r.cache.lock().unwrap().len() <= DNS_ENTRIES);
-        r.cache.lock().unwrap().insert("old.example".into(), (Instant::now() - DNS_TTL, vec![ip]));
+        r.cache
+            .lock()
+            .unwrap()
+            .insert("old.example".into(), (Instant::now() - DNS_TTL, vec![ip]));
         assert_eq!(r.cached("old.example"), None);
     }
 
@@ -1024,13 +1215,22 @@ mod tests {
             ("GET http://example.com/ HTTP/1.1\r\n folded\r\n\r\n", "400"),
             ("CONNECT example.com:25 HTTP/1.1\r\n\r\n", "403"),
             ("CONNECT [::1]:443 HTTP/1.1\r\n\r\n", "403"),
-            ("CONNECT [::ffff:169.254.169.254]:80 HTTP/1.1\r\n\r\n", "403"),
+            (
+                "CONNECT [::ffff:169.254.169.254]:80 HTTP/1.1\r\n\r\n",
+                "403",
+            ),
             ("CONNECT 169.254.169.254:80 HTTP/1.1\r\n\r\n", "403"),
         ] {
             let (_, text) = ask(proxy, request).await;
-            assert!(text.starts_with(&format!("HTTP/1.1 {status}")), "{request:?}: {text}");
+            assert!(
+                text.starts_with(&format!("HTTP/1.1 {status}")),
+                "{request:?}: {text}"
+            );
         }
-        let huge = format!("GET http://example.com/{} HTTP/1.1\r\n\r\n", "a".repeat(MAX_REQUEST_LINE + 10));
+        let huge = format!(
+            "GET http://example.com/{} HTTP/1.1\r\n\r\n",
+            "a".repeat(MAX_REQUEST_LINE + 10)
+        );
         let (_, text) = ask(proxy, &huge).await;
         assert!(text.starts_with("HTTP/1.1 431"), "{text}");
     }
@@ -1038,14 +1238,26 @@ mod tests {
     #[test]
     fn absolute_targets_split_cleanly() {
         let (host, port, path) = absolute_http("http://Example.com/a/b?c=d#frag").unwrap();
-        assert_eq!((host, port, path.as_str()), (Host::Name("example.com".into()), 80, "/a/b?c=d"));
+        assert_eq!(
+            (host, port, path.as_str()),
+            (Host::Name("example.com".into()), 80, "/a/b?c=d")
+        );
         let (_, port, path) = absolute_http("HTTP://example.com:8080").unwrap();
         assert_eq!((port, path.as_str()), (8080, "/"));
         let (host, port, path) = absolute_http("http://[2606:4700::1]:81?x").unwrap();
-        assert_eq!((host, port, path.as_str()), (Host::Ip("2606:4700::1".parse().unwrap()), 81, "/?x"));
+        assert_eq!(
+            (host, port, path.as_str()),
+            (Host::Ip("2606:4700::1".parse().unwrap()), 81, "/?x")
+        );
         let (_, port, _) = absolute_http("http://[2606:4700::1]/").unwrap();
         assert_eq!(port, 80);
-        for bad in ["https://x.com/", "http://", "http://a@b.com/", "http://x.com:0/", "ftp://x.com/"] {
+        for bad in [
+            "https://x.com/",
+            "http://",
+            "http://a@b.com/",
+            "http://x.com:0/",
+            "ftp://x.com/",
+        ] {
             assert!(absolute_http(bad).is_none(), "{bad}");
         }
     }

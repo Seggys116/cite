@@ -13,8 +13,8 @@ use crate::diagnose::{
     slot_lines, split_note,
 };
 use crate::model::{
-    SiteChange, draft_from_site, edit_site, fmt_targets, parse_rfc3339_ms, parse_targets,
-    rel_time, site_change, source_deploy_request,
+    SiteChange, draft_from_site, edit_site, fmt_targets, parse_rfc3339_ms, parse_targets, rel_time,
+    site_change, source_deploy_request,
 };
 use crate::scope::{error_survives, foreign_notice};
 use crate::siteops::{
@@ -152,7 +152,11 @@ impl Console {
     pub fn load_detail(&mut self, node: String, site_id: String, cx: &mut Context<Self>) {
         let same = error_survives(&self.detail.node, &self.detail.site_id, &node, &site_id);
         // A reload of the site on screen keeps it there until the reply, so the page neither blanks nor jumps to the top.
-        if !keeps_page(same, self.detail.data.ready().map(|d| d.site.id.as_str()), &site_id) {
+        if !keeps_page(
+            same,
+            self.detail.data.ready().map(|d| d.site.id.as_str()),
+            &site_id,
+        ) {
             self.detail.data = Load::Loading;
         }
         // An action's error must still be on screen after the reload that follows it, so it is cleared only for another site.
@@ -230,7 +234,10 @@ impl Console {
             return SiteTab::Overview;
         };
         let tabs = visible_tabs(self.tab_offer(data));
-        shown_tab(self.detail.tabs.get(&self.detail.node, &data.site.id), &tabs)
+        shown_tab(
+            self.detail.tabs.get(&self.detail.node, &data.site.id),
+            &tabs,
+        )
     }
 
     pub(crate) fn remember_tab(&mut self, tab: SiteTab) {
@@ -558,7 +565,9 @@ impl Console {
                 )
                 .into_any_element()
         } else {
-            text_dim("All changes saved").text_size(px(12.)).into_any_element()
+            text_dim("All changes saved")
+                .text_size(px(12.))
+                .into_any_element()
         };
         let mut bar = div()
             .flex()
@@ -849,9 +858,10 @@ impl Console {
                 .is_some_and(|s| is_busy_phase(&s.phase));
         let mut actions = div().flex().items_center().gap(px(8.)).child(back);
         if let Some(url) = open_url(&site.hosts) {
-            actions = actions.child(btn(id("detail", "open"), "Open", BtnKind::Plain).on_click(
-                cx.listener(move |_, _, _, cx| cx.open_url(&url)),
-            ));
+            actions = actions.child(
+                btn(id("detail", "open"), "Open", BtnKind::Plain)
+                    .on_click(cx.listener(move |_, _, _, cx| cx.open_url(&url))),
+            );
         }
         actions = actions.child(
             btn(
@@ -1246,17 +1256,13 @@ impl Console {
     // Shown on Overview whenever the last deploy failed or the live slot is unhealthy; compact, with the node's note kept whole and copyable.
     fn failure_banner(&self, b: &Banner, logs_ok: bool, cx: &mut Context<Self>) -> AnyElement {
         let red = Tone::Bad.color();
-        let mut head = div()
-            .flex()
-            .items_center()
-            .gap(px(8.))
-            .child(
-                div().flex_1().min_w_0().child(
-                    strong(b.headline.clone())
-                        .text_size(px(14.))
-                        .text_color(c(red)),
-                ),
-            );
+        let mut head = div().flex().items_center().gap(px(8.)).child(
+            div().flex_1().min_w_0().child(
+                strong(b.headline.clone())
+                    .text_size(px(14.))
+                    .text_color(c(red)),
+            ),
+        );
         if logs_ok {
             head = head.child(self.view_logs_button("banner", b.logs_slot, cx));
         }
@@ -1285,9 +1291,7 @@ impl Console {
         if let Some(f) = &b.failure {
             let when = rel_time(now_ms(), parse_rfc3339_ms(&f.at).unwrap_or(0));
             col = col
-                .child(
-                    text_dim(format!("{when}, {} slot", f.slot.as_str())).text_size(px(12.)),
-                )
+                .child(text_dim(format!("{when}, {} slot", f.slot.as_str())).text_size(px(12.)))
                 .child(self.note_block("banner-note", &f.note, cx));
         }
         let mut chips = div().flex().flex_wrap().items_center().gap(px(6.));
@@ -1581,26 +1585,25 @@ impl Console {
             Col::flex("Note"),
             Col::fixed("Id", 120.),
         ];
-        let rollback = btn(id("detail", "rollback"), "Roll back", BtnKind::Danger).on_click(
-            cx.listener(|this, _, _, cx| {
-                let other = this
-                    .detail
-                    .data
-                    .ready()
-                    .map(|d| d.site.active.other().as_str())
-                    .unwrap_or("previous");
-                this.ask(Confirm {
-                    title: "Roll back".into(),
-                    message: format!(
-                        "Return traffic to the previous version? The {other} slot becomes active again."
-                    ),
-                    label: "Roll back".into(),
-                    danger: true,
-                    action: Box::new(|this, cx| this.do_rollback(cx)),
-                });
-                cx.notify();
-            }),
-        );
+        let rollback = btn(id("detail", "rollback"), "Roll back", BtnKind::Danger)
+            .on_click(cx.listener(|this, _, _, cx| {
+            let other = this
+                .detail
+                .data
+                .ready()
+                .map(|d| d.site.active.other().as_str())
+                .unwrap_or("previous");
+            this.ask(Confirm {
+                title: "Roll back".into(),
+                message: format!(
+                    "Return traffic to the previous version? The {other} slot becomes active again."
+                ),
+                label: "Roll back".into(),
+                danger: true,
+                action: Box::new(|this, cx| this.do_rollback(cx)),
+            });
+            cx.notify();
+        }));
         let table = table(
             &cols,
             rows,
@@ -1630,20 +1633,19 @@ impl Console {
 
     fn danger_card(&self, site: &Site, cx: &mut Context<Self>) -> AnyElement {
         let name = site.name.clone();
-        let del = btn(id("detail", "delete"), "Delete site", BtnKind::Danger).on_click(
-            cx.listener(move |this, _, _, cx| {
-                this.ask(Confirm {
-                    title: "Delete site".into(),
-                    message: format!(
-                        "This removes {name} and stops routing its hosts. Deployment history is lost."
-                    ),
-                    label: "Delete site".into(),
-                    danger: true,
-                    action: Box::new(|this, cx| this.do_delete(cx)),
-                });
-                cx.notify();
-            }),
-        );
+        let del = btn(id("detail", "delete"), "Delete site", BtnKind::Danger)
+            .on_click(cx.listener(move |this, _, _, cx| {
+            this.ask(Confirm {
+                title: "Delete site".into(),
+                message: format!(
+                    "This removes {name} and stops routing its hosts. Deployment history is lost."
+                ),
+                label: "Delete site".into(),
+                danger: true,
+                action: Box::new(|this, cx| this.do_delete(cx)),
+            });
+            cx.notify();
+        }));
         let body = div()
             .flex()
             .items_center()

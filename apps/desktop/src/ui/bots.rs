@@ -947,11 +947,7 @@ fn storage_card(nodes: &[NodeStorage]) -> AnyElement {
     let mut body = div().flex().flex_col().gap(px(10.)).child(wide(
         id("bots", "storage-table"),
         cols.iter().filter_map(|col| col.width).sum::<f32>() + 160.,
-        table(
-            &cols,
-            rows,
-            Some(text_dim("No nodes reported.").p(px(12.))),
-        ),
+        table(&cols, rows, Some(text_dim("No nodes reported.").p(px(12.)))),
     ));
     if any_old {
         body = body.child(

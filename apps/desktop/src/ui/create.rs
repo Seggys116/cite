@@ -12,10 +12,10 @@ use crate::model::{
 use crate::theme::{
     ACCENT, BORDER, CARD_RADIUS, DIM, DIVIDER, SURFACE, SURFACE_HI, TEXT, Tone, c, tint,
 };
-use crate::ui::chart::{clip_tip, split};
-use crate::ui::settings::{GAP, SPACE, form_row, group, section};
 use crate::ui::certs::{access_body, access_controls};
+use crate::ui::chart::{clip_tip, split};
 use crate::ui::paths::PathRow;
+use crate::ui::settings::{GAP, SPACE, form_row, group, section};
 use crate::ui::siteform::{
     Home, SiteFields, basics, blank_draft, domains, health_fields, servers_fields, source_fields,
 };
@@ -347,11 +347,7 @@ impl Console {
             self.chosen_nodes().len(),
             &self.token_state(cx),
         );
-        let mut panel = div()
-            .flex()
-            .flex_col()
-            .gap(px(SPACE))
-            .child(body);
+        let mut panel = div().flex().flex_col().gap(px(SPACE)).child(body);
         if let Some(err) = &self.create.error {
             panel = panel.child(notice(err, Tone::Bad));
         }
@@ -595,12 +591,7 @@ impl Console {
                     .min_h(px(40.))
                     .px(px(16.))
                     .py(px(8.))
-                    .child(
-                        text_dim(label)
-                            .flex_none()
-                            .w(px(110.))
-                            .text_size(px(12.)),
-                    )
+                    .child(text_dim(label).flex_none().w(px(110.)).text_size(px(12.)))
                     .child(
                         div()
                             .flex_1()

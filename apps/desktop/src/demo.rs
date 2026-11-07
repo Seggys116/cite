@@ -1619,7 +1619,10 @@ impl DemoNode {
         let existing = find(&st.sites, id)?.clone();
         let rules = &site.outbound_rules;
         if rules.mode == cite_client::OutboundMode::Allowlist && rules.allow.is_empty() {
-            return Err(status_err(400, "the allowlist mode needs at least one allow entry"));
+            return Err(status_err(
+                400,
+                "the allowlist mode needs at least one allow entry",
+            ));
         }
         let mut next = site.clone();
         next.history = existing.history;

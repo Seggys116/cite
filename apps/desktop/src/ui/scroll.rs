@@ -2,8 +2,8 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use gpui::{
-    App, Div, ElementId, ScrollHandle, ScrollWheelEvent, SharedString, Stateful, Window,
-    div, point, prelude::*, px,
+    App, Div, ElementId, ScrollHandle, ScrollWheelEvent, SharedString, Stateful, Window, div,
+    point, prelude::*, px,
 };
 
 thread_local! {

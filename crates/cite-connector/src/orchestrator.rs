@@ -568,7 +568,11 @@ pub fn stack_specs(
         egress_proxy_image: plan.egress_image,
         egress_proxy: plan.egress_proxy,
         volumes: names.volumes().iter().map(|v| v.to_string()).collect(),
-        site_volumes: plan.site_volumes.into_iter().map(|(docker, _)| docker).collect(),
+        site_volumes: plan
+            .site_volumes
+            .into_iter()
+            .map(|(docker, _)| docker)
+            .collect(),
         manager_name: names.manager,
         executor_name: names.executor,
         init_name: names.init,
@@ -1086,15 +1090,15 @@ impl Orchestrator {
             None
         };
         let egress_proxy = proxy.map(|p| EgressProxyState {
-                running: p.running,
-                image: p.image,
-                env: p
-                    .env
-                    .into_iter()
-                    .filter(|e| env_key(e).starts_with("CITE_EGRESS_"))
-                    .collect(),
-                networks: p.networks,
-            });
+            running: p.running,
+            image: p.image,
+            env: p
+                .env
+                .into_iter()
+                .filter(|e| env_key(e).starts_with("CITE_EGRESS_"))
+                .collect(),
+            networks: p.networks,
+        });
         let exec_present = executor.is_some();
         let exec_filtered = executor
             .as_ref()
@@ -1389,8 +1393,8 @@ impl Orchestrator {
                 "site id {site_id:?} is not a valid slug"
             )));
         }
-        let filters = json!({ "label": ["cite.managed=true", format!("cite.site={site_id}")] })
-            .to_string();
+        let filters =
+            json!({ "label": ["cite.managed=true", format!("cite.site={site_id}")] }).to_string();
         let reply = self
             .send(
                 Method::GET,
@@ -1440,7 +1444,12 @@ impl Orchestrator {
     }
 
     /// Deletes a site volume and its data; refused while a running container could still be writing to it.
-    pub async fn remove_site_volume(&self, site_id: &str, name: &str, declared: bool) -> Result<()> {
+    pub async fn remove_site_volume(
+        &self,
+        site_id: &str,
+        name: &str,
+        declared: bool,
+    ) -> Result<()> {
         if !is_valid_id(site_id) || !is_valid_volume_name(name) {
             return Err(ConnectorError::BadRequest(format!(
                 "volume {name:?} is not a valid volume name"
@@ -3164,7 +3173,9 @@ pub(crate) mod tests {
                 let list: Vec<Value> = f
                     .volumes
                     .iter()
-                    .filter(|(_, labels)| wanted.iter().all(|(k, v)| labels[k.as_str()] == v.as_str()))
+                    .filter(|(_, labels)| {
+                        wanted.iter().all(|(k, v)| labels[k.as_str()] == v.as_str())
+                    })
                     .map(|(name, labels)| {
                         json!({
                             "Name": name,
@@ -4443,7 +4454,11 @@ pub(crate) mod tests {
             let f = fake.lock().unwrap();
             assert!(f.containers.is_empty());
             let left: Vec<&str> = f.networks.keys().map(String::as_str).collect();
-            assert_eq!(left, vec!["cite-egress"], "the node bridge outlives every stack");
+            assert_eq!(
+                left,
+                vec!["cite-egress"],
+                "the node bridge outlives every stack"
+            );
             assert_eq!(f.volumes.len(), 6);
         }
         orch.ensure_stack(&s, Slot::Blue, None, TOKEN)
@@ -4563,7 +4578,10 @@ pub(crate) mod tests {
         assert_eq!(specs.volumes.len(), 3);
         assert_eq!(specs.executor_image, "r.io/o/cite-executor-rust:1.0.0");
         assert_eq!(specs.egress_proxy_name, "cite-shop-green-egress-proxy");
-        assert_eq!(specs.egress_proxy_image.as_deref(), Some("r.io/o/cite-egress:1.0.0"));
+        assert_eq!(
+            specs.egress_proxy_image.as_deref(),
+            Some("r.io/o/cite-egress:1.0.0")
+        );
         let edge = stack_specs(
             &s,
             Slot::Green,
@@ -4676,7 +4694,11 @@ pub(crate) mod tests {
             .unwrap();
         orch.remove_stack("shop", false).await.unwrap();
         let f = fake.lock().unwrap();
-        assert!(f.networks.keys().all(|n| n == "cite-egress"), "{:?}", f.networks.keys());
+        assert!(
+            f.networks.keys().all(|n| n == "cite-egress"),
+            "{:?}",
+            f.networks.keys()
+        );
         let detach = f
             .log
             .iter()
@@ -5715,7 +5737,10 @@ pub(crate) mod tests {
 
     #[test]
     fn both_slots_mount_the_same_site_volumes_read_write() {
-        let s = with_volumes(site("shop", None), &[("data", "/data"), ("uploads", "/srv/up")]);
+        let s = with_volumes(
+            site("shop", None),
+            &[("data", "/data"), ("uploads", "/srv/up")],
+        );
         let env = stack_env("ghcr.io/seggys116", "0.2.0", false);
         let blue = plan_stack(&s, Slot::Blue, None, TOKEN, &env).unwrap();
         let green = plan_stack(&s, Slot::Green, None, TOKEN, &env).unwrap();
@@ -5732,7 +5757,10 @@ pub(crate) mod tests {
             assert_eq!(m["ReadOnly"], false);
             assert!(m.get("VolumeOptions").is_none());
         }
-        assert!(site_mount_pairs(&blue.manager).is_empty(), "the manager never sees site data");
+        assert!(
+            site_mount_pairs(&blue.manager).is_empty(),
+            "the manager never sees site data"
+        );
         let init_mounts = blue.init["HostConfig"]["Mounts"].as_array().unwrap();
         assert_eq!(init_mounts.len(), 3);
         assert_eq!(init_mounts[1]["Target"], "/vols/data");
@@ -5747,7 +5775,10 @@ pub(crate) mod tests {
     #[test]
     fn sites_without_volumes_keep_the_plain_specs() {
         let p = plan(Some("static"), None).unwrap();
-        assert_eq!(p.executor["HostConfig"]["Mounts"].as_array().unwrap().len(), 3);
+        assert_eq!(
+            p.executor["HostConfig"]["Mounts"].as_array().unwrap().len(),
+            3
+        );
         assert_eq!(p.init["Cmd"][0], INIT_SCRIPT);
         assert_eq!(p.init["HostConfig"]["Mounts"].as_array().unwrap().len(), 1);
         assert!(p.site_volumes.is_empty());
@@ -5809,7 +5840,10 @@ pub(crate) mod tests {
         let seen = orch.inspect_slot("shop", Slot::Blue).await.unwrap();
         assert!(orch.settings_current(&s, &seen));
         let changed = with_volumes(s.clone(), &[("data", "/data")]);
-        assert!(!orch.settings_current(&changed, &seen), "volume change, redeploy needed");
+        assert!(
+            !orch.settings_current(&changed, &seen),
+            "volume change, redeploy needed"
+        );
         orch.ensure_stack(&changed, Slot::Blue, None, TOKEN)
             .await
             .unwrap();
@@ -5826,7 +5860,12 @@ pub(crate) mod tests {
             .await
             .unwrap();
         orch.remove_stack("shop", true).await.unwrap();
-        assert!(fake.lock().unwrap().volumes.contains_key("cite-vol-shop_data"));
+        assert!(
+            fake.lock()
+                .unwrap()
+                .volumes
+                .contains_key("cite-vol-shop_data")
+        );
         let left = orch.site_volumes("shop").await.unwrap();
         assert!(!left[0].mounted);
         orch.remove_site_volumes("shop").await.unwrap();
@@ -5853,7 +5892,13 @@ pub(crate) mod tests {
         assert!(matches!(bad, Err(ConnectorError::BadRequest(_))));
         orch.stop_stack("shop", Slot::Blue).await.unwrap();
         orch.remove_site_volume("shop", "data", true).await.unwrap();
-        assert!(!fake.lock().unwrap().volumes.contains_key("cite-vol-shop_data"));
+        assert!(
+            !fake
+                .lock()
+                .unwrap()
+                .volumes
+                .contains_key("cite-vol-shop_data")
+        );
     }
 
     fn endpoints_of(spec: &Value) -> Vec<String> {
@@ -5877,7 +5922,10 @@ pub(crate) mod tests {
             endpoints_of(&on.executor),
             vec!["cite-shop-green-net", "cite-shop-green-xnet"]
         );
-        assert_eq!(on.executor["HostConfig"]["NetworkMode"], "cite-shop-green-net");
+        assert_eq!(
+            on.executor["HostConfig"]["NetworkMode"],
+            "cite-shop-green-net"
+        );
         let url = "http://cite-shop-green-egress-proxy:3128";
         let exec_env = on.executor["Env"].as_array().unwrap();
         for key in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
@@ -5907,8 +5955,7 @@ pub(crate) mod tests {
             json!(["CITE_EGRESS_MODE=public", "CITE_EGRESS_BLOCK_MAIL=true"])
         );
         assert_eq!(
-            on.manager["HostConfig"]["NetworkMode"],
-            "cite-shop-green-egress",
+            on.manager["HostConfig"]["NetworkMode"], "cite-shop-green-egress",
             "the manager keeps its own egress bridge"
         );
         assert!(!on.manager.to_string().contains("xnet"));
@@ -5918,8 +5965,13 @@ pub(crate) mod tests {
         assert_eq!(endpoints_of(&off.executor), vec!["cite-shop-green-net"]);
         assert!(off.egress_proxy.is_none() && off.egress_image.is_none());
         assert!(!env_keys(&off.executor).iter().any(|k| k.contains("PROXY")));
-        let docs = plan_stack(&site("docs", Some("static")), Slot::Blue, None, TOKEN, &env).unwrap();
-        assert_eq!(endpoints_of(&docs.executor), vec!["cite-docs-blue-net"], "static ignores it");
+        let docs =
+            plan_stack(&site("docs", Some("static")), Slot::Blue, None, TOKEN, &env).unwrap();
+        assert_eq!(
+            endpoints_of(&docs.executor),
+            vec!["cite-docs-blue-net"],
+            "static ignores it"
+        );
         assert!(docs.egress_proxy.is_none());
     }
 
@@ -5968,7 +6020,10 @@ pub(crate) mod tests {
         s.outbound_rules.allow = vec!["0177.0.0.1".into()];
         assert!(plan_stack(&s, Slot::Blue, None, TOKEN, &env).is_err());
         s.outbound = false;
-        assert!(plan_stack(&s, Slot::Blue, None, TOKEN, &env).is_ok(), "rules of a closed site are not used");
+        assert!(
+            plan_stack(&s, Slot::Blue, None, TOKEN, &env).is_ok(),
+            "rules of a closed site are not used"
+        );
     }
 
     #[tokio::test]
@@ -5982,29 +6037,46 @@ pub(crate) mod tests {
         let f = fake.lock().unwrap();
         let spec = &f.containers["cite-shop-blue-executor"].spec;
         let eps = &spec["NetworkingConfig"]["EndpointsConfig"];
-        assert_eq!(eps["cite-shop-blue-net"]["Aliases"], json!(["cite-shop-blue-executor"]));
+        assert_eq!(
+            eps["cite-shop-blue-net"]["Aliases"],
+            json!(["cite-shop-blue-executor"])
+        );
         assert_eq!(eps["cite-shop-blue-xnet"], json!({}));
-        assert!(eps.get("cite-shop-blue-egress").is_none(), "no direct route in filtered mode");
+        assert!(
+            eps.get("cite-shop-blue-egress").is_none(),
+            "no direct route in filtered mode"
+        );
         assert!(!f.networks["cite-shop-blue-xnet"].members.contains(HAPROXY));
-        assert!(!f.networks["cite-shop-blue-egress"].members.contains(HAPROXY));
+        assert!(
+            !f.networks["cite-shop-blue-egress"]
+                .members
+                .contains(HAPROXY)
+        );
     }
 
     #[tokio::test]
     async fn changed_site_rules_recreate_only_the_proxy_and_are_a_pending_setting() {
         let (orch, fake) = start_fake().await;
         let mut s = site("shop", None);
-        orch.ensure_stack(&s, Slot::Blue, None, TOKEN).await.unwrap();
+        orch.ensure_stack(&s, Slot::Blue, None, TOKEN)
+            .await
+            .unwrap();
         let seen = orch.inspect_slot("shop", Slot::Blue).await.unwrap();
         assert!(seen.executor_filtered && orch.settings_current(&s, &seen));
         s.outbound_rules.deny = vec!["ads.example".into()];
         assert!(!orch.settings_current(&s, &seen));
-        orch.ensure_stack(&s, Slot::Blue, None, TOKEN).await.unwrap();
+        orch.ensure_stack(&s, Slot::Blue, None, TOKEN)
+            .await
+            .unwrap();
         assert_eq!(count(&fake, "CREATE cite-shop-blue-egress-proxy"), 2);
         assert_eq!(count(&fake, "CREATE cite-shop-blue-executor"), 1);
         let seen = orch.inspect_slot("shop", Slot::Blue).await.unwrap();
         assert!(orch.settings_current(&s, &seen));
         let open = orch.with_egress(Egress::with_mode(EgressMode::Open));
-        assert!(!open.settings_current(&s, &seen), "a mode change is pending too");
+        assert!(
+            !open.settings_current(&s, &seen),
+            "a mode change is pending too"
+        );
     }
 
     #[tokio::test]
@@ -6055,7 +6127,9 @@ pub(crate) mod tests {
         let (orch, fake) = start_fake().await;
         let orch = orch.with_egress(Egress::with_mode(EgressMode::Open));
         let s = site("shop", None);
-        orch.ensure_stack(&s, Slot::Blue, None, TOKEN).await.unwrap();
+        orch.ensure_stack(&s, Slot::Blue, None, TOKEN)
+            .await
+            .unwrap();
         let seen = orch.inspect_slot("shop", Slot::Blue).await.unwrap();
         assert!(seen.executor_outbound && !seen.executor_filtered);
         assert!(orch.settings_current(&s, &seen));

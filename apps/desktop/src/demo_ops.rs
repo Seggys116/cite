@@ -247,7 +247,8 @@ impl DemoOps {
                         let live = declared.iter().find(|d| d.name == v.name);
                         VolumeInfo {
                             name: v.name.clone(),
-                            mount_path: live.map_or_else(|| v.mount_path.clone(), |d| d.mount_path.clone()),
+                            mount_path: live
+                                .map_or_else(|| v.mount_path.clone(), |d| d.mount_path.clone()),
                             size_bytes: Some(v.size_bytes),
                             mounted: live.is_some(),
                             created_at: Some(iso(v.created_ms)),
@@ -277,7 +278,12 @@ impl DemoOps {
     }
 
     // Like the node, data of a volume the site still declares cannot be deleted.
-    pub fn delete_volume(&mut self, site: &str, declared: &[Volume], name: &str) -> Result<(), String> {
+    pub fn delete_volume(
+        &mut self,
+        site: &str,
+        declared: &[Volume],
+        name: &str,
+    ) -> Result<(), String> {
         if declared.iter().any(|d| d.name == name) {
             return Err(format!("volume {name} is still declared by the site"));
         }
@@ -355,19 +361,27 @@ pub fn doppler_info() -> DopplerInfo {
 }
 
 pub fn doppler_projects() -> Vec<DopplerProject> {
-    [("docs-site", "Docs site"), ("storefront", "Storefront"), ("shared", "Shared")]
-        .into_iter()
-        .map(|(slug, name)| DopplerProject {
-            slug: slug.into(),
-            name: name.into(),
-        })
-        .collect()
+    [
+        ("docs-site", "Docs site"),
+        ("storefront", "Storefront"),
+        ("shared", "Shared"),
+    ]
+    .into_iter()
+    .map(|(slug, name)| DopplerProject {
+        slug: slug.into(),
+        name: name.into(),
+    })
+    .collect()
 }
 
 pub fn doppler_configs(project: &str) -> Vec<DopplerConfig> {
     let envs: &[(&str, &str)] = match project {
         "shared" => &[("prd", "Production")],
-        _ => &[("dev", "Development"), ("stg", "Staging"), ("prd", "Production")],
+        _ => &[
+            ("dev", "Development"),
+            ("stg", "Staging"),
+            ("prd", "Production"),
+        ],
     };
     envs.iter()
         .map(|(name, environment)| DopplerConfig {
@@ -445,9 +459,15 @@ pub fn doppler_bind(
     now_ms: i64,
 ) -> Result<DopplerBinding, String> {
     let mut store = bindings().lock().unwrap_or_else(|e| e.into_inner());
-    let typed = req.token.as_deref().map(str::trim).filter(|t| !t.is_empty());
+    let typed = req
+        .token
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty());
     let token_only = req.project.trim().is_empty() && req.config.trim().is_empty();
-    let kept_token = store.get(&store_key(node, site)).is_some_and(|b| b.own_token);
+    let kept_token = store
+        .get(&store_key(node, site))
+        .is_some_and(|b| b.own_token);
     let token_ok = match typed {
         Some(t) => t.starts_with("dp.st."),
         None => kept_token,
@@ -625,7 +645,10 @@ mod tests {
             runtime: false,
             token: Some("dp.st.x".into()),
         };
-        assert_eq!(doppler_bind(node, "docs", &own, 0).unwrap().token_source, "site");
+        assert_eq!(
+            doppler_bind(node, "docs", &own, 0).unwrap().token_source,
+            "site"
+        );
         assert!(!doppler_clear(node, "docs").bound);
         assert!(!doppler_sync(node, "docs", 0).bound);
     }
@@ -671,10 +694,21 @@ mod tests {
         };
         ops.declare_volumes("shop", std::slice::from_ref(&fresh), 1_700_000_000_000);
         let shop = ops.volume_infos("shop", std::slice::from_ref(&fresh));
-        assert_eq!((shop.len(), shop[0].size_bytes, shop[0].mounted), (1, Some(0), true));
+        assert_eq!(
+            (shop.len(), shop[0].size_bytes, shop[0].mounted),
+            (1, Some(0), true)
+        );
         assert_eq!(shop[0].created_at, Some(iso(1_700_000_000_000)));
-        assert!(ops.delete_volume("docs", std::slice::from_ref(&data), "data").unwrap_err().contains("still declared"));
-        assert!(ops.delete_volume("docs", &[], "missing").unwrap_err().contains("not found"));
+        assert!(
+            ops.delete_volume("docs", std::slice::from_ref(&data), "data")
+                .unwrap_err()
+                .contains("still declared")
+        );
+        assert!(
+            ops.delete_volume("docs", &[], "missing")
+                .unwrap_err()
+                .contains("not found")
+        );
         assert!(ops.delete_volume("docs", &[], "old-cache").is_ok());
         let after = ops.volume_infos("docs", std::slice::from_ref(&data));
         assert_eq!(after.len(), 1);
@@ -683,7 +717,10 @@ mod tests {
             mount_path: "/srv/data".into(),
         };
         ops.declare_volumes("docs", std::slice::from_ref(&moved), 0);
-        assert_eq!(ops.volume_infos("docs", std::slice::from_ref(&moved))[0].mount_path, "/srv/data");
+        assert_eq!(
+            ops.volume_infos("docs", std::slice::from_ref(&moved))[0].mount_path,
+            "/srv/data"
+        );
     }
 
     #[test]

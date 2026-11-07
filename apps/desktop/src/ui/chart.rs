@@ -113,9 +113,7 @@ pub fn axis_ticks(points: usize, width: f32) -> Vec<usize> {
         return vec![0];
     }
     let room = ((width / X_LABEL_SPACE).floor() as usize).clamp(2, points);
-    (0..room)
-        .map(|i| i * (points - 1) / (room - 1))
-        .collect()
+    (0..room).map(|i| i * (points - 1) / (room - 1)).collect()
 }
 
 // The value labels of the y axis from top to bottom: ceiling, half and zero.

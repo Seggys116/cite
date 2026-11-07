@@ -387,7 +387,10 @@ pub fn mount_path_problem(p: &str) -> Option<&'static str> {
     if !shaped {
         return Some("must be an absolute path of 2 to 255 letters, digits, '.', '_', '-' and '/'");
     }
-    if p.ends_with('/') || p[1..].split('/').any(|seg| seg.is_empty() || seg == "." || seg == "..")
+    if p.ends_with('/')
+        || p[1..]
+            .split('/')
+            .any(|seg| seg.is_empty() || seg == "." || seg == "..")
     {
         return Some("must be normalised: no trailing slash, empty, '.' or '..' segments");
     }
@@ -469,7 +472,11 @@ pub fn is_egress_cidr(entry: &str) -> bool {
     };
     let max = if strict_v4(ip) {
         32
-    } else if ip.contains(':') && ip.parse::<Ipv6Addr>().is_ok_and(|a| a.to_ipv4_mapped().is_none()) {
+    } else if ip.contains(':')
+        && ip
+            .parse::<Ipv6Addr>()
+            .is_ok_and(|a| a.to_ipv4_mapped().is_none())
+    {
         128
     } else {
         return false;
@@ -520,7 +527,9 @@ pub fn validate_outbound_rules(site: &Site) -> Result<(), ValidationError> {
     let what = format!("site {} outbound_rules", site.id);
     for (name, list) in [("allow", &rules.allow), ("deny", &rules.deny)] {
         if list.len() > MAX_EGRESS_ENTRIES {
-            return invalid(format!("{what}: {name} has more than {MAX_EGRESS_ENTRIES} entries"));
+            return invalid(format!(
+                "{what}: {name} has more than {MAX_EGRESS_ENTRIES} entries"
+            ));
         }
         for (i, entry) in list.iter().enumerate() {
             let entry = entry.as_str();
@@ -539,7 +548,9 @@ pub fn validate_outbound_rules(site: &Site) -> Result<(), ValidationError> {
         }
     }
     if rules.mode == crate::model::OutboundMode::Allowlist && rules.allow.is_empty() {
-        return invalid(format!("{what}: allowlist mode needs at least one allow entry"));
+        return invalid(format!(
+            "{what}: allowlist mode needs at least one allow entry"
+        ));
     }
     Ok(())
 }
@@ -567,7 +578,10 @@ fn egress_net(entry: &str) -> Option<IpNet> {
 
 /// Strict only: a site allow CIDR wider than /8 (IPv4) or /16 (IPv6), or touching loopback, link-local or
 /// unspecified ranges, is refused unless a node `CITE_STACK_EGRESS_ALLOW_CIDRS` entry already covers it.
-pub fn validate_outbound_breadth(site: &Site, node_allow: &[String]) -> Result<(), ValidationError> {
+pub fn validate_outbound_breadth(
+    site: &Site,
+    node_allow: &[String],
+) -> Result<(), ValidationError> {
     let node: Vec<IpNet> = node_allow.iter().filter_map(|e| egress_net(e)).collect();
     let sensitive: Vec<IpNet> = SENSITIVE_EGRESS_NETS
         .iter()

@@ -132,9 +132,18 @@ mod tests {
     fn exact_secrets_are_redacted_when_glued_or_coloured() {
         let mut redactor = Redactor::new();
         redactor.push_secret("SECRET");
-        assert_eq!(redactor.redact_line("\u{1b}[31mSECRET\u{1b}[0m"), "\u{1b}[31m[REDACTED]\u{1b}[0m");
-        assert_eq!(redactor.redact_line("abcSECRET_1 SECRET9"), "abc[REDACTED]_1 [REDACTED]9");
-        assert_eq!(redactor.redact_line("KEY=SECRETSECRET"), "KEY=[REDACTED][REDACTED]");
+        assert_eq!(
+            redactor.redact_line("\u{1b}[31mSECRET\u{1b}[0m"),
+            "\u{1b}[31m[REDACTED]\u{1b}[0m"
+        );
+        assert_eq!(
+            redactor.redact_line("abcSECRET_1 SECRET9"),
+            "abc[REDACTED]_1 [REDACTED]9"
+        );
+        assert_eq!(
+            redactor.redact_line("KEY=SECRETSECRET"),
+            "KEY=[REDACTED][REDACTED]"
+        );
     }
 
     #[test]

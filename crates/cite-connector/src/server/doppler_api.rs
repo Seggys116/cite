@@ -93,10 +93,7 @@ async fn projects(State(st): State<AppState>) -> ApiResult<Response> {
     json_ok(&st.doppler.projects().await?)
 }
 
-async fn configs(
-    State(st): State<AppState>,
-    Path(project): Path<String>,
-) -> ApiResult<Response> {
+async fn configs(State(st): State<AppState>, Path(project): Path<String>) -> ApiResult<Response> {
     if !is_valid_doppler_slug(&project) {
         return Err(ApiError::bad("invalid Doppler project"));
     }
@@ -143,7 +140,11 @@ async fn sync(
 ) -> ApiResult<Response> {
     source_site(&st, &id)?;
     st.store
-        .audit(&p.actor(), "site.doppler.sync.request", &format!("site={id}"))
+        .audit(
+            &p.actor(),
+            "site.doppler.sync.request",
+            &format!("site={id}"),
+        )
         .await;
     json_ok(&st.doppler.sync_now(&p.actor(), &id).await?)
 }
@@ -159,7 +160,10 @@ mod tests {
         )
         .expect("request");
         let shown = format!("{req:?}");
-        assert!(shown.contains("shop") && !shown.contains("secretvalue"), "{shown}");
+        assert!(
+            shown.contains("shop") && !shown.contains("secretvalue"),
+            "{shown}"
+        );
         assert!(serde_json::from_str::<BindReq>(r#"{"project":"a","config":"b","x":1}"#).is_err());
     }
 }

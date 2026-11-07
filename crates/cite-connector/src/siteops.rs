@@ -728,7 +728,11 @@ impl Deployer {
     }
 
     // An unreadable snapshot counts as none: the next sync rewrites it, and the manual variables still apply.
-    pub(crate) async fn doppler_snapshot(&self, id: &str, kind: EnvKind) -> BTreeMap<String, String> {
+    pub(crate) async fn doppler_snapshot(
+        &self,
+        id: &str,
+        kind: EnvKind,
+    ) -> BTreeMap<String, String> {
         match self
             .store
             .get_secret(&doppler::snapshot_secret(id, kind))

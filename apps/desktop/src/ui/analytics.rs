@@ -27,8 +27,7 @@ use crate::ui::input::TextInput;
 use crate::ui::scroll::scroll_area;
 use crate::ui::widgets::{
     BtnKind, Col, btn, btn_off, card, empty_state, field, grid, grid_min, id, mono, notice,
-    page_header, pill, seg_item, seg_row, skeleton, stat, table, text_dim, toggle,
-    tone_for_status,
+    page_header, pill, seg_item, seg_row, skeleton, stat, table, text_dim, toggle, tone_for_status,
 };
 const AUTO_TICKS: u64 = 20;
 const LOG_ROWS_KEPT: usize = 500;
@@ -1114,17 +1113,15 @@ impl Console {
             ),
         );
         let half = |card: gpui::Div| card.flex_1().min_w_0().into_any_element();
-        let row_a = grid(
-            vec![
-                half(card(Some("Status classes"), None, status_bars(data))),
-                half(card(Some("Methods"), None, method_bars(data))),
-                half(card(
-                    Some("Latency"),
-                    Some("Total time per request"),
-                    latency_bars(data),
-                )),
-            ],
-        );
+        let row_a = grid(vec![
+            half(card(Some("Status classes"), None, status_bars(data))),
+            half(card(Some("Methods"), None, method_bars(data))),
+            half(card(
+                Some("Latency"),
+                Some("Total time per request"),
+                latency_bars(data),
+            )),
+        ]);
         let tops = grid(
             data.tops
                 .iter()

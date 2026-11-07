@@ -32,10 +32,8 @@ const TICK: Duration = Duration::from_secs(10);
 const MIN_BACKOFF_SECS: u64 = 60;
 const MAX_BACKOFF_SECS: u64 = 3600;
 const MAX_JITTER_SECS: u64 = 30;
-const UNBOUND_NOTE: &str =
-    "the Doppler variables stay in the running site until it is redeployed";
-const UNDEPLOYED_NOTE: &str =
-    "the synced Doppler variables reach the site at its next deploy";
+const UNBOUND_NOTE: &str = "the Doppler variables stay in the running site until it is redeployed";
+const UNDEPLOYED_NOTE: &str = "the synced Doppler variables reach the site at its next deploy";
 
 pub trait Clock: Send + Sync {
     fn now(&self) -> u64;
@@ -270,7 +268,10 @@ impl DopplerSync {
     }
 
     fn node_token_wait(&self) -> std::result::Result<(), DopplerError> {
-        let (now, until) = (self.clock.now(), self.node_not_before.load(Ordering::SeqCst));
+        let (now, until) = (
+            self.clock.now(),
+            self.node_not_before.load(Ordering::SeqCst),
+        );
         if now < until {
             return Err(DopplerError::RateLimited {
                 retry_after: Some(until - now),
@@ -281,7 +282,10 @@ impl DopplerSync {
 
     fn note_node_result<T>(&self, result: &std::result::Result<T, DopplerError>) {
         if let Err(err @ DopplerError::RateLimited { .. }) = result {
-            let wait = err.retry_after().unwrap_or(MIN_BACKOFF_SECS).clamp(1, MAX_BACKOFF_SECS);
+            let wait = err
+                .retry_after()
+                .unwrap_or(MIN_BACKOFF_SECS)
+                .clamp(1, MAX_BACKOFF_SECS);
             let until = self.clock.now().saturating_add(wait);
             self.node_not_before.fetch_max(until, Ordering::SeqCst);
         }
@@ -429,7 +433,9 @@ impl DopplerSync {
                     done.counts[1],
                     done.skipped.len()
                 );
-                self.update(id, |s| s.succeed(now, every.saturating_add(spread), done.skipped));
+                self.update(id, |s| {
+                    s.succeed(now, every.saturating_add(spread), done.skipped)
+                });
                 if done.changed {
                     self.deployer
                         .store
@@ -703,7 +709,14 @@ impl DopplerSync {
             }
             let restore = format!("site={id}");
             if let Err(e) = self
-                .set_binding(actor, id, kept_binding, "site.doppler.restore", &restore, false)
+                .set_binding(
+                    actor,
+                    id,
+                    kept_binding,
+                    "site.doppler.restore",
+                    &restore,
+                    false,
+                )
                 .await
             {
                 tracing::warn!(site = %id, error = %e, "the previous Doppler binding could not be restored");
@@ -984,7 +997,13 @@ mod tests {
         assert!(!s.is_due(u64::MAX), "a running sync is never claimed again");
         s.fail(1000, 300, &DopplerError::Rejected);
         assert_eq!((s.phase, s.failures, s.next_due), (Phase::Error, 1, 1060));
-        s.fail(1100, 300, &DopplerError::RateLimited { retry_after: Some(500) });
+        s.fail(
+            1100,
+            300,
+            &DopplerError::RateLimited {
+                retry_after: Some(500),
+            },
+        );
         assert_eq!((s.failures, s.next_due), (2, 1600));
         assert!(!s.is_due(1599) && s.is_due(1600));
         let skipped = vec![Skipped {
@@ -994,7 +1013,12 @@ mod tests {
         s.succeed(2000, 300, skipped);
         assert_eq!((s.phase, s.failures, s.next_due), (Phase::Synced, 0, 2300));
         assert_eq!(s.last_sync_at, Some(2000));
-        assert!(s.last_error.as_deref().unwrap().contains("skipped 1 Doppler variables: PATH"));
+        assert!(
+            s.last_error
+                .as_deref()
+                .unwrap()
+                .contains("skipped 1 Doppler variables: PATH")
+        );
         s.succeed(2300, 300, Vec::new());
         assert_eq!(s.last_error, None);
     }
@@ -1010,7 +1034,11 @@ mod tests {
     #[tokio::test]
     async fn a_bind_syncs_stores_the_snapshot_and_asks_for_a_redeploy() {
         let r = rig(false).await;
-        r.source.set(&[("API_URL", "https://api"), ("DOPPLER_CONFIG", "prd"), ("PORT", "1")]);
+        r.source.set(&[
+            ("API_URL", "https://api"),
+            ("DOPPLER_CONFIG", "prd"),
+            ("PORT", "1"),
+        ]);
         let token = Some(Zeroizing::new(SITE_TOKEN.to_string()));
         let view = r
             .sync
@@ -1020,8 +1048,14 @@ mod tests {
         assert!(view.bound && view.build && view.runtime);
         assert_eq!(view.status, "synced");
         assert_eq!(view.token_source, "site");
-        assert_eq!(view.keys, 2, "API_URL for both kinds and PORT for the build");
-        assert!(view.redeploy_needed, "a bind means a redeploy; there is no orchestrator here");
+        assert_eq!(
+            view.keys, 2,
+            "API_URL for both kinds and PORT for the build"
+        );
+        assert!(
+            view.redeploy_needed,
+            "a bind means a redeploy; there is no orchestrator here"
+        );
         assert_eq!(*lock(&r.source.tokens), [SITE_TOKEN]);
         let build = r.deployer.doppler_snapshot("shop", EnvKind::Build).await;
         assert_eq!(build.keys().collect::<Vec<_>>(), ["API_URL", "PORT"]);
@@ -1034,9 +1068,15 @@ mod tests {
         let audit = audit_text(&r).await;
         assert!(audit.contains("site.doppler.bind") && audit.contains("site.doppler.sync"));
         assert!(audit.contains("site.doppler.token.set"));
-        assert!(!audit.contains("https://api") && !audit.contains("secretvalue"), "{audit}");
+        assert!(
+            !audit.contains("https://api") && !audit.contains("secretvalue"),
+            "{audit}"
+        );
         let shown = format!("{view:?} {}", serde_json::to_string(&view).unwrap());
-        assert!(!shown.contains("https://api") && !shown.contains("secretvalue"), "{shown}");
+        assert!(
+            !shown.contains("https://api") && !shown.contains("secretvalue"),
+            "{shown}"
+        );
     }
 
     #[tokio::test]
@@ -1053,15 +1093,19 @@ mod tests {
         r.sync.sync_site(ACTOR, "shop", false).await.expect("same");
         assert_eq!(syncs(&audit_text(&r).await), before, "no change, no audit");
         r.source.set(&[("A", "2")]);
-        r.sync.sync_site(ACTOR, "shop", false).await.expect("changed");
+        r.sync
+            .sync_site(ACTOR, "shop", false)
+            .await
+            .expect("changed");
         assert_eq!(syncs(&audit_text(&r).await), before + 1);
         let build = r.deployer.doppler_snapshot("shop", EnvKind::Build).await;
         assert_eq!(build["A"], "2");
-        assert!(r
-            .deployer
-            .doppler_snapshot("shop", EnvKind::Runtime)
-            .await
-            .is_empty());
+        assert!(
+            r.deployer
+                .doppler_snapshot("shop", EnvKind::Runtime)
+                .await
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -1089,7 +1133,10 @@ mod tests {
         assert_eq!(r.sync.state("shop").unwrap().next_due, now + 120);
         assert!(r.sync.claim_due(now + 119).is_empty());
         assert_eq!(r.sync.claim_due(now + 120), ["shop"]);
-        assert!(r.sync.claim_due(now + 121).is_empty(), "a claimed site waits a full interval");
+        assert!(
+            r.sync.claim_due(now + 121).is_empty(),
+            "a claimed site waits a full interval"
+        );
     }
 
     #[tokio::test]
@@ -1106,7 +1153,10 @@ mod tests {
         let err = r.sync.sync_site(ACTOR, "shop", false).await.unwrap_err();
         assert!(err.to_string().contains("128"), "{err}");
         assert_eq!(
-            r.deployer.doppler_snapshot("shop", EnvKind::Build).await.len(),
+            r.deployer
+                .doppler_snapshot("shop", EnvKind::Build)
+                .await
+                .len(),
             1
         );
     }
@@ -1131,12 +1181,13 @@ mod tests {
         assert!(!err.to_string().contains("secretvalue"));
         let site = r.deployer.get_site("shop").unwrap();
         assert_eq!(site.source.unwrap().doppler, None);
-        assert!(r
-            .deployer
-            .store
-            .get_secret(&doppler::token_secret("shop"))
-            .await
-            .is_none());
+        assert!(
+            r.deployer
+                .store
+                .get_secret(&doppler::token_secret("shop"))
+                .await
+                .is_none()
+        );
         let view = r.sync.view("shop").await.unwrap();
         assert!(!view.bound && view.status == "idle" && view.token_source == "none");
         assert!(r.sync.state("shop").is_none());
@@ -1189,12 +1240,13 @@ mod tests {
             .unwrap();
         assert_eq!(build["A"], "doppler");
         assert_eq!(build["B"], "manual");
-        assert!(r
-            .deployer
-            .env_opt("shop", EnvKind::Runtime)
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            r.deployer
+                .env_opt("shop", EnvKind::Runtime)
+                .await
+                .unwrap()
+                .is_none()
+        );
         let redact = r
             .deployer
             .redactions(&r.deployer.get_site("shop").unwrap())
@@ -1253,7 +1305,10 @@ mod tests {
         r.sync.flush_pending().await;
         let state = r.sync.state("shop").unwrap();
         assert!(!state.pending_redeploy);
-        assert!(state.redeploy_needed.is_some(), "without an orchestrator the redeploy is only flagged");
+        assert!(
+            state.redeploy_needed.is_some(),
+            "without an orchestrator the redeploy is only flagged"
+        );
     }
 
     #[tokio::test]
@@ -1290,17 +1345,29 @@ mod tests {
             .bind("admin", "shop", binding(true, false), None)
             .await
             .expect("bind");
-        r.source.fail(DopplerError::RateLimited { retry_after: Some(120) });
+        r.source.fail(DopplerError::RateLimited {
+            retry_after: Some(120),
+        });
         assert!(r.sync.sync_site(ACTOR, "shop", false).await.is_err());
         let calls = r.source.calls.load(Ordering::SeqCst);
         r.source.set(&[("A", "2")]);
         let err = r.sync.sync_site(ACTOR, "shop", false).await.unwrap_err();
         assert_eq!(err.status(), 429);
         assert!(r.sync.projects().await.is_err());
-        assert_eq!(r.source.calls.load(Ordering::SeqCst), calls, "nothing was sent while paused");
+        assert_eq!(
+            r.source.calls.load(Ordering::SeqCst),
+            calls,
+            "nothing was sent while paused"
+        );
         r.clock.advance(120);
-        r.sync.sync_site(ACTOR, "shop", false).await.expect("the pause is over");
-        assert_eq!(r.deployer.doppler_snapshot("shop", EnvKind::Build).await["A"], "2");
+        r.sync
+            .sync_site(ACTOR, "shop", false)
+            .await
+            .expect("the pause is over");
+        assert_eq!(
+            r.deployer.doppler_snapshot("shop", EnvKind::Build).await["A"],
+            "2"
+        );
     }
 
     #[test]
@@ -1318,9 +1385,19 @@ mod tests {
         r.source.set(&[("A", "1")]);
         let mut stale = r.deployer.get_site("shop").unwrap();
         stale.source.as_mut().unwrap().doppler = Some(binding(true, false));
-        let err = r.sync.fetch_and_store(&stale, &binding(true, false)).await.err().unwrap();
+        let err = r
+            .sync
+            .fetch_and_store(&stale, &binding(true, false))
+            .await
+            .err()
+            .unwrap();
         assert!(err.to_string().contains("binding changed"), "{err}");
-        assert!(r.deployer.doppler_snapshot("shop", EnvKind::Build).await.is_empty());
+        assert!(
+            r.deployer
+                .doppler_snapshot("shop", EnvKind::Build)
+                .await
+                .is_empty()
+        );
     }
 
     #[tokio::test]

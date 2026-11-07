@@ -120,7 +120,10 @@ impl fmt::Display for DopplerError {
             DopplerError::NotFound => f.write_str("Doppler has no such project or config"),
             DopplerError::RateLimited {
                 retry_after: Some(secs),
-            } => write!(f, "Doppler is rate limiting this node; retry in {secs} seconds"),
+            } => write!(
+                f,
+                "Doppler is rate limiting this node; retry in {secs} seconds"
+            ),
             DopplerError::RateLimited { retry_after: None } => {
                 f.write_str("Doppler is rate limiting this node; retry later")
             }
@@ -268,7 +271,11 @@ impl DopplerClient {
 
     // Only https://api.doppler.com is ever contacted; the test client may use plain HTTP to loopback.
     fn url(&self, path: &str, query: &[(&str, &str)]) -> Result<Url, DopplerError> {
-        let refused = || DopplerError::Unreachable("refusing to contact a host other than api.doppler.com".into());
+        let refused = || {
+            DopplerError::Unreachable(
+                "refusing to contact a host other than api.doppler.com".into(),
+            )
+        };
         let mut url = Url::parse(&format!("{}{path}", self.base)).map_err(|_| refused())?;
         let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
         let ok = if self.plain_http {
@@ -660,8 +667,18 @@ pub(crate) mod mock {
 
     fn gate(s: &MockState, headers: &HeaderMap) -> Option<Response> {
         let want = format!("Bearer {}", s.token);
-        if headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()) != Some(want.as_str()) {
-            return Some((StatusCode::UNAUTHORIZED, json!({ "messages": ["Invalid Auth token"] }).to_string()).into_response());
+        if headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            != Some(want.as_str())
+        {
+            return Some(
+                (
+                    StatusCode::UNAUTHORIZED,
+                    json!({ "messages": ["Invalid Auth token"] }).to_string(),
+                )
+                    .into_response(),
+            );
         }
         match *s.mode.lock().unwrap() {
             Mode::Normal => None,
@@ -695,7 +712,10 @@ pub(crate) mod mock {
         if let Some(r) = gate(&s, &headers) {
             return r;
         }
-        s.queries.lock().unwrap().push(format!("projects {:?}", q.0.get("page")));
+        s.queries
+            .lock()
+            .unwrap()
+            .push(format!("projects {:?}", q.0.get("page")));
         let mut slugs: Vec<String> = s
             .secrets
             .lock()
@@ -828,7 +848,10 @@ mod tests {
     #[test]
     fn tokens_are_checked_and_never_printed() {
         for bad in ["", "has space", "caf\u{e9}", &"a".repeat(513)] {
-            assert_eq!(DopplerToken::parse(bad).unwrap_err(), DopplerError::BadToken);
+            assert_eq!(
+                DopplerToken::parse(bad).unwrap_err(),
+                DopplerError::BadToken
+            );
         }
         assert!(DopplerToken::parse(&"a".repeat(512)).is_ok());
         let t = token();
@@ -918,7 +941,10 @@ mod tests {
         assert!(meta.reason.contains("metadata"), "{meta:?}");
         for f in [&build, &runtime] {
             let text = format!("{f:?} {:?}", skipped_note(&f.skipped));
-            assert!(!text.contains("/evil") && !text.contains("https://x"), "{text}");
+            assert!(
+                !text.contains("/evil") && !text.contains("https://x"),
+                "{text}"
+            );
             assert!(!text.contains("xxxx"), "{text}");
         }
     }
@@ -933,7 +959,10 @@ mod tests {
             })
             .collect();
         let note = skipped_note(&many).unwrap();
-        assert!(note.starts_with("skipped 12 Doppler variables: N0 (r)"), "{note}");
+        assert!(
+            note.starts_with("skipped 12 Doppler variables: N0 (r)"),
+            "{note}"
+        );
         assert!(note.ends_with("and 2 more"), "{note}");
     }
 
@@ -943,9 +972,18 @@ mod tests {
             map(&[("A", "doppler"), ("B", "doppler")]),
             map(&[("B", "manual"), ("C", "manual")]),
         );
-        assert_eq!(merged, map(&[("A", "doppler"), ("B", "manual"), ("C", "manual")]));
-        assert_eq!(merge_env(BTreeMap::new(), map(&[("A", "1")])), map(&[("A", "1")]));
-        assert_eq!(merge_env(map(&[("A", "1")]), BTreeMap::new()), map(&[("A", "1")]));
+        assert_eq!(
+            merged,
+            map(&[("A", "doppler"), ("B", "manual"), ("C", "manual")])
+        );
+        assert_eq!(
+            merge_env(BTreeMap::new(), map(&[("A", "1")])),
+            map(&[("A", "1")])
+        );
+        assert_eq!(
+            merge_env(map(&[("A", "1")]), BTreeMap::new()),
+            map(&[("A", "1")])
+        );
     }
 
     #[test]
@@ -956,8 +994,9 @@ mod tests {
         let mut over = many.clone();
         over.insert("EXTRA".into(), "v".into());
         assert!(env_limits(&over, "build env").unwrap_err().contains("128"));
-        let big: BTreeMap<String, String> =
-            (0..7).map(|i| (format!("B{i}"), "x".repeat(4000))).collect();
+        let big: BTreeMap<String, String> = (0..7)
+            .map(|i| (format!("B{i}"), "x".repeat(4000)))
+            .collect();
         let err = env_limits(&big, "runtime env").unwrap_err();
         assert!(err.contains("24 KiB") && !err.contains("xxxx"), "{err}");
     }
@@ -976,7 +1015,10 @@ mod tests {
             snapshot_hash(&BTreeMap::new()),
             "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
         );
-        assert_ne!(snapshot_hash(&a), snapshot_hash(&map(&[("A", "1"), ("B", "3")])));
+        assert_ne!(
+            snapshot_hash(&a),
+            snapshot_hash(&map(&[("A", "1"), ("B", "3")]))
+        );
         assert_ne!(snapshot_hash(&a), snapshot_hash(&map(&[("A", "1")])));
     }
 
@@ -1026,7 +1068,11 @@ mod tests {
     #[tokio::test]
     async fn the_client_sends_the_bearer_token_and_reads_every_endpoint() {
         let server = mock::start(TOKEN).await;
-        server.state.set("shop", "prd", json!({ "API_URL": "https://x", "DOPPLER_CONFIG": "prd" }));
+        server.state.set(
+            "shop",
+            "prd",
+            json!({ "API_URL": "https://x", "DOPPLER_CONFIG": "prd" }),
+        );
         server.state.set("shop", "dev", json!({}));
         let client = DopplerClient::local(&server.base).unwrap();
         let t = token();
@@ -1060,11 +1106,19 @@ mod tests {
         let t = token();
         server.state.mode(Mode::RateLimited(42));
         let err = client.download(&t, "shop", "prd").await.unwrap_err();
-        assert_eq!(err, DopplerError::RateLimited { retry_after: Some(42) });
+        assert_eq!(
+            err,
+            DopplerError::RateLimited {
+                retry_after: Some(42)
+            }
+        );
         assert_eq!(err.retry_after(), Some(42));
         server.state.mode(Mode::Status(500));
         let err = client.download(&t, "shop", "prd").await.unwrap_err();
-        assert!(matches!(err, DopplerError::Remote { status: 500, .. }), "{err:?}");
+        assert!(
+            matches!(err, DopplerError::Remote { status: 500, .. }),
+            "{err:?}"
+        );
         assert!(!err.to_string().contains("mocksecret"), "{err}");
         assert!(err.to_string().contains("[redacted]"), "{err}");
         server.state.mode(Mode::Status(403));

@@ -301,12 +301,10 @@ impl TextInput {
         if target < 0 || target as usize >= ranges.len() {
             return;
         }
-        let x = self
-            .layout
-            .get(line)
-            .map_or(px(0.), |l| {
-                l.shaped.x_for_index(self.to_display(ranges[line].start, cur))
-            });
+        let x = self.layout.get(line).map_or(px(0.), |l| {
+            l.shaped
+                .x_for_index(self.to_display(ranges[line].start, cur))
+        });
         let range = ranges[target as usize].clone();
         let local = self
             .layout
@@ -651,7 +649,9 @@ impl Element for TextElement {
             let text: String = if showing_placeholder {
                 input.placeholder.to_string()
             } else if input.masked {
-                BULLET.to_string().repeat(input.content[range.clone()].chars().count())
+                BULLET
+                    .to_string()
+                    .repeat(input.content[range.clone()].chars().count())
             } else {
                 input.content[range.clone()].to_string()
             };

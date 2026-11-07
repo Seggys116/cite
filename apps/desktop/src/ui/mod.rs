@@ -26,11 +26,7 @@ use gpui::{App, KeyBinding};
 
 pub fn init(cx: &mut App) {
     input::bind_keys(cx);
-    cx.bind_keys([KeyBinding::new(
-        "cmd-b",
-        crate::app::ToggleSidebar,
-        None,
-    )]);
+    cx.bind_keys([KeyBinding::new("cmd-b", crate::app::ToggleSidebar, None)]);
     cx.on_window_closed(|cx| {
         if cx.windows().is_empty() {
             cx.quit();

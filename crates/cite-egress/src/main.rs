@@ -21,7 +21,9 @@ fn listen() -> std::io::Result<TcpListener> {
 async fn main() -> ExitCode {
     tracing_subscriber::fmt()
         .json()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .init();
     let policy = match Policy::from_env() {
         Ok(p) => p,
@@ -31,7 +33,10 @@ async fn main() -> ExitCode {
         }
     };
     let local = routes::local_networks();
-    tracing::info!(count = local.len(), "own networks and gateways added to the deny ceiling");
+    tracing::info!(
+        count = local.len(),
+        "own networks and gateways added to the deny ceiling"
+    );
     let policy = policy.with_local_networks(local);
     let listener = match listen() {
         Ok(l) => l,

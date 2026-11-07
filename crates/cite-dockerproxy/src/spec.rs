@@ -129,7 +129,12 @@ enum Outbound {
 }
 
 // The executor may add one of its own stack's outbound networks, and only the one the node's egress mode names.
-fn executor_outbound(policy: &Policy, role: Role, c: &Stack, body: &Value) -> Result<Outbound, String> {
+fn executor_outbound(
+    policy: &Policy,
+    role: Role,
+    c: &Stack,
+    body: &Value,
+) -> Result<Outbound, String> {
     let endpoints = body["NetworkingConfig"]["EndpointsConfig"].as_object();
     let asks = |kind: &str| {
         endpoints.is_some_and(|e| e.contains_key(&format!("cite-{}-{}-{kind}", c.id, c.slot)))
@@ -172,12 +177,22 @@ const EXECUTOR_PROXY_KEYS: [&str; 6] = [
 fn check_executor_proxy_env(env: &Value, outbound: Outbound) -> Result<(), String> {
     let keys: Vec<&str> = env
         .as_array()
-        .map(|a| a.iter().filter_map(Value::as_str).map(|e| e.split('=').next().unwrap_or_default()).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(|e| e.split('=').next().unwrap_or_default())
+                .collect()
+        })
         .unwrap_or_default();
-    let present = EXECUTOR_PROXY_KEYS.iter().filter(|k| keys.contains(k)).count();
+    let present = EXECUTOR_PROXY_KEYS
+        .iter()
+        .filter(|k| keys.contains(k))
+        .count();
     match (outbound, present) {
         (Outbound::Filtered, n) if n == EXECUTOR_PROXY_KEYS.len() => Ok(()),
-        (Outbound::Filtered, _) => Err("a filtered executor needs every egress proxy variable".to_string()),
+        (Outbound::Filtered, _) => {
+            Err("a filtered executor needs every egress proxy variable".to_string())
+        }
         (_, 0) => Ok(()),
         _ => Err("egress proxy variables are only allowed on a filtered executor".to_string()),
     }
@@ -235,10 +250,22 @@ enum EnvRule {
 const OUTBOUND_MODES: &[&str] = &["public", "allowlist"];
 
 const EGRESS_ENV: [(&str, EnvRule); 8] = [
-    ("CITE_EGRESS_ALLOW_CIDRS", EnvRule::NodeEgress("CITE_EGRESS_ALLOW_CIDRS")),
-    ("CITE_EGRESS_DENY_CIDRS", EnvRule::NodeEgress("CITE_EGRESS_DENY_CIDRS")),
-    ("CITE_EGRESS_DENY_HOSTS", EnvRule::NodeEgress("CITE_EGRESS_DENY_HOSTS")),
-    ("CITE_EGRESS_ALLOW_PORTS", EnvRule::NodeEgress("CITE_EGRESS_ALLOW_PORTS")),
+    (
+        "CITE_EGRESS_ALLOW_CIDRS",
+        EnvRule::NodeEgress("CITE_EGRESS_ALLOW_CIDRS"),
+    ),
+    (
+        "CITE_EGRESS_DENY_CIDRS",
+        EnvRule::NodeEgress("CITE_EGRESS_DENY_CIDRS"),
+    ),
+    (
+        "CITE_EGRESS_DENY_HOSTS",
+        EnvRule::NodeEgress("CITE_EGRESS_DENY_HOSTS"),
+    ),
+    (
+        "CITE_EGRESS_ALLOW_PORTS",
+        EnvRule::NodeEgress("CITE_EGRESS_ALLOW_PORTS"),
+    ),
     ("CITE_EGRESS_MODE", EnvRule::Enum(OUTBOUND_MODES)),
     ("CITE_EGRESS_BLOCK_MAIL", EnvRule::Bool),
     ("CITE_EGRESS_ALLOW", EnvRule::EgressRules),
@@ -551,7 +578,11 @@ fn check_egress_env(policy: &Policy, env: &Value) -> Result<(), String> {
         .as_array()
         .map(|a| a.iter().filter_map(Value::as_str).collect())
         .unwrap_or_default();
-    if let Some(missing) = policy.egress_env.iter().find(|e| !entries.contains(&e.as_str())) {
+    if let Some(missing) = policy
+        .egress_env
+        .iter()
+        .find(|e| !entries.contains(&e.as_str()))
+    {
         let key = missing.split('=').next().unwrap_or_default();
         return Err(format!("Env key {key:?} is missing"));
     }
@@ -628,7 +659,10 @@ pub fn validate_container(policy: &Policy, name: &str, body: &Value) -> Result<(
         _ => Role::Init,
     };
     if role == Role::EgressProxy && policy.egress_mode != EgressMode::Filtered {
-        return Err("egress proxies exist only in filtered egress mode (CITE_STACK_EGRESS_MODE=filtered)".to_string());
+        return Err(
+            "egress proxies exist only in filtered egress mode (CITE_STACK_EGRESS_MODE=filtered)"
+                .to_string(),
+        );
     }
     let obj = object(body, "body")?;
     let image = obj

@@ -30,7 +30,10 @@ fn rules_default_to_public_with_mail_blocked_and_are_left_out_of_the_json() {
     let text = serde_json::to_value(&s).unwrap();
     assert!(text.get("outbound_rules").is_none());
     let partial = site(json!({ "allow": ["db.lan"] }));
-    assert!(partial.outbound_rules.block_mail, "a missing block_mail stays on");
+    assert!(
+        partial.outbound_rules.block_mail,
+        "a missing block_mail stays on"
+    );
     let text = serde_json::to_value(&partial).unwrap();
     assert_eq!(text["outbound_rules"]["mode"], "public");
     let unknown: Result<Site, _> = serde_json::from_value(json!({
@@ -43,7 +46,13 @@ fn rules_default_to_public_with_mail_blocked_and_are_left_out_of_the_json() {
 
 #[test]
 fn entry_shapes() {
-    for ok in ["10.0.0.0/8", "192.168.1.5", "fd00::/8", "2001:db8::1", "0.0.0.0/0"] {
+    for ok in [
+        "10.0.0.0/8",
+        "192.168.1.5",
+        "fd00::/8",
+        "2001:db8::1",
+        "0.0.0.0/0",
+    ] {
         assert!(is_egress_cidr(ok), "{ok}");
     }
     for bad in [
@@ -61,7 +70,16 @@ fn entry_shapes() {
     for ok in ["api.github.com", ".apple.com", "db.lan", "localhost"] {
         assert!(is_egress_host(ok), "{ok}");
     }
-    for bad in ["API.github.com", "*.apple.com", "a..b", "-a.b", "2130706433", "x.0x1f", " db.lan", ""] {
+    for bad in [
+        "API.github.com",
+        "*.apple.com",
+        "a..b",
+        "-a.b",
+        "2130706433",
+        "x.0x1f",
+        " db.lan",
+        "",
+    ] {
         assert!(!is_egress_host(bad), "{bad:?}");
     }
 }
@@ -84,11 +102,17 @@ fn strict_validation_table() {
         (json!({ "allow": ["http://x.com"] }), "allow entry"),
     ];
     for (rules, needle) in cases {
-        let err = validate_site_strict(&site(rules.clone())).expect_err("refused").0;
+        let err = validate_site_strict(&site(rules.clone()))
+            .expect_err("refused")
+            .0;
         assert!(err.contains(needle), "{rules}: {err}");
     }
-    let many: Vec<String> = (0..=MAX_EGRESS_ENTRIES).map(|i| format!("h{i}.example")).collect();
-    let err = validate_site_strict(&site(json!({ "allow": many }))).expect_err("65").0;
+    let many: Vec<String> = (0..=MAX_EGRESS_ENTRIES)
+        .map(|i| format!("h{i}.example"))
+        .collect();
+    let err = validate_site_strict(&site(json!({ "allow": many })))
+        .expect_err("65")
+        .0;
     assert!(err.contains("more than 64"), "{err}");
     let bad = site(json!({ "mode": "allowlist" }));
     validate_site(&bad).expect("loading a stored config stays lenient");

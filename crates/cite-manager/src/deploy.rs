@@ -835,7 +835,8 @@ impl Deployer {
             Err(_) if self.shutting_down.load(Ordering::SeqCst) => return Ok(()),
             Err(err) => {
                 let reason = err.to_string();
-                let first_line = |text: &str| redactor.redact_line(text.lines().next().unwrap_or(""));
+                let first_line =
+                    |text: &str| redactor.redact_line(text.lines().next().unwrap_or(""));
                 let recorded = state.last_failed_reason.as_deref().map(first_line);
                 let phase = state
                     .last_failed_phase
@@ -1287,8 +1288,7 @@ mod tests {
         status.last_result = Some(cite_core::LastResult {
             generation: 3,
             outcome: cite_core::Outcome::Failed,
-            reason: "the server process exited with code 1 before it listened on port 3001"
-                .into(),
+            reason: "the server process exited with code 1 before it listened on port 3001".into(),
             log_tail: vec![
                 "[green/01ARZ3NDEKTSV4RRFFQ69G5FAV] err: Error: Cannot find module 'express'"
                     .into(),

@@ -33,7 +33,11 @@ pub fn shown_output(output: &[String], open: bool) -> &[String] {
 }
 
 // The log viewer opens on the slot of the latest failed deploy, then on the slot the status names, then on the live one.
-pub fn default_log_slot(history: &[Deployment], status_failure: Option<Slot>, active: Slot) -> Slot {
+pub fn default_log_slot(
+    history: &[Deployment],
+    status_failure: Option<Slot>,
+    active: Slot,
+) -> Slot {
     newest_failure(history)
         .map(|d| d.slot)
         .or(status_failure)
@@ -323,7 +327,13 @@ mod tests {
         let plain = split_note("green slot did not pass health checks");
         assert_eq!(plain.reason, "green slot did not pass health checks");
         assert!(plain.output.is_empty());
-        assert_eq!(split_note(""), NoteParts { reason: String::new(), output: Vec::new() });
+        assert_eq!(
+            split_note(""),
+            NoteParts {
+                reason: String::new(),
+                output: Vec::new()
+            }
+        );
     }
 
     #[test]
@@ -340,11 +350,24 @@ mod tests {
     #[test]
     fn logs_open_on_the_latest_failed_slot() {
         let h = vec![
-            dep(DeployAction::Failed, Slot::Green, "x", "2025-01-01T00:00:00Z"),
-            dep(DeployAction::Promote, Slot::Blue, "y", "2025-01-02T00:00:00Z"),
+            dep(
+                DeployAction::Failed,
+                Slot::Green,
+                "x",
+                "2025-01-01T00:00:00Z",
+            ),
+            dep(
+                DeployAction::Promote,
+                Slot::Blue,
+                "y",
+                "2025-01-02T00:00:00Z",
+            ),
         ];
         assert_eq!(default_log_slot(&h, None, Slot::Blue), Slot::Green);
-        assert_eq!(default_log_slot(&[], Some(Slot::Green), Slot::Blue), Slot::Green);
+        assert_eq!(
+            default_log_slot(&[], Some(Slot::Green), Slot::Blue),
+            Slot::Green
+        );
         assert_eq!(default_log_slot(&[], None, Slot::Blue), Slot::Blue);
         assert_eq!(SlotState::Down.tone(), Tone::Bad);
         assert_eq!(SlotState::Healthy.tone(), Tone::Ok);
@@ -585,7 +608,10 @@ mod tests {
             )],
         );
         let b = banner(&s, None).expect("banner");
-        assert_eq!(b.failure.map(|f| f.note), Some("Health check timed out".to_string()));
+        assert_eq!(
+            b.failure.map(|f| f.note),
+            Some("Health check timed out".to_string())
+        );
         assert_eq!(b.logs_slot, Slot::Green);
     }
 }

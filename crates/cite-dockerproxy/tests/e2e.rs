@@ -68,7 +68,10 @@ async fn the_orchestrator_works_through_the_proxy_for_every_runtime() {
         let stacks = orch.list_stacks().await.unwrap();
         assert_eq!(stacks.len(), 8);
         let created = docker.world.lock().unwrap().containers.len();
-        assert_eq!(created, 22, "two per stack plus an egress proxy per server stack");
+        assert_eq!(
+            created, 22,
+            "two per stack plus an egress proxy per server stack"
+        );
     }
 }
 
@@ -89,7 +92,11 @@ async fn stop_redeploy_and_purge_work_through_the_proxy() {
     let w = docker.world.lock().unwrap();
     assert!(w.containers.is_empty() && w.volumes.is_empty());
     let left: Vec<&String> = w.networks.keys().collect();
-    assert_eq!(left, vec!["cite-egress"], "only the node's egress bridge stays");
+    assert_eq!(
+        left,
+        vec!["cite-egress"],
+        "only the node's egress bridge stays"
+    );
 }
 
 #[tokio::test]

@@ -2767,14 +2767,21 @@ mod tests {
         for _ in 0..100 {
             sleep(Duration::from_millis(100)).await;
             during = e.deployer.site_status("shop").await.unwrap();
-            if during.operation.as_ref().is_some_and(|o| o.step == "building") {
+            if during
+                .operation
+                .as_ref()
+                .is_some_and(|o| o.step == "building")
+            {
                 break;
             }
         }
         sleep(Duration::from_millis(300)).await;
         assert_eq!(current(&e, "shop").active, Slot::Blue);
         assert!(!green_promoted(&e), "the old release went live");
-        let op = during.operation.clone().expect("a running deploy is visible");
+        let op = during
+            .operation
+            .clone()
+            .expect("a running deploy is visible");
         assert_eq!((op.kind.as_str(), op.step.as_str()), ("deploy", "building"));
         assert_eq!(op.slot, Some(Slot::Green));
         assert_eq!(during.phase, "building");

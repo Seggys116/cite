@@ -1,5 +1,6 @@
 use cite_client::{
-    ClientError, DopplerBindRequest, DopplerBinding, DopplerConfig, DopplerInfo, DopplerProject, NodeInfo,
+    ClientError, DopplerBindRequest, DopplerBinding, DopplerConfig, DopplerInfo, DopplerProject,
+    NodeInfo,
 };
 use gpui::{AnyElement, Context, Entity, div, prelude::*, px};
 
@@ -50,7 +51,11 @@ impl NodeHandle {
         }
     }
 
-    pub(crate) async fn dp_bind(&self, site: &str, req: &DopplerBindRequest) -> Res<DopplerBinding> {
+    pub(crate) async fn dp_bind(
+        &self,
+        site: &str,
+        req: &DopplerBindRequest,
+    ) -> Res<DopplerBinding> {
         match self {
             Self::Live(c) => c.site_doppler_set(site, req).await,
             Self::Demo(n, _) => demo_ops::doppler_bind(n, site, req, crate::demo::now_ms())
@@ -94,7 +99,12 @@ impl DopplerLoad {
     }
 }
 
-pub async fn load_doppler(h: &NodeHandle, site: &str, offered: bool, node: Option<DopplerInfo>) -> DopplerLoad {
+pub async fn load_doppler(
+    h: &NodeHandle,
+    site: &str,
+    offered: bool,
+    node: Option<DopplerInfo>,
+) -> DopplerLoad {
     if !offered {
         return DopplerLoad::none();
     }
@@ -181,7 +191,11 @@ impl DopplerState {
         self.busy = false;
         self.configs_gen += 1;
         self.advanced = false;
-        for input in [self.token.clone(), self.project_in.clone(), self.config_in.clone()] {
+        for input in [
+            self.token.clone(),
+            self.project_in.clone(),
+            self.config_in.clone(),
+        ] {
             input.update(cx, |i, cx| i.set_text("", cx));
         }
     }
@@ -308,7 +322,9 @@ pub fn bind_problem(
             t if t.starts_with(SERVICE_TOKEN_PREFIX) => None,
             "" if site_token => None,
             "" => Some("Paste a service token, or open Advanced to pick a project and config."),
-            _ => Some("A service token starts with dp.st.: create one in Doppler for this project and config."),
+            _ => Some(
+                "A service token starts with dp.st.: create one in Doppler for this project and config.",
+            ),
         };
     }
     if project.is_empty() {
@@ -398,8 +414,13 @@ impl Console {
     }
 
     // Binding, syncing and removing share one path: the card shows the binding the node answers with.
-    fn doppler_action<F>(&mut self, what: &'static str, fut: F, done: &'static str, cx: &mut Context<Self>)
-    where
+    fn doppler_action<F>(
+        &mut self,
+        what: &'static str,
+        fut: F,
+        done: &'static str,
+        cx: &mut Context<Self>,
+    ) where
         F: std::future::Future<Output = Res<DopplerBinding>> + Send + 'static,
     {
         self.ops.doppler.busy = true;
@@ -442,7 +463,10 @@ impl Console {
             return;
         }
         let typed = self.ops.doppler.token.read(cx).text().trim().to_string();
-        self.ops.doppler.token.update(cx, |i, cx| i.set_text("", cx));
+        self.ops
+            .doppler
+            .token
+            .update(cx, |i, cx| i.set_text("", cx));
         let req = DopplerBindRequest {
             project,
             config,
@@ -458,7 +482,12 @@ impl Console {
             }
             res
         };
-        self.doppler_action("Doppler", fut, "Doppler connected. Variables sync now and on every change.", cx);
+        self.doppler_action(
+            "Doppler",
+            fut,
+            "Doppler connected. Variables sync now and on every change.",
+            cx,
+        );
     }
 
     fn doppler_sync(&mut self, cx: &mut Context<Self>) {
@@ -518,7 +547,12 @@ impl Console {
                 .flex_col()
                 .gap(px(4.))
                 .child(strong(binding_scope(b)).text_size(px(13.)))
-                .child(div().text_size(px(12.)).text_color(c(tone.color())).child(line))
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(c(tone.color()))
+                        .child(line),
+                )
                 .child(text_dim(token_line(&b.token_source)).text_size(px(11.)));
             if b.status == "error"
                 && let Some(e) = b.last_error.as_deref().filter(|e| e.contains('\n'))
@@ -561,7 +595,8 @@ impl Console {
                 ));
             }
             (Some(_), _) => {
-                picker = picker.child(text_dim("The token can see no Doppler projects.").text_size(px(12.)));
+                picker = picker
+                    .child(text_dim("The token can see no Doppler projects.").text_size(px(12.)));
             }
             (None, err) => {
                 if let Some(e) = err {
@@ -595,7 +630,8 @@ impl Console {
                     ));
                 }
                 (Some(_), _) => {
-                    picker = picker.child(text_dim("This project has no configs.").text_size(px(12.)));
+                    picker =
+                        picker.child(text_dim("This project has no configs.").text_size(px(12.)));
                 }
                 (None, Some(e)) => {
                     picker = picker.child(
@@ -609,31 +645,49 @@ impl Console {
                 }
             }
         }
-        let switch = |key: &'static str, label: &'static str, on: bool, flip: fn(&mut Console), cx: &mut Context<Self>| {
+        let switch = |key: &'static str,
+                      label: &'static str,
+                      on: bool,
+                      flip: fn(&mut Console),
+                      cx: &mut Context<Self>| {
             div()
                 .flex()
                 .items_center()
                 .gap(px(10.))
-                .child(toggle(id("dp", key), on).on_click(cx.listener(move |this, _, _, cx| {
-                    flip(this);
-                    cx.notify();
-                })))
+                .child(
+                    toggle(id("dp", key), on).on_click(cx.listener(move |this, _, _, cx| {
+                        flip(this);
+                        cx.notify();
+                    })),
+                )
                 .child(div().text_size(px(12.)).child(label))
         };
-        body = body.child(field(
-            "Service token",
-            Some(TOKEN_HELP),
-            d.token.clone(),
-        ));
+        body = body.child(field("Service token", Some(TOKEN_HELP), d.token.clone()));
         body = body.child(
             div()
                 .flex()
                 .flex_wrap()
                 .gap(px(20.))
-                .child(switch("build", "Sync build variables", d.build, |t| t.ops.doppler.build = !t.ops.doppler.build, cx))
-                .child(switch("runtime", "Sync runtime variables", d.runtime, |t| t.ops.doppler.runtime = !t.ops.doppler.runtime, cx)),
+                .child(switch(
+                    "build",
+                    "Sync build variables",
+                    d.build,
+                    |t| t.ops.doppler.build = !t.ops.doppler.build,
+                    cx,
+                ))
+                .child(switch(
+                    "runtime",
+                    "Sync runtime variables",
+                    d.runtime,
+                    |t| t.ops.doppler.runtime = !t.ops.doppler.runtime,
+                    cx,
+                )),
         );
-        let advanced_label = if d.advanced { "Hide advanced options" } else { ADVANCED_LABEL };
+        let advanced_label = if d.advanced {
+            "Hide advanced options"
+        } else {
+            ADVANCED_LABEL
+        };
         body = body.child(div().flex().child(
             btn(id("dp", "advanced"), advanced_label, BtnKind::Plain).on_click(cx.listener(
                 |this, _, _, cx| {
@@ -727,10 +781,22 @@ mod tests {
 
     #[test]
     fn the_sync_line_says_how_the_last_sync_went() {
-        assert_eq!(sync_line(&binding("synced", 12)), ("Synced 12 variables at 03:04:05".to_string(), Tone::Ok));
-        assert_eq!(sync_line(&binding("synced", 1)).0, "Synced 1 variable at 03:04:05");
+        assert_eq!(
+            sync_line(&binding("synced", 12)),
+            ("Synced 12 variables at 03:04:05".to_string(), Tone::Ok)
+        );
+        assert_eq!(
+            sync_line(&binding("synced", 1)).0,
+            "Synced 1 variable at 03:04:05"
+        );
         let failed = sync_line(&binding("error", 0));
-        assert_eq!(failed, ("The last sync failed: 401: token revoked".to_string(), Tone::Bad));
+        assert_eq!(
+            failed,
+            (
+                "The last sync failed: 401: token revoked".to_string(),
+                Tone::Bad
+            )
+        );
         assert_eq!(sync_line(&binding("syncing", 0)).1, Tone::Info);
         assert_eq!(sync_line(&binding("idle", 0)).0, "Not synced yet.");
         let mut quiet = binding("synced", 3);
@@ -740,13 +806,36 @@ mod tests {
 
     #[test]
     fn a_binding_needs_a_project_a_config_a_target_and_a_token() {
-        assert_eq!(bind_problem("", "prd", true, true, "", true, false), Some("Pick a project."));
-        assert_eq!(bind_problem("web", " ", true, true, "", true, false), Some("Pick a config."));
-        assert!(bind_problem("web", "prd", false, false, "", true, false).unwrap().contains("both"));
-        assert!(bind_problem("web", "prd", true, false, "", false, false).unwrap().contains("service token"));
-        assert_eq!(bind_problem("web", "prd", false, true, "", true, false), None);
-        assert_eq!(bind_problem("web", "prd", true, true, "dp.pt.x", false, false), None);
-        assert_eq!(bind_problem("web", "prd", true, true, "", false, true), None);
+        assert_eq!(
+            bind_problem("", "prd", true, true, "", true, false),
+            Some("Pick a project.")
+        );
+        assert_eq!(
+            bind_problem("web", " ", true, true, "", true, false),
+            Some("Pick a config.")
+        );
+        assert!(
+            bind_problem("web", "prd", false, false, "", true, false)
+                .unwrap()
+                .contains("both")
+        );
+        assert!(
+            bind_problem("web", "prd", true, false, "", false, false)
+                .unwrap()
+                .contains("service token")
+        );
+        assert_eq!(
+            bind_problem("web", "prd", false, true, "", true, false),
+            None
+        );
+        assert_eq!(
+            bind_problem("web", "prd", true, true, "dp.pt.x", false, false),
+            None
+        );
+        assert_eq!(
+            bind_problem("web", "prd", true, true, "", false, true),
+            None
+        );
         assert!(token_line("site").contains("this site"));
         assert!(token_line("node").contains("node"));
         assert!(token_line("none").contains("No Doppler token"));
@@ -754,15 +843,32 @@ mod tests {
 
     #[test]
     fn a_blank_project_and_config_need_a_service_token() {
-        let token_only = |typed: &str, node: bool, site: bool| bind_problem("", "", true, false, typed, node, site);
+        let token_only = |typed: &str, node: bool, site: bool| {
+            bind_problem("", "", true, false, typed, node, site)
+        };
         assert_eq!(token_only("dp.st.abc", false, false), None);
         assert_eq!(token_only(" dp.st.abc ", false, false), None);
-        assert!(token_only("", true, false).unwrap().contains("Paste a service token"));
+        assert!(
+            token_only("", true, false)
+                .unwrap()
+                .contains("Paste a service token")
+        );
         assert_eq!(token_only("", false, true), None);
-        assert!(token_only("dp.pt.abc", true, true).unwrap().contains("dp.st."));
+        assert!(
+            token_only("dp.pt.abc", true, true)
+                .unwrap()
+                .contains("dp.st.")
+        );
         assert!(token_only("dp.st.abc", true, true).is_none());
-        assert!(bind_problem("", "", false, false, "dp.st.abc", false, false).unwrap().contains("both"));
-        assert_eq!(bind_problem("web", "", true, true, "dp.st.abc", false, false), Some("Pick a config."));
+        assert!(
+            bind_problem("", "", false, false, "dp.st.abc", false, false)
+                .unwrap()
+                .contains("both")
+        );
+        assert_eq!(
+            bind_problem("web", "", true, true, "dp.st.abc", false, false),
+            Some("Pick a config.")
+        );
     }
 
     #[test]

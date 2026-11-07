@@ -357,7 +357,10 @@ fn static_root(site_src: &Path, det: &Detection, spa: bool) -> BuildResult<PathB
 }
 
 /// Picks what an SSR release packs and the argv it starts with, now that the build output exists.
-fn ssr_release(site_src: &Path, det: &Detection) -> BuildResult<(PathBuf, Vec<String>, Option<String>)> {
+fn ssr_release(
+    site_src: &Path,
+    det: &Detection,
+) -> BuildResult<(PathBuf, Vec<String>, Option<String>)> {
     if det.start_argv.is_empty() {
         return Err(BuildFailure::permanent(
             "SSR release requires a start command; set CITE_START_COMMAND",
@@ -430,7 +433,10 @@ fn stage_next_standalone(site: &Path, dist: &str) -> BuildResult<()> {
     };
     let server = standalone.join(rel);
     let copies = [
-        (site.join(dist).join("static"), server.join(dist).join("static")),
+        (
+            site.join(dist).join("static"),
+            server.join(dist).join("static"),
+        ),
         (site.join("public"), server.join("public")),
     ];
     for (from, to) in copies {
@@ -528,7 +534,9 @@ fn is_regular(fd: &std::os::fd::OwnedFd) -> bool {
 
 // The manager stages as root and the build uid owns the target tree, so no component may be a symlink and the result must be a regular file.
 fn open_release_binary(base: &Path, rel: &[&str]) -> std::result::Result<std::fs::File, String> {
-    let shown = rel.iter().fold(base.to_path_buf(), |path, part| path.join(part));
+    let shown = rel
+        .iter()
+        .fold(base.to_path_buf(), |path, part| path.join(part));
     let missing = || format!("rust release binary missing: {}", shown.display());
     let refused = || {
         format!(
@@ -544,14 +552,19 @@ fn open_release_binary(base: &Path, rel: &[&str]) -> std::result::Result<std::fs
         }
     };
     let (last, parents) = rel.split_last().ok_or_else(missing)?;
-    let mut dir = rustix::fs::openat(rustix::fs::CWD, base, dir_flags(), rustix::fs::Mode::empty())
-        .map_err(failed)?;
+    let mut dir = rustix::fs::openat(
+        rustix::fs::CWD,
+        base,
+        dir_flags(),
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(failed)?;
     for part in parents {
         dir = rustix::fs::openat(&dir, *part, dir_flags(), rustix::fs::Mode::empty())
             .map_err(failed)?;
     }
-    let fd = rustix::fs::openat(&dir, *last, file_flags(), rustix::fs::Mode::empty())
-        .map_err(failed)?;
+    let fd =
+        rustix::fs::openat(&dir, *last, file_flags(), rustix::fs::Mode::empty()).map_err(failed)?;
     if !is_regular(&fd) {
         return Err(refused());
     }
@@ -1186,7 +1199,13 @@ fn run_helper_process(
     };
     let stderr = child.stderr.take();
     let capture = Arc::new(Mutex::new(HelperCapture::default()));
-    let out_done = spawn_line_reader(stdout, redactor.clone(), false, capture.clone(), nonce.clone());
+    let out_done = spawn_line_reader(
+        stdout,
+        redactor.clone(),
+        false,
+        capture.clone(),
+        nonce.clone(),
+    );
     let err_done = spawn_line_reader(stderr, redactor.clone(), true, capture.clone(), nonce);
 
     let ended = loop {
@@ -1251,7 +1270,12 @@ impl HelperCapture {
 }
 
 /// The reason the owner sees: the helper's own `failed` event when it sent one, otherwise the step it was in and the output it printed.
-fn helper_failure(helper: &str, captured: &HelperCapture, how: &str, redactor: &Redactor) -> String {
+fn helper_failure(
+    helper: &str,
+    captured: &HelperCapture,
+    how: &str,
+    redactor: &Redactor,
+) -> String {
     if let Some((first, lines)) = &captured.failed {
         return failure_reason(first, lines, redactor, MAX_OUTCOME_REASON);
     }
@@ -2075,7 +2099,13 @@ fn build_steps(job_json: &Path) -> BuildResult<()> {
             redactor.push_secret(value.clone());
         }
     }
-    run_shell(&job.install_command, "install", &job.env, &job.src, &redactor)?;
+    run_shell(
+        &job.install_command,
+        "install",
+        &job.env,
+        &job.src,
+        &redactor,
+    )?;
     run_shell(&job.build_command, "build", &job.env, &job.src, &redactor)?;
     if let Some(dist) = &job.next_dist_dir {
         stage_next_standalone(&job.src, dist)?;
@@ -2529,10 +2559,15 @@ mod tests {
             std::env::var("PATH").unwrap_or_else(|_| "/bin:/usr/bin".into()),
         );
         let cwd = dir.path().to_path_buf();
-        let worker =
-            std::thread::spawn(move || {
-                super::run_shell("sleep 30", "install", &env, &cwd, &cite_core::Redactor::new())
-            });
+        let worker = std::thread::spawn(move || {
+            super::run_shell(
+                "sleep 30",
+                "install",
+                &env,
+                &cwd,
+                &cite_core::Redactor::new(),
+            )
+        });
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         while super::BUILD_PID.load(Ordering::SeqCst) == 0 {
             assert!(
@@ -2555,7 +2590,13 @@ mod tests {
         super::BUILD_ABORT.store(true, Ordering::SeqCst);
         let dir = tempfile::tempdir().unwrap();
         let env = HashMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]);
-        let result = super::run_shell("true", "install", &env, dir.path(), &cite_core::Redactor::new());
+        let result = super::run_shell(
+            "true",
+            "install",
+            &env,
+            dir.path(),
+            &cite_core::Redactor::new(),
+        );
         super::BUILD_ABORT.store(false, Ordering::SeqCst);
         assert!(result.unwrap_err().to_string().contains("aborted"));
     }
@@ -2785,8 +2826,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let env = HashMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]);
         let script = "i=0; while [ $i -lt 70 ]; do echo out-$i; i=$((i+1)); done; echo 'Error: next build failed' >&2; exit 3";
-        let err = super::run_shell(script, "build", &env, dir.path(), &cite_core::Redactor::new())
-            .unwrap_err();
+        let err = super::run_shell(
+            script,
+            "build",
+            &env,
+            dir.path(),
+            &cite_core::Redactor::new(),
+        )
+        .unwrap_err();
         let message = err.message();
         let first = message.lines().next().unwrap();
         assert_eq!(first, format!("build failed: exit status 3 ({script})"));
@@ -2794,7 +2841,10 @@ mod tests {
         assert!(message.contains("out-69"), "{message}");
         let shown = super::with_output(err.clone(), &cite_core::Redactor::new());
         let shown = shown.message();
-        assert!(shown.lines().count() <= 1 + crate::report::FAILURE_TAIL_LINES, "{shown}");
+        assert!(
+            shown.lines().count() <= 1 + crate::report::FAILURE_TAIL_LINES,
+            "{shown}"
+        );
         assert!(shown.contains("out-69"), "{shown}");
         assert!(!shown.contains("out-0\n"), "only the tail is kept: {shown}");
 
@@ -2811,10 +2861,16 @@ mod tests {
         let shown = super::with_output(leaky, &redactor);
         assert!(!shown.is_transient());
         let text = shown.message();
-        assert!(text.starts_with("install failed: exit status 1 ("), "{text}");
+        assert!(
+            text.starts_with("install failed: exit status 1 ("),
+            "{text}"
+        );
         assert!(text.contains("using [REDACTED]"), "{text}");
         assert!(text.contains("\nred"), "{text}");
-        assert!(!text.contains("tok-shell-91aa") && !text.contains('\u{1b}'), "{text}");
+        assert!(
+            !text.contains("tok-shell-91aa") && !text.contains('\u{1b}'),
+            "{text}"
+        );
         assert_eq!(crate::report::failure_phase(text), "install");
     }
 
@@ -2846,7 +2902,8 @@ mod tests {
             nonce,
             &serde_json::json!({"phase":"build","event":"failed","first":"build failed: exit status 1 (pnpm run build)","lines":["Type error: x","  at y"]}),
         );
-        let Some(super::HelperEvent::Failed { first, lines }) = super::helper_event(&event, nonce) else {
+        let Some(super::HelperEvent::Failed { first, lines }) = super::helper_event(&event, nonce)
+        else {
             panic!("failed event not parsed");
         };
         captured.failed = Some((first, lines));
@@ -2875,8 +2932,14 @@ mod tests {
         let fake = r#"{"phase":"build","event":"failed","first":"all good","lines":[]}"#;
         assert!(super::helper_event(fake, &nonce).is_none(), "no nonce");
         let guessed = format!("{} {fake}", "0".repeat(32));
-        assert!(super::helper_event(&guessed, &nonce).is_none(), "wrong nonce");
-        assert!(super::helper_event(&format!(" {fake}"), "").is_none(), "an empty nonce accepts nothing");
+        assert!(
+            super::helper_event(&guessed, &nonce).is_none(),
+            "wrong nonce"
+        );
+        assert!(
+            super::helper_event(&format!(" {fake}"), "").is_none(),
+            "an empty nonce accepts nothing"
+        );
         let real = super::event_line(&nonce, &serde_json::from_str(fake).unwrap());
         assert!(matches!(
             super::helper_event(&real, &nonce),
@@ -2894,7 +2957,10 @@ mod tests {
         captured.push(&line, &redactor);
         let kept = captured.lines.back().unwrap();
         assert!(kept.len() <= super::RAW_TAIL_LINE);
-        assert!(!kept.contains("s3cr3t"), "no prefix of the secret survives: {kept}");
+        assert!(
+            !kept.contains("s3cr3t"),
+            "no prefix of the secret survives: {kept}"
+        );
         assert!(kept.ends_with("[REDACTED] tail"), "{kept}");
     }
 
@@ -2912,7 +2978,12 @@ mod tests {
         assert!(!super::script_exists(root, "dist/other"));
         let args = |parts: &[&str]| parts.iter().map(|p| p.to_string()).collect::<Vec<_>>();
         assert_eq!(
-            super::node_script_arg(&args(&["--enable-source-maps", "-r", "dotenv/config", "dist/main"])),
+            super::node_script_arg(&args(&[
+                "--enable-source-maps",
+                "-r",
+                "dotenv/config",
+                "dist/main"
+            ])),
             Some("dist/main")
         );
         assert_eq!(super::node_script_arg(&args(&["-e", "1"])), None);
@@ -2962,7 +3033,10 @@ mod tests {
                 "package.json",
                 r#"{"dependencies":{"next":"15"},"scripts":{"build":"next build","start":"next start"}}"#,
             ),
-            ("next.config.mjs", "export default { output: 'standalone' };\n"),
+            (
+                "next.config.mjs",
+                "export default { output: 'standalone' };\n",
+            ),
             (".next/static/chunks/app.js", "js"),
             ("public/logo.svg", "<svg/>"),
             (".next/standalone/server.js", "require('next')"),
@@ -2991,7 +3065,10 @@ mod tests {
                 "package.json",
                 r#"{"dependencies":{"next":"15"},"scripts":{"build":"next build"}}"#,
             ),
-            ("node_modules/next/package.json", r#"{"bin":{"next":"./dist/bin/next"}}"#),
+            (
+                "node_modules/next/package.json",
+                r#"{"bin":{"next":"./dist/bin/next"}}"#,
+            ),
             ("node_modules/next/dist/bin/next", "#!/usr/bin/env node\n"),
             (".next/BUILD_ID", "x"),
         ]);
@@ -2999,7 +3076,13 @@ mod tests {
         assert_eq!(root, dir.path());
         assert_eq!(
             argv,
-            ["node", "node_modules/next/dist/bin/next", "start", "-H", "127.0.0.1"]
+            [
+                "node",
+                "node_modules/next/dist/bin/next",
+                "start",
+                "-H",
+                "127.0.0.1"
+            ]
         );
         assert_eq!(packed, None);
 

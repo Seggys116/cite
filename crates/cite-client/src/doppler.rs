@@ -165,7 +165,10 @@ mod tests {
         let req = request(Some(&value));
         req.validate().expect("valid");
         let shown = format!("{req:?}");
-        assert!(shown.contains("shop") && !shown.contains("secretvalue"), "{shown}");
+        assert!(
+            shown.contains("shop") && !shown.contains("secretvalue"),
+            "{shown}"
+        );
         let body = serde_json::to_value(&req).expect("json");
         assert_eq!(body["token"], value.as_str());
         let without = serde_json::to_value(request(None)).expect("json");
@@ -189,7 +192,8 @@ mod tests {
         assert!(req.token_only());
         req.validate().expect("token-only bind");
         req.token = None;
-        req.validate().expect("a stored service token is checked by the node");
+        req.validate()
+            .expect("a stored service token is checked by the node");
         req.token = Some(["dp.pt.", "personal"].concat());
         assert!(req.validate().is_err(), "a personal token names no config");
         let mut half = request(Some(&token));

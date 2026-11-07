@@ -150,9 +150,7 @@ impl Policy {
             egress_env: cfg.egress_env.clone(),
             container: stack("manager|executor|init|egress-proxy"),
             volume: stack("data|work|cache"),
-            site_volume: build(format!(
-                "^cite-vol-(?<id>{ID})_(?<name>{VOLUME_NAME})$"
-            )),
+            site_volume: build(format!("^cite-vol-(?<id>{ID})_(?<name>{VOLUME_NAME})$")),
             network: stack("net|xnet|egress"),
             manager_image: build(format!(
                 "^{reg}/(cite-manager:{VERSION}-node(22|24)|cite-manager-rust:{VERSION})$"

@@ -33,7 +33,11 @@ const RESERVED_V4: [([u8; 4], u8); 11] = [
 ];
 
 fn v4_in(ip: Ipv4Addr, net: [u8; 4], len: u8) -> bool {
-    let mask = if len == 0 { 0 } else { u32::MAX << (32 - u32::from(len)) };
+    let mask = if len == 0 {
+        0
+    } else {
+        u32::MAX << (32 - u32::from(len))
+    };
     u32::from(ip) & mask == u32::from(Ipv4Addr::from(net)) & mask
 }
 
@@ -48,7 +52,11 @@ pub fn classify_v4(ip: Ipv4Addr) -> Class {
 }
 
 fn v6_in(ip: Ipv6Addr, net: Ipv6Addr, len: u8) -> bool {
-    let mask = if len == 0 { 0 } else { u128::MAX << (128 - u32::from(len)) };
+    let mask = if len == 0 {
+        0
+    } else {
+        u128::MAX << (128 - u32::from(len))
+    };
     u128::from(ip) & mask == u128::from(net) & mask
 }
 
@@ -70,7 +78,12 @@ pub fn embedded_v4(ip: Ipv6Addr) -> Option<Ipv4Addr> {
         return Some(low_v4(ip));
     }
     if s[0] == 0x2002 {
-        return Some(Ipv4Addr::new((s[1] >> 8) as u8, s[1] as u8, (s[2] >> 8) as u8, s[2] as u8));
+        return Some(Ipv4Addr::new(
+            (s[1] >> 8) as u8,
+            s[1] as u8,
+            (s[2] >> 8) as u8,
+            s[2] as u8,
+        ));
     }
     None
 }
@@ -151,11 +164,19 @@ impl Cidr {
         };
         let net = match ip {
             IpAddr::V4(a) => {
-                let mask = if len == 0 { 0 } else { u32::MAX << (32 - u32::from(len)) };
+                let mask = if len == 0 {
+                    0
+                } else {
+                    u32::MAX << (32 - u32::from(len))
+                };
                 IpAddr::V4(Ipv4Addr::from(u32::from(a) & mask))
             }
             IpAddr::V6(a) => {
-                let mask = if len == 0 { 0 } else { u128::MAX << (128 - u32::from(len)) };
+                let mask = if len == 0 {
+                    0
+                } else {
+                    u128::MAX << (128 - u32::from(len))
+                };
                 IpAddr::V6(Ipv6Addr::from(u128::from(a) & mask))
             }
         };
@@ -187,7 +208,8 @@ pub fn parse_v4_strict(text: &str) -> Option<Ipv4Addr> {
     }
     let mut octets = [0u8; 4];
     for (slot, part) in octets.iter_mut().zip(&parts) {
-        let digits = !part.is_empty() && part.len() <= 3 && part.bytes().all(|b| b.is_ascii_digit());
+        let digits =
+            !part.is_empty() && part.len() <= 3 && part.bytes().all(|b| b.is_ascii_digit());
         if !digits || (part.len() > 1 && part.starts_with('0')) {
             return None;
         }
@@ -214,7 +236,10 @@ fn numeric_label(label: &str) -> bool {
 pub fn parse_host(text: &str) -> Option<Host> {
     if let Some(inner) = text.strip_prefix('[') {
         let inner = inner.strip_suffix(']')?;
-        return inner.parse::<Ipv6Addr>().ok().map(|a| Host::Ip(IpAddr::V6(a)));
+        return inner
+            .parse::<Ipv6Addr>()
+            .ok()
+            .map(|a| Host::Ip(IpAddr::V6(a)));
     }
     let lower = text.strip_suffix('.').unwrap_or(text).to_ascii_lowercase();
     if lower.is_empty() || lower.len() > 253 {
@@ -375,12 +400,27 @@ mod tests {
         ] {
             assert_eq!(parse_host(bad), None, "{bad:?}");
         }
-        assert_eq!(parse_host("127.0.0.1"), Some(Host::Ip("127.0.0.1".parse().unwrap())));
-        assert_eq!(parse_host("0.0.0.0"), Some(Host::Ip("0.0.0.0".parse().unwrap())));
+        assert_eq!(
+            parse_host("127.0.0.1"),
+            Some(Host::Ip("127.0.0.1".parse().unwrap()))
+        );
+        assert_eq!(
+            parse_host("0.0.0.0"),
+            Some(Host::Ip("0.0.0.0".parse().unwrap()))
+        );
         assert_eq!(parse_host("[::1]"), Some(Host::Ip("::1".parse().unwrap())));
-        assert_eq!(parse_host("Api.GitHub.com."), Some(Host::Name("api.github.com".into())));
-        assert_eq!(parse_host("1.2.3.4.nip.io"), Some(Host::Name("1.2.3.4.nip.io".into())));
-        assert_eq!(parse_host("_dmarc.example.com"), Some(Host::Name("_dmarc.example.com".into())));
+        assert_eq!(
+            parse_host("Api.GitHub.com."),
+            Some(Host::Name("api.github.com".into()))
+        );
+        assert_eq!(
+            parse_host("1.2.3.4.nip.io"),
+            Some(Host::Name("1.2.3.4.nip.io".into()))
+        );
+        assert_eq!(
+            parse_host("_dmarc.example.com"),
+            Some(Host::Name("_dmarc.example.com".into()))
+        );
     }
 
     #[test]
@@ -418,7 +458,10 @@ mod tests {
         let c = Cidr::parse("10.1.2.3/8").unwrap();
         assert!(c.contains("10.200.0.1".parse().unwrap()));
         assert!(!c.contains("11.0.0.1".parse().unwrap()));
-        assert!(c.contains("::ffff:10.0.0.9".parse().unwrap()), "mapped v6 matches v4 ranges");
+        assert!(
+            c.contains("::ffff:10.0.0.9".parse().unwrap()),
+            "mapped v6 matches v4 ranges"
+        );
         let one = Cidr::parse("192.168.1.20").unwrap();
         assert!(one.contains("192.168.1.20".parse().unwrap()));
         assert!(!one.contains("192.168.1.21".parse().unwrap()));

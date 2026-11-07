@@ -312,7 +312,13 @@ fn static_of(
     det
 }
 
-fn ssr_of(site: &Site, framework: &str, argv: Vec<String>, confidence: f32, cli: &str) -> Detection {
+fn ssr_of(
+    site: &Site,
+    framework: &str,
+    argv: Vec<String>,
+    confidence: f32,
+    cli: &str,
+) -> Detection {
     let mut det = Detection::blank(framework, Rendering::Ssr, confidence);
     det.start_bin = start_bin_for(&argv);
     det.start_argv = argv;
@@ -510,7 +516,9 @@ fn detect_next(site: &Site) -> Detection {
         .unwrap_or_else(|| ".next".into());
     let base_path = js_string(&text, "basePath").filter(|path| !path.is_empty());
     let exports = output.as_deref() == Some("export")
-        || site.script("build").is_some_and(|s| s.contains("next export"));
+        || site
+            .script("build")
+            .is_some_and(|s| s.contains("next export"));
     if exports {
         let alts: Vec<&str> = if dist == ".next" {
             Vec::new()
@@ -527,7 +535,13 @@ fn detect_next(site: &Site) -> Detection {
         return det;
     }
     let mut det = if output.as_deref() == Some("standalone") {
-        let mut det = ssr_of(site, "next", strings(&["node", "server.js"]), 0.9, "next build");
+        let mut det = ssr_of(
+            site,
+            "next",
+            strings(&["node", "server.js"]),
+            0.9,
+            "next build",
+        );
         det.ssr_root = Some(format!("{dist}/standalone"));
         det
     } else {
@@ -547,7 +561,10 @@ fn detect_next(site: &Site) -> Detection {
             det.note(note, 0.7);
         }
         if site.monorepo() {
-            det.note(monorepo_note("set output: 'standalone' in next.config"), 0.5);
+            det.note(
+                monorepo_note("set output: 'standalone' in next.config"),
+                0.5,
+            );
         }
         det
     };
@@ -633,7 +650,9 @@ fn detect_nuxt(site: &Site) -> Detection {
         "nuxt build",
     );
     det.ssr_root = Some(".output".into());
-    if let Some(preset) = preset.filter(|p| !matches!(p.as_str(), "node-server" | "node" | "node_server")) {
+    if let Some(preset) =
+        preset.filter(|p| !matches!(p.as_str(), "node-server" | "node" | "node_server"))
+    {
         det.note(
             format!("nitro preset `{preset}` may not build a Node server; Cite expects .output/server/index.mjs from the node-server preset"),
             0.5,
@@ -745,7 +764,10 @@ fn detect_react_router(site: &Site) -> Detection {
         "./build/server/index.js",
     ]);
     let mut det = framework_server(site, "react-router", default, "react-router build");
-    if det.start_bin.as_ref().is_some_and(|bin| bin.package == "@react-router/serve")
+    if det
+        .start_bin
+        .as_ref()
+        .is_some_and(|bin| bin.package == "@react-router/serve")
         && !site.has_prod("@react-router/serve")
     {
         det.note(
@@ -775,9 +797,16 @@ fn detect_remix(site: &Site) -> Detection {
         "node_modules/@remix-run/serve/dist/cli.js".into(),
         server,
     ];
-    let cli = if classic { "remix build" } else { "remix vite:build" };
+    let cli = if classic {
+        "remix build"
+    } else {
+        "remix vite:build"
+    };
     let mut det = framework_server(site, "remix", default, cli);
-    if det.start_bin.as_ref().is_some_and(|bin| bin.package == "@remix-run/serve")
+    if det
+        .start_bin
+        .as_ref()
+        .is_some_and(|bin| bin.package == "@remix-run/serve")
         && !site.has_prod("@remix-run/serve")
     {
         det.note(
@@ -829,16 +858,12 @@ fn detect_angular(site: &Site) -> Detection {
         .and_then(|p| p.browser.clone())
         .unwrap_or_else(|| "browser".into());
     if site.has("@angular/ssr") || site.has("@nguniversal/express-engine") {
-        let script = site
-            .pkg
-            .scripts
-            .as_object()
-            .and_then(|scripts| {
-                scripts
-                    .keys()
-                    .find(|key| key.starts_with("serve:ssr"))
-                    .cloned()
-            });
+        let script = site.pkg.scripts.as_object().and_then(|scripts| {
+            scripts
+                .keys()
+                .find(|key| key.starts_with("serve:ssr"))
+                .cloned()
+        });
         let mut notes = Vec::new();
         let argv = script
             .and_then(|key| script_argv(site, &key, &mut notes).ok())
@@ -986,7 +1011,10 @@ fn detect_node_server(site: &Site) -> Result<Option<Detection>> {
         det.note(note, 0.7);
     }
     if det.start_argv.first().is_some_and(|argv0| argv0 == "bun") {
-        det.note("this start command runs with Bun, so the site needs CITE_RUNTIME=bun", 0.7);
+        det.note(
+            "this start command runs with Bun, so the site needs CITE_RUNTIME=bun",
+            0.7,
+        );
     }
     if site.monorepo() {
         det.note(monorepo_note("bundle dependencies into the build"), 0.6);
@@ -1235,11 +1263,18 @@ fn resolve_pm(
         });
     let field = field_text.as_deref().and_then(|field| {
         let (name, version) = field.split_once('@').unwrap_or((field, ""));
-        matches!(name, "pnpm" | "bun" | "npm" | "yarn").then(|| (name.to_string(), version.to_string()))
+        matches!(name, "pnpm" | "bun" | "npm" | "yarn")
+            .then(|| (name.to_string(), version.to_string()))
     });
     let lock_dir = dirs().find(|d| LOCKFILES.iter().any(|name| d.exists(name)));
     let locks: Vec<&'static str> = lock_dir
-        .map(|d| LOCKFILES.iter().copied().filter(|name| d.exists(name)).collect())
+        .map(|d| {
+            LOCKFILES
+                .iter()
+                .copied()
+                .filter(|name| d.exists(name))
+                .collect()
+        })
         .unwrap_or_default();
     let (name, reason) = if let Some(name) = explicit.filter(|name| *name != "auto") {
         (name.to_string(), "CITE_PACKAGE_MANAGER")
@@ -1263,7 +1298,9 @@ fn resolve_pm(
     let field_major = field
         .as_ref()
         .and_then(|(_, version)| leading_major(version));
-    let field_berry = field.as_ref().is_some_and(|(field_name, _)| field_name == "yarn")
+    let field_berry = field
+        .as_ref()
+        .is_some_and(|(field_name, _)| field_name == "yarn")
         && field_major
             .as_deref()
             .is_some_and(|major| major != "1" && major != "0");
@@ -1271,10 +1308,17 @@ fn resolve_pm(
     let linker = yarnrc
         .as_deref()
         .and_then(|text| yaml_value(text, "nodeLinker"));
-    let pnp = name == "yarn" && berry && !matches!(linker.as_deref(), Some("node-modules" | "pnpm"));
+    let pnp =
+        name == "yarn" && berry && !matches!(linker.as_deref(), Some("node-modules" | "pnpm"));
     let mut notes = Vec::new();
-    let pinned = field.as_ref().is_some_and(|(field_name, _)| *field_name == name);
-    if name == "yarn" && berry && !pinned && !yarnrc.as_deref().is_some_and(|t| t.contains("yarnPath")) {
+    let pinned = field
+        .as_ref()
+        .is_some_and(|(field_name, _)| *field_name == name);
+    if name == "yarn"
+        && berry
+        && !pinned
+        && !yarnrc.as_deref().is_some_and(|t| t.contains("yarnPath"))
+    {
         notes.push(
             "the Yarn 2+ lockfile has no packageManager field to pin Yarn; add \"packageManager\": \"yarn@<version>\" so Corepack runs the right Yarn"
                 .into(),

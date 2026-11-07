@@ -432,7 +432,10 @@ async fn try_activate_slot(
                 error!(error = %err, "failed to start SSR child");
                 state
                     .slot_mgr
-                    .note_start_failure(slot, format!("the server process could not be started: {err}"))
+                    .note_start_failure(
+                        slot,
+                        format!("the server process could not be started: {err}"),
+                    )
                     .await;
                 park_stopped(state, slot, blue, green).await;
                 return false;

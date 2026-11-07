@@ -200,8 +200,16 @@ mod tests {
             let json = format!(r#"{{"{name}":"v"}}"#);
             assert!(UserEnv::from_json(&json).is_err(), "{name} was accepted");
         }
-        for lower in ["http_proxy", "https_proxy", "no_proxy", "node_use_env_proxy"] {
-            assert!(UserEnv::from_json(&format!(r#"{{"{lower}":"v"}}"#)).is_err(), "{lower}");
+        for lower in [
+            "http_proxy",
+            "https_proxy",
+            "no_proxy",
+            "node_use_env_proxy",
+        ] {
+            assert!(
+                UserEnv::from_json(&format!(r#"{{"{lower}":"v"}}"#)).is_err(),
+                "{lower}"
+            );
         }
         assert!(name_denied("http_proxy"));
         assert!(name_denied("npm_config_registry"));

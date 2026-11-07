@@ -440,16 +440,8 @@ impl Console {
             FIELD_MIN,
             vec![
                 cell("Recent events", "Kept in memory", &s.recent),
-                cell(
-                    "Minute buckets (hours)",
-                    "Fine-grained history",
-                    &s.minutes,
-                ),
-                cell(
-                    "Audit log (days)",
-                    "How long changes are kept",
-                    &s.audit,
-                ),
+                cell("Minute buckets (hours)", "Fine-grained history", &s.minutes),
+                cell("Audit log (days)", "How long changes are kept", &s.audit),
                 cell(
                     "Persist interval (s)",
                     "How often stats hit disk",

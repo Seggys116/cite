@@ -10,9 +10,9 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use cite_client::{
     AnalyticsQuery, ArchiveKind, BlockedFilter, CertificateUpload, ClientError, CutRequest,
-    DopplerBindRequest, EnvPatch, ExportFormat, ExportKind, ExportQuery, FirewallBulk, GithubTokenBody, LogsQuery,
-    MAX_PEM_BYTES, NodeClient, NodeConfig, NodeTargets, ReplicationMode, ReplicationPlan,
-    RequestCursor, TopSort, apply_site_to_nodes, fan_out,
+    DopplerBindRequest, EnvPatch, ExportFormat, ExportKind, ExportQuery, FirewallBulk,
+    GithubTokenBody, LogsQuery, MAX_PEM_BYTES, NodeClient, NodeConfig, NodeTargets,
+    ReplicationMode, ReplicationPlan, RequestCursor, TopSort, apply_site_to_nodes, fan_out,
 };
 use cite_edge::analytics::Summary;
 use cite_edge::model::{
@@ -873,10 +873,9 @@ fn node_info_decodes_the_egress_mode_when_present() {
     let old: cite_client::NodeInfo =
         serde_json::from_value(json!({ "executor_egress": true })).expect("old node");
     assert_eq!((old.executor_egress, old.egress_mode), (Some(true), None));
-    let new: cite_client::NodeInfo = serde_json::from_value(
-        json!({ "executor_egress": true, "egress_mode": "filtered" }),
-    )
-    .expect("new node");
+    let new: cite_client::NodeInfo =
+        serde_json::from_value(json!({ "executor_egress": true, "egress_mode": "filtered" }))
+            .expect("new node");
     assert_eq!(new.egress_mode.as_deref(), Some("filtered"));
     assert!(!new.extra.contains_key("egress_mode"));
 }
@@ -888,7 +887,10 @@ fn outbound_rules_default_and_round_trip_on_the_site() {
     assert!(rules.allow.is_empty() && rules.deny.is_empty() && rules.block_mail);
     let mut s = site("shop");
     let text = serde_json::to_value(&s).unwrap();
-    assert!(text.get("outbound_rules").is_none(), "the default is left out");
+    assert!(
+        text.get("outbound_rules").is_none(),
+        "the default is left out"
+    );
     s.outbound_rules = cite_client::OutboundRules {
         mode: cite_client::OutboundMode::Allowlist,
         allow: vec!["api.github.com".into()],
@@ -1633,7 +1635,10 @@ async fn doppler_calls_send_the_documented_bodies_and_validate_first() {
     let c = client("n1", &url, "cite_good");
     let projects = c.doppler_projects().await.expect("projects");
     assert_eq!(projects.len(), 2);
-    assert_eq!((projects[0].slug.as_str(), projects[0].name.as_str()), ("shop", "Shop"));
+    assert_eq!(
+        (projects[0].slug.as_str(), projects[0].name.as_str()),
+        ("shop", "Shop")
+    );
     assert_eq!(projects[1].name, "", "a missing name decodes as empty");
     let configs = c.doppler_configs("shop.web").await.expect("configs");
     assert_eq!(configs[0].name, "prd");

@@ -124,8 +124,8 @@ impl Console {
     ) -> AnyElement {
         let mut items = Vec::new();
         for tab in tabs.iter().copied() {
-            let mut item = tab_item(id("site-tab", tab.key()), tab.label(source), tab == current)
-                .gap(px(6.));
+            let mut item =
+                tab_item(id("site-tab", tab.key()), tab.label(source), tab == current).gap(px(6.));
             if unsaved && tab.has_form() {
                 item = item.child(div().size(px(6.)).rounded_full().bg(c(ACCENT)));
             }
@@ -177,7 +177,10 @@ mod tests {
             volumes: true,
         });
         let at = |t| order.iter().position(|x| *x == t).unwrap();
-        assert!(at(SiteTab::Environment) < at(SiteTab::Volumes) && at(SiteTab::Volumes) < at(SiteTab::Logs));
+        assert!(
+            at(SiteTab::Environment) < at(SiteTab::Volumes)
+                && at(SiteTab::Volumes) < at(SiteTab::Logs)
+        );
         assert_eq!(SiteTab::Build.label(false), "Health check");
         assert_eq!(SiteTab::Build.label(true), "Build");
     }

@@ -1185,10 +1185,21 @@ fn executor_with_runtime_json(text: &str) -> (usize, Result<(), String>) {
         .unwrap()
         .iter()
         .filter(|e| {
-            let k = e.as_str().unwrap_or("").split('=').next().unwrap_or("").to_string();
+            let k = e
+                .as_str()
+                .unwrap_or("")
+                .split('=')
+                .next()
+                .unwrap_or("")
+                .to_string();
             matches!(
                 k.as_str(),
-                "HTTP_PROXY" | "HTTPS_PROXY" | "http_proxy" | "https_proxy" | "NO_PROXY" | "NODE_USE_ENV_PROXY"
+                "HTTP_PROXY"
+                    | "HTTPS_PROXY"
+                    | "http_proxy"
+                    | "https_proxy"
+                    | "NO_PROXY"
+                    | "NODE_USE_ENV_PROXY"
             )
         })
         .cloned()

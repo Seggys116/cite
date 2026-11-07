@@ -109,7 +109,10 @@ pub fn summary(on: bool, r: &OutboundRules) -> String {
         if r.allow.is_empty() {
             "Only allow-listed destinations are reachable, and none is listed yet.".to_string()
         } else {
-            format!("Only these destinations are reachable: {}.", r.allow.join(", "))
+            format!(
+                "Only these destinations are reachable: {}.",
+                r.allow.join(", ")
+            )
         }
     } else {
         let mut t = "Public internet allowed. Blocked: private networks, Docker, this host, cloud metadata."
@@ -120,7 +123,11 @@ pub fn summary(on: bool, r: &OutboundRules) -> String {
         t
     };
     if !r.deny.is_empty() {
-        let lead = if is_allowlist(r) { "Always blocked" } else { "Also blocked" };
+        let lead = if is_allowlist(r) {
+            "Always blocked"
+        } else {
+            "Also blocked"
+        };
         text.push_str(&format!(" {lead}: {}.", r.deny.join(", ")));
     }
     if r.block_mail {
@@ -206,9 +213,17 @@ impl Console {
             return;
         };
         let state = &self.ops.volumes.outbound;
-        let input = if deny { state.deny_in.clone() } else { state.allow_in.clone() };
+        let input = if deny {
+            state.deny_in.clone()
+        } else {
+            state.allow_in.clone()
+        };
         let text = input.read(cx).text().to_string();
-        let list = if deny { &mut rules.deny } else { &mut rules.allow };
+        let list = if deny {
+            &mut rules.deny
+        } else {
+            &mut rules.allow
+        };
         match add_entry(&text, list.as_slice()) {
             Ok(entry) => {
                 list.push(entry);
@@ -240,7 +255,10 @@ impl Console {
                 "Always allow",
                 "Reachable even when the address is private, such as a database on your network.",
             ),
-            (false, true) => ("Allowed destinations", "The only addresses and hosts this site can reach."),
+            (false, true) => (
+                "Allowed destinations",
+                "The only addresses and hosts this site can reach.",
+            ),
             (true, _) => ("Always block", "Refused even when allowed above."),
         };
         let prefix = if deny { "ob-deny-rm" } else { "ob-allow-rm" };
@@ -278,7 +296,11 @@ impl Console {
             );
         }
         let state = &self.ops.volumes.outbound;
-        let input = if deny { state.deny_in.clone() } else { state.allow_in.clone() };
+        let input = if deny {
+            state.deny_in.clone()
+        } else {
+            state.allow_in.clone()
+        };
         let add = if busy {
             btn_off("Add").into_any_element()
         } else {
@@ -373,12 +395,11 @@ impl Console {
                 .child(self.outbound_list(false, &rules.allow, allowlist, busy, cx))
                 .child(self.outbound_list(true, &rules.deny, allowlist, busy, cx))
                 .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(10.))
-                        .child(mail)
-                        .child(div().text_size(px(12.)).child("Block mail ports (25, 465, 587)")),
+                    div().flex().items_center().gap(px(10.)).child(mail).child(
+                        div()
+                            .text_size(px(12.))
+                            .child("Block mail ports (25, 465, 587)"),
+                    ),
                 );
             if let Some(e) = &state.error {
                 body = body.child(
@@ -406,7 +427,11 @@ mod tests {
 
     fn rules(mode: &str, allow: &[&str], deny: &[&str], mail: bool) -> OutboundRules {
         OutboundRules {
-            mode: if mode == "allowlist" { OutboundMode::Allowlist } else { OutboundMode::Public },
+            mode: if mode == "allowlist" {
+                OutboundMode::Allowlist
+            } else {
+                OutboundMode::Public
+            },
             allow: allow.iter().map(|s| s.to_string()).collect(),
             deny: deny.iter().map(|s| s.to_string()).collect(),
             block_mail: mail,
@@ -432,9 +457,27 @@ mod tests {
             assert_eq!(normalize_entry(typed).as_deref(), Ok(want), "{typed}");
         }
         for bad in [
-            "", "  ", "10.0.0.0/33", "10.0.0.0/x", "300.1.1.1", "1.2.3", "fd00::/129", "a b.com",
-            "*", "*.", ".", "a..b.com", "-bad.com", "bad-.com", "http://x.com", "ex*ample.com",
-            "010.0.0.1", "10.0.0.0/08", "example.123", "example.0x1f", "*.10.0.0.1",
+            "",
+            "  ",
+            "10.0.0.0/33",
+            "10.0.0.0/x",
+            "300.1.1.1",
+            "1.2.3",
+            "fd00::/129",
+            "a b.com",
+            "*",
+            "*.",
+            ".",
+            "a..b.com",
+            "-bad.com",
+            "bad-.com",
+            "http://x.com",
+            "ex*ample.com",
+            "010.0.0.1",
+            "10.0.0.0/08",
+            "example.123",
+            "example.0x1f",
+            "*.10.0.0.1",
         ] {
             assert!(normalize_entry(bad).is_err(), "{bad:?}");
         }
@@ -446,14 +489,28 @@ mod tests {
     #[test]
     fn a_refused_entry_says_what_kind_it_was_read_as() {
         assert!(normalize_entry("10.0.0.0/33").unwrap_err().contains("CIDR"));
-        assert!(normalize_entry("300.1.1.1").unwrap_err().contains("IP address"));
+        assert!(
+            normalize_entry("300.1.1.1")
+                .unwrap_err()
+                .contains("IP address")
+        );
         assert!(normalize_entry("*.").unwrap_err().contains("1 to 253"));
-        assert!(normalize_entry("example.123").unwrap_err().contains("host name"));
+        assert!(
+            normalize_entry("example.123")
+                .unwrap_err()
+                .contains("host name")
+        );
     }
 
     #[test]
     fn accepted_entries_pass_the_nodes_own_check() {
-        for typed in ["API.GitHub.com", "*.apple.com", "fd00:0::/64", "192.168.1.20", "a_b.c-d"] {
+        for typed in [
+            "API.GitHub.com",
+            "*.apple.com",
+            "fd00:0::/64",
+            "192.168.1.20",
+            "a_b.c-d",
+        ] {
             let entry = normalize_entry(typed).unwrap();
             assert!(is_egress_cidr(&entry) || is_egress_host(&entry), "{entry}");
         }
@@ -462,19 +519,36 @@ mod tests {
     #[test]
     fn lists_refuse_duplicates_and_stay_within_64() {
         let list = vec!["api.github.com".to_string()];
-        assert!(add_entry("API.github.com", &list).unwrap_err().contains("already listed"));
+        assert!(
+            add_entry("API.github.com", &list)
+                .unwrap_err()
+                .contains("already listed")
+        );
         assert_eq!(add_entry("*.apple.com", &list).as_deref(), Ok(".apple.com"));
-        let full: Vec<String> = (0..MAX_ENTRIES).map(|i| format!("h{i}.example.com")).collect();
-        assert!(add_entry("extra.example.com", &full).unwrap_err().contains("64"));
+        let full: Vec<String> = (0..MAX_ENTRIES)
+            .map(|i| format!("h{i}.example.com"))
+            .collect();
+        assert!(
+            add_entry("extra.example.com", &full)
+                .unwrap_err()
+                .contains("64")
+        );
         assert!(add_entry("extra.example.com", &full[..MAX_ENTRIES - 1]).is_ok());
     }
 
     #[test]
     fn the_mode_decides_what_must_be_listed() {
         assert_eq!(rules_problem(&OutboundRules::default()), None);
-        assert!(rules_problem(&rules("allowlist", &[], &[], true)).unwrap().contains("at least one"));
+        assert!(
+            rules_problem(&rules("allowlist", &[], &[], true))
+                .unwrap()
+                .contains("at least one")
+        );
         assert!(rules_problem(&rules("allowlist", &[], &["x.com"], true)).is_some());
-        assert_eq!(rules_problem(&rules("allowlist", &["api.github.com"], &[], true)), None);
+        assert_eq!(
+            rules_problem(&rules("allowlist", &["api.github.com"], &[], true)),
+            None
+        );
         assert_eq!(rules_problem(&rules("public", &[], &[], false)), None);
     }
 
@@ -485,9 +559,17 @@ mod tests {
             summary(true, &public),
             "Public internet allowed. Blocked: private networks, Docker, this host, cloud metadata. Also allowed: 192.168.1.20/32. Also blocked: ads.example.com."
         );
-        assert!(summary(true, &rules("public", &[], &[], true)).ends_with("Mail ports 25, 465 and 587 are blocked."));
+        assert!(
+            summary(true, &rules("public", &[], &[], true))
+                .ends_with("Mail ports 25, 465 and 587 are blocked.")
+        );
         assert_eq!(summary(false, &public), "Outbound requests are blocked.");
-        let only = rules("allowlist", &["api.github.com", ".apple.com"], &["bad.apple.com"], false);
+        let only = rules(
+            "allowlist",
+            &["api.github.com", ".apple.com"],
+            &["bad.apple.com"],
+            false,
+        );
         assert_eq!(
             summary(true, &only),
             "Only these destinations are reachable: api.github.com, .apple.com. Always blocked: bad.apple.com."

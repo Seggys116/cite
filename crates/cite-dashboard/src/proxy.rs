@@ -803,10 +803,7 @@ mod tests {
             body_limit_for(&Method::POST, "sites/a/doppler/sync"),
             MAX_TOKEN_BODY
         );
-        assert_eq!(
-            timeout_for(&Method::PUT, "sites/a/doppler"),
-            PROXY_TIMEOUT
-        );
+        assert_eq!(timeout_for(&Method::PUT, "sites/a/doppler"), PROXY_TIMEOUT);
     }
 
     #[test]

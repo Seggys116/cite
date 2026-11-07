@@ -30,7 +30,16 @@ fn volume_names_follow_the_slug_rule() {
     for ok in ["a", "data", "uploads-2", "0", &"a".repeat(31)] {
         assert!(is_valid_volume_name(ok), "{ok}");
     }
-    for bad in ["", "-a", "Data", "a_b", "a.b", "a/b", "a b", &"a".repeat(32)] {
+    for bad in [
+        "",
+        "-a",
+        "Data",
+        "a_b",
+        "a.b",
+        "a/b",
+        "a b",
+        &"a".repeat(32),
+    ] {
         assert!(!is_valid_volume_name(bad), "{bad}");
     }
 }
@@ -180,7 +189,10 @@ fn volumes_round_trip_and_stay_out_of_the_json_when_empty() {
 #[test]
 fn outbound_defaults_to_on_for_old_sites_and_is_always_written() {
     let old = node(&[]);
-    assert!(old.outbound, "a site saved before the field gets outbound access");
+    assert!(
+        old.outbound,
+        "a site saved before the field gets outbound access"
+    );
     let text = serde_json::to_value(&old).unwrap();
     assert_eq!(text["outbound"], true);
     let mut closed = old.clone();
@@ -195,5 +207,8 @@ fn outbound_defaults_to_on_for_old_sites_and_is_always_written() {
 #[test]
 fn docker_names_cannot_collide_between_sites() {
     assert_eq!(volume_docker_name("shop", "data"), "cite-vol-shop_data");
-    assert_ne!(volume_docker_name("a", "b-c"), volume_docker_name("a-b", "c"));
+    assert_ne!(
+        volume_docker_name("a", "b-c"),
+        volume_docker_name("a-b", "c")
+    );
 }
