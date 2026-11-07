@@ -462,6 +462,7 @@ mod tests {
             access: Default::default(),
             volumes: Vec::new(),
             outbound: true,
+            outbound_rules: Default::default(),
         }
     }
 

@@ -79,10 +79,63 @@ pub struct Site {
     /// Lets a server runtime make outbound requests; sites saved before the field existed get it switched on.
     #[serde(default = "default_true")]
     pub outbound: bool,
+    /// Where an outbound site may connect when the node filters egress; omitted while it is the default.
+    #[serde(default, skip_serializing_if = "OutboundRules::is_default")]
+    pub outbound_rules: OutboundRules,
 }
 
 fn default_true() -> bool {
     true
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OutboundMode {
+    /// The public internet, plus private destinations named in `allow`.
+    #[default]
+    Public,
+    /// Only destinations named in `allow`.
+    Allowlist,
+}
+
+impl OutboundMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OutboundMode::Public => "public",
+            OutboundMode::Allowlist => "allowlist",
+        }
+    }
+}
+
+/// Per-site egress rules the stack's egress proxy enforces; entries are IPs, CIDRs or host names (a leading dot adds subdomains).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutboundRules {
+    #[serde(default)]
+    pub mode: OutboundMode,
+    #[serde(default)]
+    pub allow: Vec<String>,
+    #[serde(default)]
+    pub deny: Vec<String>,
+    #[serde(default = "default_true")]
+    pub block_mail: bool,
+}
+
+impl Default for OutboundRules {
+    fn default() -> Self {
+        OutboundRules {
+            mode: OutboundMode::Public,
+            allow: Vec::new(),
+            deny: Vec::new(),
+            block_mail: true,
+        }
+    }
+}
+
+impl OutboundRules {
+    pub fn is_default(&self) -> bool {
+        *self == OutboundRules::default()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

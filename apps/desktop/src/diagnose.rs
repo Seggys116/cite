@@ -300,6 +300,7 @@ mod tests {
             access: SiteAccess::default(),
             volumes: Vec::new(),
             outbound: true,
+            outbound_rules: Default::default(),
         }
     }
 

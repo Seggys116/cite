@@ -98,6 +98,9 @@ pub struct NodeInfo {
     /// Whether site executors may make outbound requests; absent on connectors that predate the setting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executor_egress: Option<bool>,
+    /// "filtered", "open" or "off"; absent on connectors that predate egress modes or run without an orchestrator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress_mode: Option<String>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }

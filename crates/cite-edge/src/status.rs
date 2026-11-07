@@ -162,7 +162,8 @@ const REDACTED: &str = "<redacted>";
 pub const MAX_ENV_KEYS: usize = 128;
 pub const MAX_ENV_BYTES: usize = 24 * 1024;
 const MAX_ENV_VALUE: usize = 4096;
-const DENIED_ENV: [&str; 16] = [
+// Lowercase proxy names cannot pass the uppercase name rule, so only the uppercase forms are listed.
+const DENIED_ENV: [&str; 17] = [
     "LD_PRELOAD",
     "LD_LIBRARY_PATH",
     "LD_AUDIT",
@@ -179,6 +180,7 @@ const DENIED_ENV: [&str; 16] = [
     "ALL_PROXY",
     "PNPM_HOME",
     "NPM_CONFIG_PREFIX",
+    "NODE_USE_ENV_PROXY",
 ];
 const DENIED_ENV_PREFIXES: [&str; 4] = ["XDG_", "GIT_", "NPM_CONFIG_", "CITE_"];
 // The manager refuses these build names at startup, so they must never be stored; keep in step with cite-core RESERVED_BUILD_KEYS.

@@ -259,6 +259,7 @@ pub(super) async fn node(State(st): State<AppState>) -> ApiResult<Response> {
         },
         "capabilities": site_ops::capabilities(st.orchestrator.is_some()),
         "executor_egress": st.orchestrator.as_ref().is_some_and(|o| o.executor_egress()),
+        "egress_mode": st.orchestrator.as_ref().map(|o| o.egress_mode().as_str()),
         "analytics": analytics,
     }))
     .into_response())

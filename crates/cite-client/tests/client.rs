@@ -822,6 +822,7 @@ fn site(id: &str) -> Site {
         access: Default::default(),
         volumes: Vec::new(),
         outbound: true,
+        outbound_rules: Default::default(),
     }
 }
 
@@ -865,6 +866,39 @@ fn node_info_decodes_with_and_without_the_github_status() {
     let partial: cite_client::NodeInfo =
         serde_json::from_value(json!({ "github": {} })).expect("partial");
     assert!(!partial.github.expect("status").token_configured);
+}
+
+#[test]
+fn node_info_decodes_the_egress_mode_when_present() {
+    let old: cite_client::NodeInfo =
+        serde_json::from_value(json!({ "executor_egress": true })).expect("old node");
+    assert_eq!((old.executor_egress, old.egress_mode), (Some(true), None));
+    let new: cite_client::NodeInfo = serde_json::from_value(
+        json!({ "executor_egress": true, "egress_mode": "filtered" }),
+    )
+    .expect("new node");
+    assert_eq!(new.egress_mode.as_deref(), Some("filtered"));
+    assert!(!new.extra.contains_key("egress_mode"));
+}
+
+#[test]
+fn outbound_rules_default_and_round_trip_on_the_site() {
+    let rules = cite_client::OutboundRules::default();
+    assert_eq!(rules.mode, cite_client::OutboundMode::Public);
+    assert!(rules.allow.is_empty() && rules.deny.is_empty() && rules.block_mail);
+    let mut s = site("shop");
+    let text = serde_json::to_value(&s).unwrap();
+    assert!(text.get("outbound_rules").is_none(), "the default is left out");
+    s.outbound_rules = cite_client::OutboundRules {
+        mode: cite_client::OutboundMode::Allowlist,
+        allow: vec!["api.github.com".into()],
+        deny: Vec::new(),
+        block_mail: false,
+    };
+    let text = serde_json::to_value(&s).unwrap();
+    assert_eq!(text["outbound_rules"]["mode"], "allowlist");
+    let back: Site = serde_json::from_value(text).unwrap();
+    assert_eq!(back, s);
 }
 
 // Built at run time so the fake login does not look like a hard-coded credential.

@@ -89,6 +89,7 @@ async fn load_extras(h: NodeHandle, site: String, has_source: bool) -> Result<Lo
         .and_then(|i| i.github.as_ref())
         .and_then(|g| g.api_host.clone());
     let executor_egress = info.as_ref().and_then(|i| i.executor_egress);
+    let egress_mode = info.as_ref().and_then(|i| i.egress_mode.clone());
     let dp_offered = has_source && h.offers_doppler(&caps);
     let dp_node = h.doppler_node(info);
     let want = |cap: &str| has_source && has_cap(&caps, cap);
@@ -141,6 +142,7 @@ async fn load_extras(h: NodeHandle, site: String, has_source: bool) -> Result<Lo
             caps,
             api_host,
             executor_egress,
+            egress_mode,
             status,
             status_error,
             token,

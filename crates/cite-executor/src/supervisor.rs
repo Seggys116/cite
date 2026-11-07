@@ -27,6 +27,15 @@ const LOG_LINE_MAX: usize = 1024;
 const SHIM_READ_MAX: u64 = 16 * 1024;
 /// Bind-address variables frameworks read; forced to loopback so children stay behind the executor.
 const LOOPBACK_HOST_VARS: [&str; 3] = ["HOST", "HOSTNAME", "NITRO_HOST"];
+/// Set on the executor by the connector in filtered egress mode; passed to the child last so nothing overrides them.
+const EGRESS_PROXY_VARS: [&str; 6] = [
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "NO_PROXY",
+    "NODE_USE_ENV_PROXY",
+];
 
 #[derive(Clone)]
 pub struct SlotManager {
@@ -246,6 +255,11 @@ impl SlotManager {
         }
         for name in LOOPBACK_HOST_VARS {
             cmd.env(name, "127.0.0.1");
+        }
+        for name in EGRESS_PROXY_VARS {
+            if let Some(value) = std::env::var_os(name) {
+                cmd.env(name, value);
+            }
         }
 
         let mut child = cmd.spawn()?;

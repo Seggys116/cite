@@ -1,6 +1,6 @@
 use serde_json::{Map, Value, json};
 
-use crate::config::{MIN_STACK_MEMORY, MIN_STACK_NANO_CPUS};
+use crate::config::{EgressMode, MIN_STACK_MEMORY, MIN_STACK_NANO_CPUS};
 use crate::envval;
 use crate::policy::{Policy, Stack};
 
@@ -77,7 +77,7 @@ fn site_mounts(
     host: &Map<String, Value>,
 ) -> Result<Vec<(String, String)>, String> {
     let fixed = match role {
-        Role::Manager => return Ok(Vec::new()),
+        Role::Manager | Role::EgressProxy => return Ok(Vec::new()),
         Role::Executor => 3,
         Role::Init => 1,
     };
@@ -119,21 +119,68 @@ fn site_mounts(
     Ok(out)
 }
 
-// The executor may add its own stack's egress network to the internal one, and only when the operator allows it.
-fn executor_egress(policy: &Policy, role: Role, c: &Stack, body: &Value) -> Result<bool, String> {
-    let own = format!("cite-{}-{}-egress", c.id, c.slot);
-    let asks = body["NetworkingConfig"]["EndpointsConfig"]
-        .as_object()
-        .is_some_and(|e| e.contains_key(&own));
-    if !asks || role != Role::Executor {
-        return Ok(false);
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Outbound {
+    None,
+    // The stack's egress bridge, joined directly (CITE_STACK_EGRESS_MODE=open).
+    Open,
+    // The stack's internal xnet, shared only with its egress proxy (CITE_STACK_EGRESS_MODE=filtered).
+    Filtered,
+}
+
+// The executor may add one of its own stack's outbound networks, and only the one the node's egress mode names.
+fn executor_outbound(policy: &Policy, role: Role, c: &Stack, body: &Value) -> Result<Outbound, String> {
+    let endpoints = body["NetworkingConfig"]["EndpointsConfig"].as_object();
+    let asks = |kind: &str| {
+        endpoints.is_some_and(|e| e.contains_key(&format!("cite-{}-{}-{kind}", c.id, c.slot)))
+    };
+    if role != Role::Executor {
+        return Ok(Outbound::None);
     }
-    if !policy.executor_egress {
-        return Err(
-            "executor egress is disabled on this node (CITE_STACK_EXECUTOR_EGRESS=false)".to_string(),
-        );
+    let mode = policy.egress_mode;
+    match (asks("egress"), asks("xnet")) {
+        (false, false) => Ok(Outbound::None),
+        (true, false) if mode == EgressMode::Open => Ok(Outbound::Open),
+        (false, true) if mode == EgressMode::Filtered => Ok(Outbound::Filtered),
+        (true, true) => Err("the executor may join only one outbound network".to_string()),
+        _ => Err(format!(
+            "this executor's outbound network does not match the node's egress mode (CITE_STACK_EGRESS_MODE={})",
+            match mode {
+                EgressMode::Filtered => "filtered",
+                EgressMode::Open => "open",
+                EgressMode::Off => "off",
+            }
+        )),
     }
-    Ok(true)
+}
+
+/// The address every filtered executor's proxy variables point at.
+fn egress_proxy_url(c: &Stack) -> String {
+    format!("http://cite-{}-{}-egress-proxy:3128", c.id, c.slot)
+}
+
+const EXECUTOR_PROXY_KEYS: [&str; 6] = [
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "NO_PROXY",
+    "NODE_USE_ENV_PROXY",
+];
+
+// A filtered executor carries every proxy variable, any other executor none of them.
+fn check_executor_proxy_env(env: &Value, outbound: Outbound) -> Result<(), String> {
+    let keys: Vec<&str> = env
+        .as_array()
+        .map(|a| a.iter().filter_map(Value::as_str).map(|e| e.split('=').next().unwrap_or_default()).collect())
+        .unwrap_or_default();
+    let present = EXECUTOR_PROXY_KEYS.iter().filter(|k| keys.contains(k)).count();
+    match (outbound, present) {
+        (Outbound::Filtered, n) if n == EXECUTOR_PROXY_KEYS.len() => Ok(()),
+        (Outbound::Filtered, _) => Err("a filtered executor needs every egress proxy variable".to_string()),
+        (_, 0) => Ok(()),
+        _ => Err("egress proxy variables are only allowed on a filtered executor".to_string()),
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -141,7 +188,13 @@ enum Role {
     Manager,
     Executor,
     Init,
+    EgressProxy,
 }
+
+// Fixed limits for the egress proxy; the connector's EGRESS_PROXY_* constants must match.
+const EGRESS_PROXY_MEMORY: i64 = 64 * MIB;
+const EGRESS_PROXY_NANO_CPUS: i64 = 250_000_000;
+const EGRESS_PROXY_PIDS: i64 = 128;
 
 struct Limits {
     memory: i64,
@@ -171,7 +224,26 @@ enum EnvRule {
     // Both forge keys are tied to the operator's own setting, so a manager cannot point a token at another host.
     Forge,
     ForgeApi,
+    // The stack's own egress proxy address, rebuilt from the container name.
+    EgressProxyUrl,
+    // A node-wide egress list: exactly the operator's value for this key.
+    NodeEgress(&'static str),
+    // A site's allow or deny list of CIDRs and host names.
+    EgressRules,
 }
+
+const OUTBOUND_MODES: &[&str] = &["public", "allowlist"];
+
+const EGRESS_ENV: [(&str, EnvRule); 8] = [
+    ("CITE_EGRESS_ALLOW_CIDRS", EnvRule::NodeEgress("CITE_EGRESS_ALLOW_CIDRS")),
+    ("CITE_EGRESS_DENY_CIDRS", EnvRule::NodeEgress("CITE_EGRESS_DENY_CIDRS")),
+    ("CITE_EGRESS_DENY_HOSTS", EnvRule::NodeEgress("CITE_EGRESS_DENY_HOSTS")),
+    ("CITE_EGRESS_ALLOW_PORTS", EnvRule::NodeEgress("CITE_EGRESS_ALLOW_PORTS")),
+    ("CITE_EGRESS_MODE", EnvRule::Enum(OUTBOUND_MODES)),
+    ("CITE_EGRESS_BLOCK_MAIL", EnvRule::Bool),
+    ("CITE_EGRESS_ALLOW", EnvRule::EgressRules),
+    ("CITE_EGRESS_DENY", EnvRule::EgressRules),
+];
 
 const PACKAGE_MANAGERS: &[&str] = &["npm", "pnpm", "yarn", "bun"];
 const RENDERINGS: &[&str] = &["static", "ssr"];
@@ -211,7 +283,13 @@ const MANAGER_ENV: [(&str, EnvRule); 29] = [
     ("CITE_FORGE_API_URL", EnvRule::ForgeApi),
 ];
 
-const EXECUTOR_ENV: [(&str, EnvRule); 9] = [
+const EXECUTOR_ENV: [(&str, EnvRule); 15] = [
+    ("HTTP_PROXY", EnvRule::EgressProxyUrl),
+    ("HTTPS_PROXY", EnvRule::EgressProxyUrl),
+    ("http_proxy", EnvRule::EgressProxyUrl),
+    ("https_proxy", EnvRule::EgressProxyUrl),
+    ("NO_PROXY", EnvRule::Fixed("localhost,127.0.0.1")),
+    ("NODE_USE_ENV_PROXY", EnvRule::Fixed("1")),
     ("CITE_LISTEN", EnvRule::Fixed("0.0.0.0:8080")),
     ("CITE_DATA_DIR", EnvRule::Fixed("/var/lib/cite")),
     (
@@ -269,7 +347,8 @@ fn expected(
     network: &str,
     name: &str,
     site: &[(String, String)],
-    egress: bool,
+    outbound: Outbound,
+    egress_bridge: &str,
 ) -> Value {
     let base = format!("cite-{}-{}", c.id, c.slot);
     let (data, work, cache) = (
@@ -326,10 +405,21 @@ fn expected(
             host["NanoCpus"] = json!(limits.nano_cpus);
             host["RestartPolicy"] = json!({ "Name": "unless-stopped" });
             let mut endpoints = json!({ network: { "Aliases": [name] } });
-            if egress {
-                endpoints[format!("{base}-egress")] = json!({});
+            match outbound {
+                Outbound::Open => endpoints[format!("{base}-egress")] = json!({}),
+                Outbound::Filtered => endpoints[format!("{base}-xnet")] = json!({}),
+                Outbound::None => {}
             }
             body["NetworkingConfig"] = json!({ "EndpointsConfig": endpoints });
+        }
+        Role::EgressProxy => {
+            body["User"] = json!("65532:65532");
+            body["Env"] = env.clone();
+            host["Init"] = json!(true);
+            host["NanoCpus"] = json!(limits.nano_cpus);
+            host["RestartPolicy"] = json!({ "Name": "unless-stopped" });
+            body["NetworkingConfig"] =
+                json!({ "EndpointsConfig": { network: {}, egress_bridge: {} } });
         }
         Role::Init => {
             let mut script = INIT_SCRIPT.to_string();
@@ -384,10 +474,17 @@ fn within(host: &Map<String, Value>, key: &str, min: i64, max: i64) -> Result<i6
 
 // Manager and executor memory and CPU follow the operator's bounds; init and the pid caps stay fixed.
 fn read_limits(policy: &Policy, role: Role, host: &Map<String, Value>) -> Result<Limits, String> {
+    if role == Role::EgressProxy {
+        return Ok(Limits {
+            memory: EGRESS_PROXY_MEMORY,
+            nano_cpus: Some(EGRESS_PROXY_NANO_CPUS),
+            pids: EGRESS_PROXY_PIDS,
+        });
+    }
     let (memory, cpus, pids) = match role {
         Role::Manager => ((MIN_STACK_MEMORY, policy.max_memory), true, 4096),
         Role::Executor => ((MIN_STACK_MEMORY, policy.max_memory), true, 1024),
-        Role::Init => ((1, 256 * MIB), false, 128),
+        _ => ((1, 256 * MIB), false, 128),
     };
     Ok(Limits {
         memory: within(host, "Memory", memory.0, memory.1)?,
@@ -405,7 +502,7 @@ fn is_slug_part(s: &str, max: usize, extra: &[char]) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || extra.contains(&c))
 }
 
-fn env_value_ok(policy: &Policy, rule: &EnvRule, value: &str) -> bool {
+fn env_value_ok(policy: &Policy, c: &Stack, rule: &EnvRule, value: &str) -> bool {
     match rule {
         EnvRule::Fixed(want) => value == *want,
         EnvRule::Repo => match value.split_once('/') {
@@ -442,20 +539,45 @@ fn env_value_ok(policy: &Policy, rule: &EnvRule, value: &str) -> bool {
         EnvRule::RuntimeEnvJson => envval::runtime_env_json(value),
         EnvRule::Forge => policy.forge.as_deref() == Some(value),
         EnvRule::ForgeApi => policy.forge_api_url.as_deref() == Some(value),
+        EnvRule::EgressProxyUrl => value == egress_proxy_url(c),
+        EnvRule::NodeEgress(key) => policy.egress_env.contains(&format!("{key}={value}")),
+        EnvRule::EgressRules => envval::egress_rules(value),
     }
 }
 
-fn check_env(policy: &Policy, role: Role, env: Option<&Value>) -> Result<Value, String> {
-    if role == Role::Init {
-        return match env {
-            None => Ok(Value::Null),
-            Some(_) => Err("Env is not allowed on init containers".to_string()),
-        };
+// The node's own entries must all be present, and an allowlist needs something to allow.
+fn check_egress_env(policy: &Policy, env: &Value) -> Result<(), String> {
+    let entries: Vec<&str> = env
+        .as_array()
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    if let Some(missing) = policy.egress_env.iter().find(|e| !entries.contains(&e.as_str())) {
+        let key = missing.split('=').next().unwrap_or_default();
+        return Err(format!("Env key {key:?} is missing"));
     }
-    let rules: &[(&str, EnvRule)] = if role == Role::Manager {
-        &MANAGER_ENV
-    } else {
-        &EXECUTOR_ENV
+    let has = |key: &str| entries.iter().any(|e| e.split('=').next() == Some(key));
+    for key in ["CITE_EGRESS_MODE", "CITE_EGRESS_BLOCK_MAIL"] {
+        if !has(key) {
+            return Err(format!("Env key {key:?} is missing"));
+        }
+    }
+    if entries.contains(&"CITE_EGRESS_MODE=allowlist") && !has("CITE_EGRESS_ALLOW") {
+        return Err("allowlist mode needs CITE_EGRESS_ALLOW".to_string());
+    }
+    Ok(())
+}
+
+fn check_env(policy: &Policy, c: &Stack, role: Role, env: Option<&Value>) -> Result<Value, String> {
+    let rules: &[(&str, EnvRule)] = match role {
+        Role::Init => {
+            return match env {
+                None => Ok(Value::Null),
+                Some(_) => Err("Env is not allowed on init containers".to_string()),
+            };
+        }
+        Role::Manager => &MANAGER_ENV,
+        Role::Executor => &EXECUTOR_ENV,
+        Role::EgressProxy => &EGRESS_ENV,
     };
     let entries = env.and_then(Value::as_array).ok_or("Env is missing")?;
     if entries.len() > MAX_ENV_ENTRIES {
@@ -472,7 +594,7 @@ fn check_env(policy: &Policy, role: Role, env: Option<&Value>) -> Result<Value, 
         if seen.contains(&key) {
             return Err(format!("Env key {key:?} is repeated"));
         }
-        if !env_value_ok(policy, rule, value) {
+        if !env_value_ok(policy, c, rule, value) {
             return Err(format!("Env value for {key:?} is not allowed"));
         }
         seen.push(key);
@@ -487,6 +609,7 @@ fn check_network_mode(policy: &Policy, role: Role, c: &Stack, mode: &str) -> Res
         Role::Init => mode == "none",
         Role::Manager => own("egress"),
         Role::Executor => own("net") || mode == policy.edge,
+        Role::EgressProxy => own("xnet"),
     };
     if ok {
         Ok(())
@@ -501,8 +624,12 @@ pub fn validate_container(policy: &Policy, name: &str, body: &Value) -> Result<(
     let role = match stack.kind.as_str() {
         "manager" => Role::Manager,
         "executor" => Role::Executor,
+        "egress-proxy" => Role::EgressProxy,
         _ => Role::Init,
     };
+    if role == Role::EgressProxy && policy.egress_mode != EgressMode::Filtered {
+        return Err("egress proxies exist only in filtered egress mode (CITE_STACK_EGRESS_MODE=filtered)".to_string());
+    }
     let obj = object(body, "body")?;
     let image = obj
         .get("Image")
@@ -510,12 +637,16 @@ pub fn validate_container(policy: &Policy, name: &str, body: &Value) -> Result<(
         .ok_or("Image is missing")?;
     let image_ok = match role {
         Role::Executor => policy.is_executor_image(image),
+        Role::EgressProxy => policy.is_egress_image(image),
         _ => policy.is_manager_image(image),
     };
     if !image_ok {
         return Err("Image is not allowed for this container".to_string());
     }
-    let env = check_env(policy, role, obj.get("Env"))?;
+    let env = check_env(policy, &stack, role, obj.get("Env"))?;
+    if role == Role::EgressProxy {
+        check_egress_env(policy, &env)?;
+    }
     let host = obj
         .get("HostConfig")
         .map(|h| object(h, "HostConfig"))
@@ -528,9 +659,21 @@ pub fn validate_container(policy: &Policy, name: &str, body: &Value) -> Result<(
         .ok_or("NetworkMode is missing")?;
     check_network_mode(policy, role, &stack, mode)?;
     let site = site_mounts(policy, role, &stack, host)?;
-    let egress = executor_egress(policy, role, &stack, body)?;
+    let outbound = executor_outbound(policy, role, &stack, body)?;
+    if role == Role::Executor {
+        check_executor_proxy_env(&env, outbound)?;
+    }
     let want = expected(
-        role, &stack, image, &env, &limits, mode, name, &site, egress,
+        role,
+        &stack,
+        image,
+        &env,
+        &limits,
+        mode,
+        name,
+        &site,
+        outbound,
+        &policy.egress_bridge,
     );
     match first_difference("body", &want, body) {
         Some(reason) => Err(reason),
@@ -583,11 +726,23 @@ pub fn validate_network(policy: &Policy, body: &Value) -> Result<(), String> {
     }
     exact_keys(obj, &keys)?;
     let name = obj["Name"].as_str().ok_or("Name is not a string")?;
-    let stack = policy.network(name)?;
     let internal = obj["Internal"]
         .as_bool()
         .ok_or("Internal is not a boolean")?;
-    if internal != (stack.kind == "net") {
+    // The node's egress bridge is a normal bridge that only egress proxies join.
+    if policy.is_egress_bridge(name) {
+        if internal {
+            return Err("the egress bridge must not be internal".to_string());
+        }
+        let want = json!({ "cite.managed": "true", "cite.role": "egress-bridge" });
+        return match first_difference("Labels", &want, &obj["Labels"]) {
+            Some(reason) => Err(reason),
+            None => Ok(()),
+        };
+    }
+    let stack = policy.network(name)?;
+    // The manager's egress network keeps its gateway; the executor's net and xnet never have one.
+    if internal != (stack.kind != "egress") {
         return Err("Internal does not fit the network kind".to_string());
     }
     check_labels(obj, &stack, "network")

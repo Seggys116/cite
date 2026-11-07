@@ -44,6 +44,8 @@ pub(crate) mod doppler;
 pub(crate) mod env;
 #[path = "logs.rs"]
 pub(crate) mod logs;
+#[path = "outbound.rs"]
+pub(crate) mod outbound;
 #[path = "tabs.rs"]
 pub(crate) mod tabs;
 #[path = "volumes.rs"]
@@ -477,7 +479,13 @@ impl Console {
         let blocker = problems
             .first()
             .cloned()
-            .or_else(|| edited.as_ref().err().cloned());
+            .or_else(|| edited.as_ref().err().cloned())
+            .or_else(|| {
+                edited
+                    .as_ref()
+                    .ok()
+                    .and_then(|e| outbound::rules_problem(&e.outbound_rules))
+            });
         FormState {
             problems,
             change,

@@ -4,7 +4,7 @@ use std::time::Duration;
 use regex::Regex;
 use serde_json::Value;
 
-use crate::config::Config;
+use crate::config::{Config, EgressMode};
 use crate::spec;
 use crate::target::Target;
 
@@ -114,13 +114,16 @@ pub struct Policy {
     pub(crate) forge_api_url: Option<String>,
     pub(crate) max_memory: i64,
     pub(crate) max_nano_cpus: i64,
-    pub(crate) executor_egress: bool,
+    pub(crate) egress_mode: EgressMode,
+    pub(crate) egress_bridge: String,
+    pub(crate) egress_env: Vec<String>,
     container: Regex,
     volume: Regex,
     site_volume: Regex,
     network: Regex,
     manager_image: Regex,
     executor_image: Regex,
+    egress_image: Regex,
     pull_repo: Regex,
     pull_tag: Regex,
 }
@@ -142,21 +145,24 @@ impl Policy {
             forge_api_url: cfg.forge_api_url.clone(),
             max_memory: cfg.max_memory,
             max_nano_cpus: cfg.max_nano_cpus,
-            executor_egress: cfg.executor_egress,
-            container: stack("manager|executor|init"),
+            egress_mode: cfg.egress_mode,
+            egress_bridge: cfg.egress_bridge.clone(),
+            egress_env: cfg.egress_env.clone(),
+            container: stack("manager|executor|init|egress-proxy"),
             volume: stack("data|work|cache"),
             site_volume: build(format!(
                 "^cite-vol-(?<id>{ID})_(?<name>{VOLUME_NAME})$"
             )),
-            network: stack("net|egress"),
+            network: stack("net|xnet|egress"),
             manager_image: build(format!(
                 "^{reg}/(cite-manager:{VERSION}-node(22|24)|cite-manager-rust:{VERSION})$"
             )),
             executor_image: build(format!(
                 "^{reg}/(cite-executor-node:{VERSION}-node(22|24)|cite-executor-(bun|static|rust):{VERSION})$"
             )),
+            egress_image: build(format!("^{reg}/cite-egress:{VERSION}$")),
             pull_repo: build(format!(
-                "^{reg}/(cite-manager|cite-manager-rust|cite-executor-(node|bun|static|rust))$"
+                "^{reg}/(cite-manager|cite-manager-rust|cite-executor-(node|bun|static|rust)|cite-egress)$"
             )),
             pull_tag: build(format!("^{VERSION}(-node(22|24))?$")),
         }
@@ -211,6 +217,19 @@ impl Policy {
         self.executor_image.is_match(image)
     }
 
+    pub fn is_egress_image(&self, image: &str) -> bool {
+        self.egress_image.is_match(image)
+    }
+
+    fn is_cite_image(&self, image: &str) -> bool {
+        self.is_manager_image(image) || self.is_executor_image(image) || self.is_egress_image(image)
+    }
+
+    // The node's egress bridge may be created and inspected, never deleted or attached to by name.
+    pub(crate) fn is_egress_bridge(&self, name: &str) -> bool {
+        name == self.egress_bridge
+    }
+
     // Route patterns spell out every method and segment; anything unlisted falls through to a denial.
     pub fn classify(&self, method: &str, target: &Target) -> Result<Route, String> {
         let segs: Vec<&str> = target.path[1..].split('/').collect();
@@ -227,7 +246,7 @@ impl Policy {
             ("GET", ["images", reference @ .., "json"]) if !reference.is_empty() => {
                 allow_keys(q, &[], &[])?;
                 let reference = reference.join("/");
-                if !self.is_manager_image(&reference) && !self.is_executor_image(&reference) {
+                if !self.is_cite_image(&reference) {
                     return Err("image is not a cite image".to_string());
                 }
                 Route::ImageInspect
@@ -256,7 +275,9 @@ impl Policy {
             }
             ("GET", ["networks", name]) => {
                 allow_keys(q, &[], &[])?;
-                self.network(name)?;
+                if !self.is_egress_bridge(name) {
+                    self.network(name)?;
+                }
                 Route::NetworkInspect(name.to_string())
             }
             ("DELETE", ["networks", name]) => {
@@ -345,7 +366,7 @@ impl Policy {
             return Err("image to pull is not a cite image".to_string());
         }
         let full = format!("{repo}:{tag}");
-        if !self.is_manager_image(&full) && !self.is_executor_image(&full) {
+        if !self.is_cite_image(&full) {
             return Err("image tag does not fit the image".to_string());
         }
         Ok(())

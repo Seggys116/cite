@@ -31,6 +31,8 @@ pub struct NodeExtras {
     pub api_host: Option<String>,
     // Whether the node lets site containers reach the internet; None when it does not say.
     pub executor_egress: Option<bool>,
+    // "filtered", "open" or "off"; None when the node does not say.
+    pub egress_mode: Option<String>,
     pub status: Option<SiteStatus>,
     pub status_error: Option<String>,
     pub token: Option<TokenStatus>,

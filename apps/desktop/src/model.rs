@@ -754,6 +754,7 @@ pub fn health_problem(d: &SiteDraft) -> Option<String> {
         access: Default::default(),
         volumes: Vec::new(),
         outbound: true,
+        outbound_rules: Default::default(),
     };
     cite_edge::validate::validate_site(&probe)
         .err()
@@ -971,6 +972,7 @@ pub fn build_site(draft: &SiteDraft) -> Result<Site, String> {
         access: Default::default(),
         volumes: Vec::new(),
         outbound: true,
+        outbound_rules: Default::default(),
     };
     fill_site(&mut site, draft)?;
     cite_edge::validate::validate_site_strict(&site).map_err(|e| e.to_string())?;
@@ -1011,7 +1013,8 @@ pub fn site_change(existing: &Site, edited: &Site) -> SiteChange {
         dirty: existing != edited,
         needs_redeploy: existing.source != edited.source
             || existing.volumes != edited.volumes
-            || existing.outbound != edited.outbound,
+            || existing.outbound != edited.outbound
+            || existing.outbound_rules != edited.outbound_rules,
     }
 }
 
@@ -1995,6 +1998,7 @@ mod tests {
             github: None,
             doppler: None,
             executor_egress: None,
+            egress_mode: None,
             extra,
         };
         assert_eq!(
@@ -2013,6 +2017,7 @@ mod tests {
             github: None,
             doppler: None,
             executor_egress: None,
+            egress_mode: None,
             extra: Default::default(),
         };
         assert_eq!(read_info(&bare), InfoView::default());

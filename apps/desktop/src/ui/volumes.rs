@@ -10,10 +10,9 @@ use crate::theme::Tone;
 use crate::ui::detail::Data;
 use crate::ui::input::TextInput;
 use crate::ui::widgets::{
-    BtnKind, Col, btn, btn_off, card, empty_state, field, id, mono, notice, pill, strong, table,
-    text_dim, toggle,
+    BtnKind, Col, btn, btn_off, card, empty_state, field, id, mono, notice, pill, table, text_dim,
 };
-use crate::siteops::{CAP_OUTBOUND, has_cap};
+use crate::ui::detail::outbound::OutboundState;
 
 const MAX_NAME: usize = 31;
 const MIN_PATH: usize = 2;
@@ -151,8 +150,8 @@ pub struct VolumeState {
     pub staged: Option<Vec<Volume>>,
     pub existing: Option<Result<Vec<VolumeInfo>, String>>,
     pub error: Option<String>,
-    // The outbound switch as edited; saved together with the volumes through the Save bar.
-    pub outbound: Option<bool>,
+    // The outbound policy as edited; saved together with the volumes through the Save bar.
+    pub outbound: OutboundState,
     pub name_in: Entity<TextInput>,
     pub path_in: Entity<TextInput>,
 }
@@ -163,7 +162,7 @@ impl VolumeState {
             staged: None,
             existing: None,
             error: None,
-            outbound: None,
+            outbound: OutboundState::new(cx),
             name_in: new_input(cx, "uploads", |i| i.mono()),
             path_in: new_input(cx, "/data", |i| i.mono()),
         }
@@ -173,7 +172,7 @@ impl VolumeState {
         self.staged = None;
         self.existing = None;
         self.error = None;
-        self.outbound = None;
+        self.outbound.reset(cx);
         for input in [self.name_in.clone(), self.path_in.clone()] {
             input.update(cx, |i, cx| i.set_text("", cx));
         }
@@ -184,28 +183,16 @@ impl VolumeState {
         if let Some(list) = &self.staged {
             site.volumes = list.clone();
         }
-        if let Some(on) = self.outbound {
-            site.outbound = on;
-        }
+        self.outbound.apply_to(&mut site);
         site
     }
 
-    // Both edits are dropped together once saved or discarded.
+    // The volume and outbound edits are dropped together once saved or discarded.
     pub fn clear_edits(&mut self) {
         self.staged = None;
-        self.outbound = None;
+        self.outbound.clear();
         self.error = None;
     }
-}
-
-// The switch shows the edit while there is one, otherwise what the node has saved.
-pub fn outbound_shown(saved: bool, staged: Option<bool>) -> bool {
-    staged.unwrap_or(saved)
-}
-
-// The node says its executors have no route out, so the switch cannot have an effect.
-pub fn egress_blocked(egress: Option<bool>) -> bool {
-    egress == Some(false)
 }
 
 impl Console {
@@ -259,43 +246,6 @@ impl Console {
         self.ops_action(cx, "Volume data", fut, move |_| {
             format!("The data of volume {shown} was deleted")
         });
-    }
-
-    pub(crate) fn outbound_card(&self, data: &Data, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let ex = &self.ops.extras;
-        if !self.ops.loaded || !has_cap(&ex.caps, CAP_OUTBOUND) || !volumes_apply(&data.site) {
-            return None;
-        }
-        let blocked = egress_blocked(ex.executor_egress);
-        let on = outbound_shown(data.site.outbound, self.ops.volumes.outbound);
-        let mut switch = toggle(id("outbound", "switch"), on);
-        if !blocked {
-            switch = switch.on_click(cx.listener(|this, _, _, cx| {
-                let saved = this.detail.data.ready().is_some_and(|d| d.site.outbound);
-                let now = outbound_shown(saved, this.ops.volumes.outbound);
-                this.ops.volumes.outbound = Some(!now);
-                cx.notify();
-            }));
-        }
-        let mut body = div().flex().flex_col().gap(px(10.)).child(
-            div()
-                .flex()
-                .items_center()
-                .gap(px(12.))
-                .child(switch)
-                .child(strong(if on { "Allowed" } else { "Blocked" })),
-        );
-        body = body.child(
-            text_dim("Lets this site's server code make requests to the internet, for example to GitHub or the App Store. Applies on the next deploy.")
-                .text_size(px(12.)),
-        );
-        if blocked {
-            body = body.child(notice(
-                "This node does not let site containers reach the internet, so this switch has no effect until the node allows it.",
-                Tone::Warn,
-            ));
-        }
-        Some(card(Some("Outbound network access"), None, body).into_any_element())
     }
 
     // The declared volumes with their live state, the add row, and the data kept for volumes no longer declared.
@@ -594,15 +544,6 @@ mod tests {
         assert!(!source_serves(Some(&source(Some(RenderMode::Static), Some("node")))));
         assert!(!source_serves(Some(&source(None, Some("static")))));
         assert!(!source_serves(None));
-    }
-
-    #[test]
-    fn the_outbound_switch_follows_the_edit_and_the_nodes_egress() {
-        assert!(outbound_shown(true, None));
-        assert!(!outbound_shown(true, Some(false)));
-        assert!(outbound_shown(false, Some(true)));
-        assert!(egress_blocked(Some(false)));
-        assert!(!egress_blocked(Some(true)) && !egress_blocked(None));
     }
 
     #[test]

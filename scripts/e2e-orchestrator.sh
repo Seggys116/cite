@@ -314,7 +314,7 @@ if docker inspect "$HAPROXY" >/dev/null 2>&1 || [ -n "$(docker ps -aq --filter l
 fi
 for ref in "cite-connector:$CITE_VERSION" "cite-dockerproxy:$CITE_VERSION" \
   "cite-manager:$CITE_STACK_VERSION-node22" "cite-executor-node:$CITE_STACK_VERSION-node22" \
-  "cite-executor-static:$CITE_STACK_VERSION"; do
+  "cite-executor-static:$CITE_STACK_VERSION" "cite-egress:$CITE_STACK_VERSION"; do
   docker image inspect "$REGISTRY/$ref" >/dev/null 2>&1 || { echo "e2e-orchestrator: image $REGISTRY/$ref is missing" >&2; exit 2; }
 done
 docker image inspect "$MOCK_IMAGE" >/dev/null 2>&1 || { echo "e2e-orchestrator: image $MOCK_IMAGE is missing" >&2; exit 2; }
@@ -380,7 +380,24 @@ if docker inspect "cite-$SITE-blue-init" >/dev/null 2>&1; then
 fi
 
 echo "== network isolation"
-expect "executor is only on its own internal network" "$NET" "$(nets_of "$EXECUTOR")"
+XNET="cite-$SITE-blue-xnet"
+PROXY="cite-$SITE-blue-egress-proxy"
+expect "executor is only on its own internal network and the proxy network" "$(printf '%s\n%s' "$NET" "$XNET")" "$(nets_of "$EXECUTOR")"
+expect "the egress proxy is on its stack network and the node bridge" "$(printf '%s\n%s' "$XNET" cite-egress)" "$(nets_of "$PROXY")"
+BODY=$(docker network inspect "$XNET")
+jq_ok "proxy network is internal and holds only the executor and its proxy" ".[0].Internal == true and (([.[0].Containers[].Name] | sort) == ([\"$PROXY\", \"$EXECUTOR\"] | sort))"
+BODY=$(docker inspect "$PROXY")
+jq_ok "egress proxy is hardened and unprivileged" '.[0].HostConfig.ReadonlyRootfs == true and (.[0].HostConfig.CapDrop | index("ALL")) != null and (.[0].HostConfig.Privileged == false)'
+PROBE_IMAGE="ghcr.io/seggys116/cite-manager:$CITE_STACK_VERSION-node22"
+probe() {
+  docker run --rm --network "$XNET" --entrypoint node "$PROBE_IMAGE" -e "
+const net=require('net');const s=net.connect(3128,'$PROXY',()=>{s.write('CONNECT $1:443 HTTP/1.1\\r\\nHost: $1:443\\r\\n\\r\\n')});
+s.on('data',d=>{console.log(String(d).split(' ')[1]);s.destroy();process.exit(0)});s.on('error',()=>{console.log('error');process.exit(0)});setTimeout(()=>{console.log('timeout');process.exit(0)},8000)"
+}
+expect "the egress proxy refuses loopback" 403 "$(probe 127.0.0.1)"
+expect "the egress proxy refuses cloud metadata" 403 "$(probe 169.254.169.254)"
+expect "the egress proxy refuses a private range" 403 "$(probe 10.0.0.1)"
+expect "the egress proxy refuses the Docker host" 403 "$(probe host.docker.internal)"
 expect "executor is not on cite_edge" 0 "$(nets_of "$EXECUTOR" | grep -cx cite_edge || true)"
 expect "manager is only on its egress network" "$EGRESS" "$(nets_of "$MANAGER")"
 BODY=$(docker network inspect "$NET")
@@ -473,7 +490,7 @@ truthy "green manager was created" docker inspect "$GREEN_MANAGER"
 BODY=$(docker inspect "$GREEN_MANAGER")
 jq_ok "green manager builds the requested ref" '.[0].Config.Env | any(. == "CITE_BRANCH=release")'
 jq_ok "green manager is hardened" "$HARDENED"
-expect "green executor is only on its own network" "$GREEN_NET" "$(nets_of "cite-$SITE-green-executor")"
+expect "green executor is only on its own network and the proxy network" "$(printf '%s\n%s' "$GREEN_NET" "cite-$SITE-green-xnet")" "$(nets_of "cite-$SITE-green-executor")"
 api GET "/api/v1/sites/$SITE"
 if printf '%s' "$BODY" | jq -e '.active == "blue"' >/dev/null; then
   jq_ok "failed deploy kept blue active and was recorded" '(.history | last | .action) == "failed" and .active == "blue"'
@@ -764,7 +781,8 @@ else
   remove_stack
   expect "no cite.managed container remains" 0 "$(docker ps -aq --filter label=cite.managed=true | wc -l | tr -d ' ')"
   expect "no cite.managed volume remains" 0 "$(docker volume ls -q --filter label=cite.managed=true | wc -l | tr -d ' ')"
-  expect "no cite.managed network remains" 0 "$(docker network ls -q --filter label=cite.managed=true | wc -l | tr -d ' ')"
+  expect "only the shared egress bridge remains of the cite.managed networks" "" "$(docker network ls --filter label=cite.managed=true --format '{{.Name}}' | grep -vx cite-egress || true)"
+  docker network rm cite-egress >/dev/null 2>&1 || true
   expect "no cite-e2e container remains" 0 "$(docker ps -aq --filter name=cite-e2e | wc -l | tr -d ' ')"
   expect "no cite-e2e volume remains" 0 "$(docker volume ls -q --filter name=cite-e2e | wc -l | tr -d ' ')"
   expect "no cite-e2e network remains" 0 "$(docker network ls -q --filter name=cite-e2e | wc -l | tr -d ' ')"

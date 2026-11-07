@@ -1,5 +1,6 @@
 mod common;
 
+use cite_connector::egress::Egress;
 use cite_connector::orchestrator::{SpecSet, StackEnv, stack_specs};
 use cite_dockerproxy::policy::{MAX_BODY, Route};
 use cite_dockerproxy::target::normalise;
@@ -41,6 +42,7 @@ fn site(id: &str, runtime: &str, node_major: Option<u8>) -> Site {
         access: Default::default(),
         volumes: Vec::new(),
         outbound: true,
+        outbound_rules: Default::default(),
     }
 }
 
@@ -51,6 +53,7 @@ fn specs(id: &str, runtime: &str, slot: Slot, isolate: bool) -> SpecSet {
         edge_network: "cite_edge",
         isolate,
         github_api_url: None,
+        egress: &Egress::default(),
     };
     stack_specs(&site(id, runtime, None), slot, None, TOKEN, &env).unwrap()
 }
@@ -104,6 +107,7 @@ fn every_spec_the_orchestrator_emits_is_accepted() {
                             edge_network: "cite_edge",
                             isolate,
                             github_api_url: api_url,
+                            egress: &Egress::default(),
                         };
                         for git_ref in [None, Some("release/1.2")] {
                             let s = stack_specs(
@@ -128,6 +132,18 @@ fn every_spec_the_orchestrator_emits_is_accepted() {
                                 });
                                 checked += 1;
                             }
+                            if let Some(proxy) = &s.egress_proxy {
+                                let target = normalise(&format!(
+                                    "/v1.45/containers/create?name={}",
+                                    s.egress_proxy_name
+                                ))
+                                .unwrap();
+                                let route = policy.classify("POST", &target).unwrap();
+                                policy.validate_body(&route, proxy).unwrap_or_else(|e| {
+                                    panic!("{} {runtime}: {e}", s.egress_proxy_name)
+                                });
+                            }
+                            assert_eq!(s.egress_proxy.is_some(), runtime != "static");
                         }
                     }
                 }
@@ -147,6 +163,7 @@ fn the_github_api_url_is_accepted_only_when_it_equals_the_operator_setting() {
             edge_network: "cite_edge",
             isolate: true,
             github_api_url: url,
+            egress: &Egress::default(),
         };
         stack_specs(&site("shop", "node", None), Slot::Blue, None, TOKEN, &env).unwrap()
     };
@@ -221,7 +238,7 @@ fn volume_and_network_bodies_of_the_orchestrator_are_accepted() {
         policy.validate_body(&Route::VolumeCreate, &body).unwrap();
     }
     for network in &s.networks {
-        let internal = network.ends_with("-net");
+        let internal = network.ends_with("-net") || network.ends_with("-xnet");
         let body = json!({ "Name": network, "Driver": "bridge", "Internal": internal, "Labels": labels("network") });
         policy.validate_body(&Route::NetworkCreate, &body).unwrap();
     }
@@ -1163,17 +1180,32 @@ fn runtime_environment_json_follows_the_build_environment_rules() {
 fn executor_with_runtime_json(text: &str) -> (usize, Result<(), String>) {
     let s = specs("shop", "node", Slot::Blue, true);
     let mut body = s.executor.clone();
-    body["Env"] = json!([
-        "CITE_LISTEN=0.0.0.0:8080",
-        "CITE_DATA_DIR=/var/lib/cite",
-        "CITE_RELEASES_DIR=/var/lib/cite/releases",
-        "CITE_CONTROL_DIR=/var/lib/cite/control",
-        "CITE_STATUS_DIR=/var/lib/cite/status",
-        "RUST_LOG=info",
-        "CITE_NODE_BIN=/nodejs/bin/node",
-        "CITE_NODE=24",
-        format!("CITE_RUNTIME_ENV_JSON={text}"),
-    ]);
+    let proxy_vars: Vec<Value> = s.executor["Env"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| {
+            let k = e.as_str().unwrap_or("").split('=').next().unwrap_or("").to_string();
+            matches!(
+                k.as_str(),
+                "HTTP_PROXY" | "HTTPS_PROXY" | "http_proxy" | "https_proxy" | "NO_PROXY" | "NODE_USE_ENV_PROXY"
+            )
+        })
+        .cloned()
+        .collect();
+    let mut env = vec![
+        json!("CITE_LISTEN=0.0.0.0:8080"),
+        json!("CITE_DATA_DIR=/var/lib/cite"),
+        json!("CITE_RELEASES_DIR=/var/lib/cite/releases"),
+        json!("CITE_CONTROL_DIR=/var/lib/cite/control"),
+        json!("CITE_STATUS_DIR=/var/lib/cite/status"),
+        json!("RUST_LOG=info"),
+        json!("CITE_NODE_BIN=/nodejs/bin/node"),
+        json!("CITE_NODE=24"),
+        json!(format!("CITE_RUNTIME_ENV_JSON={text}")),
+    ];
+    env.extend(proxy_vars);
+    body["Env"] = Value::Array(env);
     let bytes = serde_json::to_vec(&body).unwrap();
     let parsed = cite_dockerproxy::strict::parse(&bytes).unwrap();
     let target = normalise(&format!(

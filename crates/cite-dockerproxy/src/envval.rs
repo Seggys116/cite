@@ -17,7 +17,7 @@ const UNQUOTED_META: [char; 10] = ['(', ')', '{', '}', '*', '?', '~', '!', '#', 
 const NOT_RUNNABLE: [&str; 10] = [
     "npm", "npx", "pnpm", "yarn", "corepack", "cargo", "rustc", "sh", "bash", "env",
 ];
-const DENIED_KEYS: [&str; 15] = [
+const DENIED_KEYS: [&str; 16] = [
     "LD_PRELOAD",
     "LD_LIBRARY_PATH",
     "LD_AUDIT",
@@ -33,8 +33,91 @@ const DENIED_KEYS: [&str; 15] = [
     "NO_PROXY",
     "ALL_PROXY",
     "PNPM_HOME",
+    "NODE_USE_ENV_PROXY",
 ];
 const DENIED_PREFIXES: [&str; 3] = ["XDG_", "GIT_", "NPM_CONFIG_"];
+
+// Same entry rules as cite-edge's is_egress_cidr and is_egress_host and the egress proxy's own parser.
+const MAX_EGRESS_ENTRIES: usize = 64;
+
+fn strict_v4(text: &str) -> bool {
+    let parts: Vec<&str> = text.split('.').collect();
+    parts.len() == 4
+        && parts.iter().all(|p| {
+            (1..=3).contains(&p.len())
+                && p.bytes().all(|b| b.is_ascii_digit())
+                && !(p.len() > 1 && p.starts_with('0'))
+                && p.parse::<u16>().is_ok_and(|n| n <= 255)
+        })
+}
+
+pub fn egress_cidr(entry: &str) -> bool {
+    let (ip, len) = match entry.split_once('/') {
+        Some((ip, len)) => (ip, Some(len)),
+        None => (entry, None),
+    };
+    let max = if strict_v4(ip) {
+        32
+    } else if ip.contains(':') && ip.parse::<std::net::Ipv6Addr>().is_ok() {
+        128
+    } else {
+        return false;
+    };
+    len.is_none_or(|l| {
+        (1..=3).contains(&l.len())
+            && l.bytes().all(|b| b.is_ascii_digit())
+            && !(l.len() > 1 && l.starts_with('0'))
+            && l.parse::<u8>().is_ok_and(|n| n <= max)
+    })
+}
+
+pub fn egress_host(entry: &str) -> bool {
+    let name = entry.strip_prefix('.').unwrap_or(entry);
+    let last = name.rsplit('.').next().unwrap_or_default();
+    let numeric = last.bytes().all(|b| b.is_ascii_digit())
+        || last
+            .strip_prefix("0x")
+            .is_some_and(|h| h.bytes().all(|b| b.is_ascii_hexdigit()));
+    (1..=253).contains(&name.len())
+        && !numeric
+        && name.split('.').all(|label| {
+            (1..=63).contains(&label.len())
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+        })
+}
+
+pub fn egress_port_range(entry: &str) -> bool {
+    let port = |p: &str| {
+        (1..=5).contains(&p.len())
+            && p.bytes().all(|b| b.is_ascii_digit())
+            && !(p.len() > 1 && p.starts_with('0'))
+            && p.parse::<u32>().is_ok_and(|n| (1..=65535).contains(&n))
+    };
+    match entry.split_once('-') {
+        Some((a, b)) => port(a) && port(b) && a.parse::<u32>().ok() <= b.parse::<u32>().ok(),
+        None => port(entry),
+    }
+}
+
+/// A comma list as the connector writes it: no spaces, no empty or repeated entries, at most 64.
+pub fn egress_list(v: &str, entry_ok: impl Fn(&str) -> bool) -> bool {
+    let entries: Vec<&str> = v.split(',').collect();
+    !v.is_empty()
+        && entries.len() <= MAX_EGRESS_ENTRIES
+        && entries
+            .iter()
+            .enumerate()
+            .all(|(i, e)| entry_ok(e) && !entries[..i].contains(e))
+}
+
+/// A site's allow or deny list: CIDRs and host names mixed.
+pub fn egress_rules(v: &str) -> bool {
+    egress_list(v, |e| egress_cidr(e) || egress_host(e))
+}
 
 pub fn rel_path(v: &str) -> bool {
     !v.is_empty()
@@ -218,6 +301,41 @@ fn env_json(v: &str, extra_denied: &[&str], extra_prefixes: &[&str]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn egress_entries_are_strict() {
+        for ok in ["10.0.0.0/8", "192.168.1.5", "0.0.0.0/0", "fd00::/8", "::1", "2001:db8::/32"] {
+            assert!(egress_cidr(ok), "{ok}");
+        }
+        for bad in [
+            "010.0.0.1", "10.0.0.0/33", "10.0.0.0/08", "10.0.0/8", "fd00::/129", "example.com", "",
+            "1.2.3.4/", " 10.0.0.1",
+        ] {
+            assert!(!egress_cidr(bad), "{bad:?}");
+        }
+        for ok in ["api.github.com", ".apple.com", "db.lan", "_x.example", "a-b.example"] {
+            assert!(egress_host(ok), "{ok}");
+        }
+        for bad in [
+            "Api.github.com", "*.apple.com", "..apple.com", "a..b", "-a.com", "10.0.0.1", "2130706433",
+            "x.0x10", "", ".", "a b.com", "caf\u{e9}.com",
+        ] {
+            assert!(!egress_host(bad), "{bad:?}");
+        }
+        for ok in ["443", "1", "65535", "8000-8100", "80-80"] {
+            assert!(egress_port_range(ok), "{ok}");
+        }
+        for bad in ["0", "65536", "443-80", "080", "a", "1-", "-1", ""] {
+            assert!(!egress_port_range(bad), "{bad:?}");
+        }
+        assert!(egress_rules("api.github.com,10.0.0.0/8,.apple.com"));
+        for bad in ["", "a.com,a.com", "a.com, b.com", "a.com,,b.com", "a.com,Bad.com"] {
+            assert!(!egress_rules(bad), "{bad:?}");
+        }
+        let many: Vec<String> = (0..65).map(|i| format!("h{i}.example")).collect();
+        assert!(egress_rules(&many[..64].join(",")));
+        assert!(!egress_rules(&many.join(",")));
+    }
 
     #[test]
     fn rel_paths_are_plain_relative_paths() {

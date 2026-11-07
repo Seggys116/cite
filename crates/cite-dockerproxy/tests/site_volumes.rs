@@ -1,5 +1,6 @@
 mod common;
 
+use cite_connector::egress::{Egress, EgressMode};
 use cite_connector::orchestrator::{SpecSet, StackEnv, stack_specs};
 use cite_dockerproxy::policy::{Policy, Route};
 use cite_dockerproxy::target::normalise;
@@ -31,12 +32,17 @@ fn site(id: &str, runtime: &str, volumes: &[(&str, &str)], outbound: bool) -> Si
 }
 
 fn specs_for(s: &Site, slot: Slot, isolate: bool) -> SpecSet {
+    specs_with(s, slot, isolate, &Egress::default())
+}
+
+fn specs_with(s: &Site, slot: Slot, isolate: bool, egress: &Egress) -> SpecSet {
     let env = StackEnv {
         registry: common::REGISTRY,
         version: "0.2.0",
         edge_network: "cite_edge",
         isolate,
         github_api_url: None,
+        egress,
     };
     stack_specs(s, slot, None, TOKEN, &env).unwrap()
 }
@@ -191,30 +197,54 @@ fn site_volume_bodies_and_routes_are_pinned() {
 }
 
 #[test]
-fn executor_egress_follows_the_operator_switch() {
-    let open = specs_for(&site("shop", "node", &[], true), Slot::Blue, true);
+fn executor_outbound_follows_the_node_egress_mode() {
+    let s = site("shop", "node", &[], true);
+    let filtered = specs_for(&s, Slot::Blue, true);
+    let open = specs_with(&s, Slot::Blue, true, &Egress::with_mode(EgressMode::Open));
     let closed = specs_for(&site("shop", "node", &[], false), Slot::Blue, true);
     let eps = &open.executor["NetworkingConfig"]["EndpointsConfig"];
     assert_eq!(eps["cite-shop-blue-net"]["Aliases"], json!(["cite-shop-blue-executor"]));
     assert_eq!(eps["cite-shop-blue-egress"], json!({}));
-    assert!(closed.executor["NetworkingConfig"]["EndpointsConfig"]
-        .get("cite-shop-blue-egress")
-        .is_none());
-    let allowed = common::policy();
-    let denied = common::policy_with(&[("CITE_STACK_EXECUTOR_EGRESS", "false")]);
-    check(&allowed, &open.executor_name, &open.executor).unwrap();
-    check(&allowed, &closed.executor_name, &closed.executor).unwrap();
-    check(&denied, &closed.executor_name, &closed.executor).unwrap();
-    let err = check(&denied, &open.executor_name, &open.executor).unwrap_err();
-    assert!(err.contains("CITE_STACK_EXECUTOR_EGRESS"), "{err}");
+    assert_eq!(
+        filtered.executor["NetworkingConfig"]["EndpointsConfig"]["cite-shop-blue-xnet"],
+        json!({})
+    );
+    let filtered_node = common::policy();
+    let open_node = common::policy_with(&[("CITE_STACK_EGRESS_MODE", "open")]);
+    let off_node = common::policy_with(&[("CITE_STACK_EGRESS_MODE", "off")]);
+    let legacy_off = common::policy_with(&[("CITE_STACK_EXECUTOR_EGRESS", "false")]);
+    check(&filtered_node, &filtered.executor_name, &filtered.executor).unwrap();
+    check(&open_node, &open.executor_name, &open.executor).unwrap();
+    for policy in [&filtered_node, &open_node, &off_node, &legacy_off] {
+        check(policy, &closed.executor_name, &closed.executor).unwrap();
+    }
+    for (policy, body) in [
+        (&filtered_node, &open.executor),
+        (&open_node, &filtered.executor),
+        (&off_node, &open.executor),
+        (&off_node, &filtered.executor),
+        (&legacy_off, &filtered.executor),
+    ] {
+        let err = check(policy, &open.executor_name, body).unwrap_err();
+        assert!(err.contains("CITE_STACK_EGRESS_MODE"), "{err}");
+    }
     let mut aliased = open.executor.clone();
     aliased["NetworkingConfig"]["EndpointsConfig"]["cite-shop-blue-egress"] =
         json!({ "Aliases": ["cite-shop-blue-executor"] });
-    assert!(check(&allowed, &open.executor_name, &aliased).is_err());
+    assert!(check(&open_node, &open.executor_name, &aliased).is_err());
+    let mut both = filtered.executor.clone();
+    both["NetworkingConfig"]["EndpointsConfig"]["cite-shop-blue-egress"] = json!({});
+    assert!(check(&filtered_node, &filtered.executor_name, &both).is_err());
     let mut foreign = closed.executor.clone();
     foreign["NetworkingConfig"]["EndpointsConfig"]["cite-shop-green-egress"] = json!({});
-    assert!(check(&allowed, &closed.executor_name, &foreign).is_err());
+    assert!(check(&open_node, &closed.executor_name, &foreign).is_err());
+    let mut foreign_x = closed.executor.clone();
+    foreign_x["NetworkingConfig"]["EndpointsConfig"]["cite-shop-green-xnet"] = json!({});
+    assert!(check(&filtered_node, &closed.executor_name, &foreign_x).is_err());
     let mut manager = open.manager.clone();
     manager["NetworkingConfig"]["EndpointsConfig"]["cite-shop-blue-net"] = json!({});
-    assert!(check(&allowed, &open.manager_name, &manager).is_err());
+    assert!(check(&open_node, &open.manager_name, &manager).is_err());
+    let mut manager_x = filtered.manager.clone();
+    manager_x["NetworkingConfig"]["EndpointsConfig"]["cite-shop-blue-xnet"] = json!({});
+    assert!(check(&filtered_node, &filtered.manager_name, &manager_x).is_err());
 }

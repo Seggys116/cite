@@ -331,7 +331,8 @@ pub fn validate_site_strict(site: &Site) -> Result<(), ValidationError> {
     if let Some(src) = &site.source {
         validate_source(src).map_err(|e| ValidationError(format!("site {} {}", site.id, e.0)))?;
     }
-    validate_volumes(site)
+    validate_volumes(site)?;
+    validate_outbound_rules(site)
 }
 
 pub const MAX_VOLUMES: usize = 8;
@@ -441,6 +442,104 @@ pub fn validate_volumes(site: &Site) -> Result<(), ValidationError> {
                 ));
             }
         }
+    }
+    Ok(())
+}
+
+/// Most entries in one egress list, per site or per node setting.
+pub const MAX_EGRESS_ENTRIES: usize = 64;
+
+// Four plain decimal octets; the egress proxy refuses shorthand, octal and hex forms, so they are never stored.
+fn strict_v4(text: &str) -> bool {
+    let parts: Vec<&str> = text.split('.').collect();
+    parts.len() == 4
+        && parts.iter().all(|p| {
+            (1..=3).contains(&p.len())
+                && p.bytes().all(|b| b.is_ascii_digit())
+                && !(p.len() > 1 && p.starts_with('0'))
+                && p.parse::<u16>().is_ok_and(|n| n <= 255)
+        })
+}
+
+/// An IP address or CIDR in the strict form the egress proxy accepts.
+pub fn is_egress_cidr(entry: &str) -> bool {
+    let (ip, len) = match entry.split_once('/') {
+        Some((ip, len)) => (ip, Some(len)),
+        None => (entry, None),
+    };
+    let max = if strict_v4(ip) {
+        32
+    } else if ip.contains(':') && ip.parse::<Ipv6Addr>().is_ok() {
+        128
+    } else {
+        return false;
+    };
+    len.is_none_or(|l| {
+        (1..=3).contains(&l.len())
+            && l.bytes().all(|b| b.is_ascii_digit())
+            && !(l.len() > 1 && l.starts_with('0'))
+            && l.parse::<u8>().is_ok_and(|n| n <= max)
+    })
+}
+
+/// A lowercase host name, optionally with a leading dot; a name ending in a numeric label reads as an address and is refused.
+pub fn is_egress_host(entry: &str) -> bool {
+    let name = entry.strip_prefix('.').unwrap_or(entry);
+    let last = name.rsplit('.').next().unwrap_or_default();
+    let numeric = last.bytes().all(|b| b.is_ascii_digit())
+        || last
+            .strip_prefix("0x")
+            .is_some_and(|h| h.bytes().all(|b| b.is_ascii_hexdigit()));
+    (1..=253).contains(&name.len())
+        && !numeric
+        && name.split('.').all(|label| {
+            (1..=63).contains(&label.len())
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+        })
+}
+
+/// Trims each entry and rewrites `*.name` as `.name`; run before strict validation on create and update.
+pub fn normalise_outbound_rules(rules: &mut crate::model::OutboundRules) {
+    for list in [&mut rules.allow, &mut rules.deny] {
+        for entry in list.iter_mut() {
+            let trimmed = entry.trim();
+            *entry = match trimmed.strip_prefix("*.") {
+                Some(rest) => format!(".{rest}"),
+                None => trimmed.to_string(),
+            };
+        }
+    }
+}
+
+pub fn validate_outbound_rules(site: &Site) -> Result<(), ValidationError> {
+    let rules = &site.outbound_rules;
+    let what = format!("site {} outbound_rules", site.id);
+    for (name, list) in [("allow", &rules.allow), ("deny", &rules.deny)] {
+        if list.len() > MAX_EGRESS_ENTRIES {
+            return invalid(format!("{what}: {name} has more than {MAX_EGRESS_ENTRIES} entries"));
+        }
+        for (i, entry) in list.iter().enumerate() {
+            let entry = entry.as_str();
+            let shaped = entry
+                .strip_prefix('*')
+                .filter(|rest| rest.starts_with('.'))
+                .unwrap_or(entry);
+            if !is_egress_cidr(shaped) && !is_egress_host(shaped) {
+                return invalid(format!(
+                    "{what}: {name} entry {entry:?} must be an IP, a CIDR or a lowercase host name (a leading '.' or '*.' adds subdomains)"
+                ));
+            }
+            if list[..i].iter().any(|other| other == entry) {
+                return invalid(format!("{what}: {name} entry {entry:?} is listed twice"));
+            }
+        }
+    }
+    if rules.mode == crate::model::OutboundMode::Allowlist && rules.allow.is_empty() {
+        return invalid(format!("{what}: allowlist mode needs at least one allow entry"));
     }
     Ok(())
 }
@@ -1432,6 +1531,7 @@ pub(crate) mod fixtures {
             access: SiteAccess::default(),
             volumes: Vec::new(),
             outbound: true,
+            outbound_rules: Default::default(),
         }
     }
 

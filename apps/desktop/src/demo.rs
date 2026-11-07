@@ -767,6 +767,7 @@ fn seed_sites(node: i64, now: i64) -> Vec<Site> {
                 Vec::new()
             },
             outbound: true,
+            outbound_rules: Default::default(),
         };
     use DeployAction::{Failed, Promote, Rollback, Switch};
     vec![
@@ -1291,6 +1292,7 @@ impl DemoNode {
                 source: "env".into(),
             }),
             executor_egress: (self.index == 0).then_some(true),
+            egress_mode: (self.index == 0).then(|| "filtered".to_string()),
             extra,
         })
     }
@@ -1615,6 +1617,10 @@ impl DemoNode {
         check_access(site)?;
         let mut st = self.st();
         let existing = find(&st.sites, id)?.clone();
+        let rules = &site.outbound_rules;
+        if rules.mode == cite_client::OutboundMode::Allowlist && rules.allow.is_empty() {
+            return Err(status_err(400, "the allowlist mode needs at least one allow entry"));
+        }
         let mut next = site.clone();
         next.history = existing.history;
         next.active = existing.active;

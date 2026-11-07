@@ -45,6 +45,7 @@ fn manager_spec() -> (String, Value) {
         access: Default::default(),
         volumes: Vec::new(),
         outbound: true,
+        outbound_rules: Default::default(),
     };
     let env = StackEnv {
         registry: common::REGISTRY,
@@ -52,6 +53,7 @@ fn manager_spec() -> (String, Value) {
         edge_network: "cite_edge",
         isolate: true,
         github_api_url: None,
+        egress: &cite_connector::egress::Egress::default(),
     };
     let specs = stack_specs(&site, Slot::Blue, None, "ghp_token", &env).unwrap();
     (specs.manager_name, specs.manager)

@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use cite_edge::model::{
     DeployAction, Deployment, EdgeConfig, Maintenance, Site, Slot, Target, Upstream,
 };
-use cite_edge::validate::validate_site_strict;
+use cite_edge::validate::{normalise_outbound_rules, validate_site_strict};
 use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
@@ -663,6 +663,7 @@ impl Deployer {
         github_token: Option<String>,
     ) -> Result<Site> {
         site.history.clear();
+        normalise_outbound_rules(&mut site.outbound_rules);
         validate_site_strict(&site)?;
         let id = site.id.clone();
         let lock = self.site_lock(&id);
@@ -768,6 +769,7 @@ impl Deployer {
 
     // Slots, the active choice and maintenance move only through their own endpoints, so a stale client copy cannot undo a deploy.
     async fn update_site_inner(&self, actor: &str, mut site: Site) -> Result<Site> {
+        normalise_outbound_rules(&mut site.outbound_rules);
         validate_site_strict(&site)?;
         let id = site.id.clone();
         let lock = self.site_lock(&id);
@@ -792,6 +794,7 @@ impl Deployer {
         let mut routing = site.clone();
         routing.source = existing.source.clone();
         routing.volumes = existing.volumes.clone();
+        routing.outbound_rules = existing.outbound_rules.clone();
         let source_only = routing == existing && site.source.is_some() && existing.source.is_some();
         let sid = id.clone();
         if source_only {
@@ -1497,6 +1500,8 @@ mod tests {
                 executor_volumes: Vec::new(),
                 executor_present: false,
                 executor_outbound: false,
+                executor_filtered: false,
+                egress_proxy: None,
             };
             if self.orch.slot_ref(site_id, slot).await?.is_none() {
                 return Ok(seen);
@@ -1664,6 +1669,7 @@ mod tests {
             access: Default::default(),
             volumes: Vec::new(),
             outbound: true,
+            outbound_rules: Default::default(),
         }
     }
 
@@ -2860,6 +2866,8 @@ mod tests {
             executor_volumes: Vec::new(),
             executor_present: false,
             executor_outbound: false,
+            executor_filtered: false,
+            egress_proxy: None,
         }
     }
 

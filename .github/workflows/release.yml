@@ -98,6 +98,7 @@ jobs:
           - { key: executor-static, name: cite-executor-static, dockerfile: images/executor-static/Dockerfile, node: "", args: "" }
           - { key: manager-rust, name: cite-manager-rust, dockerfile: images/manager-rust/Dockerfile, node: "", args: "" }
           - { key: executor-rust, name: cite-executor-rust, dockerfile: images/executor-rust/Dockerfile, node: "", args: "" }
+          - { key: egress, name: cite-egress, dockerfile: images/egress/Dockerfile, node: "", args: "" }
         platform:
           - { arch: amd64, runner: ubuntu-latest }
           - { arch: arm64, runner: ubuntu-24.04-arm }
@@ -153,6 +154,7 @@ jobs:
           - { key: executor-static, name: cite-executor-static, suffix: "" }
           - { key: manager-rust, name: cite-manager-rust, suffix: "" }
           - { key: executor-rust, name: cite-executor-rust, suffix: "" }
+          - { key: egress, name: cite-egress, suffix: "" }
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:

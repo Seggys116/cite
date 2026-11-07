@@ -9,6 +9,7 @@ pub mod config;
 pub mod deploy;
 pub(crate) mod doppler;
 pub(crate) mod dopplersync;
+pub mod egress;
 pub mod error;
 pub mod haproxy;
 pub mod init;

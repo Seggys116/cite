@@ -526,6 +526,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cite-egress"
+version = "0.4.1"
+dependencies = [
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "cite-executor"
 version = "0.4.1"
 dependencies = [

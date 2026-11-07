@@ -15,7 +15,7 @@ const MAX_KEYS: usize = 128;
 const MAX_NAME_LEN: usize = 64;
 const MAX_VALUE_BYTES: usize = 4096;
 /// Names the child must not control: loader, TLS, proxy and home hooks, plus every key the supervisor sets itself.
-const DENIED: [&str; 20] = [
+const DENIED: [&str; 21] = [
     "LD_PRELOAD",
     "LD_LIBRARY_PATH",
     "LD_AUDIT",
@@ -36,6 +36,7 @@ const DENIED: [&str; 20] = [
     "HOST",
     "HOSTNAME",
     "NITRO_HOST",
+    "NODE_USE_ENV_PROXY",
 ];
 const DENIED_PREFIXES: [&str; 4] = ["XDG_", "GIT_", "NPM_CONFIG_", "CITE_"];
 
@@ -193,10 +194,14 @@ mod tests {
             "HOST",
             "HOSTNAME",
             "NITRO_HOST",
+            "NODE_USE_ENV_PROXY",
             "CITE_ANYTHING",
         ] {
             let json = format!(r#"{{"{name}":"v"}}"#);
             assert!(UserEnv::from_json(&json).is_err(), "{name} was accepted");
+        }
+        for lower in ["http_proxy", "https_proxy", "no_proxy", "node_use_env_proxy"] {
+            assert!(UserEnv::from_json(&format!(r#"{{"{lower}":"v"}}"#)).is_err(), "{lower}");
         }
         assert!(name_denied("http_proxy"));
         assert!(name_denied("npm_config_registry"));

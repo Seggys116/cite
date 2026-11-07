@@ -15,6 +15,7 @@ executor_node = "cite-executor-node"
 executor_bun = "cite-executor-bun"
 executor_static = "cite-executor-static"
 executor_rust = "cite-executor-rust"
+egress = "cite-egress"
 
 [[node]]
 major = 22
