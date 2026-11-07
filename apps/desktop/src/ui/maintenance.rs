@@ -203,17 +203,21 @@ impl Console {
                 div()
                     .flex()
                     .gap(px(12.))
-                    .child(div().flex_1().child(field("Name", None, m.name.clone())))
-                    .child(div().w(px(200.)).child(field(
+                    .child(div().flex().flex_col().flex_1().child(field(
+                        "Name",
+                        None,
+                        m.name.clone(),
+                    )))
+                    .child(div().flex().flex_col().w(px(200.)).child(field(
                         "Id",
                         Some("Defaults to the name"),
                         m.page_id.clone(),
                     )))
-                    .child(
-                        div()
-                            .w(px(100.))
-                            .child(field("Status", None, m.status.clone())),
-                    ),
+                    .child(div().flex().flex_col().w(px(100.)).child(field(
+                        "Status",
+                        None,
+                        m.status.clone(),
+                    ))),
             )
             .child(field(
                 "HTML",
@@ -393,6 +397,8 @@ impl Console {
                     .child(sw)
                     .child(
                         div()
+                            .flex()
+                            .flex_col()
                             .w(px(180.))
                             .flex_none()
                             .child(strong(site.name.clone())),

@@ -291,7 +291,14 @@ impl Console {
                     .py(px(4.))
                     .border_b_1()
                     .border_color(c(DIVIDER))
-                    .child(div().flex_1().min_w_0().child(mono(entry.clone())))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w_0()
+                            .child(mono(entry.clone())),
+                    )
                     .child(remove),
             );
         }
@@ -316,7 +323,7 @@ impl Console {
                 .flex()
                 .items_center()
                 .gap(px(8.))
-                .child(div().flex_1().min_w_0().child(input))
+                .child(div().flex().flex_col().flex_1().min_w_0().child(input))
                 .child(add),
         );
         col.into_any_element()
@@ -397,6 +404,8 @@ impl Console {
                 .child(
                     div().flex().items_center().gap(px(10.)).child(mail).child(
                         div()
+                            .flex()
+                            .flex_col()
                             .text_size(px(12.))
                             .child("Block mail ports (25, 465, 587)"),
                     ),

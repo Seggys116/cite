@@ -9,6 +9,7 @@ use crate::app::{Confirm, Console, Load, View, new_input};
 use crate::certs::zone_newly_enabled;
 use crate::demo::now_ms;
 use crate::diagnose::{
+    started_deployment,
     Banner, NOTE_PREVIEW, banner, deploy_outcome, failure_text, save_outcome, shown_output,
     slot_lines, split_note,
 };
@@ -73,6 +74,7 @@ pub struct State {
     pub targets: Entity<TextInput>,
     pub note: Entity<TextInput>,
     pub busy: bool,
+    pub busy_what: &'static str,
     pub error: Option<String>,
     // The slot whose build log explains the error on screen, when it came from a deploy.
     pub error_slot: Option<Slot>,
@@ -113,6 +115,7 @@ impl State {
             targets: new_input(cx, "10.0.0.12:8080, 10.0.0.13:8080 50", |i| i.mono()),
             note: new_input(cx, "Release notes (optional)", |i| i),
             busy: false,
+            busy_what: "",
             error: None,
             error_slot: None,
             maint_enabled: false,
@@ -273,9 +276,11 @@ impl Console {
         F: Future<Output = Result<T, ClientError>> + Send + 'static,
     {
         self.detail.busy = true;
+        self.detail.busy_what = busy_text(what);
         self.clear_error();
         self.fetch_origin(cx, fut, move |this, res, here, origin, cx| {
             let result = res.map_err(|e| e.to_string()).and_then(|v| outcome(&v));
+            this.detail.busy = false;
             if !here {
                 let (msg, tone) = match result {
                     Ok(m) => (m, Tone::Ok),
@@ -345,7 +350,16 @@ impl Console {
         };
         let idle = site.active.other();
         let logs_slot = site.source.is_some().then_some(idle);
-        let fut = async move { h.deploy(&site.id, &req).await };
+        let from_source = site.source.is_some();
+        let fut = async move {
+            if from_source {
+                let note = req.note.clone();
+                let id = h.deploy_async(&site.id, None, note.as_deref()).await?;
+                Ok(started_deployment(id, idle))
+            } else {
+                h.deploy(&site.id, &req).await
+            }
+        };
         self.site_action(cx, "Deploy", fut, logs_slot, deploy_outcome);
     }
 
@@ -403,6 +417,7 @@ impl Console {
         );
         let idle = existing.active.other();
         self.detail.busy = true;
+        self.detail.busy_what = if redeploy { "Saving, then starting a build" } else { "Saving the site" };
         self.clear_error();
         let fut = async move {
             h.update_site(&edited.id, &edited).await?;
@@ -416,7 +431,14 @@ impl Console {
                 None
             };
             let deploy = if redeploy {
-                Some(h.deploy(&edited.id, &req).await.map_err(|e| e.to_string()))
+                let started = if edited.source.is_some() {
+                    h.deploy_async(&edited.id, None, req.note.as_deref())
+                        .await
+                        .map(|id| started_deployment(id, idle))
+                } else {
+                    h.deploy(&edited.id, &req).await
+                };
+                Some(started.map_err(|e| e.to_string()))
             } else {
                 None
             };
@@ -449,6 +471,7 @@ impl Console {
                     Some(Err(e)) => warn = Some(rotation_failed(&e)),
                     None => {}
                 }
+                this.detail.busy = false;
                 if !here {
                     // A secret for another place is kept under its own node and site and shown only there.
                     let (mut text, tone) = match outcome {
@@ -623,11 +646,13 @@ impl Console {
             return;
         };
         self.detail.busy = true;
+        self.detail.busy_what = "Rotating the zone secret";
         self.clear_error();
         self.fetch_origin(
             cx,
             async move { h.rotate_zone_secret(&site.id).await },
             |this, res, here, origin, cx| {
+                this.detail.busy = false;
                 if !here {
                     let (text, tone) = match res {
                         Ok(reveal) => {
@@ -679,10 +704,12 @@ impl Console {
         };
         let name = site.name.clone();
         self.detail.busy = true;
+        self.detail.busy_what = "Deleting the site";
         self.fetch_origin(
             cx,
             async move { h.delete_site(&site.id).await },
             move |this, res, here, origin, cx| {
+                this.detail.busy = false;
                 if !here {
                     let (text, tone) = match res {
                         Ok(()) => (format!("Site {name} deleted"), Tone::Ok),
@@ -972,6 +999,8 @@ impl Console {
             .text_color(c(red))
             .child(
                 div()
+                    .flex()
+                    .flex_col()
                     .flex_1()
                     .min_w_0()
                     .child(self.note_block("error-note", msg, cx)),
@@ -997,7 +1026,7 @@ impl Console {
             .gap(px(16.))
             .child(self.header(data, back, cx));
         if self.detail.busy {
-            col = col.child(notice("Working on the node...", Tone::Info));
+            col = col.child(notice(&format!("{}...", self.detail.busy_what), Tone::Info));
         }
         if let Some(err) = &self.detail.error {
             col = col.child(self.error_notice(err, data, cx));
@@ -1176,6 +1205,8 @@ impl Console {
             .child(title)
             .child(list);
         div()
+            .flex()
+            .flex_col()
             .flex_1()
             .min_w_0()
             .child(card(None, None, body))
@@ -1220,6 +1251,8 @@ impl Console {
                     .gap(px(12.))
                     .child(
                         div()
+                            .flex()
+                            .flex_col()
                             .flex_1()
                             .min_w_0()
                             .child(field("Note", None, self.detail.note.clone())),
@@ -1257,7 +1290,7 @@ impl Console {
     fn failure_banner(&self, b: &Banner, logs_ok: bool, cx: &mut Context<Self>) -> AnyElement {
         let red = Tone::Bad.color();
         let mut head = div().flex().items_center().gap(px(8.)).child(
-            div().flex_1().min_w_0().child(
+            div().flex().flex_col().flex_1().min_w_0().child(
                 strong(b.headline.clone())
                     .text_size(px(14.))
                     .text_color(c(red)),
@@ -1568,6 +1601,8 @@ impl Console {
                     action_pill(d.action),
                     slot_pill(d.slot),
                     div()
+                        .flex()
+                        .flex_col()
                         .child(if d.note.is_empty() {
                             "-".to_string()
                         } else {
@@ -1662,6 +1697,17 @@ impl Console {
             )
             .child(del);
         card(Some("Delete"), None, body).into_any_element()
+    }
+}
+
+// What the page is waiting for, in words the owner would use.
+fn busy_text(what: &str) -> &'static str {
+    match what {
+        "Deploy" => "Starting a build",
+        "Switch" => "Switching the active slot",
+        "Rollback" => "Rolling back",
+        "Maintenance change" => "Changing maintenance mode",
+        _ => "Waiting for the node",
     }
 }
 

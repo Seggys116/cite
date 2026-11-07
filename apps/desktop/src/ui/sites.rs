@@ -5,10 +5,11 @@ use crate::api::{NodeHandle, join_all};
 use crate::app::{Console, Load, View, new_input};
 use crate::demo::now_ms;
 use crate::model::{parse_rfc3339_ms, rel_time};
+use crate::siteops::is_busy_phase;
 use crate::theme::{BORDER, DIM, DIVIDER, MONO, Tone, c, tint};
 use crate::ui::chart::{clip_tip, clip_tip_full, wide};
 use crate::ui::input::TextInput;
-use crate::ui::overview::{action_pill, slot_pill};
+use crate::ui::overview::slot_pill;
 use crate::ui::widgets::{
     BtnKind, Col, btn, card, dot, empty_state, id, notice, page_header, pill, skeleton, text_dim,
 };
@@ -17,6 +18,70 @@ pub struct Row {
     pub node: String,
     pub site: Site,
     pub health: Vec<(String, String)>,
+    // Build phase from the site status, fetched only for source-built sites.
+    pub phase: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SiteState {
+    Building,
+    Redeploying,
+    Failed,
+    Maintenance,
+    Down,
+    Serving,
+}
+
+impl SiteState {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Building => "Building",
+            Self::Redeploying => "Redeploying",
+            Self::Failed => "Failed",
+            Self::Maintenance => "Maintenance",
+            Self::Down => "Down",
+            Self::Serving => "Serving",
+        }
+    }
+
+    pub fn tone(self) -> Tone {
+        match self {
+            Self::Building | Self::Redeploying => Tone::Info,
+            Self::Failed | Self::Down => Tone::Bad,
+            Self::Maintenance => Tone::Warn,
+            Self::Serving => Tone::Ok,
+        }
+    }
+
+    pub fn pill(self) -> gpui::Div {
+        pill(self.label(), self.tone())
+    }
+}
+
+// A running build wins, then maintenance, the node's own failed phase, red health and finally a failed last deploy.
+pub fn site_state(site: &Site, health: &[(String, String)], phase: Option<&str>) -> SiteState {
+    let last_failed = last_deploy(site).is_some_and(|(a, _)| a == DeployAction::Failed);
+    if phase.is_some_and(is_busy_phase) {
+        let served_before = site.history.iter().any(|d| d.action != DeployAction::Failed);
+        return if served_before {
+            SiteState::Redeploying
+        } else {
+            SiteState::Building
+        };
+    }
+    if site.maintenance.enabled {
+        SiteState::Maintenance
+    } else if phase == Some("failed") {
+        SiteState::Failed
+    } else if phase == Some("unhealthy")
+        || (!health.is_empty() && health.iter().all(|(_, s)| health_tone(s) == Tone::Bad))
+    {
+        SiteState::Down
+    } else if last_failed {
+        SiteState::Failed
+    } else {
+        SiteState::Serving
+    }
 }
 
 pub struct Data {
@@ -73,6 +138,7 @@ async fn node_rows(h: NodeHandle) -> (String, Result<Vec<Row>, String>) {
                     node: name.clone(),
                     site,
                     health: Vec::new(),
+                    phase: None,
                 })
                 .collect();
             (name, Ok(rows))
@@ -139,7 +205,50 @@ impl Console {
             cx.notify();
             if loaded {
                 this.load_site_health(cx);
+                this.load_site_phases(cx);
             }
+        });
+    }
+
+    // One status call per source-built site, once per load; sites without a build never need it.
+    fn load_site_phases(&mut self, cx: &mut Context<Self>) {
+        let Load::Ready(data) = &self.sites.data else {
+            return;
+        };
+        let jobs: Vec<(NodeHandle, String)> = data
+            .rows
+            .iter()
+            .filter(|r| r.site.source.is_some())
+            .filter_map(|r| Some((self.handle_named(&r.node)?, r.site.id.clone())))
+            .collect();
+        if jobs.is_empty() {
+            return;
+        }
+        let fut = async move {
+            let all = join_all(
+                jobs.into_iter()
+                    .map(|(h, site)| async move {
+                        let phase = h.site_status(&site).await.ok().map(|s| s.phase);
+                        (h.name().to_string(), site, phase)
+                    })
+                    .collect(),
+            )
+            .await;
+            Ok::<_, cite_client::ClientError>(all.into_iter().flatten().collect::<Vec<_>>())
+        };
+        self.fetch_scoped(cx, fut, |this, res, cx| {
+            if let (Load::Ready(data), Ok(phases)) = (&mut this.sites.data, res) {
+                for (node, site, phase) in phases {
+                    if let Some(row) = data
+                        .rows
+                        .iter_mut()
+                        .find(|r| r.node == node && r.site.id == site)
+                    {
+                        row.phase = phase;
+                    }
+                }
+            }
+            cx.notify();
         });
     }
 
@@ -213,6 +322,8 @@ impl Console {
                         .gap(px(12.))
                         .child(
                             div()
+                                .flex()
+                                .flex_col()
                                 .flex_1()
                                 .min_w_0()
                                 .max_w(px(420.))
@@ -253,11 +364,7 @@ impl Console {
                         .children(r.health.iter().map(|(_, s)| dot(health_tone(s))))
                         .into_any_element()
                 };
-                let state = if r.site.maintenance.enabled {
-                    pill("Maintenance", Tone::Warn)
-                } else {
-                    pill("Serving", Tone::Ok)
-                };
+                let state = site_state(&r.site, &r.health, r.phase.as_deref()).pill();
                 let kind = pill(
                     if r.site.kind == SiteKind::Api {
                         "API"
@@ -267,17 +374,9 @@ impl Console {
                     Tone::Muted,
                 );
                 let deploy = match last_deploy(&r.site) {
-                    Some((action, at)) => div()
-                        .flex()
-                        .items_center()
-                        .gap(px(6.))
-                        .min_w_0()
-                        .child(action_pill(action))
-                        .child(
-                            text_dim(rel_time(now, at))
-                                .text_size(px(11.))
-                                .whitespace_nowrap(),
-                        )
+                    Some((_, at)) => text_dim(rel_time(now, at))
+                        .text_size(px(12.))
+                        .whitespace_nowrap()
                         .into_any_element(),
                     None => text_dim("never").text_size(px(12.)).into_any_element(),
                 };
@@ -500,6 +599,52 @@ mod tests {
             hosts_label(&hosts(&["a.com", "b.com", "c.com", "d.com"])),
             "a.com, b.com +2"
         );
+    }
+
+    #[test]
+    fn site_state_follows_phase_maintenance_health_and_history() {
+        use cite_edge::model::Deployment;
+        let entry = |at: &str, action| Deployment {
+            id: at.into(),
+            at: at.into(),
+            slot: Slot::Blue,
+            action,
+            note: String::new(),
+        };
+        let health = |s: &[&str]| -> Vec<(String, String)> {
+            s.iter().map(|x| ("t".to_string(), x.to_string())).collect()
+        };
+        let mut s = site("shop", Slot::Blue);
+        assert_eq!(site_state(&s, &[], None), SiteState::Serving);
+        assert_eq!(site_state(&s, &health(&["UP"]), None), SiteState::Serving);
+        assert_eq!(
+            site_state(&s, &health(&["DOWN", "UP"]), None),
+            SiteState::Serving
+        );
+        assert_eq!(
+            site_state(&s, &health(&["DOWN", "DOWN"]), None),
+            SiteState::Down
+        );
+        assert_eq!(site_state(&s, &[], Some("building")), SiteState::Building);
+        assert_eq!(site_state(&s, &[], Some("idle")), SiteState::Serving);
+        assert_eq!(site_state(&s, &[], Some("unhealthy")), SiteState::Down);
+        assert_eq!(site_state(&s, &[], Some("failed")), SiteState::Failed);
+        s.history = vec![entry("2026-11-02T10:00:00Z", DeployAction::Promote)];
+        assert_eq!(
+            site_state(&s, &[], Some("packing")),
+            SiteState::Redeploying
+        );
+        s.history.push(entry("2026-11-03T10:00:00Z", DeployAction::Failed));
+        assert_eq!(site_state(&s, &[], None), SiteState::Failed);
+        s.maintenance.enabled = true;
+        assert_eq!(site_state(&s, &[], None), SiteState::Maintenance);
+        assert_eq!(
+            site_state(&s, &[], Some("building")),
+            SiteState::Redeploying
+        );
+        assert_eq!(SiteState::Building.tone(), Tone::Info);
+        assert_eq!(SiteState::Maintenance.tone(), Tone::Warn);
+        assert_eq!(SiteState::Serving.tone(), Tone::Ok);
     }
 
     #[test]

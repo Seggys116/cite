@@ -495,7 +495,11 @@ impl Console {
     fn rule_form(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let f = &self.firewall;
         let half = |label: &str, hint: Option<&str>, e: &Entity<TextInput>| {
-            div().flex_1().child(field(label, hint, e.clone()))
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .child(field(label, hint, e.clone()))
         };
         let mut kinds = Vec::new();
         for kind in [RuleKind::Block, RuleKind::Redirect, RuleKind::Effects] {
@@ -582,7 +586,7 @@ impl Console {
                 div()
                     .flex()
                     .gap(px(12.))
-                    .child(div().flex_1().child(self.scheme_field(cx)))
+                    .child(div().flex().flex_col().flex_1().child(self.scheme_field(cx)))
                     .child(half("Referer regex", None, &self.firewall.referer)),
             );
         if let Some(err) = &self.firewall.error {
@@ -721,7 +725,7 @@ impl Console {
                 .items_center()
                 .gap(px(10.))
                 .child(cors_box)
-                .child(div().child("Answer CORS requests")),
+                .child(div().flex().flex_col().child("Answer CORS requests")),
         );
         if f.cors_on {
             cors = cors.child(self.cors_fields(cx));
@@ -791,12 +795,21 @@ impl Console {
             .child(seg_row(kinds))
             .child(
                 div()
+                    .flex()
+                    .flex_col()
                     .flex_1()
                     .min_w(px(140.))
                     .max_w(px(220.))
                     .child(row.name.clone()),
             )
-            .child(div().flex_1().min_w(px(160.)).child(value))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_w(px(160.))
+                    .child(value),
+            )
             .child(
                 btn(id("fw-op-del", i), "Remove", BtnKind::Danger).on_click(cx.listener(
                     move |this, _, _, cx| {
@@ -816,7 +829,11 @@ impl Console {
     fn cors_fields(&self, cx: &mut Context<Self>) -> AnyElement {
         let f = &self.firewall;
         let half = |label: &str, hint: Option<&str>, e: &Entity<TextInput>| {
-            div().flex_1().child(field(label, hint, e.clone()))
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .child(field(label, hint, e.clone()))
         };
         let creds = checkbox(id("fw-cors", "creds"), f.cors_credentials).on_click(cx.listener(
             |this, _, _, cx| {
@@ -853,7 +870,7 @@ impl Console {
                     .items_center()
                     .gap(px(10.))
                     .child(creds)
-                    .child(div().child("Allow credentials")),
+                    .child(div().flex().flex_col().child("Allow credentials")),
             );
         if f.cors_credentials {
             col = col.child(
@@ -915,7 +932,7 @@ impl Console {
                     .items_center()
                     .gap(px(10.))
                     .child(negate)
-                    .child(div().child("Match when the header is not this value")),
+                    .child(div().flex().flex_col().child("Match when the header is not this value")),
             )
             .child(
                 div()
@@ -923,7 +940,7 @@ impl Console {
                     .items_center()
                     .gap(px(10.))
                     .child(secret)
-                    .child(div().child("Secret value")),
+                    .child(div().flex().flex_col().child("Secret value")),
             )
             .child(
                 text_dim("A secret value is hidden while you type, is never shown in the rule list and cannot be read back.")
@@ -937,13 +954,17 @@ impl Console {
                 div()
                     .flex()
                     .gap(px(12.))
-                    .child(div().flex_1().child(field(
+                    .child(div().flex().flex_col().flex_1().child(field(
                         "Header name",
                         Some("Optional. Letters, digits, - and _."),
                         f.header_name.clone(),
                     )))
-                    .child(div().flex_1().child(field("Header value", None, value)))
-                    .child(div().child(field(
+                    .child(div().flex().flex_col().flex_1().child(field(
+                        "Header value",
+                        None,
+                        value,
+                    )))
+                    .child(div().flex().flex_col().child(field(
                         "Compare as",
                         None,
                         div().flex().child(seg_row(modes)),

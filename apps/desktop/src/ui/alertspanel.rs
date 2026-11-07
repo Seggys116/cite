@@ -501,7 +501,13 @@ impl Console {
                 .items_center()
                 .justify_between()
                 .gap(px(12.))
-                .child(div().flex_1().child(notice(err, Tone::Bad)))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .child(notice(err, Tone::Bad)),
+                )
                 .child(retry);
             return card(Some("Alerts"), Some(subtitle.as_str()), body).into_any_element();
         }
@@ -524,13 +530,22 @@ impl Console {
                         },
                     )),
                 )
-                .child(div().child("Send alerts")),
+                .child(div().flex().flex_col().child("Send alerts")),
         );
-        body = body.child(div().w_full().max_w(px(260.)).child(field(
-            "Cooldown (seconds)",
-            Some("How long to wait before the same alert is sent again. 900 is 15 minutes."),
-            form.cooldown.clone(),
-        )));
+        body = body.child(
+            div()
+                .flex()
+                .flex_col()
+                .w_full()
+                .max_w(px(260.))
+                .child(field(
+                    "Cooldown (seconds)",
+                    Some(
+                        "How long to wait before the same alert is sent again. 900 is 15 minutes.",
+                    ),
+                    form.cooldown.clone(),
+                )),
+        );
         body = body.child(section_title(&format!(
             "Webhooks ({} of {MAX_WEBHOOKS})",
             form.hooks.len()
@@ -648,7 +663,7 @@ impl Console {
                             }),
                         ),
                     )
-                    .child(div().child(event_label(event))),
+                    .child(div().flex().flex_col().child(event_label(event))),
             );
         }
         list.into_any_element()
@@ -723,6 +738,8 @@ impl Console {
         Self::panel_shell()
             .child(
                 div()
+                    .flex()
+                    .flex_col()
                     .w_full()
                     .max_w(px(420.))
                     .child(field("Name", None, row.name.clone())),
@@ -802,11 +819,14 @@ impl Console {
                 Some("The SMTP host that sends the message."),
                 mail.host.clone(),
             ))
-            .child(div().w_full().max_w(px(200.)).child(field(
-                "Port",
-                Some(port_hint.as_str()),
-                mail.port.clone(),
-            )))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .w_full()
+                    .max_w(px(200.))
+                    .child(field("Port", Some(port_hint.as_str()), mail.port.clone())),
+            )
             .child(field("Security", None, div().flex().child(seg_row(modes))))
             .child(field(
                 "User name",

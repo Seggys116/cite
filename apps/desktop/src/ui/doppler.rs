@@ -549,6 +549,8 @@ impl Console {
                 .child(strong(binding_scope(b)).text_size(px(13.)))
                 .child(
                     div()
+                        .flex()
+                        .flex_col()
                         .text_size(px(12.))
                         .text_color(c(tone.color()))
                         .child(line),
@@ -660,7 +662,7 @@ impl Console {
                         cx.notify();
                     })),
                 )
-                .child(div().text_size(px(12.)).child(label))
+                .child(div().flex().flex_col().text_size(px(12.)).child(label))
         };
         body = body.child(field("Service token", Some(TOKEN_HELP), d.token.clone()));
         body = body.child(
@@ -744,6 +746,8 @@ impl Console {
         if let Some(e) = &d.error {
             body = body.child(
                 div()
+                    .flex()
+                    .flex_col()
                     .text_size(px(12.))
                     .text_color(c(Tone::Bad.color()))
                     .child(e.clone()),

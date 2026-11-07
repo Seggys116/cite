@@ -789,6 +789,8 @@ impl Console {
                     .pb(px(space::MD))
                     .child(
                         div()
+                            .flex()
+                            .flex_col()
                             .px(px(10.))
                             .pt(px(space::XS))
                             .child(logo(self.logo_flipped())),
@@ -1030,8 +1032,8 @@ impl Console {
                 }
             }))
             .on_click(cx.listener(move |this, _, _, cx| this.dismiss_toast(toast_id, cx)))
-            .child(div().mt(px(5.)).child(crate::ui::widgets::dot(toast.tone)))
-            .child(div().flex_1().min_w_0().child(toast.text.clone()))
+            .child(div().flex().flex_col().mt(px(5.)).child(crate::ui::widgets::dot(toast.tone)))
+            .child(div().flex().flex_col().flex_1().min_w_0().child(toast.text.clone()))
             .child(text_dim("\u{00d7}").text_size(px(font::MD)))
     }
 }
@@ -1067,6 +1069,8 @@ impl Render for Console {
         let scroll_key = format!("scroll-{:?}", self.view);
         let mut scroller = div()
             .id(gpui::SharedString::from(scroll_key))
+            .flex()
+            .flex_col()
             .flex_1()
             .min_h_0()
             .overflow_y_scroll();

@@ -464,6 +464,7 @@ impl Console {
                     .child(actions),
             )
             .child(self.note_block("status-note", &reason, cx))
+            .children(crate::diagnose::failure_hint(&reason).map(text_dim))
             .into_any_element()
     }
 
@@ -545,13 +546,17 @@ impl Console {
                         .children(live.then(|| pill("live", Tone::Ok)))
                         .into_any_element(),
                     mono(r.container).into_any_element(),
-                    div().child(r.health).into_any_element(),
-                    div().child(r.restarts.to_string()).into_any_element(),
-                    div().child(r.exit).into_any_element(),
-                    div().child(r.phase).into_any_element(),
+                    div().flex().flex_col().child(r.health).into_any_element(),
+                    div()
+                        .flex()
+                        .flex_col()
+                        .child(r.restarts.to_string())
+                        .into_any_element(),
+                    div().flex().flex_col().child(r.exit).into_any_element(),
+                    div().flex().flex_col().child(r.phase).into_any_element(),
                     mono(r.live).into_any_element(),
                     mono(r.head).into_any_element(),
-                    div().child(r.haproxy).into_any_element(),
+                    div().flex().flex_col().child(r.haproxy).into_any_element(),
                 ]
             })
             .collect();
@@ -888,6 +893,8 @@ impl Console {
                     pill(&r.result, tone).into_any_element(),
                     mono(r.sha).into_any_element(),
                     div()
+                        .flex()
+                        .flex_col()
                         .child(crate::diagnose::split_note(&r.reason).reason)
                         .into_any_element(),
                     text_dim(clock(&r.finished)).into_any_element(),
@@ -931,12 +938,12 @@ impl Console {
                     .flex()
                     .items_end()
                     .gap(px(12.))
-                    .child(div().flex_1().min_w_0().child(field(
+                    .child(div().flex().flex_col().flex_1().min_w_0().child(field(
                         "Deploy a branch, tag or commit",
                         Some("Builds this ref into the idle slot without waiting here; watch the status above."),
                         self.ops.git_ref.clone(),
                     )))
-                    .child(div().pb(px(18.)).child(go)),
+                    .child(div().flex().flex_col().pb(px(18.)).child(go)),
             );
         }
         Some(

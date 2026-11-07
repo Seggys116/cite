@@ -198,6 +198,8 @@ pub fn line_chart(lines: Vec<Line>, height: f32, grid: bool) -> Div {
         .unwrap_or(0);
     let ceiling = nice_max(max);
     let area = div()
+        .flex()
+        .flex_col()
         .relative()
         .flex_1()
         .min_w_0()
@@ -235,6 +237,8 @@ pub fn x_axis(key: &str, stamps: Vec<String>) -> Div {
     let single = ticks.len() == 1;
     let labels = ticks.into_iter().filter_map(|i| stamps.get(i).cloned());
     div()
+        .flex()
+        .flex_col()
         .relative()
         .w_full()
         .min_w_0()
@@ -249,7 +253,14 @@ pub fn x_axis(key: &str, stamps: Vec<String>) -> Div {
                 .overflow_hidden()
                 .text_size(px(11.))
                 .text_color(c(DIM))
-                .children(labels.map(|l| div().flex_none().whitespace_nowrap().child(l))),
+                .children(labels.map(|l| {
+                    div()
+                        .flex()
+                        .flex_col()
+                        .flex_none()
+                        .whitespace_nowrap()
+                        .child(l)
+                })),
         )
 }
 
@@ -280,6 +291,8 @@ pub fn hbar(label: &str, value: u64, max: u64, color: u32, text: String) -> Div 
         .min_w_0()
         .child(
             div()
+                .flex()
+                .flex_col()
                 .w(px(70.))
                 .flex_shrink()
                 .min_w(px(36.))
@@ -292,6 +305,8 @@ pub fn hbar(label: &str, value: u64, max: u64, color: u32, text: String) -> Div 
         )
         .child(
             div()
+                .flex()
+                .flex_col()
                 .flex_1()
                 .min_w(px(24.))
                 .h(px(8.))
@@ -323,6 +338,8 @@ struct Tip(SharedString);
 impl Render for Tip {
     fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
         div()
+            .flex()
+            .flex_col()
             .max_w(px(520.))
             .px(px(8.))
             .py(px(5.))
@@ -356,6 +373,8 @@ pub fn clip_tip_full(
     let text: SharedString = text.into();
     let tip: SharedString = full.into();
     div()
+        .flex()
+        .flex_col()
         .id(key)
         .min_w_0()
         .overflow_hidden()
@@ -368,11 +387,20 @@ pub fn clip_tip_full(
 // Lets a table keep its column widths on narrow windows by scrolling sideways instead of overlapping.
 pub fn wide(key: ElementId, min_width: f32, body: impl IntoElement) -> Stateful<Div> {
     let mut table = div()
+        .flex()
+        .flex_col()
         .id(key)
         .w_full()
         .min_w_0()
         .overflow_x_scroll()
-        .child(div().min_w(px(min_width)).w_full().child(body));
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .min_w(px(min_width))
+                .w_full()
+                .child(body),
+        );
     // A vertical wheel must reach the page scroller instead of panning the table sideways.
     table.style().restrict_scroll_to_axis = Some(true);
     table

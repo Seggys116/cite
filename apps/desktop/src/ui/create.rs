@@ -407,6 +407,8 @@ impl Console {
                     .child(badge)
                     .child(
                         div()
+                            .flex()
+                            .flex_col()
                             .text_size(px(12.))
                             .whitespace_nowrap()
                             .text_color(c(if s == current { TEXT } else { DIM }))
@@ -437,6 +439,8 @@ impl Console {
         if let Some(p) = &problem {
             row = row.child(
                 div()
+                    .flex()
+                    .flex_col()
                     .flex_1()
                     .min_w(px(180.))
                     .child(text_dim(p.clone()).text_size(px(12.))),
@@ -594,6 +598,8 @@ impl Console {
                     .child(text_dim(label).flex_none().w(px(110.)).text_size(px(12.)))
                     .child(
                         div()
+                            .flex()
+                            .flex_col()
                             .flex_1()
                             .min_w_0()
                             .child(clip_tip(id("create-review", i), value).text_size(px(13.))),
@@ -656,7 +662,12 @@ impl Console {
             };
             let row = form_row(&name, holds, switch);
             rows.push(if replicate {
-                div().opacity(0.5).child(row).into_any_element()
+                div()
+                    .flex()
+                    .flex_col()
+                    .opacity(0.5)
+                    .child(row)
+                    .into_any_element()
             } else {
                 row
             });

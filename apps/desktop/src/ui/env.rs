@@ -213,7 +213,7 @@ impl Console {
                             .py(px(6.))
                             .border_b_1()
                             .border_color(c(DIVIDER))
-                            .child(div().flex_1().min_w_0().child(mono(name.clone())))
+                            .child(div().flex().flex_col().flex_1().min_w_0().child(mono(name.clone())))
                             .child(text_dim("value hidden").text_size(px(11.)))
                             .child(btn(id(key, name), "Remove", BtnKind::Danger).on_click(
                                 cx.listener(move |this, _, _, cx| {
@@ -245,8 +245,20 @@ impl Console {
             div()
                 .flex()
                 .gap(px(12.))
-                .child(div().flex_1().child(strong("Name").text_size(px(12.))))
-                .child(div().flex_1().child(strong("Value").text_size(px(12.))))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .child(strong("Name").text_size(px(12.))),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .child(strong("Value").text_size(px(12.))),
+                )
                 .child(div().w(px(76.)).flex_none()),
         );
         let single = rows.len() == 1;
@@ -269,9 +281,23 @@ impl Console {
                     .flex()
                     .items_center()
                     .gap(px(12.))
-                    .child(div().flex_1().min_w_0().child(row.name.clone()))
-                    .child(div().flex_1().min_w_0().child(row.value.clone()))
-                    .child(div().w(px(76.)).flex_none().child(drop)),
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w_0()
+                            .child(row.name.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w_0()
+                            .child(row.value.clone()),
+                    )
+                    .child(div().flex().flex_col().w(px(76.)).flex_none().child(drop)),
             );
         }
         let ready = !self.ops.busy && named_rows(&typed) > 0;

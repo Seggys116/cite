@@ -27,6 +27,8 @@ pub fn scroll_area(key: impl Into<SharedString>) -> Stateful<Div> {
 
 pub fn scroll_area_with(key: impl Into<SharedString>, handle: &ScrollHandle) -> Stateful<Div> {
     div()
+        .flex()
+        .flex_col()
         .id(ElementId::Name(key.into()))
         .min_h_0()
         .overflow_y_scroll()

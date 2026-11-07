@@ -549,13 +549,18 @@ impl Console {
                     cx.notify();
                 })),
             )
-            .child(div().child("Archive old data before deleting it"));
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .child("Archive old data before deleting it"),
+            );
         let mut panel = div()
             .flex()
             .flex_col()
             .gap(px(12.))
             .child(field("Cut by", None, div().flex().child(seg_row(basis))))
-            .child(div().w(px(280.)).child(input))
+            .child(div().flex().flex_col().w(px(280.)).child(input))
             .child(archive_row);
         if !a.archive {
             panel = panel
@@ -574,7 +579,12 @@ impl Console {
                                 cx.notify();
                             }),
                         ))
-                        .child(div().child("I understand this deletes data permanently")),
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .child("I understand this deletes data permanently"),
+                        ),
                 );
         }
         let mut hint = None;

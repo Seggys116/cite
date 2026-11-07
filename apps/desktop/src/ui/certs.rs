@@ -559,7 +559,7 @@ impl Console {
                     .flex()
                     .items_end()
                     .gap(px(10.))
-                    .child(div().flex_1().min_w_0().max_w(px(200.)).child(field(
+                    .child(div().flex().flex_col().flex_1().min_w_0().max_w(px(200.)).child(field(
                         "HTTPS port",
                         Some("Usually 443"),
                         self.certs.port.clone(),
@@ -755,6 +755,8 @@ impl Console {
             .child(strong(title))
             .child(
                 div()
+                    .flex()
+                    .flex_col()
                     .w_full()
                     .max_w(px(420.))
                     .child(field("Name", None, s.name.clone())),
@@ -863,7 +865,7 @@ pub fn access_body(controls: AccessControls, draft: AccessDraft) -> Div {
                 .items_center()
                 .gap(px(10.))
                 .child(controls.cloudflare_box)
-                .child(div().child(PROXY_LABEL)),
+                .child(div().flex().flex_col().child(PROXY_LABEL)),
         )
         .child(text_dim(PROXY_HELP).text_size(px(12.)))
         .child(
@@ -872,7 +874,7 @@ pub fn access_body(controls: AccessControls, draft: AccessDraft) -> Div {
                 .items_center()
                 .gap(px(10.))
                 .child(controls.zone_box)
-                .child(div().child(ZONE_LABEL))
+                .child(div().flex().flex_col().child(ZONE_LABEL))
                 .when(!draft.cloudflare_only, |d| d.opacity(0.5)),
         )
         .child(text_dim(zone_lock_help(draft.cloudflare_only, draft.zone_lock)).text_size(px(12.)))

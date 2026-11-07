@@ -21,23 +21,31 @@ pub fn id(prefix: &str, key: impl std::fmt::Display) -> ElementId {
 }
 
 pub fn text_dim(s: impl Into<SharedString>) -> Div {
-    div().text_color(c(DIM)).child(s.into())
+    div().flex().flex_col().text_color(c(DIM)).child(s.into())
 }
 
 pub fn mono(s: impl Into<SharedString>) -> Div {
     div()
+        .flex()
+        .flex_col()
         .font_family(MONO)
         .text_size(px(font::SM))
         .child(s.into())
 }
 
 pub fn strong(s: impl Into<SharedString>) -> Div {
-    div().font_weight(FontWeight::SEMIBOLD).child(s.into())
+    div()
+        .flex()
+        .flex_col()
+        .font_weight(FontWeight::SEMIBOLD)
+        .child(s.into())
 }
 
 // Single-line text that clips with an ellipsis instead of wrapping inside narrow cells.
 pub fn clip(s: impl Into<SharedString>) -> Div {
     div()
+        .flex()
+        .flex_col()
         .min_w_0()
         .overflow_hidden()
         .text_ellipsis()
@@ -294,6 +302,8 @@ pub fn skeleton(height: f32) -> Div {
 pub fn notice(message: &str, tone: Tone) -> Div {
     let color = tone.color();
     div()
+        .flex()
+        .flex_col()
         .px(px(space::MD))
         .py(px(space::SM))
         .rounded(px(ROW_RADIUS))
@@ -323,6 +333,8 @@ pub fn code_block(
     max_height: f32,
 ) -> Div {
     div()
+        .flex()
+        .flex_col()
         .w_full()
         .min_w_0()
         .rounded(px(ROW_RADIUS))
@@ -362,6 +374,8 @@ pub fn toggle(key: ElementId, on: bool) -> Stateful<Div> {
 
 pub fn seg_item(key: ElementId, label: &str, active: bool) -> Stateful<Div> {
     let mut item = div()
+        .flex()
+        .flex_col()
         .id(key)
         .px(px(11.))
         .py(px(5.))

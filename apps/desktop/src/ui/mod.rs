@@ -9,6 +9,8 @@ pub mod create;
 pub mod detail;
 pub mod firewall;
 pub mod input;
+#[cfg(test)]
+mod layout_tests;
 pub mod maintenance;
 pub mod nodes;
 pub mod ops;

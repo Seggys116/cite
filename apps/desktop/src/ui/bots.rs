@@ -435,6 +435,8 @@ impl Console {
         }
         let half = |label: &str, hint: Option<&str>, input: &Entity<TextInput>| {
             div()
+                .flex()
+                .flex_col()
                 .flex_1()
                 .min_w(px(180.))
                 .child(field(label, hint, input.clone()))
@@ -997,7 +999,7 @@ fn kv(label: &str, value: &str, missing: &str) -> AnyElement {
                 .w(px(140.))
                 .text_size(px(12.)),
         )
-        .child(div().flex_1().min_w_0().child(shown))
+        .child(div().flex().flex_col().flex_1().min_w_0().child(shown))
         .into_any_element()
 }
 
@@ -1025,7 +1027,10 @@ pub fn request_detail(e: &LogEvent, close: AnyElement) -> AnyElement {
             )
             .child(text_dim(class_help(&e.bot_class)).text_size(px(12.)))
     } else {
-        div().child(text_dim("This request was recorded without a bot verdict."))
+        div()
+            .flex()
+            .flex_col()
+            .child(text_dim("This request was recorded without a bot verdict."))
     };
     let mut signals = div().flex().flex_col().gap(px(6.));
     let parsed = parse_signals(&e.bot_signals);

@@ -223,7 +223,30 @@ pub fn banner(site: &Site, live: Option<&Value>) -> Option<Banner> {
 }
 
 // What a finished deploy means for the owner, with the node's own note kept in full when it failed.
+// A build that was started and not waited for: the node answers at once and the status panel follows it.
+const STARTED_AT: &str = "started";
+
+pub fn started_deployment(id: String, slot: cite_edge::model::Slot) -> Deployment {
+    Deployment {
+        id,
+        at: STARTED_AT.to_string(),
+        slot,
+        action: DeployAction::Promote,
+        note: String::new(),
+    }
+}
+
+fn was_started(d: &Deployment) -> bool {
+    d.at == STARTED_AT
+}
+
 pub fn deploy_outcome(d: &Deployment) -> Result<String, String> {
+    if was_started(d) {
+        return Ok(format!(
+            "Build started on the {} slot. The status panel shows how it goes.",
+            d.slot.as_str()
+        ));
+    }
     if d.action == DeployAction::Failed {
         Err(if d.note.is_empty() {
             "The deploy failed. The active slot was left untouched.".to_string()
@@ -245,6 +268,10 @@ pub fn deploy_outcome(d: &Deployment) -> Result<String, String> {
 pub fn save_outcome(deploy: Option<&Result<Deployment, String>>) -> Result<String, String> {
     match deploy {
         None => Ok("Saved".to_string()),
+        Some(Ok(d)) if was_started(d) => Ok(format!(
+            "Saved. A build started on the {} slot; the status panel shows how it goes.",
+            d.slot.as_str()
+        )),
         Some(Ok(d)) => match deploy_outcome(d) {
             Ok(_) => Ok(format!(
                 "Saved and redeployed. The {} slot is now active.",
@@ -253,6 +280,16 @@ pub fn save_outcome(deploy: Option<&Result<Deployment, String>>) -> Result<Strin
             Err(e) => Err(format!("Saved, but the redeploy failed. {e}")),
         },
         Some(Err(e)) => Err(format!("Saved, but the redeploy failed: {e}")),
+    }
+}
+
+// One line saying what to try for the failures that have a known fix.
+pub fn failure_hint(note: &str) -> Option<&'static str> {
+    let lower = note.to_ascii_lowercase();
+    if lower.contains("out of memory") || lower.contains("oom") || lower.contains("heap out of memory") {
+        Some("The build ran out of memory. Raise Build memory in the Build tab (Next.js builds often need 4096 MiB or more), save and redeploy.")
+    } else {
+        None
     }
 }
 

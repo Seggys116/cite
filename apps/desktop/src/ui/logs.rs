@@ -274,7 +274,13 @@ impl Console {
             .gap(px(10.))
             .child(seg_row(sources))
             .child(seg_row(slots))
-            .child(div().w(px(240.)).child(logs.search.clone()))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .w(px(240.))
+                    .child(logs.search.clone()),
+            )
             .child(div().flex_1())
             .child(text_dim(count).text_size(px(11.)))
             .child(

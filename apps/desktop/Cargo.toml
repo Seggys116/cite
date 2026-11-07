@@ -20,6 +20,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 unicode-segmentation = "1"
 
 [dev-dependencies]
+gpui = { version = "0.2", features = ["test-support"] }
 tempfile = "3"
 
 [target.'cfg(windows)'.build-dependencies]

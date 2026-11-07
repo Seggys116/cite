@@ -410,6 +410,8 @@ impl Console {
                 "Days to keep",
                 Some("1 to 3650"),
                 div()
+                    .flex()
+                    .flex_col()
                     .w(px(140.))
                     .flex_shrink()
                     .min_w(px(80.))
@@ -624,11 +626,19 @@ impl Console {
                     .flex()
                     .items_end()
                     .gap(px(10.))
-                    .child(div().flex_1().min_w_0().max_w(px(420.)).child(field(
-                        "New token name",
-                        None,
-                        self.settings.token_name.clone(),
-                    )))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w_0()
+                            .max_w(px(420.))
+                            .child(field(
+                                "New token name",
+                                None,
+                                self.settings.token_name.clone(),
+                            )),
+                    )
                     .child(
                         btn(id("tok", "create"), "Create token", BtnKind::Primary).on_click(
                             cx.listener(|this, _, _, cx| {
@@ -674,6 +684,8 @@ pub(crate) fn section(title: &str, body: impl IntoElement) -> Div {
         .min_w_0()
         .child(
             div()
+                .flex()
+                .flex_col()
                 .pl(px(4.))
                 .text_size(px(11.))
                 .font_weight(FontWeight::SEMIBOLD)
@@ -714,6 +726,8 @@ pub(crate) fn form_row(title: &str, detail: Option<&str>, control: AnyElement) -
         .min_w(px(120.))
         .child(
             div()
+                .flex()
+                .flex_col()
                 .text_size(px(13.))
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(c(TEXT))

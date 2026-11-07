@@ -10,6 +10,7 @@ use crate::model::{
 };
 use crate::theme::{BORDER, DIM, GREEN, MONO, Tone, c};
 use crate::ui::chart::{STAT_MIN, clip_tip, spark, wide};
+use crate::ui::sites::{SiteState, site_state};
 use crate::ui::widgets::{
     BtnKind, Col, btn, card, empty_state, grid, grid_min, id, mono, page_header, pill,
     section_title, skeleton, stat, table, text_dim,
@@ -19,7 +20,7 @@ pub struct DeployRow {
     pub at_ms: i64,
     pub node: String,
     pub site: String,
-    pub action: DeployAction,
+    pub state: SiteState,
     pub slot: Slot,
     pub note: String,
 }
@@ -47,11 +48,13 @@ async fn collect(h: NodeHandle) -> (NodeSnapshot, Vec<DeployRow>) {
     let deploys = sites
         .iter()
         .flat_map(|s| {
-            s.history.iter().map(|d| DeployRow {
+            let state = site_state(s, &[], None);
+            let name = &name;
+            s.history.iter().map(move |d| DeployRow {
                 at_ms: parse_rfc3339_ms(&d.at).unwrap_or(0),
                 node: name.clone(),
                 site: s.name.clone(),
-                action: d.action,
+                state,
                 slot: d.slot,
                 note: d.note.clone(),
             })
@@ -240,8 +243,8 @@ fn overview_body(data: &Data, cx: &mut Context<Console>) -> AnyElement {
                     .text_size(px(12.))
                     .into_any_element(),
                 clip_tip(id("ov-dep-site", i), d.site.clone()).into_any_element(),
-                action_pill(d.action),
                 slot_pill(d.slot),
+                d.state.pill().into_any_element(),
                 clip_tip(
                     id("ov-dep-note", i),
                     if d.note.is_empty() {
@@ -259,8 +262,8 @@ fn overview_body(data: &Data, cx: &mut Context<Console>) -> AnyElement {
         Col::fixed("When", 90.),
         Col::fixed("Node", 110.),
         Col::flex("Site"),
-        Col::fixed("Action", 90.),
         Col::fixed("Slot", 70.),
+        Col::fixed("State", 110.),
         Col::flex("Note"),
     ];
     let recent = card(

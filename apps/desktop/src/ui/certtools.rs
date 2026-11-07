@@ -596,7 +596,7 @@ impl Console {
                     cx.notify();
                 })),
             )
-            .child(div().child(label.to_string()))
+            .child(div().flex().flex_col().child(label.to_string()))
             .into_any_element()
     }
 
@@ -684,7 +684,7 @@ impl Console {
                     .flex()
                     .items_end()
                     .gap(px(10.))
-                    .child(div().flex_1().min_w_0().max_w(px(420.)).child(field(
+                    .child(div().flex().flex_col().flex_1().min_w_0().max_w(px(420.)).child(field(
                         "Add a host",
                         Some("A name like shop.example.com, or *.example.com for every subdomain."),
                         inputs.host.clone(),
@@ -721,24 +721,45 @@ impl Console {
             .flex_col()
             .gap(px(12.))
             .child(text_dim(format!("For {}", panel.hosts.join(", "))).min_w_0());
-        form = form.child(div().w_full().max_w(px(420.)).child(field(
-            "Name",
-            Some("Optional. Shown in the certificate list."),
-            inputs.name.clone(),
-        )));
+        form = form.child(
+            div()
+                .flex()
+                .flex_col()
+                .w_full()
+                .max_w(px(420.))
+                .child(field(
+                    "Name",
+                    Some("Optional. Shown in the certificate list."),
+                    inputs.name.clone(),
+                )),
+        );
         if mode == Mode::Generate {
-            form = form.child(div().w_full().max_w(px(200.)).child(field(
-                "Days valid",
-                Some("Leave blank for 365."),
-                inputs.days.clone(),
-            )));
+            form = form.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .w_full()
+                    .max_w(px(200.))
+                    .child(field(
+                        "Days valid",
+                        Some("Leave blank for 365."),
+                        inputs.days.clone(),
+                    )),
+            );
         }
         if mode == Mode::Acme {
-            form = form.child(div().w_full().max_w(px(420.)).child(field(
-                "Email",
-                Some("Let's Encrypt sends expiry warnings here."),
-                inputs.email.clone(),
-            )));
+            form = form.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .w_full()
+                    .max_w(px(420.))
+                    .child(field(
+                        "Email",
+                        Some("Let's Encrypt sends expiry warnings here."),
+                        inputs.email.clone(),
+                    )),
+            );
         }
         if mode == Mode::OriginCa {
             let mut items = Vec::new();

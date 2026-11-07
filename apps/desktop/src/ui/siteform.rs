@@ -368,7 +368,7 @@ pub fn basics(
             div()
                 .flex()
                 .gap(px(12.))
-                .child(div().flex_1().child(with_problem(
+                .child(div().flex().flex_col().flex_1().child(with_problem(
                     "Name",
                     None,
                     &f.name,
@@ -376,7 +376,7 @@ pub fn basics(
                     editing,
                     cx,
                 )))
-                .child(div().flex_1().child(id_field)),
+                .child(div().flex().flex_col().flex_1().child(id_field)),
         )
 }
 
@@ -514,12 +514,12 @@ pub fn servers_fields(f: &SiteFields) -> Div {
     div()
         .flex()
         .gap(px(12.))
-        .child(div().flex_1().child(field(
+        .child(div().flex().flex_col().flex_1().child(field(
             "Blue targets",
             Some("host:port with an optional weight, separated by commas."),
             f.blue.clone(),
         )))
-        .child(div().flex_1().child(field(
+        .child(div().flex().flex_col().flex_1().child(field(
             "Green targets",
             Some("Green is where the first deploy lands."),
             f.green.clone(),
@@ -530,6 +530,8 @@ pub fn servers_fields(f: &SiteFields) -> Div {
 pub fn health_fields(f: &SiteFields, problems: &FieldProblems) -> Div {
     let small = |label: &str, hint: &str, input: &Entity<TextInput>| {
         div()
+            .flex()
+            .flex_col()
             .flex_1()
             .child(field(label, Some(hint), input.clone()))
     };

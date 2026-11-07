@@ -946,7 +946,7 @@ impl Console {
                     .items_center()
                     .gap(px(8.))
                     .child(
-                        div().flex_1().min_w_0().child(
+                        div().flex().flex_col().flex_1().min_w_0().child(
                             clip_tip(id("an-preset-name", i), p.name.clone())
                                 .font_weight(gpui::FontWeight::SEMIBOLD),
                         ),
@@ -1006,6 +1006,8 @@ impl Console {
                     .gap(px(8.))
                     .child(
                         div()
+                            .flex()
+                            .flex_col()
                             .flex_1()
                             .min_w_0()
                             .child(self.analytics.preset_name.clone()),
@@ -1019,6 +1021,8 @@ impl Console {
                     .gap(px(8.))
                     .child(
                         div()
+                            .flex()
+                            .flex_col()
                             .flex_1()
                             .min_w_0()
                             .child(self.analytics.preset_text.clone()),
@@ -1174,7 +1178,7 @@ impl Console {
                     .cursor_pointer()
                     .hover(|s| s.bg(tint(0xffffff, 0.05)))
                     .child(
-                        div().flex_1().min_w_0().child(
+                        div().flex().flex_col().flex_1().min_w_0().child(
                             clip_tip(id("an-top-key", format!("{kind}-{i}")), item.key.clone())
                                 .font_family(MONO)
                                 .text_size(px(12.)),
@@ -1216,6 +1220,8 @@ impl Console {
             };
             rows = rows.child(
                 div()
+                    .flex()
+                    .flex_col()
                     .id(id("an-botclass", i))
                     .cursor_pointer()
                     .child(hbar(
@@ -1282,6 +1288,8 @@ impl Console {
                     mono(fmt_ms(f64::from(e.total_ms))).into_any_element(),
                     bot_badge(e),
                     div()
+                        .flex()
+                        .flex_col()
                         .id(id("an-detail", i))
                         .cursor_pointer()
                         .text_size(px(12.))

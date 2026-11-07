@@ -308,17 +308,17 @@ impl Console {
                 .flex()
                 .items_end()
                 .gap(px(12.))
-                .child(div().flex_1().min_w_0().child(field(
+                .child(div().flex().flex_col().flex_1().min_w_0().child(field(
                     "Name",
                     Some("Lower case letters, digits and -."),
                     v.name_in.clone(),
                 )))
-                .child(div().flex_1().min_w_0().child(field(
+                .child(div().flex().flex_col().flex_1().min_w_0().child(field(
                     "Mount path",
                     Some("Absolute folder inside the container."),
                     v.path_in.clone(),
                 )))
-                .child(div().pb(px(18.)).child(add)),
+                .child(div().flex().flex_col().pb(px(18.)).child(add)),
         );
         if let Some(e) = &v.error {
             list = list.child(

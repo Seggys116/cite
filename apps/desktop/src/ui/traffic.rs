@@ -499,6 +499,8 @@ fn recent_card(events: &[LogEvent], cx: &mut Context<Console>) -> AnyElement {
                     None => div().into_any_element(),
                 },
                 div()
+                    .flex()
+                    .flex_col()
                     .id(id("inspect", i))
                     .cursor_pointer()
                     .text_size(px(12.))

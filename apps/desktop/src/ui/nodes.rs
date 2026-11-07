@@ -490,7 +490,7 @@ pub(crate) fn step(n: usize, title: &str, detail: &str, body: impl IntoElement) 
                     .child(text_dim(detail.to_string()).text_size(px(11.))),
             ),
         )
-        .child(div().pl(px(32.)).min_w_0().child(body))
+        .child(div().flex().flex_col().pl(px(32.)).min_w_0().child(body))
         .into_any_element()
 }
 

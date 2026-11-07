@@ -86,7 +86,7 @@ pub fn path_editor(
                 .items_center()
                 .gap(px(8.))
                 .child(toggles)
-                .child(div().flex_1().child(row.input.clone()))
+                .child(div().flex().flex_col().flex_1().child(row.input.clone()))
                 .child(
                     btn(id(key, format!("del{i}")), "Remove", BtnKind::Plain).on_click(
                         cx.listener(move |this, _, _, cx| {
@@ -144,7 +144,7 @@ pub fn path_editor(
                 .flex()
                 .items_center()
                 .gap(px(8.))
-                .child(div().flex_1().child(sample.clone()))
+                .child(div().flex().flex_col().flex_1().child(sample.clone()))
                 .children(verdict),
         );
     }

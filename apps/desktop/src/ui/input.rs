@@ -184,6 +184,12 @@ impl TextInput {
         &self.content
     }
 
+    // Where the text area was last painted, taken so the next frame must paint it again.
+    #[cfg(test)]
+    pub fn take_bounds(&mut self) -> Option<Bounds<Pixels>> {
+        self.bounds.take()
+    }
+
     pub fn is_multiline(&self) -> bool {
         self.min_lines > 1
     }
@@ -618,8 +624,13 @@ impl Element for TextElement {
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         let rows = self.input.read(cx).visible_lines();
-        let mut style = Style::default();
-        style.size.width = relative(1.).into();
+        // Grows to fill the inner row instead of taking a percentage of it.
+        let mut style = Style {
+            flex_grow: 1.,
+            flex_basis: relative(0.).into(),
+            ..Default::default()
+        };
+        style.min_size.width = px(0.).into();
         style.size.height = (window.line_height() * rows as f32).into();
         (window.request_layout(style, [], cx), ())
     }
@@ -827,6 +838,7 @@ impl Render for TextInput {
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
+            .flex()
             .w_full()
             .min_w(px(layout::INPUT_MIN_W))
             .bg(c(INPUT))
@@ -842,10 +854,13 @@ impl Render for TextInput {
         if self.mono {
             root = root.font_family(MONO);
         }
+        // Flex boxes, not block ones: taffy's block layout can keep the child sizes from a min-width measuring pass.
         // Clipping on the inner box keeps scrolled text out of the padding.
         root.child(
             div()
-                .w_full()
+                .flex()
+                .flex_1()
+                .min_w_0()
                 .overflow_hidden()
                 .child(TextElement { input: cx.entity() }),
         )
