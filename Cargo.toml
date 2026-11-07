@@ -65,7 +65,7 @@ tempfile = "3"
 libc = "0.2"
 rusqlite = { version = "0.37", features = ["bundled"] }
 x509-parser = "0.17"
-pem = "3"
+pem = "4"
 zeroize = "1"
 base64 = "0.22"
 ring = "0.17"
