@@ -1,21 +1,23 @@
 //! Build job helpers and privileged-helper invocation.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use cite_core::schema::{Health, ReleaseManifest, Rendering, Slot};
 use cite_core::{
-    Detection, ExtractLimits, ManagerConfig, PackLimits, Redactor, RenderingSetting, RuntimeKind,
-    detect_site_configured, extract_archive, hash_tree, new_id, now_rfc3339, pack_dir,
-    split_command, validate_start_argv,
+    Detection, ExtractLimits, MAX_OUTCOME_REASON, ManagerConfig, PackLimits, Redactor,
+    RenderingSetting, RuntimeKind, detect_site_in, extract_archive, hash_tree, new_id,
+    next_standalone_server_dir, node_range_allows, now_rfc3339, pack_dir, package_bin_path,
+    render_argv, split_command, validate_start_argv,
 };
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 
-use crate::report::{BuildEvent, Detected};
+use crate::report::{BuildEvent, Detected, FAILURE_TAIL_LINES, failure_phase, failure_reason};
 use crate::{ManagerError, Result};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -28,8 +30,14 @@ pub struct BuildJob {
     pub build_command: String,
     pub prune_command: Option<String>,
     pub env: HashMap<String, String>,
+    /// The `env` keys that came from the site's build env, whose values the helper redacts before it keeps any output.
+    #[serde(default)]
+    pub redact_keys: Vec<String>,
     pub cache_dir: Option<PathBuf>,
     pub timeout_s: u64,
+    /// Next.js distDir: a standalone server it writes gets its static assets and public dir copied in.
+    #[serde(default)]
+    pub next_dist_dir: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -67,7 +75,7 @@ pub fn resolve_site(cfg: &ManagerConfig, src_root: &Path) -> Result<(Detection, 
     let mut det = if cfg.runtime == RuntimeKind::Rust {
         cite_core::detect::detect_rust_site(&site_root)?
     } else {
-        let det = detect_site_configured(&site_root, pm, forced).map_err(|err| {
+        let det = detect_site_in(src_root, &cfg.root_dir, pm, forced).map_err(|err| {
             let msg = err.to_string();
             if msg.contains("ambiguous") || msg.contains("CITE_RENDERING") {
                 ManagerError::new(format!("{msg} (set CITE_RENDERING)"))
@@ -94,12 +102,16 @@ pub fn resolve_site(cfg: &ManagerConfig, src_root: &Path) -> Result<(Detection, 
     }
     if let Some(dir) = &cfg.output_dir {
         det.output_dir = dir.clone();
+        det.alt_output_dirs.clear();
         det.pack_output_only = true;
     }
     if let Some(cmd) = &cfg.start_command {
         let argv = split_command(cmd)?;
         validate_start_argv(&argv)?;
         det.start_argv = argv;
+        det.ssr_root = None;
+        det.start_bin = None;
+        det.next_dist_dir = None;
         det.pack_output_only = false;
     }
     if let Some(spa) = &cfg.spa_fallback {
@@ -123,12 +135,33 @@ pub fn resolve_site(cfg: &ManagerConfig, src_root: &Path) -> Result<(Detection, 
         return Err(ManagerError::new("rust runtime cannot be static"));
     }
 
-    if let Some(detected) = &det.node_major
-        && detected != &cfg.node_major
+    if let Some(detected) = det.node_major.clone()
+        && detected != cfg.node_major
+    {
+        // An engines range such as `>=18` admits the stack's Node; only an exact pin or a range that excludes it is a mismatch.
+        let range_admits = !det.node_exact
+            && det
+                .node_engines
+                .as_deref()
+                .zip(cfg.node_major.parse::<u32>().ok())
+                .and_then(|(range, major)| node_range_allows(range, major))
+                == Some(true);
+        if !range_admits {
+            return Err(ManagerError::new(format!(
+                "site requires Node {detected} but this stack is CITE_NODE={} — set CITE_NODE to match",
+                cfg.node_major
+            )));
+        }
+        det.node_major = Some(cfg.node_major.clone());
+    }
+    if rendering == Rendering::Ssr
+        && cfg.runtime != RuntimeKind::Bun
+        && det.start_argv.first().is_some_and(|argv0| argv0 == "bun")
     {
         return Err(ManagerError::new(format!(
-            "site requires Node {detected} but this stack is CITE_NODE={} — set CITE_NODE to match",
-            cfg.node_major
+            "the start command `{}` runs with Bun but this site runs on {:?}; set CITE_RUNTIME=bun or use a node start command",
+            render_argv(&det.start_argv),
+            cfg.runtime
         )));
     }
 
@@ -224,11 +257,50 @@ pub fn prune_command(
         return None;
     }
     match pm {
-        "pnpm" => Some("pnpm prune --prod".into()),
+        // Without a TTY, pnpm aborts a prune that must rebuild node_modules unless CI is set.
+        "pnpm" => Some("CI=true pnpm prune --prod".into()),
         "yarn" if yarn_berry => Some("yarn workspaces focus --production".into()),
         "yarn" | "bun" | "cargo" => None,
         _ => Some("npm prune --omit=dev".into()),
     }
+}
+
+/// Node options that take the next argument as their value, so it is not the script.
+const NODE_VALUE_FLAGS: [&str; 9] = [
+    "-r",
+    "--require",
+    "--import",
+    "--loader",
+    "--experimental-loader",
+    "--env-file",
+    "-C",
+    "--conditions",
+    "--title",
+];
+
+/// The script a `node` / `bun` argv runs: the first argument that is neither an option nor an option's value.
+fn node_script_arg(args: &[String]) -> Option<&str> {
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if NODE_VALUE_FLAGS.contains(&arg.as_str()) {
+            iter.next();
+        } else if matches!(arg.as_str(), "-e" | "--eval" | "-p" | "--print") {
+            return None;
+        } else if !arg.starts_with('-') {
+            return Some(arg);
+        }
+    }
+    None
+}
+
+/// Node resolves `dist/main` to `dist/main.js` or `dist/main/index.js`, so those count as present.
+fn script_exists(root: &Path, script: &str) -> bool {
+    let path = root.join(script);
+    path.is_file()
+        || ["js", "mjs", "cjs"]
+            .iter()
+            .any(|ext| root.join(format!("{script}.{ext}")).is_file())
+        || path.join("index.js").is_file()
 }
 
 /// `node x.js` / `bun x.js` need the script; any other program runs from `node_modules/.bin`, so its arguments are not paths.
@@ -236,8 +308,12 @@ fn start_target_problem(site_src: &Path, argv: &[String]) -> Option<String> {
     let program = argv.first()?;
     match program.as_str() {
         "node" | "bun" => {
-            let script = argv.get(1)?;
-            (!site_src.join(script).exists()).then(|| format!("SSR start target missing: {script}"))
+            let script = node_script_arg(&argv[1..])?;
+            (!script_exists(site_src, script)).then(|| {
+                format!(
+                    "SSR start target missing: {script} (the build did not write it, or the production prune removed it; set CITE_START_COMMAND if the server lives elsewhere)"
+                )
+            })
         }
         name => (!site_src.join("node_modules/.bin").join(name).exists()).then(|| {
             format!(
@@ -245,6 +321,136 @@ fn start_target_problem(site_src: &Path, argv: &[String]) -> Option<String> {
             )
         }),
     }
+}
+
+/// The first of `output_dir` and its alternatives that holds index.html after the build; with an SPA fallback any existing one will do.
+fn static_root(site_src: &Path, det: &Detection, spa: bool) -> BuildResult<PathBuf> {
+    let candidates: Vec<&str> = std::iter::once(det.output_dir.as_str())
+        .chain(det.alt_output_dirs.iter().map(String::as_str))
+        .collect();
+    if let Some(found) = candidates
+        .iter()
+        .map(|dir| site_src.join(dir))
+        .find(|dir| dir.join("index.html").is_file())
+    {
+        return Ok(found);
+    }
+    let primary = site_src.join(&det.output_dir);
+    if spa
+        && let Some(found) = candidates
+            .iter()
+            .map(|dir| site_src.join(dir))
+            .find(|dir| dir.is_dir())
+    {
+        return Ok(found);
+    }
+    if !primary.is_dir() {
+        return Err(BuildFailure::permanent(format!(
+            "static output_dir missing: {} (looked in {}); set CITE_OUTPUT_DIR to the directory the build writes",
+            primary.display(),
+            candidates.join(", ")
+        )));
+    }
+    Err(BuildFailure::permanent(
+        "static release requires index.html (or set CITE_SPA_FALLBACK)",
+    ))
+}
+
+/// Picks what an SSR release packs and the argv it starts with, now that the build output exists.
+fn ssr_release(
+    site_src: &Path,
+    det: &Detection,
+) -> BuildResult<(PathBuf, Vec<String>, Option<String>)> {
+    if det.start_argv.is_empty() {
+        return Err(BuildFailure::permanent(
+            "SSR release requires a start command; set CITE_START_COMMAND",
+        ));
+    }
+    let mut argv = det.start_argv.clone();
+    let mut root = site_src.to_path_buf();
+    let mut packed = det.ssr_root.clone();
+    let runs_next = det.ssr_root.is_some()
+        || det
+            .start_bin
+            .as_ref()
+            .is_some_and(|bin| bin.package == "next");
+    if let Some(dist) = det.next_dist_dir.as_deref().filter(|_| runs_next) {
+        let standalone = site_src.join(dist).join("standalone");
+        match next_standalone_server_dir(&standalone, dist) {
+            Some(rel) => {
+                root = standalone;
+                argv = vec!["node".into(), rel.join("server.js").display().to_string()];
+                packed = Some(format!("{dist}/standalone"));
+            }
+            None if det.ssr_root.is_some() => {
+                return Err(BuildFailure::permanent(format!(
+                    "next.config sets output: 'standalone' but the build wrote no {dist}/standalone/server.js"
+                )));
+            }
+            None => packed = None,
+        }
+    } else if let Some(sub) = &det.ssr_root {
+        root = site_src.join(sub);
+        if !root.is_dir() {
+            return Err(BuildFailure::permanent(format!(
+                "SSR output {sub} is missing after the build"
+            )));
+        }
+    }
+    if packed.is_none()
+        && let Some(bin) = &det.start_bin
+    {
+        if let Some(path) = package_bin_path(site_src, bin)
+            && argv.len() >= 2
+        {
+            argv[1] = path;
+        }
+        if bin.package != "next"
+            && let Some(server) = argv.get(2)
+            && !script_exists(site_src, server)
+        {
+            return Err(BuildFailure::permanent(format!(
+                "the server build {server} is missing after the build; check the build output path or set CITE_START_COMMAND"
+            )));
+        }
+    }
+    if let Some(problem) = start_target_problem(&root, &argv) {
+        let hint = det
+            .notes
+            .first()
+            .map(|note| format!("; detection noted: {note}"))
+            .unwrap_or_default();
+        return Err(BuildFailure::permanent(format!("{problem}{hint}")));
+    }
+    Ok((root, argv, packed))
+}
+
+/// Runs as the build uid after the build: Next's standalone server expects `<distDir>/static` and `public` beside it.
+fn stage_next_standalone(site: &Path, dist: &str) -> BuildResult<()> {
+    let standalone = site.join(dist).join("standalone");
+    let Some(rel) = next_standalone_server_dir(&standalone, dist) else {
+        return Ok(());
+    };
+    let server = standalone.join(rel);
+    let copies = [
+        (
+            site.join(dist).join("static"),
+            server.join(dist).join("static"),
+        ),
+        (site.join("public"), server.join("public")),
+    ];
+    for (from, to) in copies {
+        if !from.is_dir() || to.exists() {
+            continue;
+        }
+        copy_dir_nofollow(&from, &to, &standalone).map_err(|err| {
+            BuildFailure::permanent(format!(
+                "build failed: could not copy {} into the standalone server: {err}",
+                from.display()
+            ))
+        })?;
+    }
+    Ok(())
 }
 
 const RUST_ASSET_DIRS: [&str; 4] = ["public", "static", "assets", "templates"];
@@ -270,13 +476,8 @@ fn stage_rust_release(
             "refusing cargo binary name `{name}`"
         )));
     }
-    let looked_up = rust_release_binary(site_src, env, name);
-    if !looked_up.is_file() {
-        return Err(BuildFailure::permanent(format!(
-            "rust release binary missing: {}",
-            looked_up.display()
-        )));
-    }
+    let (base, rel) = rust_release_binary(site_src, env, name);
+    let binary = open_release_binary(&base, &rel).map_err(BuildFailure::permanent)?;
     let stage = job_dir.join("out").join("app");
     let dest = stage.join("bin").join(name);
     if !path_within(&stage, &dest) {
@@ -287,8 +488,7 @@ fn stage_rust_release(
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::copy(&looked_up, &dest)?;
-    std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))?;
+    copy_open_file(binary, &dest, 0o755)?;
     copy_rust_assets(site_src, &stage)?;
     let argv0 = start_argv.first().map(String::as_str).unwrap_or("");
     let expected = format!("bin/{name}");
@@ -306,11 +506,84 @@ fn stage_rust_release(
     Ok(stage)
 }
 
-fn rust_release_binary(site_src: &Path, env: &HashMap<String, String>, name: &str) -> PathBuf {
+/// The directory the manager trusts and the build-controlled components below it, opened one at a time.
+fn rust_release_binary<'a>(
+    site_src: &Path,
+    env: &HashMap<String, String>,
+    name: &'a str,
+) -> (PathBuf, Vec<&'a str>) {
     match env.get("CARGO_TARGET_DIR") {
-        Some(target) => Path::new(target).join("release").join(name),
-        None => site_src.join("target").join("release").join(name),
+        Some(target) => (PathBuf::from(target), vec!["release", name]),
+        None => (site_src.to_path_buf(), vec!["target", "release", name]),
     }
+}
+
+fn file_flags() -> rustix::fs::OFlags {
+    rustix::fs::OFlags::RDONLY
+        | rustix::fs::OFlags::NOFOLLOW
+        | rustix::fs::OFlags::NONBLOCK
+        | rustix::fs::OFlags::CLOEXEC
+}
+
+fn is_regular(fd: &std::os::fd::OwnedFd) -> bool {
+    rustix::fs::fstat(fd).is_ok_and(|st| {
+        rustix::fs::FileType::from_raw_mode(st.st_mode as rustix::fs::RawMode)
+            == rustix::fs::FileType::RegularFile
+    })
+}
+
+// The manager stages as root and the build uid owns the target tree, so no component may be a symlink and the result must be a regular file.
+fn open_release_binary(base: &Path, rel: &[&str]) -> std::result::Result<std::fs::File, String> {
+    let shown = rel
+        .iter()
+        .fold(base.to_path_buf(), |path, part| path.join(part));
+    let missing = || format!("rust release binary missing: {}", shown.display());
+    let refused = || {
+        format!(
+            "rust release binary is not a regular file (symlinks are not followed): {}",
+            shown.display()
+        )
+    };
+    let failed = |err: rustix::io::Errno| {
+        if err == rustix::io::Errno::NOENT {
+            missing()
+        } else {
+            refused()
+        }
+    };
+    let (last, parents) = rel.split_last().ok_or_else(missing)?;
+    let mut dir = rustix::fs::openat(
+        rustix::fs::CWD,
+        base,
+        dir_flags(),
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(failed)?;
+    for part in parents {
+        dir = rustix::fs::openat(&dir, *part, dir_flags(), rustix::fs::Mode::empty())
+            .map_err(failed)?;
+    }
+    let fd =
+        rustix::fs::openat(&dir, *last, file_flags(), rustix::fs::Mode::empty()).map_err(failed)?;
+    if !is_regular(&fd) {
+        return Err(refused());
+    }
+    Ok(std::fs::File::from(fd))
+}
+
+/// Copies from an already opened source; the destination is never followed if it is a symlink.
+fn copy_open_file(mut from: std::fs::File, dest: &Path, mode: u32) -> BuildResult<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut out = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(mode)
+        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
+        .open(dest)?;
+    std::io::copy(&mut from, &mut out)?;
+    out.set_permissions(std::fs::Permissions::from_mode(mode))?;
+    Ok(())
 }
 
 fn bin_component_ok(name: &str) -> bool {
@@ -325,42 +598,80 @@ fn path_within(root: &Path, candidate: &Path) -> bool {
 }
 
 fn copy_rust_assets(site_src: &Path, stage: &Path) -> BuildResult<()> {
+    let Ok(site) = rustix::fs::openat(
+        rustix::fs::CWD,
+        site_src,
+        dir_flags(),
+        rustix::fs::Mode::empty(),
+    ) else {
+        return Ok(());
+    };
     for name in RUST_ASSET_DIRS {
-        let src = site_src.join(name);
-        let Ok(meta) = std::fs::symlink_metadata(&src) else {
+        let Ok(src) = rustix::fs::openat(&site, name, dir_flags(), rustix::fs::Mode::empty())
+        else {
             continue;
         };
-        if !meta.file_type().is_dir() {
-            continue;
-        }
         let dest = stage.join(name);
         if !path_within(stage, &dest) {
             continue;
         }
-        copy_dir_nofollow(&src, &dest, stage)?;
+        copy_tree_fd(&src, &dest, stage, 0)?;
     }
     Ok(())
 }
 
 fn copy_dir_nofollow(src: &Path, dest: &Path, stage: &Path) -> BuildResult<()> {
+    let dir = rustix::fs::openat(rustix::fs::CWD, src, dir_flags(), rustix::fs::Mode::empty())
+        .map_err(std::io::Error::from)?;
+    copy_tree_fd(&dir, dest, stage, 0)
+}
+
+// Every read goes through handles opened without following links, so a symlink swapped in anywhere is skipped or refused.
+fn copy_tree_fd(
+    dir: &std::os::fd::OwnedFd,
+    dest: &Path,
+    stage: &Path,
+    depth: usize,
+) -> BuildResult<()> {
+    use std::os::unix::ffi::OsStrExt;
     if !path_within(stage, dest) {
         return Ok(());
     }
+    if depth > MAX_CACHE_DEPTH {
+        return Err(BuildFailure::permanent(format!(
+            "{} is nested too deeply to copy",
+            dest.display()
+        )));
+    }
     std::fs::create_dir_all(dest)?;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
-        if file_type.is_symlink() {
+    let entries = rustix::fs::Dir::read_from(dir).map_err(std::io::Error::from)?;
+    for entry in entries {
+        let entry = entry.map_err(std::io::Error::from)?;
+        let name = entry.file_name();
+        if name.to_bytes() == b"." || name.to_bytes() == b".." {
             continue;
         }
-        let child = dest.join(entry.file_name());
+        let child = dest.join(std::ffi::OsStr::from_bytes(name.to_bytes()));
         if !path_within(stage, &child) {
             continue;
         }
-        if file_type.is_dir() {
-            copy_dir_nofollow(&entry.path(), &child, stage)?;
-        } else if file_type.is_file() {
-            std::fs::copy(entry.path(), &child)?;
+        let stat = rustix::fs::statat(dir, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(std::io::Error::from)?;
+        match rustix::fs::FileType::from_raw_mode(stat.st_mode as rustix::fs::RawMode) {
+            rustix::fs::FileType::Directory => {
+                let sub = rustix::fs::openat(dir, name, dir_flags(), rustix::fs::Mode::empty())
+                    .map_err(std::io::Error::from)?;
+                copy_tree_fd(&sub, &child, stage, depth + 1)?;
+            }
+            rustix::fs::FileType::RegularFile => {
+                let fd = rustix::fs::openat(dir, name, file_flags(), rustix::fs::Mode::empty())
+                    .map_err(std::io::Error::from)?;
+                if is_regular(&fd) {
+                    let mode = (stat.st_mode as u32) & 0o777;
+                    copy_open_file(std::fs::File::from(fd), &child, mode)?;
+                }
+            }
+            _ => {}
         }
     }
     Ok(())
@@ -370,6 +681,9 @@ fn copy_dir_nofollow(src: &Path, dest: &Path, stage: &Path) -> BuildResult<()> {
 fn log_detection_warnings(det: &Detection, redactor: &Redactor) {
     for warning in &det.warnings {
         warn!(phase = "build", "{}", redactor.redact_line(warning));
+    }
+    for note in &det.notes {
+        info!(phase = "build", "detection: {}", redactor.redact_line(note));
     }
 }
 
@@ -543,14 +857,15 @@ async fn build_in_job(
         ));
     }
 
-    let (det, rendering) = resolve_site(cfg, &src).map_err(BuildFailure::permanent)?;
+    let (mut det, rendering) = resolve_site(cfg, &src).map_err(BuildFailure::permanent)?;
 
     let build_env = load_build_env(cfg)?;
     log_detection_warnings(&det, redactor);
-    observer(BuildEvent::Detected(Detected::from_detection(
+    observer(BuildEvent::Detected(Box::new(Detected::from_detection(
         &det, rendering,
-    )));
+    ))));
     prepare_job_home(&home)?;
+    let redact_keys: Vec<String> = build_env.keys().cloned().collect();
     let mut env = build_env;
     let cache = cfg.build_cache.then_some(cfg.cache_dir.as_path());
     env.extend(job_env(&home, cache));
@@ -558,6 +873,12 @@ async fn build_in_job(
         "PATH".into(),
         std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into()),
     );
+    for (key, value) in [
+        ("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0"),
+        ("NEXT_TELEMETRY_DISABLED", "1"),
+    ] {
+        env.entry(key.into()).or_insert_with(|| value.into());
+    }
     if cfg.build_cache {
         prepare_cache(cfg)?;
     }
@@ -575,15 +896,25 @@ async fn build_in_job(
         out: out.clone(),
         install_command: det.install_command.clone(),
         build_command: det.build_command.clone(),
-        prune_command: prune_command(
-            &det.package_manager,
-            rendering,
-            cfg.prune,
-            yarn_berry(&site_src, &det.install_command),
-        ),
+        // A release packed from a self-contained build output never ships the site's node_modules, so pruning them is wasted work.
+        prune_command: if det.ssr_root.is_some() && rendering == Rendering::Ssr {
+            None
+        } else {
+            prune_command(
+                &det.package_manager,
+                rendering,
+                cfg.prune,
+                yarn_berry(&site_src, &det.install_command),
+            )
+        },
         env,
+        redact_keys,
         cache_dir: cfg.build_cache.then(|| cfg.cache_dir.clone()),
         timeout_s: cfg.build_timeout.as_secs().max(1),
+        next_dist_dir: det
+            .next_dist_dir
+            .clone()
+            .filter(|_| rendering == Rendering::Ssr),
     };
 
     execute_build(cfg, &job, redactor).await?;
@@ -602,33 +933,22 @@ async fn build_in_job(
         }
         stage_rust_release(job_dir, &site_src, &job.env, &det.start_argv)?
     } else if det.pack_output_only || rendering == Rendering::Static {
-        let root = site_src.join(&det.output_dir);
-        if !root.is_dir() {
-            return Err(BuildFailure::permanent(format!(
-                "static output_dir missing: {}",
-                root.display()
-            )));
-        }
-        if cfg.spa_fallback.is_none()
-            && det.spa_fallback.is_none()
-            && !root.join("index.html").is_file()
-        {
-            return Err(BuildFailure::permanent(
-                "static release requires index.html (or set CITE_SPA_FALLBACK)",
-            ));
+        let spa = cfg.spa_fallback.is_some() || det.spa_fallback.is_some();
+        let root = static_root(&site_src, &det, spa)?;
+        if let Ok(rel) = root.strip_prefix(&site_src) {
+            let shown = rel.display().to_string();
+            det.output_dir = if shown.is_empty() { ".".into() } else { shown };
         }
         root
     } else {
-        if det.start_argv.is_empty() {
-            return Err(BuildFailure::permanent(
-                "SSR release requires a start command; set CITE_START_COMMAND",
-            ));
-        }
-        if let Some(problem) = start_target_problem(&site_src, &det.start_argv) {
-            return Err(BuildFailure::permanent(problem));
-        }
-        site_src
+        let (root, argv, packed) = ssr_release(&site_src, &det)?;
+        det.start_argv = argv;
+        det.ssr_root = packed;
+        root
     };
+    observer(BuildEvent::Detected(Box::new(Detected::from_detection(
+        &det, rendering,
+    ))));
 
     let tar_path = out.join("release.tar");
     let pack_limits = PackLimits {
@@ -636,11 +956,26 @@ async fn build_in_job(
         max_files: cfg.max_entries,
     };
     observer(BuildEvent::Packing);
-    pack_release(cfg, &pack_root, &tar_path, &pack_limits, redactor).await?;
-    let report = hash_tree(&pack_root).map_err(BuildFailure::permanent)?;
+    let pack_failed = |err: BuildFailure| {
+        if err.message().starts_with("pack") {
+            err
+        } else {
+            let message = format!("pack failed: {}", err.message());
+            match err {
+                BuildFailure::Permanent(_) => BuildFailure::Permanent(message),
+                BuildFailure::Transient(_) => BuildFailure::Transient(message),
+            }
+        }
+    };
+    pack_release(cfg, &pack_root, &tar_path, &pack_limits, redactor)
+        .await
+        .map_err(pack_failed)?;
+    let report = hash_tree(&pack_root)
+        .map_err(BuildFailure::permanent)
+        .map_err(pack_failed)?;
     if report.bytes > cfg.max_release_bytes {
         return Err(BuildFailure::permanent(
-            "release exceeds CITE_MAX_RELEASE_BYTES",
+            "pack failed: release exceeds CITE_MAX_RELEASE_BYTES",
         ));
     }
 
@@ -684,11 +1019,13 @@ async fn execute_build(
         allow_traverse(job_dir)?;
         allow_traverse(&job.out)?;
         let src_root = job_dir.join("src");
-        if job.src != src_root && src_root.is_dir() {
+        let nested = job.src != src_root && src_root.is_dir() && job.src.starts_with(&src_root);
+        if nested {
             // A nested site root leaves its parent root-owned 0750, which the build user must still traverse.
             allow_traverse(&src_root)?;
         }
-        give_tree(&job.src, uid, gid)?;
+        // A monorepo install writes node_modules at the workspace root, so the build user gets the whole checkout.
+        give_tree(if nested { &src_root } else { &job.src }, uid, gid)?;
         give_tree(&job.home, uid, gid)?;
         verify_build_access(&job.src, uid, gid)?;
         verify_build_access(&job.home, uid, gid)?;
@@ -714,12 +1051,27 @@ async fn execute_build(
     let timeout = Duration::from_secs(job.timeout_s);
     let handle = tokio::task::spawn_blocking(move || run_build_steps(&path));
     match tokio::time::timeout(timeout, handle).await {
-        Ok(Ok(result)) => result,
+        Ok(Ok(result)) => result.map_err(|failure| with_output(failure, redactor)),
         Ok(Err(err)) => Err(BuildFailure::transient(format!("build join: {err}"))),
         Err(_) => {
             // Best-effort: blocking task may still finish; surface timeout to caller.
-            Err(BuildFailure::permanent("build timed out"))
+            Err(BuildFailure::permanent(format!(
+                "build failed: timed out after {}s",
+                job.timeout_s
+            )))
         }
+    }
+}
+
+/// Reformats a `first line` + raw output failure into the redacted, capped reason the owner sees.
+fn with_output(failure: BuildFailure, redactor: &Redactor) -> BuildFailure {
+    let message = failure.message();
+    let (first, rest) = message.split_once('\n').unwrap_or((message, ""));
+    let lines: Vec<String> = rest.lines().map(str::to_string).collect();
+    let text = failure_reason(first, &lines, redactor, MAX_OUTCOME_REASON);
+    match failure {
+        BuildFailure::Permanent(_) => BuildFailure::Permanent(text),
+        BuildFailure::Transient(_) => BuildFailure::Transient(text),
     }
 }
 
@@ -822,6 +1174,8 @@ fn run_helper_process(
     }
     cmd.stdin(Stdio::null());
     apply_helper_env(&mut cmd);
+    let nonce = new_event_nonce()?;
+    cmd.env(EVENT_NONCE_ENV, &nonce);
 
     #[cfg(unix)]
     {
@@ -844,51 +1198,147 @@ fn run_helper_process(
         None
     };
     let stderr = child.stderr.take();
-    let out_done = spawn_line_reader(stdout, redactor.clone(), false);
-    let err_done = spawn_line_reader(stderr, redactor.clone(), true);
+    let capture = Arc::new(Mutex::new(HelperCapture::default()));
+    let out_done = spawn_line_reader(
+        stdout,
+        redactor.clone(),
+        false,
+        capture.clone(),
+        nonce.clone(),
+    );
+    let err_done = spawn_line_reader(stderr, redactor.clone(), true, capture.clone(), nonce);
 
-    let mut result = loop {
+    let ended = loop {
         match child.try_wait()? {
-            Some(status) => {
-                break if status.success() {
-                    Ok(())
-                } else {
-                    Err(BuildFailure::permanent(format!(
-                        "{helper} exited with {status}"
-                    )))
-                };
-            }
+            Some(status) if status.success() => break None,
+            Some(status) => break Some(HelperEnd::Failed(describe_status(&status))),
             None if started.elapsed() > timeout => {
                 terminate_child(&mut child, ids);
-                break Err(BuildFailure::permanent(format!("{helper} timed out")));
+                break Some(HelperEnd::Failed(format!("timed out after {timeout_s}s")));
             }
             None if abortable && BUILD_ABORT.load(std::sync::atomic::Ordering::SeqCst) => {
                 terminate_child(&mut child, ids);
-                break Err(BuildFailure::transient(format!("{helper} aborted")));
+                break Some(HelperEnd::Aborted);
             }
             None => std::thread::sleep(Duration::from_millis(50)),
         }
     };
     // A background process left by the build can hold the pipes open, so it is swept before the readers are awaited.
-    if abortable
-        && let Some((uid, gid)) = ids
-        && !sweep_build_uid(uid, gid)
-        && result.is_ok()
-    {
-        result = Err(BuildFailure::transient(format!(
-            "{helper} left processes running that could not be stopped"
-        )));
-    }
+    let left_running = match ids {
+        Some((uid, gid)) if abortable => !sweep_build_uid(uid, gid),
+        _ => false,
+    };
     let _ = out_done.recv_timeout(READER_DRAIN_TIMEOUT);
     let _ = err_done.recv_timeout(READER_DRAIN_TIMEOUT);
     drop(registration);
-    result
+    let captured = capture.lock().unwrap_or_else(|err| err.into_inner());
+    match ended {
+        Some(HelperEnd::Failed(how)) => Err(BuildFailure::permanent(helper_failure(
+            helper, &captured, &how, redactor,
+        ))),
+        Some(HelperEnd::Aborted) => Err(BuildFailure::transient(format!("{helper} aborted"))),
+        None if left_running => Err(BuildFailure::transient(format!(
+            "{helper} left processes running that could not be stopped"
+        ))),
+        None => Ok(()),
+    }
+}
+
+enum HelperEnd {
+    Failed(String),
+    Aborted,
+}
+
+/// What a helper's output said about where it failed, gathered while its lines are logged.
+#[derive(Debug, Default)]
+struct HelperCapture {
+    phase: Option<String>,
+    command: Option<String>,
+    lines: VecDeque<String>,
+    failed: Option<(String, Vec<String>)>,
+}
+
+impl HelperCapture {
+    // Redacted while the whole line is at hand, so a secret crossing the cut cannot leave a prefix behind.
+    fn push(&mut self, line: &str, redactor: &Redactor) {
+        self.lines
+            .push_back(clip_bytes(&redactor.redact_line(line), RAW_TAIL_LINE));
+        while self.lines.len() > FAILURE_TAIL_LINES * 2 {
+            self.lines.pop_front();
+        }
+    }
+}
+
+/// The reason the owner sees: the helper's own `failed` event when it sent one, otherwise the step it was in and the output it printed.
+fn helper_failure(
+    helper: &str,
+    captured: &HelperCapture,
+    how: &str,
+    redactor: &Redactor,
+) -> String {
+    if let Some((first, lines)) = &captured.failed {
+        return failure_reason(first, lines, redactor, MAX_OUTCOME_REASON);
+    }
+    let phase = captured.phase.clone().unwrap_or_else(|| {
+        match helper {
+            "__pack" => "pack",
+            "__clean" => "clean",
+            _ => "build",
+        }
+        .to_string()
+    });
+    let mut first = format!("{phase} failed: {how}");
+    if let Some(command) = &captured.command {
+        first.push_str(&format!(" ({command})"));
+    }
+    let lines: Vec<String> = captured.lines.iter().cloned().collect();
+    failure_reason(&first, &lines, redactor, MAX_OUTCOME_REASON)
+}
+
+/// `exit status 1` or `killed by signal 9`, the wording failure reasons use.
+fn describe_status(status: &std::process::ExitStatus) -> String {
+    use std::os::unix::process::ExitStatusExt;
+    match (status.code(), status.signal()) {
+        (Some(code), _) => format!("exit status {code}"),
+        (None, Some(signal)) => format!("killed by signal {signal}"),
+        _ => status.to_string(),
+    }
+}
+
+fn clip_bytes(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_string();
+    }
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_string()
 }
 
 const READER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Longest log line kept; the rest of an over-long line is read and discarded.
-const MAX_LOG_LINE: usize = 16 * 1024;
+/// Longest helper line read: only a helper's `failed` event, which carries its output tail on one line, may be this long.
+const MAX_LOG_LINE: usize = 256 * 1024;
+
+/// Longest ordinary build output line logged or kept; the rest of an over-long line is discarded.
+const MAX_OUTPUT_LINE: usize = 16 * 1024;
+
+/// Output kept per line for a failure reason, cut after redaction.
+const RAW_TAIL_LINE: usize = 2048;
+
+/// Carries the per-run nonce to the helper; the build commands it runs never receive it.
+const EVENT_NONCE_ENV: &str = "CITE_HELPER_EVENT_NONCE";
+
+static EVENT_NONCE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// 128 random bits, hex; build output cannot guess it, so it cannot pass for a helper event.
+fn new_event_nonce() -> std::io::Result<String> {
+    use std::io::Read;
+    let mut bytes = [0u8; 16];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
 
 /// Reads to EOF without ever buffering more than `cap` bytes per line, decoding lossily so odd bytes never end the drain.
 fn for_each_line<R: std::io::BufRead>(mut reader: R, cap: usize, mut on_line: impl FnMut(&str)) {
@@ -926,11 +1376,36 @@ fn spawn_line_reader<R: std::io::Read + Send + 'static>(
     stream: Option<R>,
     redactor: Redactor,
     is_stderr: bool,
+    capture: Arc<Mutex<HelperCapture>>,
+    nonce: String,
 ) -> std::sync::mpsc::Receiver<()> {
     let (done, finished) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         if let Some(stream) = stream {
             for_each_line(std::io::BufReader::new(stream), MAX_LOG_LINE, |line| {
+                let event = (!is_stderr).then(|| helper_event(line, &nonce)).flatten();
+                let line = if event.is_none() {
+                    clip_bytes(line, MAX_OUTPUT_LINE)
+                } else {
+                    line.to_string()
+                };
+                let line = line.as_str();
+                let mut captured = capture.lock().unwrap_or_else(|err| err.into_inner());
+                match event {
+                    Some(HelperEvent::Start { phase, command }) => {
+                        captured.phase = Some(phase);
+                        captured.command = command;
+                        captured.lines.clear();
+                    }
+                    Some(HelperEvent::Failed { first, lines }) => {
+                        warn!(phase = "build", "{}", redactor.redact_line(&first));
+                        captured.failed = Some((first, lines));
+                        return;
+                    }
+                    Some(HelperEvent::Other) => {}
+                    None => captured.push(line, &redactor),
+                }
+                drop(captured);
                 if is_stderr {
                     warn!(phase = "build", "{}", redactor.redact_line(line));
                 } else {
@@ -941,6 +1416,52 @@ fn spawn_line_reader<R: std::io::Read + Send + 'static>(
         let _ = done.send(());
     });
     finished
+}
+
+enum HelperEvent {
+    Start {
+        phase: String,
+        command: Option<String>,
+    },
+    Failed {
+        first: String,
+        lines: Vec<String>,
+    },
+    Other,
+}
+
+/// Parses the JSON progress events `__build` prints between the command output it forwards; only lines led by this run's nonce count.
+fn helper_event(line: &str, nonce: &str) -> Option<HelperEvent> {
+    if nonce.is_empty() {
+        return None;
+    }
+    let json = line.strip_prefix(nonce)?.strip_prefix(' ')?;
+    if !json.starts_with('{') {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+    let phase = value.get("phase")?.as_str()?.to_string();
+    let text = |key: &str| value.get(key).and_then(|v| v.as_str()).map(str::to_string);
+    Some(match value.get("event")?.as_str()? {
+        "start" => HelperEvent::Start {
+            phase,
+            command: text("command"),
+        },
+        "failed" => HelperEvent::Failed {
+            first: text("first").unwrap_or_else(|| format!("{phase} failed")),
+            lines: value
+                .get("lines")
+                .and_then(|v| v.as_array())
+                .map(|lines| {
+                    lines
+                        .iter()
+                        .filter_map(|line| line.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        },
+        _ => HelperEvent::Other,
+    })
 }
 
 /// The helper gets a minimal environment so the manager's secrets never reach the build uid.
@@ -1552,13 +2073,45 @@ pub fn run_build_helper(job_json: &Path) -> Result<()> {
     run_build_steps(job_json).map_err(ManagerError::from)
 }
 
+/// A failure is also printed as a `failed` event so the supervising manager can show the output tail, not only the helper's exit status.
 fn run_build_steps(job_json: &Path) -> BuildResult<()> {
+    EVENT_NONCE.get_or_init(|| std::env::var(EVENT_NONCE_ENV).unwrap_or_default());
+    let result = build_steps(job_json);
+    if let Err(err) = &result {
+        let message = err.message();
+        let (first, rest) = message.split_once('\n').unwrap_or((message, ""));
+        emit_event(&serde_json::json!({
+            "phase": failure_phase(first),
+            "event": "failed",
+            "first": first,
+            "lines": rest.lines().collect::<Vec<_>>(),
+        }));
+    }
+    result
+}
+
+fn build_steps(job_json: &Path) -> BuildResult<()> {
     let text = std::fs::read_to_string(job_json)?;
     let job: BuildJob = serde_json::from_str(&text)?;
-    run_shell(&job.install_command, "install", &job.env, &job.src)?;
-    run_shell(&job.build_command, "build", &job.env, &job.src)?;
+    let mut redactor = Redactor::new();
+    for key in &job.redact_keys {
+        if let Some(value) = job.env.get(key) {
+            redactor.push_secret(value.clone());
+        }
+    }
+    run_shell(
+        &job.install_command,
+        "install",
+        &job.env,
+        &job.src,
+        &redactor,
+    )?;
+    run_shell(&job.build_command, "build", &job.env, &job.src, &redactor)?;
+    if let Some(dist) = &job.next_dist_dir {
+        stage_next_standalone(&job.src, dist)?;
+    }
     if let Some(prune) = &job.prune_command {
-        run_shell(prune, "prune", &job.env, &job.src)?;
+        run_shell(prune, "prune", &job.env, &job.src, &redactor)?;
     }
     Ok(())
 }
@@ -1605,7 +2158,39 @@ fn signal_pid(pid: u32, grace: Duration) {
 /// A closed stdout must not abort the build, so write failures are ignored.
 fn emit_event(event: &serde_json::Value) {
     use std::io::Write;
-    let _ = writeln!(std::io::stdout(), "{event}");
+    let nonce = EVENT_NONCE.get().map(String::as_str).unwrap_or_default();
+    let _ = writeln!(std::io::stdout().lock(), "{}", event_line(nonce, event));
+}
+
+fn event_line(nonce: &str, event: &serde_json::Value) -> String {
+    format!("{nonce} {event}")
+}
+
+/// Copies a command's output to this process's matching stream line by line and keeps the last lines for a failure reason.
+fn forward_output<R: std::io::Read + Send + 'static>(
+    stream: Option<R>,
+    tail: Arc<Mutex<HelperCapture>>,
+    is_stderr: bool,
+    redactor: Redactor,
+) -> std::sync::mpsc::Receiver<()> {
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::Write;
+        if let Some(stream) = stream {
+            for_each_line(std::io::BufReader::new(stream), MAX_OUTPUT_LINE, |line| {
+                if is_stderr {
+                    let _ = writeln!(std::io::stderr().lock(), "{line}");
+                } else {
+                    let _ = writeln!(std::io::stdout().lock(), "{line}");
+                }
+                tail.lock()
+                    .unwrap_or_else(|err| err.into_inner())
+                    .push(line, &redactor);
+            });
+        }
+        let _ = done.send(());
+    });
+    finished
 }
 
 fn run_shell(
@@ -1613,13 +2198,16 @@ fn run_shell(
     phase: &str,
     env: &HashMap<String, String>,
     cwd: &Path,
+    redactor: &Redactor,
 ) -> BuildResult<()> {
     let _gate = BUILD_GATE.lock().unwrap_or_else(|err| err.into_inner());
     emit_event(&serde_json::json!({"phase": phase, "event": "start", "command": command}));
     let mut cmd = Command::new("sh");
     cmd.arg("-c").arg(command);
     cmd.current_dir(cwd);
-    cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     cmd.env_clear();
     cmd.envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
     #[cfg(unix)]
@@ -1632,6 +2220,9 @@ fn run_shell(
     }
     let mut child = cmd.spawn()?;
     BUILD_PID.store(child.id(), std::sync::atomic::Ordering::SeqCst);
+    let tail = Arc::new(Mutex::new(HelperCapture::default()));
+    let out_done = forward_output(child.stdout.take(), tail.clone(), false, redactor.clone());
+    let err_done = forward_output(child.stderr.take(), tail.clone(), true, redactor.clone());
     let status = loop {
         if BUILD_ABORT.load(std::sync::atomic::Ordering::SeqCst) {
             signal_pid(child.id(), Duration::from_millis(200));
@@ -1645,13 +2236,18 @@ fn run_shell(
         }
     };
     BUILD_PID.store(0, std::sync::atomic::Ordering::SeqCst);
+    let _ = out_done.recv_timeout(READER_DRAIN_TIMEOUT);
+    let _ = err_done.recv_timeout(READER_DRAIN_TIMEOUT);
     if status.success() {
         emit_event(&serde_json::json!({"phase": phase, "event": "ok"}));
         Ok(())
     } else {
-        Err(BuildFailure::permanent(format!(
-            "{phase} command failed with {status}"
-        )))
+        let mut message = format!("{phase} failed: {} ({command})", describe_status(&status));
+        for line in &tail.lock().unwrap_or_else(|err| err.into_inner()).lines {
+            message.push('\n');
+            message.push_str(line);
+        }
+        Err(BuildFailure::permanent(message))
     }
 }
 
@@ -1759,7 +2355,7 @@ mod tests {
         );
         assert_eq!(
             prune_command("pnpm", Rendering::Ssr, None, false).as_deref(),
-            Some("pnpm prune --prod")
+            Some("CI=true pnpm prune --prod")
         );
         assert_eq!(prune_command("bun", Rendering::Ssr, None, false), None);
         assert_eq!(prune_command("cargo", Rendering::Ssr, None, false), None);
@@ -1963,8 +2559,15 @@ mod tests {
             std::env::var("PATH").unwrap_or_else(|_| "/bin:/usr/bin".into()),
         );
         let cwd = dir.path().to_path_buf();
-        let worker =
-            std::thread::spawn(move || super::run_shell("sleep 30", "install", &env, &cwd));
+        let worker = std::thread::spawn(move || {
+            super::run_shell(
+                "sleep 30",
+                "install",
+                &env,
+                &cwd,
+                &cite_core::Redactor::new(),
+            )
+        });
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         while super::BUILD_PID.load(Ordering::SeqCst) == 0 {
             assert!(
@@ -1987,7 +2590,13 @@ mod tests {
         super::BUILD_ABORT.store(true, Ordering::SeqCst);
         let dir = tempfile::tempdir().unwrap();
         let env = HashMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]);
-        let result = super::run_shell("true", "install", &env, dir.path());
+        let result = super::run_shell(
+            "true",
+            "install",
+            &env,
+            dir.path(),
+            &cite_core::Redactor::new(),
+        );
         super::BUILD_ABORT.store(false, Ordering::SeqCst);
         assert!(result.unwrap_err().to_string().contains("aborted"));
     }
@@ -2191,8 +2800,10 @@ mod tests {
             build_command: "/usr/bin/true".into(),
             prune_command: Some("/usr/bin/true".into()),
             env: HashMap::from([("PATH".into(), "/usr/bin:/bin".into())]),
+            redact_keys: Vec::new(),
             cache_dir: None,
             timeout_s: 5,
+            next_dist_dir: None,
         };
         let path = dir.path().join("job.json");
         std::fs::write(&path, serde_json::to_vec(&job).unwrap()).unwrap();
@@ -2202,7 +2813,320 @@ mod tests {
         failed.build_command = "/usr/bin/false".into();
         std::fs::write(&path, serde_json::to_vec(&failed).unwrap()).unwrap();
         let err = run_build_helper(&path).unwrap_err();
-        assert!(err.to_string().contains("build command failed"), "{err}");
+        assert!(
+            err.to_string()
+                .starts_with("build failed: exit status 1 (/usr/bin/false)"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_failing_command_reports_its_phase_command_and_last_output_lines() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let env = HashMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]);
+        let script = "i=0; while [ $i -lt 70 ]; do echo out-$i; i=$((i+1)); done; echo 'Error: next build failed' >&2; exit 3";
+        let err = super::run_shell(
+            script,
+            "build",
+            &env,
+            dir.path(),
+            &cite_core::Redactor::new(),
+        )
+        .unwrap_err();
+        let message = err.message();
+        let first = message.lines().next().unwrap();
+        assert_eq!(first, format!("build failed: exit status 3 ({script})"));
+        assert!(message.contains("Error: next build failed"), "{message}");
+        assert!(message.contains("out-69"), "{message}");
+        let shown = super::with_output(err.clone(), &cite_core::Redactor::new());
+        let shown = shown.message();
+        assert!(
+            shown.lines().count() <= 1 + crate::report::FAILURE_TAIL_LINES,
+            "{shown}"
+        );
+        assert!(shown.contains("out-69"), "{shown}");
+        assert!(!shown.contains("out-0\n"), "only the tail is kept: {shown}");
+
+        let mut redactor = cite_core::Redactor::new();
+        redactor.push_secret("tok-shell-91aa");
+        let leaky = super::run_shell(
+            "echo using tok-shell-91aa; echo '\u{1b}[31mred\u{1b}[0m'; exit 1",
+            "install",
+            &env,
+            dir.path(),
+            &cite_core::Redactor::new(),
+        )
+        .unwrap_err();
+        let shown = super::with_output(leaky, &redactor);
+        assert!(!shown.is_transient());
+        let text = shown.message();
+        assert!(
+            text.starts_with("install failed: exit status 1 ("),
+            "{text}"
+        );
+        assert!(text.contains("using [REDACTED]"), "{text}");
+        assert!(text.contains("\nred"), "{text}");
+        assert!(
+            !text.contains("tok-shell-91aa") && !text.contains('\u{1b}'),
+            "{text}"
+        );
+        assert_eq!(crate::report::failure_phase(text), "install");
+    }
+
+    #[test]
+    fn helper_failures_prefer_the_failed_event_and_fall_back_to_the_captured_tail() {
+        let redactor = cite_core::Redactor::new();
+        let nonce = "0123456789abcdef0123456789abcdef";
+        let mut captured = super::HelperCapture::default();
+        for line in [
+            r#"0123456789abcdef0123456789abcdef {"phase":"install","event":"start","command":"pnpm install --frozen-lockfile"}"#,
+            "ERR_PNPM_OUTDATED_LOCKFILE  Cannot install with frozen-lockfile",
+        ] {
+            match super::helper_event(line, nonce) {
+                Some(super::HelperEvent::Start { phase, command }) => {
+                    captured.phase = Some(phase);
+                    captured.command = command;
+                }
+                None => captured.push(line, &redactor),
+                _ => panic!("unexpected event for {line}"),
+            }
+        }
+        let reason = super::helper_failure("__build", &captured, "exit status 1", &redactor);
+        assert_eq!(
+            reason,
+            "install failed: exit status 1 (pnpm install --frozen-lockfile)\nERR_PNPM_OUTDATED_LOCKFILE  Cannot install with frozen-lockfile"
+        );
+
+        let event = super::event_line(
+            nonce,
+            &serde_json::json!({"phase":"build","event":"failed","first":"build failed: exit status 1 (pnpm run build)","lines":["Type error: x","  at y"]}),
+        );
+        let Some(super::HelperEvent::Failed { first, lines }) = super::helper_event(&event, nonce)
+        else {
+            panic!("failed event not parsed");
+        };
+        captured.failed = Some((first, lines));
+        let reason = super::helper_failure("__build", &captured, "exit status 1", &redactor);
+        assert_eq!(
+            reason,
+            "build failed: exit status 1 (pnpm run build)\nType error: x\n  at y"
+        );
+
+        let pack = super::helper_failure(
+            "__pack",
+            &super::HelperCapture::default(),
+            "timed out after 120s",
+            &redactor,
+        );
+        assert_eq!(pack, "pack failed: timed out after 120s");
+        assert!(super::helper_event(&format!("{nonce} {{not json"), nonce).is_none());
+        assert!(super::helper_event("plain output", nonce).is_none());
+    }
+
+    #[test]
+    fn build_output_cannot_fake_a_helper_event() {
+        let nonce = super::new_event_nonce().unwrap();
+        assert_eq!(nonce.len(), 32);
+        assert_ne!(nonce, super::new_event_nonce().unwrap());
+        let fake = r#"{"phase":"build","event":"failed","first":"all good","lines":[]}"#;
+        assert!(super::helper_event(fake, &nonce).is_none(), "no nonce");
+        let guessed = format!("{} {fake}", "0".repeat(32));
+        assert!(
+            super::helper_event(&guessed, &nonce).is_none(),
+            "wrong nonce"
+        );
+        assert!(
+            super::helper_event(&format!(" {fake}"), "").is_none(),
+            "an empty nonce accepts nothing"
+        );
+        let real = super::event_line(&nonce, &serde_json::from_str(fake).unwrap());
+        assert!(matches!(
+            super::helper_event(&real, &nonce),
+            Some(super::HelperEvent::Failed { .. })
+        ));
+    }
+
+    #[test]
+    fn captured_lines_are_redacted_before_they_are_cut() {
+        let secret = "s3cr3t-value-that-crosses-the-cut";
+        let mut redactor = cite_core::Redactor::new();
+        redactor.push_secret(secret);
+        let mut captured = super::HelperCapture::default();
+        let line = format!("{}{secret} tail", "x".repeat(super::RAW_TAIL_LINE - 20));
+        captured.push(&line, &redactor);
+        let kept = captured.lines.back().unwrap();
+        assert!(kept.len() <= super::RAW_TAIL_LINE);
+        assert!(
+            !kept.contains("s3cr3t"),
+            "no prefix of the secret survives: {kept}"
+        );
+        assert!(kept.ends_with("[REDACTED] tail"), "{kept}");
+    }
+
+    #[test]
+    fn node_scripts_resolve_like_node_does() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("dist/server")).unwrap();
+        std::fs::write(root.join("dist/main.js"), "").unwrap();
+        std::fs::write(root.join("dist/server/index.js"), "").unwrap();
+        assert!(super::script_exists(root, "dist/main"));
+        assert!(super::script_exists(root, "dist/main.js"));
+        assert!(super::script_exists(root, "dist/server"));
+        assert!(super::script_exists(root, "./dist/main.js"));
+        assert!(!super::script_exists(root, "dist/other"));
+        let args = |parts: &[&str]| parts.iter().map(|p| p.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            super::node_script_arg(&args(&[
+                "--enable-source-maps",
+                "-r",
+                "dotenv/config",
+                "dist/main"
+            ])),
+            Some("dist/main")
+        );
+        assert_eq!(super::node_script_arg(&args(&["-e", "1"])), None);
+        assert!(
+            super::start_target_problem(root, &args(&["node", "--import", "tsx", "dist/main"]))
+                .is_none()
+        );
+    }
+
+    fn detection_for(files: &[(&str, &str)]) -> (tempfile::TempDir, cite_core::Detection) {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, body) in files {
+            let path = dir.path().join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        }
+        let det = cite_core::detect_site(dir.path()).unwrap();
+        (dir, det)
+    }
+
+    #[test]
+    fn static_output_falls_back_to_the_first_dir_with_index_html() {
+        let (dir, det) = detection_for(&[
+            (
+                "package.json",
+                r#"{"devDependencies":{"@angular/core":"16"},"scripts":{"build":"ng build"}}"#,
+            ),
+            ("dist/app/index.html", "<html>"),
+        ]);
+        assert_eq!(det.output_dir, "dist/app/browser");
+        let root = super::static_root(dir.path(), &det, false).unwrap();
+        assert_eq!(root, dir.path().join("dist/app"));
+
+        let (empty, det) = detection_for(&[(
+            "package.json",
+            r#"{"devDependencies":{"vite":"6"},"scripts":{"build":"vite build"}}"#,
+        )]);
+        let err = super::static_root(empty.path(), &det, false).unwrap_err();
+        assert!(err.message().contains("static output_dir missing"), "{err}");
+        assert!(err.message().contains("CITE_OUTPUT_DIR"), "{err}");
+    }
+
+    #[test]
+    fn next_standalone_builds_are_staged_and_packed_from_the_standalone_dir() {
+        let (dir, det) = detection_for(&[
+            (
+                "package.json",
+                r#"{"dependencies":{"next":"15"},"scripts":{"build":"next build","start":"next start"}}"#,
+            ),
+            (
+                "next.config.mjs",
+                "export default { output: 'standalone' };\n",
+            ),
+            (".next/static/chunks/app.js", "js"),
+            ("public/logo.svg", "<svg/>"),
+            (".next/standalone/server.js", "require('next')"),
+            (".next/standalone/.next/BUILD_ID", "x"),
+            (".next/standalone/node_modules/next/package.json", "{}"),
+        ]);
+        super::stage_next_standalone(dir.path(), ".next").unwrap();
+        let standalone = dir.path().join(".next/standalone");
+        assert!(standalone.join(".next/static/chunks/app.js").is_file());
+        assert!(standalone.join("public/logo.svg").is_file());
+
+        let (root, argv, packed) = super::ssr_release(dir.path(), &det).unwrap();
+        assert_eq!(root, standalone);
+        assert_eq!(argv, ["node", "server.js"]);
+        assert_eq!(packed.as_deref(), Some(".next/standalone"));
+
+        std::fs::remove_dir_all(&standalone).unwrap();
+        let err = super::ssr_release(dir.path(), &det).unwrap_err();
+        assert!(err.message().contains("standalone/server.js"), "{err}");
+    }
+
+    #[test]
+    fn next_start_runs_the_installed_next_bin_and_prefers_a_standalone_output() {
+        let (dir, det) = detection_for(&[
+            (
+                "package.json",
+                r#"{"dependencies":{"next":"15"},"scripts":{"build":"next build"}}"#,
+            ),
+            (
+                "node_modules/next/package.json",
+                r#"{"bin":{"next":"./dist/bin/next"}}"#,
+            ),
+            ("node_modules/next/dist/bin/next", "#!/usr/bin/env node\n"),
+            (".next/BUILD_ID", "x"),
+        ]);
+        let (root, argv, packed) = super::ssr_release(dir.path(), &det).unwrap();
+        assert_eq!(root, dir.path());
+        assert_eq!(
+            argv,
+            [
+                "node",
+                "node_modules/next/dist/bin/next",
+                "start",
+                "-H",
+                "127.0.0.1"
+            ]
+        );
+        assert_eq!(packed, None);
+
+        std::fs::create_dir_all(dir.path().join(".next/standalone/.next")).unwrap();
+        std::fs::write(dir.path().join(".next/standalone/server.js"), "").unwrap();
+        let (root, argv, _) = super::ssr_release(dir.path(), &det).unwrap();
+        assert_eq!(root, dir.path().join(".next/standalone"));
+        assert_eq!(argv, ["node", "server.js"]);
+
+        let (bare, det) = detection_for(&[(
+            "package.json",
+            r#"{"dependencies":{"next":"15"},"scripts":{"build":"next build"}}"#,
+        )]);
+        let err = super::ssr_release(bare.path(), &det).unwrap_err();
+        assert!(err.message().contains("SSR start target missing"), "{err}");
+    }
+
+    #[test]
+    fn resolve_site_accepts_engine_ranges_and_refuses_bun_on_node() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"dependencies":{"express":"4"},"engines":{"node":">=18"},"scripts":{"start":"node server.js"}}"#,
+        )
+        .unwrap();
+        let mut env = HashMap::new();
+        env.insert("CITE_REPO".into(), "owner/name".into());
+        env.insert("CITE_NODE".into(), "22".into());
+        let cfg = ManagerConfig::load_from(&env, None).unwrap();
+        let (det, rendering) = resolve_site(&cfg, dir.path()).unwrap();
+        assert_eq!(rendering, Rendering::Ssr);
+        assert_eq!(det.node_major.as_deref(), Some("22"));
+
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"dependencies":{"hono":"4"},"scripts":{"start":"bun src/index.ts"}}"#,
+        )
+        .unwrap();
+        let err = resolve_site(&cfg, dir.path()).unwrap_err().to_string();
+        assert!(err.contains("CITE_RUNTIME=bun"), "{err}");
+        env.insert("CITE_RUNTIME".into(), "bun".into());
+        let cfg = ManagerConfig::load_from(&env, None).unwrap();
+        let (det, _) = resolve_site(&cfg, dir.path()).unwrap();
+        assert_eq!(det.start_argv, ["bun", "src/index.ts"]);
     }
 
     #[test]
@@ -2300,7 +3224,13 @@ mod tests {
             .stdout(std::process::Stdio::piped())
             .spawn()
             .unwrap();
-        let done = super::spawn_line_reader(quick.stdout.take(), cite_core::Redactor::new(), false);
+        let done = super::spawn_line_reader(
+            quick.stdout.take(),
+            cite_core::Redactor::new(),
+            false,
+            Default::default(),
+            String::new(),
+        );
         assert!(done.recv_timeout(std::time::Duration::from_secs(5)).is_ok());
         let _ = quick.wait();
 
@@ -2309,7 +3239,13 @@ mod tests {
             .stdout(std::process::Stdio::piped())
             .spawn()
             .unwrap();
-        let done = super::spawn_line_reader(held.stdout.take(), cite_core::Redactor::new(), false);
+        let done = super::spawn_line_reader(
+            held.stdout.take(),
+            cite_core::Redactor::new(),
+            false,
+            Default::default(),
+            String::new(),
+        );
         assert!(
             done.recv_timeout(std::time::Duration::from_millis(200))
                 .is_err()
@@ -2385,6 +3321,7 @@ mod tests {
             .await
             .expect_err("build command fails");
         assert!(!err.is_transient(), "{err}");
+        assert_eq!(err.message(), "build failed: exit status 1 (false)");
 
         env.insert("CITE_MIN_FREE_BYTES".into(), "9000000000000000".into());
         let cfg = ManagerConfig::load_from(&env, None).unwrap();
@@ -2628,5 +3565,39 @@ mod tests {
             mismatch.to_string().contains("does not match"),
             "{mismatch}"
         );
+    }
+
+    #[test]
+    fn stage_rust_release_never_follows_a_symlink_in_the_target_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let site = tmp.path().join("site");
+        let job = tmp.path().join("job");
+        std::fs::create_dir_all(site.join("target/release")).unwrap();
+        std::fs::create_dir_all(job.join("out")).unwrap();
+        std::fs::write(site.join("Cargo.toml"), "[package]\nname = \"hello\"\n").unwrap();
+        let secret = tmp.path().join("manager-env");
+        std::fs::write(&secret, b"CITE_GITHUB_TOKEN=ghp_x").unwrap();
+        std::os::unix::fs::symlink(&secret, site.join("target/release/hello")).unwrap();
+        let err = super::stage_rust_release(&job, &site, &HashMap::new(), &["bin/hello".into()])
+            .unwrap_err();
+        assert!(err.to_string().contains("not a regular file"), "{err}");
+        assert!(!job.join("out/app/bin/hello").exists());
+
+        let decoy = tmp.path().join("decoy");
+        std::fs::create_dir_all(decoy.join("release")).unwrap();
+        std::fs::copy(&secret, decoy.join("release/hello")).unwrap();
+        std::fs::remove_dir_all(site.join("target")).unwrap();
+        std::os::unix::fs::symlink(&decoy, site.join("target")).unwrap();
+        let err = super::stage_rust_release(&job, &site, &HashMap::new(), &["bin/hello".into()])
+            .unwrap_err();
+        assert!(err.to_string().contains("not a regular file"), "{err}");
+
+        let cache = tmp.path().join("cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::os::unix::fs::symlink(decoy.join("release"), cache.join("release")).unwrap();
+        let env = HashMap::from([("CARGO_TARGET_DIR".into(), cache.display().to_string())]);
+        let err = super::stage_rust_release(&job, &site, &env, &["bin/hello".into()]).unwrap_err();
+        assert!(err.to_string().contains("not a regular file"), "{err}");
+        assert!(!job.join("out/app/bin/hello").exists());
     }
 }

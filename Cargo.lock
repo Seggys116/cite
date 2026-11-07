@@ -368,7 +368,7 @@ dependencies = [
 
 [[package]]
 name = "cite-client"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "axum",
  "bytes",
@@ -386,7 +386,7 @@ dependencies = [
 
 [[package]]
 name = "cite-connector"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "arc-swap",
  "axum",
@@ -433,7 +433,7 @@ dependencies = [
 
 [[package]]
 name = "cite-core"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "cap-std",
  "flate2",
@@ -455,7 +455,7 @@ dependencies = [
 
 [[package]]
 name = "cite-dashboard"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "axum",
  "bytes",
@@ -487,7 +487,7 @@ dependencies = [
 
 [[package]]
 name = "cite-dockerproxy"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "bytes",
  "cite-connector",
@@ -508,7 +508,7 @@ dependencies = [
 
 [[package]]
 name = "cite-edge"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "argon2",
  "getrandom 0.3.4",
@@ -526,8 +526,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "cite-egress"
+version = "0.4.1"
+dependencies = [
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "cite-executor"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "arc-swap",
  "bytes",
@@ -555,7 +564,7 @@ dependencies = [
 
 [[package]]
 name = "cite-manager"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "cite-core",
  "cite-executor",
@@ -577,7 +586,7 @@ dependencies = [
 
 [[package]]
 name = "cite-mock-github"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "axum",
  "bytes",
@@ -591,7 +600,7 @@ dependencies = [
 
 [[package]]
 name = "cite-store"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "cite-edge",
  "flate2",

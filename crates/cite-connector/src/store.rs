@@ -30,8 +30,11 @@ const AUDIT_TAIL_MAX: usize = 1000;
 const AUDIT_ACTOR_MAX: usize = 128;
 const AUDIT_DETAIL_MAX: usize = 1024;
 const SECRET_NAME_MAX: usize = 128;
-const SECRET_VALUE_MAX: usize = 16 * 1024;
+// Above the 24 KiB an environment map may take, so a full build or runtime env always fits.
+const SECRET_VALUE_MAX: usize = 32 * 1024;
 const MAX_SECRETS: usize = 512;
+// Room for a token and two full env maps per site across a large fleet; put_secret refuses a write past it.
+const SECRETS_FILE_MAX_BYTES: u64 = 16 * 1024 * 1024;
 const TOKEN_CHECK_CONCURRENCY: usize = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -477,9 +480,12 @@ impl Store {
             &paths.credentials,
             MAX_SMALL_FILE_BYTES,
         )?;
-        let secrets =
-            load_json::<HashMap<String, String>>(&paths.dir, &paths.secrets, MAX_SMALL_FILE_BYTES)?
-                .unwrap_or_default();
+        let secrets = load_json::<HashMap<String, String>>(
+            &paths.dir,
+            &paths.secrets,
+            SECRETS_FILE_MAX_BYTES,
+        )?
+        .unwrap_or_default();
         let tokens =
             load_json::<Stamped<ApiTokens>>(&paths.dir, &paths.tokens, MAX_SMALL_FILE_BYTES)?;
         let disk = AuthDisk {
@@ -631,32 +637,15 @@ impl Store {
         if !map.contains_key(name) && map.len() >= MAX_SECRETS {
             return Err(ConnectorError::BadRequest("too many secrets".into()));
         }
-        let mut next = map.clone();
-        next.insert(name.to_string(), value.to_string());
-        let bytes = serde_json::to_vec(&next)?;
-        write_file(
-            self.paths.dir.clone(),
-            self.paths.secrets.clone(),
-            bytes,
-            0o600,
-        )
-        .await?;
-        *map = next;
-        Ok(())
-    }
-
-    pub async fn get_secret(&self, name: &str) -> Option<String> {
-        self.secrets.lock().await.get(name).cloned()
-    }
-
-    pub async fn delete_secret(&self, name: &str) {
-        let mut map = self.secrets.lock().await;
-        if !map.contains_key(name) {
-            return;
-        }
-        let mut next = map.clone();
-        next.remove(name);
-        let written = match serde_json::to_vec(&next) {
+        // Changed in place and put back on failure; readers wait on the same lock, so none sees the attempt.
+        let previous = map.insert(name.to_string(), value.to_string());
+        let written = match serde_json::to_vec(&*map) {
+            Ok(bytes) if bytes.len() as u64 > SECRETS_FILE_MAX_BYTES => {
+                Err(ConnectorError::BadRequest(format!(
+                    "the secrets file would exceed {} MiB; remove secrets or env values that are no longer used",
+                    SECRETS_FILE_MAX_BYTES >> 20
+                )))
+            }
             Ok(bytes) => {
                 write_file(
                     self.paths.dir.clone(),
@@ -668,9 +657,39 @@ impl Store {
             }
             Err(e) => Err(ConnectorError::from(e)),
         };
-        match written {
-            Ok(()) => *map = next,
-            Err(e) => tracing::error!(error = %e, "secret removal could not be persisted"),
+        if written.is_err() {
+            match previous {
+                Some(old) => map.insert(name.to_string(), old),
+                None => map.remove(name),
+            };
+        }
+        written
+    }
+
+    pub async fn get_secret(&self, name: &str) -> Option<String> {
+        self.secrets.lock().await.get(name).cloned()
+    }
+
+    pub async fn delete_secret(&self, name: &str) {
+        let mut map = self.secrets.lock().await;
+        let Some(old) = map.remove(name) else {
+            return;
+        };
+        let written = match serde_json::to_vec(&*map) {
+            Ok(bytes) => {
+                write_file(
+                    self.paths.dir.clone(),
+                    self.paths.secrets.clone(),
+                    bytes,
+                    0o600,
+                )
+                .await
+            }
+            Err(e) => Err(ConnectorError::from(e)),
+        };
+        if let Err(e) = written {
+            map.insert(name.to_string(), old);
+            tracing::error!(error = %e, "secret removal could not be persisted");
         }
     }
 
@@ -1572,6 +1591,41 @@ mod tests {
         reopened.delete_secret("gh-blog").await;
         assert_eq!(reopened.get_secret("gh-blog").await, None);
         assert!(store.put_secret("bad name", "x").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_large_secrets_file_loads_and_a_write_past_the_cap_is_refused() {
+        let (dir, store) = open_temp().await;
+        drop(store);
+        let value = "a".repeat(SECRET_VALUE_MAX);
+        let seed: HashMap<String, String> = (0..MAX_SECRETS - 1)
+            .map(|i| (format!("s{i:03}"), value.clone()))
+            .collect();
+        let path = dir.path().join("secrets.json");
+        fs::write(&path, serde_json::to_vec(&seed).unwrap()).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(fs::metadata(&path).unwrap().len() > MAX_SMALL_FILE_BYTES);
+        let store = Store::open(&test_config(dir.path()))
+            .await
+            .expect("a fleet-sized file loads");
+        assert_eq!(
+            store.get_secret("s000").await.as_deref(),
+            Some(value.as_str())
+        );
+        let before = fs::read(&path).unwrap();
+        let err = store.put_secret("s999", &value).await.unwrap_err();
+        assert!(err.to_string().contains("16 MiB"), "{err}");
+        assert_eq!(
+            store.get_secret("s999").await,
+            None,
+            "a refused write leaves memory unchanged"
+        );
+        assert_eq!(fs::read(&path).unwrap(), before, "and the file unchanged");
+        store
+            .put_secret("s000", "small")
+            .await
+            .expect("a shrinking write fits");
+        assert_eq!(store.get_secret("s000").await.as_deref(), Some("small"));
     }
 
     #[tokio::test]

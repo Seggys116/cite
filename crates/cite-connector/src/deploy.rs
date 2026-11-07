@@ -6,7 +6,9 @@ use std::time::{Duration, Instant};
 use cite_edge::model::{
     DeployAction, Deployment, EdgeConfig, Maintenance, Site, Slot, Target, Upstream,
 };
-use cite_edge::validate::validate_site_strict;
+use cite_edge::validate::{
+    normalise_outbound_rules, validate_outbound_breadth, validate_site_strict,
+};
 use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
@@ -53,6 +55,7 @@ pub struct Deployer {
     pub(crate) orchestrator: Option<Arc<Orchestrator>>,
     pub(crate) probe: Option<Arc<dyn SlotProbe>>,
     locks: StdMutex<HashMap<String, Arc<Mutex<()>>>>,
+    doppler_gates: StdMutex<HashMap<String, Arc<Mutex<()>>>>,
     // Bumped by every drain schedule so an older timer can tell a later switch happened.
     drain_gen: Arc<StdMutex<HashMap<String, u64>>>,
     config_lock: Mutex<()>,
@@ -312,6 +315,7 @@ impl Deployer {
             orchestrator,
             probe,
             locks: StdMutex::new(HashMap::new()),
+            doppler_gates: StdMutex::new(HashMap::new()),
             drain_gen: Arc::default(),
             config_lock: Mutex::new(()),
             timing: Timing {
@@ -392,6 +396,27 @@ impl Deployer {
     pub(crate) fn site_lock(&self, id: &str) -> Arc<Mutex<()>> {
         let mut locks = self.locks.lock().unwrap_or_else(|p| p.into_inner());
         locks.entry(id.to_string()).or_default().clone()
+    }
+
+    /// Serialises Doppler syncs, binds and unbinds of one site with its delete; always taken before the site lock.
+    pub(crate) fn doppler_gate(&self, id: &str) -> Arc<Mutex<()>> {
+        let mut gates = self.doppler_gates.lock().unwrap_or_else(|p| p.into_inner());
+        gates.entry(id.to_string()).or_default().clone()
+    }
+
+    pub(crate) fn retain_doppler_gates(&self, keep: impl Fn(&str) -> bool) {
+        let mut gates = self.doppler_gates.lock().unwrap_or_else(|p| p.into_inner());
+        gates.retain(|id, _| keep(id));
+    }
+
+    fn check_outbound_breadth(&self, site: &Site) -> Result<()> {
+        let node = self
+            .orchestrator
+            .as_ref()
+            .map(|o| o.egress().node_allow_cidrs())
+            .unwrap_or_default();
+        validate_outbound_breadth(site, &node)?;
+        Ok(())
     }
 
     pub(crate) fn orchestrator(&self) -> Result<&Arc<Orchestrator>> {
@@ -663,7 +688,9 @@ impl Deployer {
         github_token: Option<String>,
     ) -> Result<Site> {
         site.history.clear();
+        normalise_outbound_rules(&mut site.outbound_rules);
         validate_site_strict(&site)?;
+        self.check_outbound_breadth(&site)?;
         let id = site.id.clone();
         let lock = self.site_lock(&id);
         let _guard = lock.lock().await;
@@ -678,9 +705,10 @@ impl Deployer {
             let orch = self.orchestrator()?;
             orch.limits().check_source(source)?;
             let token = github_token.filter(|t| !t.is_empty());
-            // The secret name is assigned here; a client-supplied one could read another site's token.
+            // The secret name is assigned here (a client-supplied one could read another site's token); a Doppler binding only comes from its own route.
             if let Some(source) = site.source.as_mut() {
                 source.secret = None;
+                source.doppler = None;
             }
             if let Some(token) = &token {
                 let name = secret_name(&id);
@@ -767,11 +795,15 @@ impl Deployer {
 
     // Slots, the active choice and maintenance move only through their own endpoints, so a stale client copy cannot undo a deploy.
     async fn update_site_inner(&self, actor: &str, mut site: Site) -> Result<Site> {
+        normalise_outbound_rules(&mut site.outbound_rules);
         validate_site_strict(&site)?;
         let id = site.id.clone();
         let lock = self.site_lock(&id);
         let _guard = lock.lock().await;
         let existing = self.get_site(&id)?;
+        if site.outbound_rules != existing.outbound_rules {
+            self.check_outbound_breadth(&site)?;
+        }
         if let Some(source) = &site.source {
             self.orchestrator()?.limits().check_source(source)?;
         }
@@ -782,6 +814,7 @@ impl Deployer {
         site.maintenance = existing.maintenance.clone();
         if let Some(source) = site.source.as_mut() {
             source.secret = existing.source.as_ref().and_then(|s| s.secret.clone());
+            source.doppler = existing.source.as_ref().and_then(|s| s.doppler.clone());
         }
         if site == existing {
             return Ok(existing);
@@ -789,6 +822,8 @@ impl Deployer {
         // Build settings are not part of the HAProxy config, so changing only them is a store write that waits for the next deploy.
         let mut routing = site.clone();
         routing.source = existing.source.clone();
+        routing.volumes = existing.volumes.clone();
+        routing.outbound_rules = existing.outbound_rules.clone();
         let source_only = routing == existing && site.source.is_some() && existing.source.is_some();
         let sid = id.clone();
         if source_only {
@@ -810,12 +845,36 @@ impl Deployer {
         self.get_site(&id)
     }
 
-    pub async fn delete_site(self: &Arc<Self>, actor: &str, id: &str) -> Result<()> {
-        let (this, actor, id) = (Arc::clone(self), actor.to_string(), id.to_string());
-        detach(async move { this.delete_site_inner(&actor, &id).await }).await
+    /// Deletes the data of one site volume under the site lock, so no deploy can mount it meanwhile.
+    pub async fn delete_site_volume(&self, id: &str, name: &str) -> Result<()> {
+        let lock = self.site_lock(id);
+        let _guard = lock.lock().await;
+        let site = self.get_site(id)?;
+        let declared = site.volumes.iter().any(|v| v.name == name);
+        self.orchestrator()?
+            .remove_site_volume(id, name, declared)
+            .await
     }
 
-    async fn delete_site_inner(&self, actor: &str, id: &str) -> Result<()> {
+    pub async fn delete_site(self: &Arc<Self>, actor: &str, id: &str) -> Result<()> {
+        self.delete_site_with(actor, id, false).await
+    }
+
+    /// Persistent site volumes survive a delete unless `purge_volumes` is set.
+    pub async fn delete_site_with(
+        self: &Arc<Self>,
+        actor: &str,
+        id: &str,
+        purge_volumes: bool,
+    ) -> Result<()> {
+        let (this, actor, id) = (Arc::clone(self), actor.to_string(), id.to_string());
+        detach(async move { this.delete_site_inner(&actor, &id, purge_volumes).await }).await
+    }
+
+    async fn delete_site_inner(&self, actor: &str, id: &str, purge_volumes: bool) -> Result<()> {
+        // A Doppler sync in flight finishes first, so it cannot write a snapshot after the secrets below are gone.
+        let doppler_gate = self.doppler_gate(id);
+        let _doppler_held = doppler_gate.lock().await;
         let lock = self.site_lock(id);
         let guard = lock.lock().await;
         let site = self.get_site(id)?;
@@ -843,11 +902,23 @@ impl Deployer {
         {
             tracing::warn!("stacks of deleted site {id} could not be removed: {err}");
         }
+        if purge_volumes
+            && let Some(orch) = &self.orchestrator
+            && let Err(err) = orch.remove_site_volumes(id).await
+        {
+            tracing::warn!("volumes of deleted site {id} could not be removed: {err}");
+        }
         self.drop_secret(site.source.as_ref().and_then(|s| s.secret.as_deref()))
             .await;
         for kind in [EnvKind::Build, EnvKind::Runtime] {
             self.store.delete_secret(&kind.secret(id)).await;
+            self.store
+                .delete_secret(&crate::doppler::snapshot_secret(id, kind))
+                .await;
         }
+        self.store
+            .delete_secret(&crate::doppler::token_secret(id))
+            .await;
         self.store.delete_secret(&repo_record(id)).await;
         self.site_ops.forget(id);
         drop(guard);
@@ -1458,6 +1529,11 @@ mod tests {
                 manager_nano_cpus: limits.manager_nano_cpus,
                 executor_memory: limits.executor_memory,
                 executor_nano_cpus: limits.executor_nano_cpus,
+                executor_volumes: Vec::new(),
+                executor_present: false,
+                executor_outbound: false,
+                executor_filtered: false,
+                egress_proxy: None,
             };
             if self.orch.slot_ref(site_id, slot).await?.is_none() {
                 return Ok(seen);
@@ -1623,6 +1699,9 @@ mod tests {
             source: None,
             history: vec![],
             access: Default::default(),
+            volumes: Vec::new(),
+            outbound: true,
+            outbound_rules: Default::default(),
         }
     }
 
@@ -2684,11 +2763,25 @@ mod tests {
                 .deploy_and_wait("t", "shop", None, Some("v2".into()), None)
                 .await
         });
-        sleep(Duration::from_millis(400)).await;
+        let mut during = e.deployer.site_status("shop").await.unwrap();
+        for _ in 0..100 {
+            sleep(Duration::from_millis(100)).await;
+            during = e.deployer.site_status("shop").await.unwrap();
+            if during
+                .operation
+                .as_ref()
+                .is_some_and(|o| o.step == "building")
+            {
+                break;
+            }
+        }
+        sleep(Duration::from_millis(300)).await;
         assert_eq!(current(&e, "shop").active, Slot::Blue);
         assert!(!green_promoted(&e), "the old release went live");
-        let during = e.deployer.site_status("shop").await.unwrap();
-        let op = during.operation.expect("a running deploy is visible");
+        let op = during
+            .operation
+            .clone()
+            .expect("a running deploy is visible");
         assert_eq!((op.kind.as_str(), op.step.as_str()), ("deploy", "building"));
         assert_eq!(op.slot, Some(Slot::Green));
         assert_eq!(during.phase, "building");
@@ -2809,6 +2902,11 @@ mod tests {
             manager_nano_cpus: 0,
             executor_memory: 0,
             executor_nano_cpus: 0,
+            executor_volumes: Vec::new(),
+            executor_present: false,
+            executor_outbound: false,
+            executor_filtered: false,
+            egress_proxy: None,
         }
     }
 

@@ -10,12 +10,12 @@ use serde::Deserialize;
 use serde::de::{Deserializer, MapAccess, Visitor};
 
 pub const ENV_NAME: &str = "CITE_RUNTIME_ENV_JSON";
-const MAX_JSON_BYTES: usize = 12 * 1024;
-const MAX_KEYS: usize = 64;
+const MAX_JSON_BYTES: usize = 24 * 1024;
+const MAX_KEYS: usize = 128;
 const MAX_NAME_LEN: usize = 64;
 const MAX_VALUE_BYTES: usize = 4096;
 /// Names the child must not control: loader, TLS, proxy and home hooks, plus every key the supervisor sets itself.
-const DENIED: [&str; 20] = [
+const DENIED: [&str; 21] = [
     "LD_PRELOAD",
     "LD_LIBRARY_PATH",
     "LD_AUDIT",
@@ -36,6 +36,7 @@ const DENIED: [&str; 20] = [
     "HOST",
     "HOSTNAME",
     "NITRO_HOST",
+    "NODE_USE_ENV_PROXY",
 ];
 const DENIED_PREFIXES: [&str; 4] = ["XDG_", "GIT_", "NPM_CONFIG_", "CITE_"];
 
@@ -101,12 +102,12 @@ impl UserEnv {
     /// Parses and validates the JSON; errors name the rule that failed and never echo a name or value.
     pub fn from_json(text: &str) -> Result<Self> {
         if text.len() > MAX_JSON_BYTES {
-            return Err(reject("the document is larger than 12 KiB"));
+            return Err(reject("the document is larger than 24 KiB"));
         }
         let Pairs(pairs) = serde_json::from_str(text)
             .map_err(|_| reject("expected one JSON object whose values are all strings"))?;
         if pairs.len() > MAX_KEYS {
-            return Err(reject("more than 64 variables"));
+            return Err(reject("more than 128 variables"));
         }
         let mut seen = BTreeSet::new();
         let mut vars = BTreeMap::new();
@@ -193,10 +194,22 @@ mod tests {
             "HOST",
             "HOSTNAME",
             "NITRO_HOST",
+            "NODE_USE_ENV_PROXY",
             "CITE_ANYTHING",
         ] {
             let json = format!(r#"{{"{name}":"v"}}"#);
             assert!(UserEnv::from_json(&json).is_err(), "{name} was accepted");
+        }
+        for lower in [
+            "http_proxy",
+            "https_proxy",
+            "no_proxy",
+            "node_use_env_proxy",
+        ] {
+            assert!(
+                UserEnv::from_json(&format!(r#"{{"{lower}":"v"}}"#)).is_err(),
+                "{lower}"
+            );
         }
         assert!(name_denied("http_proxy"));
         assert!(name_denied("npm_config_registry"));
@@ -233,8 +246,8 @@ mod tests {
             let body: Vec<String> = (0..n).map(|i| format!(r#""K{i}":"v""#)).collect();
             format!("{{{}}}", body.join(","))
         };
-        assert!(UserEnv::from_json(&many(64)).is_ok());
-        assert!(UserEnv::from_json(&many(65)).is_err());
+        assert!(UserEnv::from_json(&many(128)).is_ok());
+        assert!(UserEnv::from_json(&many(129)).is_err());
 
         let value = |n: usize| format!(r#"{{"A":"{}"}}"#, "x".repeat(n));
         assert!(UserEnv::from_json(&value(4096)).is_ok());

@@ -27,6 +27,15 @@ const LOG_LINE_MAX: usize = 1024;
 const SHIM_READ_MAX: u64 = 16 * 1024;
 /// Bind-address variables frameworks read; forced to loopback so children stay behind the executor.
 const LOOPBACK_HOST_VARS: [&str; 3] = ["HOST", "HOSTNAME", "NITRO_HOST"];
+/// Set on the executor by the connector in filtered egress mode; passed to the child last so nothing overrides them.
+const EGRESS_PROXY_VARS: [&str; 6] = [
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "NO_PROXY",
+    "NODE_USE_ENV_PROXY",
+];
 
 #[derive(Clone)]
 pub struct SlotManager {
@@ -44,6 +53,8 @@ struct SlotRuntime {
     log: VecDeque<String>,
     crashes: VecDeque<Instant>,
     started_at: Option<Instant>,
+    /// Why the last start of this slot never became healthy, for the activation result.
+    start_failure: Option<String>,
 }
 
 impl SlotRuntime {
@@ -54,6 +65,7 @@ impl SlotRuntime {
             log: VecDeque::new(),
             crashes: VecDeque::new(),
             started_at: None,
+            start_failure: None,
         }
     }
 
@@ -139,6 +151,25 @@ impl SlotManager {
         self.shutting_down.load(Ordering::SeqCst)
     }
 
+    /// Records why a start failed; it also goes to the slot log so it sits beside the server's own output.
+    pub async fn note_start_failure(&self, slot: Slot, reason: String) {
+        let rt_arc = self.runtime(slot);
+        let mut rt = rt_arc.lock().await;
+        if rt
+            .log
+            .back()
+            .is_some_and(|last| reason.starts_with(last.as_str()))
+        {
+            rt.log.pop_back();
+        }
+        rt.push_log(reason.clone());
+        rt.start_failure = Some(reason);
+    }
+
+    pub async fn take_start_failure(&self, slot: Slot) -> Option<String> {
+        self.runtime(slot).lock().await.start_failure.take()
+    }
+
     pub async fn record_crash(&self, slot: Slot, reason: String) {
         let rt_arc = self.runtime(slot);
         let mut rt = rt_arc.lock().await;
@@ -180,8 +211,12 @@ impl SlotManager {
             .map_err(cite_core::Error::msg)?;
         validate_start_argv(&manifest.start_argv)?;
 
-        let keep_crashes = self.runtime(slot).lock().await.release_id.as_deref()
-            == Some(manifest.release_id.as_str());
+        let keep_crashes = {
+            let rt_arc = self.runtime(slot);
+            let mut rt = rt_arc.lock().await;
+            rt.start_failure = None;
+            rt.release_id.as_deref() == Some(manifest.release_id.as_str())
+        };
         self.stop_slot(slot).await;
 
         let app_dir = self.config.slot_dir(slot).join("app");
@@ -197,6 +232,8 @@ impl SlotManager {
             .process_group(0)
             .kill_on_drop(true)
             .env_clear()
+            // Next.js would otherwise try to write telemetry state into a home it cannot write; the owner may override it.
+            .env("NEXT_TELEMETRY_DISABLED", "1")
             // Owner variables go in first so every supervisor-set key below overrides them.
             .envs(self.user_env.vars())
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
@@ -218,6 +255,11 @@ impl SlotManager {
         }
         for name in LOOPBACK_HOST_VARS {
             cmd.env(name, "127.0.0.1");
+        }
+        for name in EGRESS_PROXY_VARS {
+            if let Some(value) = std::env::var_os(name) {
+                cmd.env(name, value);
+            }
         }
 
         let mut child = cmd.spawn()?;
@@ -273,7 +315,7 @@ impl SlotManager {
             Ok(Some(status)) => {
                 rt.child = None;
                 signal_group(group, rustix::process::Signal::KILL);
-                let reason = format!("child exited with {status}");
+                let reason = format!("the server process exited with {}", describe_exit(&status));
                 rt.push_log(reason.clone());
                 rt.crashes.push_back(Instant::now());
                 trim_crashes(&mut rt.crashes, self.config.crash_window);
@@ -313,6 +355,16 @@ impl SlotManager {
         let base = Duration::from_millis(200);
         let max = Duration::from_secs(30);
         base.saturating_mul(2u32.saturating_pow(exp)).min(max)
+    }
+}
+
+/// `code 1` or `signal 9`, the wording start failures use.
+pub(crate) fn describe_exit(status: &std::process::ExitStatus) -> String {
+    use std::os::unix::process::ExitStatusExt;
+    match (status.code(), status.signal()) {
+        (Some(code), _) => format!("code {code}"),
+        (None, Some(signal)) => format!("signal {signal}"),
+        _ => status.to_string(),
     }
 }
 
@@ -415,7 +467,14 @@ fn resolve_argv(
     }
     let argv0 = argv[0].as_str();
     match argv0 {
+        // The Bun image has no node binary; Bun runs Node entry points itself.
+        "node" if config.runtime == RuntimeKind::Bun => {
+            Ok((PathBuf::from(&config.bun_bin), argv[1..].to_vec()))
+        }
         "node" => Ok((PathBuf::from(&config.node_bin), argv[1..].to_vec())),
+        "bun" if config.runtime != RuntimeKind::Bun => Err(cite_core::Error::msg(
+            "the start command runs with bun but this executor runs Node; deploy the site with CITE_RUNTIME=bun",
+        )),
         "bun" => Ok((PathBuf::from(&config.bun_bin), argv[1..].to_vec())),
         other => {
             let bin = app_dir.join("node_modules").join(".bin").join(other);
@@ -835,6 +894,121 @@ fi
         cfg.bin_shims = BinShims::Deny;
         let err = resolve_argv(&cfg, &app, &["ok".into()]).unwrap_err();
         assert!(err.to_string().contains("CITE_BIN_SHIMS=deny"), "{err}");
+    }
+
+    #[test]
+    fn bun_start_commands_need_the_bun_runtime_and_bun_runs_node_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = dir.path().join("app");
+        std::fs::create_dir_all(&app).unwrap();
+        let node = node_config(dir.path());
+        let err = resolve_argv(&node, &app, &["bun".into(), "src/index.ts".into()]).unwrap_err();
+        assert!(err.to_string().contains("CITE_RUNTIME=bun"), "{err}");
+
+        let mut env = std::collections::HashMap::new();
+        env.insert("CITE_RUNTIME".into(), "bun".into());
+        env.insert("CITE_RELEASES_DIR".into(), dir.path().display().to_string());
+        env.insert("CITE_DATA_DIR".into(), dir.path().display().to_string());
+        env.insert("CITE_PORT_BASE".into(), "21013".into());
+        env.insert("CITE_LISTEN".into(), "127.0.0.1:0".into());
+        env.insert("CITE_NODE".into(), "22".into());
+        let bun = ExecutorConfig::load_from(&env, None).unwrap();
+        let (program, args) =
+            resolve_argv(&bun, &app, &["node".into(), "server.js".into()]).unwrap();
+        assert_eq!(program, PathBuf::from(&bun.bun_bin));
+        assert_eq!(args, ["server.js"]);
+        let (program, _) = resolve_argv(&bun, &app, &["bun".into(), "x.ts".into()]).unwrap();
+        assert_eq!(program, PathBuf::from(&bun.bun_bin));
+    }
+
+    fn script_release(releases: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let bin_dir = releases.join("blue/app/bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let script = bin_dir.join("hello");
+        std::fs::write(&script, body).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[tokio::test]
+    async fn ssr_child_gets_its_port_production_env_and_loopback_host_in_the_app_dir() {
+        let data = tempfile::tempdir().unwrap();
+        let releases = data.path().join("releases");
+        script_release(
+            &releases,
+            "#!/bin/sh\npwd > pwd.txt\nenv > env.tmp\nmv env.tmp env.txt\nexec sleep 30\n",
+        );
+        let mgr = SlotManager::new(rust_config(&releases, 21_011), Redactor::new());
+        let app = mgr.app_root(Slot::Blue);
+        mgr.start_ssr(Slot::Blue, &rust_manifest("18"))
+            .await
+            .expect("start child");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !app.join("env.txt").is_file() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let env = std::fs::read_to_string(app.join("env.txt")).unwrap_or_default();
+        let pwd = std::fs::read_to_string(app.join("pwd.txt")).unwrap_or_default();
+        mgr.shutdown_all().await;
+        let vars: Vec<&str> = env.lines().collect();
+        for expected in [
+            "PORT=21011",
+            "NODE_ENV=production",
+            "HOST=127.0.0.1",
+            "HOSTNAME=127.0.0.1",
+            "NITRO_HOST=127.0.0.1",
+            "NEXT_TELEMETRY_DISABLED=1",
+        ] {
+            assert!(vars.contains(&expected), "{expected} missing from {vars:?}");
+        }
+        assert!(vars.iter().any(|v| v.starts_with("PATH=")));
+        assert_eq!(
+            Path::new(pwd.trim()).canonicalize().unwrap(),
+            app.canonicalize().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_child_that_exits_reports_its_code_and_keeps_its_output() {
+        let data = tempfile::tempdir().unwrap();
+        let releases = data.path().join("releases");
+        script_release(
+            &releases,
+            "#!/bin/sh\necho 'Error: Cannot find module express' >&2\nexit 3\n",
+        );
+        let mgr = SlotManager::new(rust_config(&releases, 21_012), Redactor::new());
+        mgr.start_ssr(Slot::Blue, &rust_manifest("18"))
+            .await
+            .expect("start child");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !mgr
+            .log_tail(Slot::Blue)
+            .await
+            .iter()
+            .any(|line| line.contains("Cannot find module"))
+            && Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let mut exited = None;
+        while exited.is_none() && Instant::now() < deadline {
+            exited = mgr.poll_exit(Slot::Blue).await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let exited = exited.expect("child exit seen");
+        assert_eq!(exited, "the server process exited with code 3");
+        let reason = format!("{exited} before it listened on port 21012");
+        mgr.note_start_failure(Slot::Blue, reason.clone()).await;
+        let tail = mgr.log_tail(Slot::Blue).await;
+        assert!(
+            tail.iter()
+                .any(|line| line.contains("err: Error: Cannot find module express"))
+        );
+        assert_eq!(tail.last(), Some(&reason));
+        assert!(!tail.iter().any(|line| line == &exited), "{tail:?}");
+        assert_eq!(mgr.take_start_failure(Slot::Blue).await, Some(reason));
+        assert_eq!(mgr.take_start_failure(Slot::Blue).await, None);
+        mgr.shutdown_all().await;
     }
 
     #[test]

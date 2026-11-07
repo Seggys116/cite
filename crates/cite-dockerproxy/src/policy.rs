@@ -4,7 +4,7 @@ use std::time::Duration;
 use regex::Regex;
 use serde_json::Value;
 
-use crate::config::Config;
+use crate::config::{Config, EgressMode};
 use crate::spec;
 use crate::target::Target;
 
@@ -16,6 +16,8 @@ const MAX_LOG_SINCE: usize = 20;
 // Matches the slug rule of site ids (lowercase, digits, dashes, at most 40 characters).
 const ID: &str = "[a-z0-9][a-z0-9-]{0,39}";
 const VERSION: &str = "[0-9]+\\.[0-9]+\\.[0-9]+";
+// The underscore never occurs in a site id, so a site volume name always splits one way.
+const VOLUME_NAME: &str = "[a-z0-9][a-z0-9-]{0,30}";
 const MAX_STOP_GRACE: u32 = 60;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 const WAIT_TIMEOUT: Duration = Duration::from_secs(300);
@@ -40,6 +42,7 @@ pub enum Route {
     ImagePull,
     ImageInspect,
     VolumeCreate,
+    VolumeList,
     VolumeInspect(String),
     VolumeDelete(String),
     NetworkCreate,
@@ -111,11 +114,16 @@ pub struct Policy {
     pub(crate) forge_api_url: Option<String>,
     pub(crate) max_memory: i64,
     pub(crate) max_nano_cpus: i64,
+    pub(crate) egress_mode: EgressMode,
+    pub(crate) egress_bridge: String,
+    pub(crate) egress_env: Vec<String>,
     container: Regex,
     volume: Regex,
+    site_volume: Regex,
     network: Regex,
     manager_image: Regex,
     executor_image: Regex,
+    egress_image: Regex,
     pull_repo: Regex,
     pull_tag: Regex,
 }
@@ -137,17 +145,22 @@ impl Policy {
             forge_api_url: cfg.forge_api_url.clone(),
             max_memory: cfg.max_memory,
             max_nano_cpus: cfg.max_nano_cpus,
-            container: stack("manager|executor|init"),
+            egress_mode: cfg.egress_mode,
+            egress_bridge: cfg.egress_bridge.clone(),
+            egress_env: cfg.egress_env.clone(),
+            container: stack("manager|executor|init|egress-proxy"),
             volume: stack("data|work|cache"),
-            network: stack("net|egress"),
+            site_volume: build(format!("^cite-vol-(?<id>{ID})_(?<name>{VOLUME_NAME})$")),
+            network: stack("net|xnet|egress"),
             manager_image: build(format!(
                 "^{reg}/(cite-manager:{VERSION}-node(22|24)|cite-manager-rust:{VERSION})$"
             )),
             executor_image: build(format!(
                 "^{reg}/(cite-executor-node:{VERSION}-node(22|24)|cite-executor-(bun|static|rust):{VERSION})$"
             )),
+            egress_image: build(format!("^{reg}/cite-egress:{VERSION}$")),
             pull_repo: build(format!(
-                "^{reg}/(cite-manager|cite-manager-rust|cite-executor-(node|bun|static|rust))$"
+                "^{reg}/(cite-manager|cite-manager-rust|cite-executor-(node|bun|static|rust)|cite-egress)$"
             )),
             pull_tag: build(format!("^{VERSION}(-node(22|24))?$")),
         }
@@ -177,12 +190,42 @@ impl Policy {
         Self::parse(&self.network, "network", name)
     }
 
+    /// (site id, volume name) of a persistent site volume.
+    pub fn site_volume(&self, name: &str) -> Result<(String, String), String> {
+        let caps = self
+            .site_volume
+            .captures(name)
+            .ok_or_else(|| "volume name is not a cite site volume name".to_string())?;
+        Ok((caps["id"].to_string(), caps["name"].to_string()))
+    }
+
+    // Stack volumes and site volumes are the only volumes the connector may touch.
+    fn any_volume(&self, name: &str) -> Result<(), String> {
+        if name.starts_with("cite-vol-") && self.site_volume(name).is_ok() {
+            return Ok(());
+        }
+        self.volume(name).map(|_| ())
+    }
+
     pub fn is_manager_image(&self, image: &str) -> bool {
         self.manager_image.is_match(image)
     }
 
     pub fn is_executor_image(&self, image: &str) -> bool {
         self.executor_image.is_match(image)
+    }
+
+    pub fn is_egress_image(&self, image: &str) -> bool {
+        self.egress_image.is_match(image)
+    }
+
+    fn is_cite_image(&self, image: &str) -> bool {
+        self.is_manager_image(image) || self.is_executor_image(image) || self.is_egress_image(image)
+    }
+
+    // The node's egress bridge may be created and inspected, never deleted or attached to by name.
+    pub(crate) fn is_egress_bridge(&self, name: &str) -> bool {
+        name == self.egress_bridge
     }
 
     // Route patterns spell out every method and segment; anything unlisted falls through to a denial.
@@ -201,7 +244,7 @@ impl Policy {
             ("GET", ["images", reference @ .., "json"]) if !reference.is_empty() => {
                 allow_keys(q, &[], &[])?;
                 let reference = reference.join("/");
-                if !self.is_manager_image(&reference) && !self.is_executor_image(&reference) {
+                if !self.is_cite_image(&reference) {
                     return Err("image is not a cite image".to_string());
                 }
                 Route::ImageInspect
@@ -210,14 +253,18 @@ impl Policy {
                 allow_keys(q, &[], &[])?;
                 Route::VolumeCreate
             }
+            ("GET", ["volumes"]) => {
+                check_label_filters(q, &[])?;
+                Route::VolumeList
+            }
             ("GET", ["volumes", name]) => {
                 allow_keys(q, &[], &[])?;
-                self.volume(name)?;
+                self.any_volume(name)?;
                 Route::VolumeInspect(name.to_string())
             }
             ("DELETE", ["volumes", name]) => {
                 allow_keys(q, &[], &[])?;
-                self.volume(name)?;
+                self.any_volume(name)?;
                 Route::VolumeDelete(name.to_string())
             }
             ("POST", ["networks", "create"]) => {
@@ -226,7 +273,9 @@ impl Policy {
             }
             ("GET", ["networks", name]) => {
                 allow_keys(q, &[], &[])?;
-                self.network(name)?;
+                if !self.is_egress_bridge(name) {
+                    self.network(name)?;
+                }
                 Route::NetworkInspect(name.to_string())
             }
             ("DELETE", ["networks", name]) => {
@@ -315,7 +364,7 @@ impl Policy {
             return Err("image to pull is not a cite image".to_string());
         }
         let full = format!("{repo}:{tag}");
-        if !self.is_manager_image(&full) && !self.is_executor_image(&full) {
+        if !self.is_cite_image(&full) {
             return Err("image tag does not fit the image".to_string());
         }
         Ok(())
@@ -409,8 +458,15 @@ fn check_logs(q: &BTreeMap<String, String>) -> Result<(), String> {
 
 // The listing must be pinned to cite-managed containers by its label filter.
 fn check_list(q: &BTreeMap<String, String>) -> Result<(), String> {
-    allow_keys(q, &["all", "filters"], &["filters"])?;
-    bool_value(q, "all")?;
+    check_label_filters(q, &["all"])?;
+    bool_value(q, "all")
+}
+
+// Container and volume listings both carry a mandatory label filter that includes cite.managed=true.
+fn check_label_filters(q: &BTreeMap<String, String>, extra: &[&str]) -> Result<(), String> {
+    let mut allowed = vec!["filters"];
+    allowed.extend_from_slice(extra);
+    allow_keys(q, &allowed, &["filters"])?;
     let filters: Value =
         serde_json::from_str(&q["filters"]).map_err(|_| "filters is not json".to_string())?;
     let obj = filters.as_object().ok_or("filters is not an object")?;

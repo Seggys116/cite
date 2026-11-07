@@ -3,7 +3,7 @@
 
 services:
   dockerproxy:
-    image: ghcr.io/seggys116/cite-dockerproxy:${CITE_VERSION:-0.4.0}
+    image: ghcr.io/seggys116/cite-dockerproxy:${CITE_VERSION:-0.4.1}
     restart: unless-stopped
     init: true
     user: "10001:10001"
@@ -25,6 +25,14 @@ services:
       CITE_STACK_FORGE_API_URL: ${CITE_STACK_FORGE_API_URL:-}
       CITE_STACK_MAX_MEM: ${CITE_STACK_MAX_MEM:-16g}
       CITE_STACK_MAX_CPUS: ${CITE_STACK_MAX_CPUS:-8}
+      CITE_STACK_EGRESS_MODE: ${CITE_STACK_EGRESS_MODE:-}
+      CITE_STACK_EXECUTOR_EGRESS: ${CITE_STACK_EXECUTOR_EGRESS:-}
+      CITE_STACK_EGRESS_BRIDGE: ${CITE_STACK_EGRESS_BRIDGE:-cite-egress}
+      CITE_STACK_EGRESS_ALLOW_CIDRS: ${CITE_STACK_EGRESS_ALLOW_CIDRS:-}
+      CITE_STACK_EGRESS_DENY_CIDRS: ${CITE_STACK_EGRESS_DENY_CIDRS:-}
+      CITE_STACK_EGRESS_DENY_HOSTS: ${CITE_STACK_EGRESS_DENY_HOSTS:-}
+      CITE_STACK_EGRESS_ALLOW_PORTS: ${CITE_STACK_EGRESS_ALLOW_PORTS:-}
+      CITE_NODE_PUBLIC_IPS: ${CITE_NODE_PUBLIC_IPS:-}
       RUST_LOG: ${RUST_LOG:-info}
     # A read-only bind does not restrict the API on a unix socket; the filter in the proxy does.
     volumes:
@@ -53,6 +61,14 @@ services:
       CITE_STACK_FORGE_API_URL: ${CITE_STACK_FORGE_API_URL:-}
       CITE_STACK_MAX_MEM: ${CITE_STACK_MAX_MEM:-16g}
       CITE_STACK_MAX_CPUS: ${CITE_STACK_MAX_CPUS:-8}
+      CITE_STACK_EGRESS_MODE: ${CITE_STACK_EGRESS_MODE:-}
+      CITE_STACK_EXECUTOR_EGRESS: ${CITE_STACK_EXECUTOR_EGRESS:-}
+      CITE_STACK_EGRESS_BRIDGE: ${CITE_STACK_EGRESS_BRIDGE:-cite-egress}
+      CITE_STACK_EGRESS_ALLOW_CIDRS: ${CITE_STACK_EGRESS_ALLOW_CIDRS:-}
+      CITE_STACK_EGRESS_DENY_CIDRS: ${CITE_STACK_EGRESS_DENY_CIDRS:-}
+      CITE_STACK_EGRESS_DENY_HOSTS: ${CITE_STACK_EGRESS_DENY_HOSTS:-}
+      CITE_STACK_EGRESS_ALLOW_PORTS: ${CITE_STACK_EGRESS_ALLOW_PORTS:-}
+      CITE_NODE_PUBLIC_IPS: ${CITE_NODE_PUBLIC_IPS:-}
       CITE_HAPROXY_CONTAINER: cite-node-haproxy
       CITE_REGISTRY: ${CITE_REGISTRY:-ghcr.io/seggys116}
       CITE_STACK_VERSION: ${CITE_STACK_VERSION:-}
@@ -61,6 +77,10 @@ services:
       # Node-wide GitHub token for sites that carry none of their own; empty means not set. The _FILE form needs the file mounted into the connector.
       CITE_GITHUB_TOKEN: ${CITE_GITHUB_TOKEN:-}
       CITE_GITHUB_TOKEN_FILE: ${CITE_GITHUB_TOKEN_FILE:-}
+      # Node-wide Doppler token for sites bound to Doppler without one of their own, and how often bound sites are synced.
+      CITE_DOPPLER_TOKEN: ${CITE_DOPPLER_TOKEN:-}
+      CITE_DOPPLER_TOKEN_FILE: ${CITE_DOPPLER_TOKEN_FILE:-}
+      CITE_DOPPLER_POLL_SECS: ${CITE_DOPPLER_POLL_SECS:-300}
     networks:
       - docker_api
 

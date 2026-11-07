@@ -261,6 +261,7 @@ jobs:
           docker build -f images/manager/Dockerfile -t "$R/cite-manager:$V-node22" .
           docker build -f images/executor-node/Dockerfile -t "$R/cite-executor-node:$V-node22" .
           docker build -f images/executor-static/Dockerfile -t "$R/cite-executor-static:$V" .
+          docker build -f images/egress/Dockerfile -t "$R/cite-egress:$V" .
           docker build -f images/mock-github/Dockerfile -t cite-mock-github:e2e .
       - name: Run the orchestrator end to end script
         run: CITE_VERSION=0.0.1 bash scripts/e2e-orchestrator.sh

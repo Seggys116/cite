@@ -23,7 +23,10 @@ pub use config::{
     node_flag_denied, parse_build_env_json, parse_env_file,
 };
 pub use confined::{FileKey, FileName, NAME_MAX, TrustedDir};
-pub use detect::{Detection, detect_site, detect_site_configured, detect_site_with};
+pub use detect::{
+    Detection, StartBin, detect_site, detect_site_configured, detect_site_in, detect_site_with,
+    next_standalone_server_dir, node_range_allows, package_bin_path,
+};
 pub use duration::{PollInterval, parse_byte_size, parse_duration, parse_poll_interval};
 pub use error::{Error, Result};
 pub use extract::{ExtractLimits, ExtractReport, extract_archive};
@@ -219,6 +222,7 @@ mod workspace_invariants {
             "images/executor-bun/Dockerfile",
             "images/executor-static/Dockerfile",
             "images/executor-rust/Dockerfile",
+            "images/egress/Dockerfile",
             "images/mock-github/Dockerfile",
         ] {
             let text = std::fs::read_to_string(root.join(file)).unwrap();
@@ -293,6 +297,7 @@ mod workspace_invariants {
             "images/executor-bun/Dockerfile",
             "images/executor-static/Dockerfile",
             "images/executor-rust/Dockerfile",
+            "images/egress/Dockerfile",
         ] {
             let text = std::fs::read_to_string(root.join(file)).unwrap();
             assert!(
@@ -317,6 +322,31 @@ mod workspace_invariants {
         assert!(example.contains(&format!("CITE_VERSION={version}")));
         let schema = std::fs::read_to_string(root.join("crates/cite-core/src/schema.rs")).unwrap();
         assert!(schema.contains("Err(Error::Version { found: v })"));
+    }
+
+    #[test]
+    fn the_egress_image_is_built_and_published_like_the_static_executor() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let read = |p: &str| std::fs::read_to_string(root.join(p)).unwrap();
+        assert!(read("images/images.toml").contains("egress = \"cite-egress\""));
+        let release = read(".github/workflows/release.yml");
+        assert!(release.contains(
+            "{ key: egress, name: cite-egress, dockerfile: images/egress/Dockerfile, node: \"\", args: \"\" }"
+        ));
+        assert!(release.contains("{ key: egress, name: cite-egress, suffix: \"\" }"));
+        let node = read(".github/workflows/node.yml");
+        assert!(node.contains("images/egress/Dockerfile -t \"$R/cite-egress:$V\""));
+        let dockerfile = read("images/egress/Dockerfile");
+        let static_executor = read("images/executor-static/Dockerfile");
+        let base = |text: &str| {
+            text.lines()
+                .find(|l| l.starts_with("ARG STATIC_IMAGE="))
+                .map(str::to_string)
+        };
+        assert_eq!(base(&dockerfile), base(&static_executor));
+        assert!(dockerfile.contains("USER 65532:65532"));
+        assert!(dockerfile.contains("cargo build --locked --release -p cite-egress"));
+        assert!(!dockerfile.contains("HEALTHCHECK"));
     }
 
     #[test]

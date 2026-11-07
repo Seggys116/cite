@@ -5,6 +5,7 @@ pub mod archive;
 pub mod certificate;
 pub mod client;
 pub mod config;
+pub mod doppler;
 pub mod error;
 pub mod export;
 pub mod firewall;
@@ -28,13 +29,18 @@ pub use certificate::{
     CertificateInfo, CertificateList, CertificateSaved, CertificateUpload, CloudflareRanges,
     MAX_CERT_NAME_CHARS, MAX_PEM_BYTES, validate_certificate_id, validate_certificate_name,
 };
+pub use cite_edge::model::{OutboundMode, OutboundRules, Volume};
 pub use client::{
     AuditEntry, CreatedToken, DeployRequest, Forwarded, GithubInfo, LoginResponse, NodeClient,
-    NodeInfo, PresetInfo, ReloadResult, RequestQuery, SiteDetail, TokenMeta,
+    NodeInfo, PresetInfo, ReloadResult, RequestQuery, SiteDetail, TokenMeta, VolumeInfo,
 };
 pub use config::{
     CONFIG_VERSION, ConfigFile, DEFAULT_LISTEN, DashboardConfig, MAX_NODES, NodeConfig,
     is_loopback_host, parse_node_url,
+};
+pub use doppler::{
+    DOPPLER_SERVICE_TOKEN_PREFIX, DopplerBindRequest, DopplerBinding, DopplerConfig, DopplerInfo,
+    DopplerProject, MAX_DOPPLER_SLUG_CHARS, MAX_DOPPLER_TOKEN_BYTES, validate_doppler_slug,
 };
 pub use error::{ClientError, ConfigError};
 pub use export::{

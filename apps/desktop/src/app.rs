@@ -6,7 +6,8 @@ use std::time::Duration;
 
 use cite_client::{ClientError, MemoryTokenStore, NodeClient, TokenStore};
 use gpui::{
-    AnyElement, App, Context, Entity, IntoElement, Render, Window, deferred, div, prelude::*, px,
+    AnyElement, App, ClickEvent, Context, Entity, FocusHandle, IntoElement, Render, Subscription,
+    Window, WindowBounds, actions, deferred, div, prelude::*, px,
 };
 
 use crate::api::{NodeHandle, spawn_io};
@@ -15,8 +16,9 @@ use crate::demo::{demo_config, demo_nodes};
 use crate::keychain::KeychainTokenStore;
 use crate::scope::{Origin, Scope, apply_if_current, foreign_notice};
 use crate::theme::{
-    ACCENT, BG, BLUE, BORDER, CARD_RADIUS, CHIP_RADIUS, DIM, DIVIDER, GREEN, INPUT, RED,
-    ROW_RADIUS, SIDEBAR, SURFACE, TEXT, TOPBAR, Tone, c, chip_fill, chip_stroke, tint,
+    ACCENT, BG, BLUE, BORDER, CARD_RADIUS, CHIP_RADIUS, DIM, DIVIDER, GREEN, INPUT, PANEL_RADIUS,
+    RED, ROW_RADIUS, SIDEBAR, SURFACE, TEXT, Tone, WINDOW, c, chip_fill, chip_stroke, font, layout,
+    space, tint,
 };
 use crate::ui::input::TextInput;
 use crate::ui::widgets::{BtnKind, btn, id, strong, text_dim};
@@ -24,31 +26,90 @@ use crate::ui::{
     alertspanel, analytics, bots, certs, certtools, create, detail, firewall, maintenance, nodes,
     ops, overview, settings, sites, storage, traffic,
 };
+use crate::window_state::{Frame, WindowState, window_state_path};
 use crate::zone::keep_for_site;
+
+actions!(cite_shell, [ToggleSidebar]);
 
 const TICK: Duration = Duration::from_millis(500);
 const LOGO_FLIP_TICKS: u64 = 5;
 const REFRESH_TICKS: u64 = 6;
 const TOAST_TICKS: u64 = 8;
+const ERROR_TOAST_TICKS: u64 = 24;
+const MAX_TOASTS: usize = 4;
+// Window moves arrive in bursts, so the state file is written once they settle.
+const SAVE_DELAY_TICKS: u64 = 2;
+const NARROW_CONTENT_W: f32 = 760.0;
 
-// Errors never expire on their own; everything else disappears after a few ticks.
+// Successes and notes go after about 4 seconds, errors after about 12.
 fn toast_until(tone: Tone, tick: u64) -> u64 {
     if tone == Tone::Bad {
-        u64::MAX
+        tick + ERROR_TOAST_TICKS
     } else {
         tick + TOAST_TICKS
     }
+}
+
+// The root view repaints whole on any notify, so the logo flips only while it is on screen in an active window.
+fn logo_flip_due(tick: u64, window_active: bool, sidebar_collapsed: bool) -> bool {
+    window_active && !sidebar_collapsed && tick.is_multiple_of(LOGO_FLIP_TICKS)
+}
+
+// A hovered toast is held until a moment after the pointer leaves it.
+fn expire_toasts(toasts: &mut Vec<Toast>, hovered: Option<u64>, tick: u64) -> bool {
+    let before = toasts.len();
+    for t in toasts.iter_mut() {
+        if Some(t.id) == hovered {
+            t.until = t.until.max(tick + 2);
+        }
+    }
+    toasts.retain(|t| t.until > tick);
+    toasts.len() != before
 }
 
 #[cfg(test)]
 mod toast_tests {
     use super::*;
 
+    fn toast(id: u64, tone: Tone, until: u64) -> Toast {
+        Toast {
+            id,
+            text: String::new(),
+            tone,
+            until,
+        }
+    }
+
     #[test]
-    fn errors_stay_and_other_toasts_expire() {
-        assert_eq!(toast_until(Tone::Bad, 10), u64::MAX);
+    fn errors_last_longer_than_other_toasts() {
+        assert_eq!(toast_until(Tone::Bad, 10), 10 + ERROR_TOAST_TICKS);
         assert_eq!(toast_until(Tone::Ok, 10), 10 + TOAST_TICKS);
         assert_eq!(toast_until(Tone::Warn, 0), TOAST_TICKS);
+        assert_eq!(TICK.as_millis() as u64 * TOAST_TICKS, 4_000);
+        assert_eq!(TICK.as_millis() as u64 * ERROR_TOAST_TICKS, 12_000);
+    }
+
+    #[test]
+    fn expired_toasts_go_and_a_hovered_one_stays() {
+        let mut list = vec![
+            toast(1, Tone::Ok, 5),
+            toast(2, Tone::Bad, 5),
+            toast(3, Tone::Ok, 9),
+        ];
+        assert!(expire_toasts(&mut list, Some(2), 5));
+        assert_eq!(list.iter().map(|t| t.id).collect::<Vec<_>>(), vec![2, 3]);
+        assert_eq!(list[0].until, 7);
+        assert!(!expire_toasts(&mut list, None, 6));
+        assert!(expire_toasts(&mut list, None, 7));
+        assert_eq!(list.iter().map(|t| t.id).collect::<Vec<_>>(), vec![3]);
+    }
+
+    #[test]
+    fn the_logo_repaints_only_when_it_can_be_seen() {
+        assert!(logo_flip_due(LOGO_FLIP_TICKS, true, false));
+        assert!(!logo_flip_due(LOGO_FLIP_TICKS + 1, true, false));
+        assert!(!logo_flip_due(LOGO_FLIP_TICKS, false, false));
+        assert!(!logo_flip_due(LOGO_FLIP_TICKS, true, true));
     }
 }
 
@@ -154,6 +215,7 @@ impl<T> Load<T> {
 }
 
 pub struct Toast {
+    pub id: u64,
     pub text: String,
     pub tone: Tone,
     pub until: u64,
@@ -188,9 +250,19 @@ pub struct Console {
     pub view: View,
     pub selected: Option<String>,
     pub switcher_open: bool,
-    pub toast: Option<Toast>,
+    // Newest last; drawn as a stack in the bottom-right corner.
+    pub toasts: Vec<Toast>,
+    toast_seq: u64,
+    hovered_toast: Option<u64>,
     pub confirm: Option<Confirm>,
     pub tick: u64,
+    pub sidebar_collapsed: bool,
+    // Width of the page column inside its padding, measured on every paint for views that adapt.
+    pub content_width: f32,
+    window_state: WindowState,
+    window_state_changed: Option<u64>,
+    focus: FocusHandle,
+    _subs: Vec<Subscription>,
     // Set on every paint, so timers can stay quiet while the window is in the background.
     pub window_active: bool,
     pub scope: Scope,
@@ -213,7 +285,12 @@ pub struct Console {
 }
 
 impl Console {
-    pub fn new(opts: Options, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        opts: Options,
+        window_state: WindowState,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let (config, config_path, tokens): (DesktopConfig, PathBuf, Arc<dyn TokenStore>) =
             if opts.demo {
                 (
@@ -237,9 +314,17 @@ impl Console {
             view: opts.view.unwrap_or(View::Overview),
             selected: opts.select,
             switcher_open: false,
-            toast: None,
+            toasts: Vec::new(),
+            toast_seq: 0,
+            hovered_toast: None,
             confirm: None,
             tick: 0,
+            sidebar_collapsed: window_state.sidebar_collapsed,
+            content_width: layout::CONTENT_MAX_W,
+            window_state,
+            window_state_changed: None,
+            focus: cx.focus_handle(),
+            _subs: Vec::new(),
             window_active: true,
             scope: Scope::default(),
             overview: overview::State::default(),
@@ -274,6 +359,21 @@ impl Console {
                 .unwrap_or_default();
         }
         console.load_current(cx);
+        // Demo runs never write the window state, so screenshots cannot change a real user's layout.
+        if !console.demo {
+            console
+                ._subs
+                .push(cx.observe_window_bounds(window, |this, window, _| {
+                    this.record_bounds(window);
+                }));
+            console._subs.push(cx.on_app_quit(|this, _| {
+                if this.window_state_changed.is_some() {
+                    this.save_window_state();
+                }
+                async {}
+            }));
+        }
+        window.focus(&console.focus);
         cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(TICK).await;
@@ -389,9 +489,7 @@ impl Console {
         F: Future<Output = Result<T, ClientError>> + Send + 'static,
     {
         let origin = self.origin();
-        if self.toast.as_ref().is_some_and(|t| t.tone == Tone::Bad) {
-            self.toast = None;
-        }
+        self.toasts.retain(|t| t.tone != Tone::Bad);
         self.fetch(cx, fut, move |this, res, cx| {
             let here = this.still_here(&origin);
             apply(this, res, here, &origin, cx);
@@ -434,13 +532,71 @@ impl Console {
         self.analytics.log.inspect = None;
     }
 
-    // Toasts expire on the tick loop so no timer is held per message; an error stays until it is clicked away or the next action starts.
+    // Toasts expire on the tick loop so no timer is held per message; a new action also clears earlier errors.
     pub fn say(&mut self, text: impl Into<String>, tone: Tone) {
-        self.toast = Some(Toast {
-            text: text.into(),
+        let text = text.into();
+        self.toasts.retain(|t| t.text != text);
+        self.toast_seq += 1;
+        self.toasts.push(Toast {
+            id: self.toast_seq,
+            text,
             tone,
             until: toast_until(tone, self.tick),
         });
+        if self.toasts.len() > MAX_TOASTS {
+            let extra = self.toasts.len() - MAX_TOASTS;
+            self.toasts.drain(..extra);
+        }
+    }
+
+    pub fn dismiss_toast(&mut self, toast_id: u64, cx: &mut Context<Self>) {
+        self.toasts.retain(|t| t.id != toast_id);
+        if self.hovered_toast == Some(toast_id) {
+            self.hovered_toast = None;
+        }
+        cx.notify();
+    }
+
+    pub fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
+        self.sidebar_collapsed = !self.sidebar_collapsed;
+        if !self.demo {
+            self.window_state.sidebar_collapsed = self.sidebar_collapsed;
+            self.window_state_changed = Some(self.tick);
+        }
+        cx.notify();
+    }
+
+    // Views can stack their columns when this is true.
+    pub fn narrow(&self) -> bool {
+        self.content_width < NARROW_CONTENT_W
+    }
+
+    fn record_bounds(&mut self, window: &Window) {
+        let (bounds, maximized) = match window.window_bounds() {
+            WindowBounds::Windowed(b) => (b, false),
+            WindowBounds::Maximized(b) => (b, true),
+            // A full-screen window keeps the frame it will return to.
+            WindowBounds::Fullscreen(b) => (b, self.window_state.maximized),
+        };
+        let frame = Frame {
+            x: f32::from(bounds.origin.x),
+            y: f32::from(bounds.origin.y),
+            width: f32::from(bounds.size.width),
+            height: f32::from(bounds.size.height),
+        };
+        if self.window_state.frame != Some(frame) || self.window_state.maximized != maximized {
+            self.window_state.frame = Some(frame);
+            self.window_state.maximized = maximized;
+            self.window_state_changed = Some(self.tick);
+        }
+    }
+
+    // A failed write only loses the remembered layout, so it is reported on stderr and not as a toast.
+    fn save_window_state(&mut self) {
+        self.window_state_changed = None;
+        if let Err(err) = self.window_state.save(&window_state_path()) {
+            eprintln!("cannot save the window state: {err}");
+        }
     }
 
     pub fn ask(&mut self, confirm: Confirm) {
@@ -519,13 +675,17 @@ impl Console {
     // Runs every half second: flips the logo colours, expires toasts and refreshes live data.
     fn on_tick(&mut self, cx: &mut Context<Self>) {
         self.tick += 1;
-        // A window in the background is not repainted for the logo.
-        let mut dirty = self.window_active && self.tick.is_multiple_of(LOGO_FLIP_TICKS);
+        let mut dirty = logo_flip_due(self.tick, self.window_active, self.sidebar_collapsed);
         self.ops_tick(cx);
         self.analytics_tick(cx);
-        if self.toast.as_ref().is_some_and(|t| t.until <= self.tick) {
-            self.toast = None;
+        if expire_toasts(&mut self.toasts, self.hovered_toast, self.tick) {
             dirty = true;
+        }
+        if self
+            .window_state_changed
+            .is_some_and(|at| self.tick >= at + SAVE_DELAY_TICKS)
+        {
+            self.save_window_state();
         }
         if self.view == View::Traffic && self.tick.is_multiple_of(REFRESH_TICKS) {
             self.refresh_recent(cx);
@@ -541,9 +701,38 @@ impl Console {
         }
     }
 
+    // Term's sidebar glyph: a rounded frame with a bar down its left side.
+    fn sidebar_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("sidebar-toggle")
+            .flex()
+            .items_center()
+            .justify_center()
+            .flex_none()
+            .size(px(layout::CONTROL_H))
+            .rounded(px(ROW_RADIUS))
+            .cursor_pointer()
+            .hover(|s| s.bg(tint(0xffffff, 0.06)))
+            .child(
+                div()
+                    .flex()
+                    .w(px(16.))
+                    .h(px(13.))
+                    .rounded(px(3.))
+                    .border_1()
+                    .border_color(c(DIM))
+                    .child(div().w(px(5.)).h_full().border_r_1().border_color(c(DIM))),
+            )
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx)))
+    }
+
     fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let section = self.view.section();
-        let mut nav = div().flex().flex_col().gap(px(2.)).mt(px(20.));
+        let mut nav = div()
+            .flex()
+            .flex_col()
+            .gap(px(space::XXS))
+            .mt(px(space::LG));
         for label in NAV {
             let active = label == section;
             nav = nav.child(
@@ -551,11 +740,11 @@ impl Console {
                     .id(id("nav", label))
                     .flex()
                     .items_center()
-                    .h(px(32.))
+                    .h(px(layout::ROW_H))
                     .px(px(10.))
                     .rounded(px(ROW_RADIUS))
                     .cursor_pointer()
-                    .text_size(px(13.))
+                    .text_size(px(font::BASE))
                     .when(active, |d| d.bg(chip_fill()).text_color(c(0xffffff)))
                     .when(!active, |d| {
                         d.text_color(c(DIM)).hover(|s| s.bg(tint(0xffffff, 0.04)))
@@ -567,32 +756,54 @@ impl Console {
             );
         }
         div()
+            .id("sidebar")
             .flex()
             .flex_col()
             .flex_none()
-            .w(px(240.))
+            .w(px(layout::SIDEBAR_W))
             .h_full()
-            .px(px(10.))
-            .py(px(14.))
+            .rounded(px(PANEL_RADIUS))
+            .border_1()
+            .border_color(tint(0xffffff, 0.08))
             .bg(c(SIDEBAR))
-            .border_r_1()
-            .border_color(c(DIVIDER))
             .child(
                 div()
-                    .px(px(10.))
-                    .pt(px(4.))
-                    .child(logo(self.logo_flipped())),
+                    .id("sidebar-top")
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .justify_end()
+                    .h(px(layout::TOP_ROW_H))
+                    .pl(px(layout::TRAFFIC_LIGHTS_W))
+                    .pr(px(space::XS))
+                    .on_click(cx.listener(zoom_on_double_click))
+                    .child(self.sidebar_toggle(cx)),
             )
-            .child(nav)
-            .child(div().flex_1())
             .child(
-                text_dim(if self.demo {
-                    "Demo data"
-                } else {
-                    "Keychain-backed"
-                })
-                .px(px(10.))
-                .text_size(px(11.)),
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h_0()
+                    .px(px(10.))
+                    .pb(px(space::MD))
+                    .child(
+                        div()
+                            .px(px(10.))
+                            .pt(px(space::XS))
+                            .child(logo(self.logo_flipped())),
+                    )
+                    .child(nav)
+                    .child(div().flex_1())
+                    .child(
+                        text_dim(if self.demo {
+                            "Demo data"
+                        } else {
+                            "Keychain-backed"
+                        })
+                        .px(px(10.))
+                        .text_size(px(font::XS)),
+                    ),
             )
     }
 
@@ -603,16 +814,16 @@ impl Console {
                 .id("switcher")
                 .flex()
                 .items_center()
-                .gap(px(8.))
-                .h(px(28.))
+                .gap(px(space::SM))
+                .h(px(layout::CONTROL_H))
                 .px(px(10.))
                 .rounded(px(CHIP_RADIUS))
                 .border_1()
                 .border_color(chip_stroke())
                 .bg(c(INPUT))
                 .cursor_pointer()
-                .text_size(px(12.))
-                .child(text_dim("Node"))
+                .text_size(px(font::SM))
+                .when(!self.narrow(), |d| d.child(text_dim("Node")))
                 .child(strong(label))
                 .child(text_dim("\u{25be}"))
                 .on_click(cx.listener(|this, _, _, cx| {
@@ -623,10 +834,10 @@ impl Console {
         if self.switcher_open {
             let mut menu = div()
                 .absolute()
-                .top(px(32.))
+                .top(px(layout::ROW_H))
                 .right(px(0.))
                 .w(px(220.))
-                .p(px(4.))
+                .p(px(space::XS))
                 .rounded(px(CARD_RADIUS))
                 .border_1()
                 .border_color(c(BORDER))
@@ -640,31 +851,44 @@ impl Console {
             }
             switcher = switcher.child(deferred(menu).with_priority(10));
         }
+        // The panel's own header row, not a window strip: it shares the panel surface and clears the traffic lights when the sidebar is hidden.
+        let collapsed = self.sidebar_collapsed;
         div()
+            .id("panel-top")
             .flex()
             .flex_none()
             .items_center()
             .justify_between()
-            .h(px(36.))
-            .px(px(24.))
+            .gap(px(space::MD))
+            .h(px(layout::TOP_ROW_H + space::XS))
+            .pr(px(space::MD))
+            .pl(px(if collapsed {
+                layout::TRAFFIC_LIGHTS_W - layout::WINDOW_INSET
+            } else {
+                space::LG
+            }))
             .border_b_1()
             .border_color(c(DIVIDER))
-            .bg(c(TOPBAR))
+            .on_click(cx.listener(zoom_on_double_click))
             .child(
                 div()
                     .flex()
                     .items_center()
-                    .gap(px(8.))
-                    .child(strong(self.view.section()).text_size(px(13.)))
+                    .min_w_0()
+                    .gap(px(space::SM))
+                    .when(collapsed, |d| d.child(self.sidebar_toggle(cx)))
+                    .child(strong(self.view.section()).text_size(px(font::BASE)))
                     .when_some(self.breadcrumb(), |d, crumb| {
-                        d.child(text_dim("/")).child(text_dim(crumb))
+                        d.child(text_dim("/"))
+                            .child(crate::ui::widgets::clip(crumb).text_color(c(DIM)))
                     }),
             )
             .child(
                 div()
                     .flex()
+                    .flex_none()
                     .items_center()
-                    .gap(px(10.))
+                    .gap(px(space::SM))
                     .child(
                         btn(id("topbar", "refresh"), "Refresh", BtnKind::Plain).on_click(
                             cx.listener(|this, _, _, cx| {
@@ -717,21 +941,22 @@ impl Console {
             };
             let dialog = div()
                 .w(px(420.))
-                .p(px(20.))
+                .max_w(gpui::relative(1.))
+                .p(px(space::XL))
                 .flex()
                 .flex_col()
-                .gap(px(12.))
+                .gap(px(space::MD))
                 .rounded(px(CARD_RADIUS))
                 .border_1()
                 .border_color(c(BORDER))
                 .bg(c(SURFACE))
-                .child(strong(confirm.title.clone()).text_size(px(16.)))
-                .child(text_dim(confirm.message.clone()).text_size(px(13.)))
+                .child(strong(confirm.title.clone()).text_size(px(font::LG)))
+                .child(text_dim(confirm.message.clone()).text_size(px(font::BASE)))
                 .child(
                     div()
                         .flex()
                         .justify_end()
-                        .gap(px(8.))
+                        .gap(px(space::SM))
                         .child(
                             btn(id("confirm", "cancel"), "Cancel", BtnKind::Plain).on_click(
                                 cx.listener(|this, _, _, cx| {
@@ -762,43 +987,68 @@ impl Console {
                 .child(dialog);
             out.push(deferred(scrim).with_priority(50).into_any_element());
         }
-        if let Some(toast) = &self.toast {
-            let color = toast.tone.color();
-            let sticky = toast.tone == Tone::Bad;
-            let mut body = div()
-                .id("toast")
+        if !self.toasts.is_empty() {
+            let mut stack = div()
                 .absolute()
-                .bottom(px(20.))
-                .right(px(20.))
-                .max_w(px(420.))
-                .px(px(14.))
-                .py(px(10.))
+                .bottom(px(space::XL))
+                .right(px(space::XL))
                 .flex()
                 .flex_col()
-                .gap(px(4.))
-                .rounded(px(CARD_RADIUS))
-                .border_1()
-                .border_color(tint(color, 0.5))
-                .bg(c(SURFACE))
-                .text_size(px(13.))
-                .cursor_pointer()
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.toast = None;
-                    cx.notify();
-                }))
-                .child(toast.text.clone());
-            if sticky {
-                body = body.child(text_dim("Click to dismiss").text_size(px(11.)));
+                .items_end()
+                .gap(px(space::SM));
+            for toast in &self.toasts {
+                stack = stack.child(self.toast_card(toast, cx));
             }
-            out.push(deferred(body).with_priority(60).into_any_element());
+            out.push(deferred(stack).with_priority(60).into_any_element());
         }
         out
+    }
+
+    fn toast_card(&self, toast: &Toast, cx: &mut Context<Self>) -> impl IntoElement {
+        let color = toast.tone.color();
+        let toast_id = toast.id;
+        div()
+            .id(id("toast", toast_id))
+            .flex()
+            .items_start()
+            .gap(px(space::SM))
+            .w(px(360.))
+            .px(px(space::MD))
+            .py(px(10.))
+            .rounded(px(CARD_RADIUS))
+            .border_1()
+            .border_color(tint(color, 0.5))
+            .bg(c(SURFACE))
+            .occlude()
+            .text_size(px(font::BASE))
+            .cursor_pointer()
+            .on_hover(cx.listener(move |this, hovered: &bool, _, _| {
+                if *hovered {
+                    this.hovered_toast = Some(toast_id);
+                } else if this.hovered_toast == Some(toast_id) {
+                    this.hovered_toast = None;
+                }
+            }))
+            .on_click(cx.listener(move |this, _, _, cx| this.dismiss_toast(toast_id, cx)))
+            .child(div().mt(px(5.)).child(crate::ui::widgets::dot(toast.tone)))
+            .child(div().flex_1().min_w_0().child(toast.text.clone()))
+            .child(text_dim("\u{00d7}").text_size(px(font::MD)))
     }
 }
 
 impl Render for Console {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.window_active = window.is_window_active();
+        let panel_width = f32::from(window.viewport_size().width)
+            - layout::WINDOW_INSET * 2.0
+            - if self.sidebar_collapsed {
+                0.0
+            } else {
+                layout::SIDEBAR_W + layout::WINDOW_INSET
+            };
+        let padding = layout::page_padding(panel_width);
+        // Measured before the views render so they can adapt in the same frame.
+        self.content_width = (panel_width - padding * 2.0).min(layout::CONTENT_MAX_W);
         let content = match self.view.clone() {
             View::Overview => self.render_overview(cx),
             View::Nodes => self.render_nodes(cx),
@@ -824,34 +1074,63 @@ impl Render for Console {
             handle.scroll_to_bottom();
             scroller = scroller.track_scroll(handle);
         }
+        // The column is centred with equal margins and stops growing at CONTENT_MAX_W.
+        let column = div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .min_w_0()
+            .max_w(px(layout::CONTENT_MAX_W))
+            .gap(px(space::LG))
+            .child(content);
         let main = div()
             .flex()
             .flex_col()
             .flex_1()
             .min_w_0()
             .h_full()
+            .rounded(px(PANEL_RADIUS))
+            .border_1()
+            .border_color(c(DIVIDER))
+            .bg(c(BG))
             .child(self.topbar(cx))
             .child(
                 scroller.child(
                     div()
                         .flex()
-                        .flex_col()
-                        .gap(px(16.))
-                        .p(px(24.))
-                        .max_w(px(1180.))
-                        .child(content),
+                        .justify_center()
+                        .w_full()
+                        .px(px(padding))
+                        .pt(px(space::XL))
+                        .pb(px(space::XXL))
+                        .child(column),
                 ),
             );
         div()
             .relative()
             .flex()
             .size_full()
-            .bg(c(BG))
+            .gap(px(layout::WINDOW_INSET))
+            .p(px(layout::WINDOW_INSET))
+            .bg(c(WINDOW))
             .text_color(c(TEXT))
-            .text_size(px(13.))
-            .child(self.sidebar(cx))
+            .text_size(px(font::BASE))
+            .track_focus(&self.focus)
+            .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| this.toggle_sidebar(cx)))
+            .when(!self.sidebar_collapsed, |d| d.child(self.sidebar(cx)))
             .child(main)
             .children(self.overlays(cx))
+    }
+}
+
+fn zoom_on_double_click(
+    _: &mut Console,
+    event: &ClickEvent,
+    window: &mut Window,
+    _: &mut Context<Console>,
+) {
+    if event.click_count() >= 2 {
+        window.titlebar_double_click();
     }
 }
 
@@ -931,9 +1210,9 @@ impl Console {
             .flex()
             .items_center()
             .justify_between()
-            .gap(px(12.))
-            .px(px(14.))
-            .py(px(12.))
+            .gap(px(space::MD))
+            .px(px(space::LG))
+            .py(px(space::MD))
             .rounded(px(CARD_RADIUS))
             .border_1()
             .border_color(tint(RED, 0.5))
@@ -942,9 +1221,11 @@ impl Console {
                 div()
                     .flex()
                     .flex_col()
-                    .gap(px(2.))
+                    .flex_1()
+                    .min_w_0()
+                    .gap(px(space::XXS))
                     .child(strong("Could not load this view").text_color(c(RED)))
-                    .child(text_dim(message.to_string()).text_size(px(12.))),
+                    .child(text_dim(message.to_string()).text_size(px(font::SM))),
             )
             .child(
                 btn(id("retry", "load"), "Retry", BtnKind::Plain).on_click(cx.listener(
@@ -965,9 +1246,9 @@ impl Console {
                 .flex()
                 .flex_col()
                 .items_center()
-                .gap(px(10.))
-                .py(px(30.))
-                .child(strong("No nodes yet").text_size(px(16.)))
+                .gap(px(space::MD))
+                .py(px(space::XXL))
+                .child(strong("No nodes yet").text_size(px(font::LG)))
                 .child(text_dim("Add a node to start managing sites."))
                 .child(
                     btn(id("empty", "add"), "Add a node", BtnKind::Primary)
@@ -985,7 +1266,7 @@ impl Console {
                 text_dim(format!(
                     "Showing {name}. Pick a node in the switcher to change it."
                 ))
-                .text_size(px(12.))
+                .text_size(px(font::SM))
                 .into_any_element(),
             );
         }

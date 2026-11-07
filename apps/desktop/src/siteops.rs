@@ -15,6 +15,9 @@ pub const CAP_RUNTIME_ENV: &str = "site-runtime-env";
 pub const CAP_ASYNC_DEPLOY: &str = "deploy-async";
 pub const CAP_SOURCE_BUILD: &str = "source-build";
 pub const CAP_FORGES: &str = "forges";
+pub const CAP_DOPPLER: &str = "doppler";
+pub const CAP_VOLUMES: &str = "volumes";
+pub const CAP_OUTBOUND: &str = "outbound";
 
 // A feature is offered only when the node says it has it, so nodes older than 0.4.0 show none of the new cards.
 pub fn has_cap(caps: &[String], name: &str) -> bool {
@@ -26,6 +29,10 @@ pub fn has_cap(caps: &[String], name: &str) -> bool {
 pub struct NodeExtras {
     pub caps: Vec<String>,
     pub api_host: Option<String>,
+    // Whether the node lets site containers reach the internet; None when it does not say.
+    pub executor_egress: Option<bool>,
+    // "filtered", "open" or "off"; None when the node does not say.
+    pub egress_mode: Option<String>,
     pub status: Option<SiteStatus>,
     pub status_error: Option<String>,
     pub token: Option<TokenStatus>,
@@ -153,6 +160,8 @@ pub struct LogRow {
     pub level: LogLevel,
     pub phase: String,
     pub text: String,
+    // Lower-cased text and phase, made once so a search does not redo it for every row on every paint.
+    folded: (String, String),
 }
 
 pub const LOG_CAP: usize = 5000;
@@ -172,11 +181,14 @@ impl LogBuffer {
     pub fn push(&mut self, reply: LogsResponse) -> usize {
         let added = reply.lines.len();
         for line in &reply.lines {
+            let phase = line.phase.clone().unwrap_or_default();
+            let text = strip_ansi(&line.text);
             self.rows.push_back(LogRow {
                 ts: line.ts.clone().unwrap_or_default(),
                 level: level_of(line),
-                phase: line.phase.clone().unwrap_or_default(),
-                text: strip_ansi(&line.text),
+                folded: (text.to_lowercase(), phase.to_lowercase()),
+                phase,
+                text,
             });
         }
         while self.rows.len() > LOG_CAP {
@@ -206,11 +218,7 @@ impl LogBuffer {
         let n = needle.trim().to_lowercase();
         self.rows
             .iter()
-            .filter(|r| {
-                n.is_empty()
-                    || r.text.to_lowercase().contains(&n)
-                    || r.phase.to_lowercase().contains(&n)
-            })
+            .filter(|r| n.is_empty() || r.folded.0.contains(&n) || r.folded.1.contains(&n))
             .collect()
     }
 

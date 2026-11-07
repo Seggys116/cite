@@ -14,6 +14,7 @@ pub mod nodes;
 pub mod ops;
 pub mod overview;
 pub mod paths;
+pub mod scroll;
 pub mod settings;
 pub mod siteform;
 pub mod sites;
@@ -21,10 +22,11 @@ pub mod storage;
 pub mod traffic;
 pub mod widgets;
 
-use gpui::App;
+use gpui::{App, KeyBinding};
 
 pub fn init(cx: &mut App) {
     input::bind_keys(cx);
+    cx.bind_keys([KeyBinding::new("cmd-b", crate::app::ToggleSidebar, None)]);
     cx.on_window_closed(|cx| {
         if cx.windows().is_empty() {
             cx.quit();

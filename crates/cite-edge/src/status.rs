@@ -8,7 +8,7 @@ use crate::model::Slot;
 use crate::validate::{ValidationError, invalid};
 
 /// Features a node advertises so a client can hide controls the node cannot serve.
-pub const CAPABILITIES: [&str; 13] = [
+pub const CAPABILITIES: [&str; 16] = [
     "site-status",
     "site-logs",
     "source-build",
@@ -22,6 +22,9 @@ pub const CAPABILITIES: [&str; 13] = [
     "alerts",
     "forges",
     "analytics-filters",
+    "doppler",
+    "volumes",
+    "outbound",
 ];
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -155,10 +158,12 @@ pub struct BuildEnvNames {
 }
 
 const REDACTED: &str = "<redacted>";
-const MAX_ENV_KEYS: usize = 64;
-const MAX_ENV_BYTES: usize = 12 * 1024;
+/// Most variables a build or runtime environment may hold, and the most bytes its JSON may take.
+pub const MAX_ENV_KEYS: usize = 128;
+pub const MAX_ENV_BYTES: usize = 24 * 1024;
 const MAX_ENV_VALUE: usize = 4096;
-const DENIED_ENV: [&str; 16] = [
+// Lowercase proxy names cannot pass the uppercase name rule, so only the uppercase forms are listed.
+const DENIED_ENV: [&str; 17] = [
     "LD_PRELOAD",
     "LD_LIBRARY_PATH",
     "LD_AUDIT",
@@ -175,6 +180,7 @@ const DENIED_ENV: [&str; 16] = [
     "ALL_PROXY",
     "PNPM_HOME",
     "NPM_CONFIG_PREFIX",
+    "NODE_USE_ENV_PROXY",
 ];
 const DENIED_ENV_PREFIXES: [&str; 4] = ["XDG_", "GIT_", "NPM_CONFIG_", "CITE_"];
 // The manager refuses these build names at startup, so they must never be stored; keep in step with cite-core RESERVED_BUILD_KEYS.
@@ -313,7 +319,10 @@ impl BuildEnvPatch {
         }
         let size = serde_json::to_string(self).map_or(usize::MAX, |s| s.len());
         if size > MAX_ENV_BYTES {
-            return invalid(format!("{label}: the change is larger than 12 KiB"));
+            return invalid(format!(
+                "{label}: the change is larger than {} KiB",
+                MAX_ENV_BYTES / 1024
+            ));
         }
         Ok(())
     }

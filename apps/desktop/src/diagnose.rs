@@ -1,45 +1,47 @@
 use cite_edge::model::{DeployAction, Deployment, Site, Slot};
 use serde_json::Value;
 
-pub const LOG_TAIL: u32 = 200;
+use crate::theme::Tone;
 
-// The node reports only a status per target, never why a probe failed, and has no log endpoint yet.
-pub const NO_REASON_NOTE: &str = "The node reports only whether each target passes its health check, not why a check fails, and it has no log endpoint yet. The commands below read the logs on the node itself.";
+// Lines of build output a collapsed note shows; the rest open on request.
+pub const NOTE_PREVIEW: usize = 6;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LogCommand {
-    pub label: &'static str,
-    pub explains: &'static str,
-    pub slot: Slot,
-    pub command: String,
+pub struct NoteParts {
+    pub reason: String,
+    pub output: Vec<String>,
 }
 
-// Containers are named cite-<site>-<slot>-<role> by the node's orchestrator.
-pub fn container_name(site_id: &str, slot: Slot, role: &str) -> String {
-    format!("cite-{site_id}-{}-{role}", slot.as_str())
+// The node puts the reason on the first line and the last lines of the build output after it.
+pub fn split_note(note: &str) -> NoteParts {
+    let mut lines = note.trim_end().lines();
+    let reason = lines.next().unwrap_or("").trim().to_string();
+    let mut output: Vec<String> = lines.map(|l| l.trim_end().to_string()).collect();
+    while output.first().is_some_and(|l| l.trim().is_empty()) {
+        output.remove(0);
+    }
+    NoteParts { reason, output }
 }
 
-pub fn log_commands(site_id: &str, slot: Slot) -> Vec<LogCommand> {
-    let line = |role: &str| {
-        format!(
-            "docker logs --tail {LOG_TAIL} {}",
-            container_name(site_id, slot, role)
-        )
-    };
-    vec![
-        LogCommand {
-            label: "Build and fetch log",
-            explains: "Cloning, installing and building the repository",
-            slot,
-            command: line("manager"),
-        },
-        LogCommand {
-            label: "Runtime log",
-            explains: "The running site's own output",
-            slot,
-            command: line("executor"),
-        },
-    ]
+// The output lines on screen: the newest few while collapsed, all of them once opened.
+pub fn shown_output(output: &[String], open: bool) -> &[String] {
+    if open || output.len() <= NOTE_PREVIEW {
+        output
+    } else {
+        &output[output.len() - NOTE_PREVIEW..]
+    }
+}
+
+// The log viewer opens on the slot of the latest failed deploy, then on the slot the status names, then on the live one.
+pub fn default_log_slot(
+    history: &[Deployment],
+    status_failure: Option<Slot>,
+    active: Slot,
+) -> Slot {
+    newest_failure(history)
+        .map(|d| d.slot)
+        .or(status_failure)
+        .unwrap_or(active)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -118,6 +120,23 @@ impl SlotState {
     pub fn is_bad(self) -> bool {
         matches!(self, SlotState::Degraded | SlotState::Down)
     }
+
+    pub fn tone(self) -> Tone {
+        match self {
+            SlotState::Healthy => Tone::Ok,
+            SlotState::Degraded => Tone::Warn,
+            SlotState::Down => Tone::Bad,
+            SlotState::NoTargets | SlotState::Unknown => Tone::Muted,
+        }
+    }
+}
+
+// Both slots of a site as the live block reports them, blue first.
+pub fn slot_lines(site: &Site, live: Option<&Value>) -> Vec<SlotLine> {
+    vec![
+        slot_line(site, live, Slot::Blue),
+        slot_line(site, live, Slot::Green),
+    ]
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -140,8 +159,8 @@ pub struct Banner {
     pub headline: String,
     pub failure: Option<FailureNote>,
     pub slots: Vec<SlotLine>,
-    pub commands: Vec<LogCommand>,
-    pub checks: Vec<String>,
+    // The slot whose build logs explain the problem: the failed one, or the unhealthy live one.
+    pub logs_slot: Slot,
 }
 
 // The newest Failed entry; history is stored oldest first.
@@ -169,49 +188,9 @@ fn slot_line(site: &Site, live: Option<&Value>, slot: Slot) -> SlotLine {
     }
 }
 
-fn checks_for(site: &Site, failure: Option<&FailureNote>) -> Vec<String> {
-    let mut out = Vec::new();
-    let note = failure.map(|f| f.note.to_lowercase()).unwrap_or_default();
-    if site.source.is_some() {
-        out.push(
-            "Read the build and fetch log of the slot that failed: it shows the clone, install and build output."
-                .to_string(),
-        );
-        out.push(
-            "If the build succeeded but the site did not come up, read the runtime log."
-                .to_string(),
-        );
-        out.push(
-            "Check that the repository, branch, runtime and Node version below match your project, then Save and redeploy."
-                .to_string(),
-        );
-        if note.contains("stack could not be started") {
-            out.push(
-                "The node could not start the containers; the message above comes from Docker. Check the node's disk space, the images and registry access."
-                    .to_string(),
-            );
-        }
-    } else {
-        out.push(
-            "Check that every target accepts connections from the node and is listed as host:port."
-                .to_string(),
-        );
-    }
-    if note.contains("health check") || note.is_empty() {
-        out.push(format!(
-            "The site must answer {} with a success status; check the health check path below.",
-            site.health.path
-        ));
-    }
-    out
-}
-
 // What the banner at the top of the site page says, or None when nothing is wrong.
 pub fn banner(site: &Site, live: Option<&Value>) -> Option<Banner> {
-    let slots = vec![
-        slot_line(site, live, Slot::Blue),
-        slot_line(site, live, Slot::Green),
-    ];
+    let slots = slot_lines(site, live);
     let active = slots.iter().find(|s| s.active).map(|s| s.state);
     let failed = last_deploy_failed(&site.history);
     let unhealthy = active.is_some_and(SlotState::is_bad);
@@ -234,26 +213,12 @@ pub fn banner(site: &Site, live: Option<&Value>) -> Option<Banner> {
         (Some(f), false) => format!("The last deployment to {} failed", f.slot.as_str()),
         (None, _) => format!("The active {} slot is not healthy", site.active.as_str()),
     };
-    let mut commands = Vec::new();
-    if site.source.is_some() {
-        let mut covered: Vec<Slot> = Vec::new();
-        if let Some(f) = &failure {
-            covered.push(f.slot);
-        }
-        if unhealthy && !covered.contains(&site.active) {
-            covered.push(site.active);
-        }
-        for slot in covered {
-            commands.extend(log_commands(&site.id, slot));
-        }
-    }
-    let checks = checks_for(site, failure.as_ref());
+    let logs_slot = failure.as_ref().map_or(site.active, |f| f.slot);
     Some(Banner {
         headline,
         failure,
         slots,
-        commands,
-        checks,
+        logs_slot,
     })
 }
 
@@ -337,6 +302,9 @@ mod tests {
             }),
             history,
             access: SiteAccess::default(),
+            volumes: Vec::new(),
+            outbound: true,
+            outbound_rules: Default::default(),
         }
     }
 
@@ -351,30 +319,59 @@ mod tests {
     }
 
     #[test]
-    fn container_names_follow_the_orchestrator() {
+    fn a_note_splits_into_the_reason_and_the_build_output() {
+        let note = "build failed: exit 1\n\n> astro build\nerror: missing script\n";
+        let parts = split_note(note);
+        assert_eq!(parts.reason, "build failed: exit 1");
+        assert_eq!(parts.output, vec!["> astro build", "error: missing script"]);
+        let plain = split_note("green slot did not pass health checks");
+        assert_eq!(plain.reason, "green slot did not pass health checks");
+        assert!(plain.output.is_empty());
         assert_eq!(
-            container_name("docs", Slot::Green, "manager"),
-            "cite-docs-green-manager"
+            split_note(""),
+            NoteParts {
+                reason: String::new(),
+                output: Vec::new()
+            }
         );
+    }
+
+    #[test]
+    fn collapsed_output_shows_only_the_newest_lines() {
+        let many: Vec<String> = (0..10).map(|i| format!("line {i}")).collect();
+        let short = shown_output(&many, false);
+        assert_eq!(short.len(), NOTE_PREVIEW);
+        assert_eq!(short.last().map(String::as_str), Some("line 9"));
+        assert_eq!(shown_output(&many, true).len(), 10);
+        let few: Vec<String> = vec!["a".into(), "b".into()];
+        assert_eq!(shown_output(&few, false).len(), 2);
+    }
+
+    #[test]
+    fn logs_open_on_the_latest_failed_slot() {
+        let h = vec![
+            dep(
+                DeployAction::Failed,
+                Slot::Green,
+                "x",
+                "2025-01-01T00:00:00Z",
+            ),
+            dep(
+                DeployAction::Promote,
+                Slot::Blue,
+                "y",
+                "2025-01-02T00:00:00Z",
+            ),
+        ];
+        assert_eq!(default_log_slot(&h, None, Slot::Blue), Slot::Green);
         assert_eq!(
-            container_name("my-shop-2", Slot::Blue, "executor"),
-            "cite-my-shop-2-blue-executor"
+            default_log_slot(&[], Some(Slot::Green), Slot::Blue),
+            Slot::Green
         );
-        let cmds = log_commands("docs", Slot::Green);
-        assert_eq!(cmds.len(), 2);
-        assert_eq!(
-            cmds[0].command,
-            "docker logs --tail 200 cite-docs-green-manager"
-        );
-        assert_eq!(
-            cmds[1].command,
-            "docker logs --tail 200 cite-docs-green-executor"
-        );
-        assert!(cmds[0].label.contains("Build") && cmds[1].label.contains("Runtime"));
-        assert!(
-            cmds.iter()
-                .all(|c| c.slot == Slot::Green && !c.explains.is_empty())
-        );
+        assert_eq!(default_log_slot(&[], None, Slot::Blue), Slot::Blue);
+        assert_eq!(SlotState::Down.tone(), Tone::Bad);
+        assert_eq!(SlotState::Healthy.tone(), Tone::Ok);
+        assert_eq!(SlotState::Unknown.tone(), Tone::Muted);
     }
 
     #[test]
@@ -469,7 +466,7 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_deploy_shows_the_full_note_the_commands_and_what_to_check() {
+    fn a_failed_deploy_shows_the_full_note_and_points_at_the_failed_slot() {
         let note = "green slot did not pass health checks within 120s (Release 4.2.0)";
         let s = site(
             true,
@@ -497,30 +494,14 @@ mod tests {
             failure_text(&f),
             format!("2025-01-02T00:00:00Z (green slot): {note}")
         );
-        assert_eq!(b.commands.len(), 2);
-        assert!(b.commands[0].command.ends_with("cite-docs-green-manager"));
+        assert_eq!(b.logs_slot, Slot::Green);
         assert_eq!(b.slots.len(), 2);
         assert!(b.slots[0].active && b.slots[0].state == SlotState::Healthy);
         assert_eq!(b.slots[1].state, SlotState::NoTargets);
-        assert!(b.checks.iter().any(|c| c.contains("build and fetch log")));
-        assert!(b.checks.iter().any(|c| c.contains("health check path")));
-        assert!(NO_REASON_NOTE.contains("no log endpoint"));
     }
 
     #[test]
-    fn a_start_failure_points_at_docker_and_a_healthy_site_has_no_banner() {
-        let s = site(
-            true,
-            vec![dep(
-                DeployAction::Failed,
-                Slot::Green,
-                "stack could not be started: pull access denied",
-                "2025-01-02T00:00:00Z",
-            )],
-        );
-        let b = banner(&s, None).expect("banner");
-        assert!(b.checks.iter().any(|c| c.contains("disk space")));
-        assert!(!b.checks.iter().any(|c| c.contains("health check path")));
+    fn a_healthy_site_has_no_banner() {
         let ok = site(
             true,
             vec![dep(
@@ -550,14 +531,13 @@ mod tests {
         let b = banner(&s, Some(&l)).expect("banner");
         assert_eq!(b.headline, "The active blue slot is not healthy");
         assert!(b.failure.is_none());
-        assert_eq!(b.commands.len(), 2);
-        assert!(b.commands[0].command.contains("cite-docs-blue-manager"));
+        assert_eq!(b.logs_slot, Slot::Blue);
         assert_eq!(b.slots[0].state, SlotState::Degraded);
     }
 
     #[test]
-    fn both_a_failure_and_a_down_slot_cover_both_slots_once() {
-        let mut s = site(
+    fn a_failure_and_a_down_slot_point_the_logs_at_the_failure() {
+        let s = site(
             true,
             vec![dep(
                 DeployAction::Failed,
@@ -572,10 +552,7 @@ mod tests {
             b.headline,
             "The last deployment to green failed and the active slot is unhealthy"
         );
-        assert_eq!(b.commands.len(), 4);
-        s.history[0].slot = Slot::Blue;
-        let same = banner(&s, Some(&l)).expect("banner");
-        assert_eq!(same.commands.len(), 2);
+        assert_eq!(b.logs_slot, Slot::Green);
     }
 
     #[test]
@@ -620,7 +597,7 @@ mod tests {
     }
 
     #[test]
-    fn server_sites_get_no_container_commands() {
+    fn server_sites_raise_the_banner_too() {
         let s = site(
             false,
             vec![dep(
@@ -631,8 +608,10 @@ mod tests {
             )],
         );
         let b = banner(&s, None).expect("banner");
-        assert!(b.commands.is_empty());
-        assert!(b.checks.iter().any(|c| c.contains("accepts connections")));
-        assert!(!b.checks.iter().any(|c| c.contains("build and fetch log")));
+        assert_eq!(
+            b.failure.map(|f| f.note),
+            Some("Health check timed out".to_string())
+        );
+        assert_eq!(b.logs_slot, Slot::Green);
     }
 }

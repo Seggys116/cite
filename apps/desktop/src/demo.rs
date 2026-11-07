@@ -13,7 +13,7 @@ use cite_edge::model::{
     BotPolicy, Cors, DeployAction, Deployment, EdgeSettings, FirewallAction, FirewallRule,
     HeaderMatch, HeaderOp, HeaderOpKind, HeaderTarget, HealthCheck, LogEvent, Maintenance,
     MaintenancePage, Matchers, Redirect, Site, SiteAccess, SiteKind, Slot, Source, Target, TlsMode,
-    Upstream,
+    Upstream, Volume,
 };
 use cite_edge::presets::presets;
 use serde_json::{Map, Value, json};
@@ -758,6 +758,16 @@ fn seed_sites(node: i64, now: i64) -> Vec<Site> {
                 },
                 zone_lock: id == "api",
             },
+            volumes: if id == "docs" {
+                vec![Volume {
+                    name: "data".into(),
+                    mount_path: "/data".into(),
+                }]
+            } else {
+                Vec::new()
+            },
+            outbound: true,
+            outbound_rules: Default::default(),
         };
     use DeployAction::{Failed, Promote, Rollback, Switch};
     vec![
@@ -1255,13 +1265,19 @@ impl DemoNode {
         );
         Ok(NodeInfo {
             name: self.name.clone(),
-            version: if self.index == 0 { "0.4.0" } else { "0.3.1" }.into(),
+            version: if self.index == 0 { "0.4.1" } else { "0.3.1" }.into(),
             // The second node plays a release from before the capability list, so the new cards stay hidden there.
             capabilities: if self.index == 0 {
-                cite_edge::status::CAPABILITIES
+                let mut caps: Vec<String> = cite_edge::status::CAPABILITIES
                     .iter()
                     .map(|c| c.to_string())
-                    .collect()
+                    .collect();
+                for extra_cap in [crate::siteops::CAP_VOLUMES, crate::siteops::CAP_OUTBOUND] {
+                    if !caps.iter().any(|c| c == extra_cap) {
+                        caps.push(extra_cap.to_string());
+                    }
+                }
+                caps
             } else {
                 Vec::new()
             },
@@ -1271,6 +1287,12 @@ impl DemoNode {
                 source: if self.index == 0 { "env" } else { "none" }.into(),
                 api_host: (self.index == 0).then(|| "api.github.com".to_string()),
             }),
+            doppler: (self.index == 0).then(|| cite_client::DopplerInfo {
+                configured: true,
+                source: "env".into(),
+            }),
+            executor_egress: (self.index == 0).then_some(true),
+            egress_mode: (self.index == 0).then(|| "filtered".to_string()),
             extra,
         })
     }
@@ -1595,6 +1617,13 @@ impl DemoNode {
         check_access(site)?;
         let mut st = self.st();
         let existing = find(&st.sites, id)?.clone();
+        let rules = &site.outbound_rules;
+        if rules.mode == cite_client::OutboundMode::Allowlist && rules.allow.is_empty() {
+            return Err(status_err(
+                400,
+                "the allowlist mode needs at least one allow entry",
+            ));
+        }
         let mut next = site.clone();
         next.history = existing.history;
         next.active = existing.active;
@@ -1607,8 +1636,25 @@ impl DemoNode {
         cite_edge::validate::validate_site_strict(&next)
             .map_err(|e| status_err(400, e.to_string()))?;
         *find_mut(&mut st.sites, id)? = next.clone();
+        st.ops.declare_volumes(id, &next.volumes, now_ms());
         sync_zone(&mut st, &next);
         Ok(next)
+    }
+
+    pub fn volumes(&self, id: &str) -> Res<Vec<cite_client::VolumeInfo>> {
+        self.require_ops()?;
+        let st = self.st();
+        let declared = find(&st.sites, id)?.volumes.clone();
+        Ok(st.ops.volume_infos(id, &declared))
+    }
+
+    pub fn volume_delete(&self, id: &str, name: &str) -> Res<()> {
+        self.require_ops()?;
+        let mut st = self.st();
+        let declared = find(&st.sites, id)?.volumes.clone();
+        st.ops
+            .delete_volume(id, &declared, name)
+            .map_err(|e| status_err(409, e))
     }
 
     pub fn delete_site(&self, id: &str) -> Res<()> {
@@ -2888,12 +2934,7 @@ mod tests {
                 .contains("did not pass health checks within 120s")
         );
         assert_eq!(failure.slot, Slot::Green);
-        assert_eq!(banner.commands.len(), 2);
-        assert!(
-            banner.commands[0]
-                .command
-                .contains("cite-docs-green-manager")
-        );
+        assert_eq!(banner.logs_slot, Slot::Green);
         let green = banner
             .slots
             .iter()

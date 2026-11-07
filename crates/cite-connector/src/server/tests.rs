@@ -13,6 +13,7 @@ use crate::store::testing::test_config;
 mod analytics_filters;
 mod archive_api;
 mod certificates_api;
+mod doppler_api;
 mod firewall_bulk;
 mod site_ops_api;
 mod zone_api;
@@ -559,6 +560,10 @@ async fn node_reports_identity_and_counts() {
     assert_eq!(
         node["github"],
         json!({ "token_configured": false, "source": "none", "api_host": "api.github.com" })
+    );
+    assert_eq!(
+        node["doppler"],
+        json!({ "configured": false, "source": "none" })
     );
 }
 

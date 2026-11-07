@@ -165,6 +165,14 @@ fn route(w: &mut World, method: &str, path: &str, query: &str, body: &[u8]) -> (
             w.volumes.insert(name, doc["Labels"].clone());
             (201, "{}".to_string())
         }
+        ("GET", ["volumes"]) => {
+            let list: Vec<Value> = w
+                .volumes
+                .iter()
+                .map(|(n, labels)| json!({ "Name": n, "Labels": labels }))
+                .collect();
+            (200, json!({ "Volumes": list }).to_string())
+        }
         ("GET", ["volumes", name]) => match w.volumes.get(*name) {
             Some(labels) => (200, json!({ "Labels": labels }).to_string()),
             None => missing(),
@@ -220,7 +228,11 @@ fn route(w: &mut World, method: &str, path: &str, query: &str, body: &[u8]) -> (
                 json!({
                     "State": { "Running": up },
                     "Config": { "Image": spec["Image"], "Env": spec["Env"], "Labels": spec["Labels"] },
-                    "HostConfig": { "NetworkMode": spec["HostConfig"]["NetworkMode"] },
+                    "HostConfig": {
+                        "NetworkMode": spec["HostConfig"]["NetworkMode"],
+                        "Mounts": spec["HostConfig"]["Mounts"],
+                    },
+                    "NetworkSettings": { "Networks": spec["NetworkingConfig"]["EndpointsConfig"] },
                 })
                 .to_string(),
             ),

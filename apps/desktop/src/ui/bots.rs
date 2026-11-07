@@ -18,11 +18,12 @@ use crate::bots::{
 use crate::demo::now_ms;
 use crate::model::{WINDOWS, fmt_bytes, fmt_int, fmt_num, fmt_pct, merge_top};
 use crate::theme::{BORDER, DIM, SURFACE, Tone, c, tint};
+use crate::ui::chart::{PANE_MIN, STAT_MIN, clip_tip, wide};
 use crate::ui::input::TextInput;
 use crate::ui::traffic::top_table;
 use crate::ui::widgets::{
-    BtnKind, Col, btn, card, clip, field, id, mono, notice, pill, pill_color, seg_item, seg_row,
-    skeleton, stat, strong, table, text_dim,
+    BtnKind, Col, btn, card, clip, field, grid_min, id, mono, notice, pill, pill_color, seg_item,
+    seg_row, skeleton, stat, strong, table, text_dim,
 };
 
 const TOP_LIMIT: usize = 25;
@@ -639,11 +640,8 @@ fn bots_body(s: &BotSummary) -> AnyElement {
     } else {
         Tone::Muted
     };
-    let stats = div()
-        .flex()
-        .flex_wrap()
-        .gap(px(12.))
-        .child(stat(
+    let tiles = [
+        stat(
             "Bot share",
             fmt_share(s.bot_share_pct),
             format!(
@@ -652,48 +650,58 @@ fn bots_body(s: &BotSummary) -> AnyElement {
                 fmt_int(s.total_requests)
             ),
             tone,
-        ))
-        .child(stat(
+        ),
+        stat(
             "Bot requests",
             fmt_num(s.bot_requests),
             "flagged by the detector".into(),
             Tone::Muted,
-        ))
-        .child(stat(
+        ),
+        stat(
             "Total requests",
             fmt_num(s.total_requests),
             "in this window".into(),
             Tone::Muted,
-        ));
-    let half = |card: gpui::Div| card.flex_1().min_w(px(340.));
-    let row_a = div()
-        .flex()
-        .flex_wrap()
-        .gap(px(16.))
-        .child(half(card(
-            Some("Traffic by class"),
-            Some("Segment width is the share of requests"),
-            class_panel(s),
-        )))
-        .child(half(card(
-            Some("Score distribution"),
-            Some("Requests per bot score band"),
-            score_panel(s),
-        )));
-    let row_b = div()
-        .flex()
-        .flex_wrap()
-        .gap(px(16.))
-        .child(half(card(
-            Some("Top signals"),
-            Some("What the detector noticed"),
-            signals_table(&s.signals),
-        )))
-        .child(half(card(
-            Some("Top bot agents"),
-            None,
-            top_table(&s.agents, false),
-        )));
+        ),
+    ];
+    let stats = grid_min(
+        STAT_MIN,
+        tiles
+            .into_iter()
+            .map(|t| t.min_w_0().h_full().into_any_element())
+            .collect(),
+    );
+    let half = |card: gpui::Div| card.flex_1().min_w_0().into_any_element();
+    let row_a = grid_min(
+        PANE_MIN,
+        vec![
+            half(card(
+                Some("Traffic by class"),
+                Some("Segment width is the share of requests"),
+                class_panel(s),
+            )),
+            half(card(
+                Some("Score distribution"),
+                Some("Requests per bot score band"),
+                score_panel(s),
+            )),
+        ],
+    );
+    let row_b = grid_min(
+        PANE_MIN,
+        vec![
+            half(card(
+                Some("Top signals"),
+                Some("What the detector noticed"),
+                signals_table(&s.signals),
+            )),
+            half(card(
+                Some("Top bot agents"),
+                None,
+                top_table(&s.agents, false),
+            )),
+        ],
+    );
     div()
         .flex()
         .flex_col()
@@ -751,14 +759,14 @@ fn class_panel(s: &BotSummary) -> AnyElement {
                 .child(
                     mono(fmt_int(slice.count))
                         .flex_none()
-                        .w(px(84.))
+                        .min_w(px(56.))
                         .flex()
                         .justify_end(),
                 )
                 .child(
                     mono(fmt_share(share_of(slice.count, total) * 100.0))
                         .flex_none()
-                        .w(px(64.))
+                        .min_w(px(48.))
                         .flex()
                         .justify_end()
                         .text_color(c(DIM)),
@@ -844,9 +852,10 @@ fn top_explorer(items: &[TopItem]) -> AnyElement {
     let with_bytes = items.iter().any(|t| t.bytes > 0);
     let rows: Vec<Vec<AnyElement>> = items
         .iter()
-        .map(|t| {
+        .enumerate()
+        .map(|(i, t)| {
             let mut cells = vec![
-                clip(t.key.clone())
+                clip_tip(id("bots-top-key", i), t.key.clone())
                     .font_family(crate::theme::MONO)
                     .text_size(px(12.))
                     .into_any_element(),
@@ -935,10 +944,10 @@ fn storage_card(nodes: &[NodeStorage]) -> AnyElement {
     let any_old = nodes
         .iter()
         .any(|n| matches!(n.outcome, StorageOutcome::Unsupported));
-    let mut body = div().flex().flex_col().gap(px(10.)).child(table(
-        &cols,
-        rows,
-        Some(text_dim("No nodes reported.").p(px(12.))),
+    let mut body = div().flex().flex_col().gap(px(10.)).child(wide(
+        id("bots", "storage-table"),
+        cols.iter().filter_map(|col| col.width).sum::<f32>() + 160.,
+        table(&cols, rows, Some(text_dim("No nodes reported.").p(px(12.)))),
     ));
     if any_old {
         body = body.child(

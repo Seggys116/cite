@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use cite_client::{ClientError, NodeOutcome};
-use gpui::{AnyElement, Context, Div, div, prelude::*, px};
+use gpui::{AnyElement, Context, Div, FontWeight, div, prelude::*, px};
 
 use crate::api::apply_to_handles;
 use crate::app::{Console, View};
@@ -9,9 +9,13 @@ use crate::model::{
     Placement, SiteDraft, SourceKind, build_site, draft_github_token, node_has_github_token,
     plan_placement, slugify,
 };
-use crate::theme::{ACCENT, DIM, Tone, c};
+use crate::theme::{
+    ACCENT, BORDER, CARD_RADIUS, DIM, DIVIDER, SURFACE, SURFACE_HI, TEXT, Tone, c, tint,
+};
 use crate::ui::certs::{access_body, access_controls};
+use crate::ui::chart::{clip_tip, split};
 use crate::ui::paths::PathRow;
+use crate::ui::settings::{GAP, SPACE, form_row, group, section};
 use crate::ui::siteform::{
     Home, SiteFields, basics, blank_draft, domains, health_fields, servers_fields, source_fields,
 };
@@ -24,7 +28,7 @@ use crate::zone::{ZoneReveal, create_verdict};
 type CreateDone = (Vec<NodeOutcome>, Vec<ZoneReveal>, Vec<String>);
 use crate::ui::input::InputEvent;
 use crate::ui::widgets::{
-    BtnKind, btn, btn_off, card, field, id, mono, notice, page_header, pill, seg_item, seg_row,
+    BtnKind, btn, btn_off, card, field, id, notice, page_header, seg_item, seg_row, strong,
     text_dim, toggle,
 };
 
@@ -301,7 +305,7 @@ impl Console {
             return div()
                 .flex()
                 .flex_col()
-                .gap(px(16.))
+                .gap(px(SPACE))
                 .child(header)
                 .child(self.no_nodes_block(cx))
                 .into_any_element();
@@ -316,14 +320,14 @@ impl Console {
             Step::Setup => div()
                 .flex()
                 .flex_col()
-                .gap(px(12.))
+                .gap(px(SPACE))
                 .child(servers_fields(&self.create.fields))
                 .child(health_fields(&self.create.fields, &problems))
                 .into_any_element(),
             Step::Domains => div()
                 .flex()
                 .flex_col()
-                .gap(px(16.))
+                .gap(px(SPACE))
                 .child(basics(&self.create.fields, HOME, &problems, false, cx))
                 .child(domains(&self.create.fields, HOME, &problems, false, cx))
                 .into_any_element(),
@@ -343,26 +347,32 @@ impl Console {
             self.chosen_nodes().len(),
             &self.token_state(cx),
         );
-        let mut col = div()
+        let mut panel = div().flex().flex_col().gap(px(SPACE)).child(body);
+        if let Some(err) = &self.create.error {
+            panel = panel.child(notice(err, Tone::Bad));
+        }
+        panel = panel.child(self.wizard_nav(step, problem, cx));
+        let heading = format!(
+            "Step {} of {}: {}",
+            step.index() + 1,
+            STEPS.len(),
+            step.heading(kind)
+        );
+        div()
             .flex()
             .flex_col()
-            .gap(px(16.))
+            .gap(px(SPACE))
             .child(header)
             .child(self.step_indicator())
-            .child(card(Some(step.heading(kind)), None, body));
-        if let Some(err) = &self.create.error {
-            col = col.child(notice(err, Tone::Bad));
-        }
-        col.child(self.wizard_nav(step, problem, cx))
+            .child(card(Some(&heading), None, panel))
             .into_any_element()
     }
 
     // Done steps show a check colour, the current one the accent, the rest stay muted.
     fn step_indicator(&self) -> Div {
         let current = self.create.step;
-        let mut row = div().flex().items_center().gap(px(8.));
-        for s in STEPS {
-            let label = format!("{}  {}", s.index() + 1, s.title(self.create.fields.source));
+        let mut row = div().flex().flex_wrap().items_center().gap(px(6.));
+        for (i, s) in STEPS.into_iter().enumerate() {
             let tone = if s == current {
                 Tone::Info
             } else if s.index() < current.index() {
@@ -370,7 +380,40 @@ impl Console {
             } else {
                 Tone::Muted
             };
-            row = row.child(pill(&label, tone));
+            if i > 0 {
+                row = row.child(div().w(px(16.)).h(px(1.)).bg(c(BORDER)));
+            }
+            let color = tone.color();
+            let badge = div()
+                .flex()
+                .items_center()
+                .justify_center()
+                .flex_none()
+                .size(px(20.))
+                .rounded_full()
+                .border_1()
+                .border_color(tint(color, 0.5))
+                .bg(tint(color, if s == current { 0.18 } else { 0.08 }))
+                .text_color(c(color))
+                .text_size(px(11.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .child((s.index() + 1).to_string());
+            row = row.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .flex_none()
+                    .gap(px(6.))
+                    .child(badge)
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .whitespace_nowrap()
+                            .text_color(c(if s == current { TEXT } else { DIM }))
+                            .when(s == current, |d| d.font_weight(FontWeight::MEDIUM))
+                            .child(s.title(self.create.fields.source).to_string()),
+                    ),
+            );
         }
         row
     }
@@ -382,9 +425,22 @@ impl Console {
         problem: Option<String>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let mut row = div().flex().items_center().justify_end().gap(px(8.));
+        let mut row = div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .justify_end()
+            .gap(px(8.))
+            .pt(px(GAP))
+            .border_t_1()
+            .border_color(c(DIVIDER));
         if let Some(p) = &problem {
-            row = row.child(div().flex_1().child(text_dim(p.clone()).text_size(px(12.))));
+            row = row.child(
+                div()
+                    .flex_1()
+                    .min_w(px(180.))
+                    .child(text_dim(p.clone()).text_size(px(12.))),
+            );
         }
         row = row.child(
             btn(id("create", "cancel"), "Cancel", BtnKind::Plain)
@@ -428,10 +484,43 @@ impl Console {
                     kind: SourceKind,
                     cx: &mut Context<Self>| {
             let on = self.create.fields.source == kind;
-            let mut item = card(Some(title), Some(text), div())
+            let mark = div()
+                .flex()
+                .items_center()
+                .justify_center()
+                .flex_none()
+                .size(px(18.))
+                .rounded_full()
+                .border_1()
+                .border_color(if on { c(ACCENT) } else { c(BORDER) })
+                .when(on, |d| {
+                    d.child(div().size(px(8.)).rounded_full().bg(c(ACCENT)))
+                });
+            let mut item = div()
                 .id(id("source", key))
+                .flex()
+                .items_start()
+                .gap(px(GAP))
+                .w_full()
+                .h_full()
+                .p(px(16.))
+                .rounded(px(CARD_RADIUS))
+                .border_1()
+                .border_color(c(BORDER))
+                .bg(c(SURFACE))
                 .cursor_pointer()
-                .flex_1();
+                .hover(|s| s.bg(c(SURFACE_HI)))
+                .child(mark)
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(4.))
+                        .flex_1()
+                        .min_w_0()
+                        .child(strong(title.to_string()).text_size(px(14.)))
+                        .child(text_dim(text.to_string()).text_size(px(12.))),
+                );
             if on {
                 item = item.border_color(c(ACCENT));
             }
@@ -440,25 +529,23 @@ impl Console {
                 this.create.error = None;
                 cx.notify();
             }))
-        };
-        div()
-            .flex()
-            .gap(px(12.))
-            .child(pick(
-                "github",
-                "Build from a GitHub repository",
-                "The node pulls the code, builds it and redeploys when the branch changes.",
-                SourceKind::Github,
-                cx,
-            ))
-            .child(pick(
-                "servers",
-                "Serve servers I already run",
-                "Route traffic to existing host:port addresses you manage yourself.",
-                SourceKind::Servers,
-                cx,
-            ))
             .into_any_element()
+        };
+        let github = pick(
+            "github",
+            "Build from a GitHub repository",
+            "Recommended. The node pulls the code, builds it and redeploys when the branch changes; it runs the servers for you.",
+            SourceKind::Github,
+            cx,
+        );
+        let servers = pick(
+            "servers",
+            "Serve servers I already run",
+            "Route traffic to existing host:port addresses you manage yourself.",
+            SourceKind::Servers,
+            cx,
+        );
+        split("create-source", 620., GAP, github, servers).into_any_element()
     }
 
     // Only the repository fields and the token control; nothing about upstream slots.
@@ -467,27 +554,18 @@ impl Console {
         let mut body = div()
             .flex()
             .flex_col()
-            .gap(px(12.))
+            .gap(px(GAP))
             .child(source_fields(&s.fields, HOME, problems, cx));
         let view = self.token_state(cx);
         if view.offer_toggle {
-            body =
-                body.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(10.))
-                        .child(toggle(id("create", "own-token"), s.own_token).on_click(
-                            cx.listener(|this, _, _, cx| {
-                                this.create.own_token = !this.create.own_token;
-                                cx.notify();
-                            }),
-                        ))
-                        .child(div().child(TOKEN_TOGGLE)),
-                );
-            if !view.show_field {
-                body = body.child(text_dim(view.help).text_size(px(12.)));
-            }
+            let switch = toggle(id("create", "own-token"), s.own_token)
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.create.own_token = !this.create.own_token;
+                    cx.notify();
+                }))
+                .into_any_element();
+            let detail = (!view.show_field).then_some(view.help);
+            body = body.child(group(vec![form_row(TOKEN_TOGGLE, detail, switch)]));
         }
         if view.show_field {
             body = body.child(field(
@@ -502,22 +580,33 @@ impl Console {
     // The last step: nodes first, then a plain summary of everything chosen.
     fn where_body(&self, cx: &mut Context<Self>) -> AnyElement {
         let draft = self.draft(cx);
-        let mut review = div().flex().flex_col().gap(px(6.));
-        for (label, value) in review_rows(&draft, &self.chosen_nodes()) {
-            review = review.child(
+        let review: Vec<AnyElement> = review_rows(&draft, &self.chosen_nodes())
+            .into_iter()
+            .enumerate()
+            .map(|(i, (label, value))| {
                 div()
                     .flex()
-                    .gap(px(12.))
-                    .child(div().w(px(100.)).child(text_dim(label)))
-                    .child(div().flex_1().child(value)),
-            );
-        }
+                    .items_center()
+                    .gap(px(GAP))
+                    .min_h(px(40.))
+                    .px(px(16.))
+                    .py(px(8.))
+                    .child(text_dim(label).flex_none().w(px(110.)).text_size(px(12.)))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(clip_tip(id("create-review", i), value).text_size(px(13.))),
+                    )
+                    .into_any_element()
+            })
+            .collect();
         div()
             .flex()
             .flex_col()
-            .gap(px(16.))
-            .child(self.placement_body(cx))
-            .child(card(Some("Review"), None, review))
+            .gap(px(SPACE))
+            .child(section("Nodes", self.placement_body(cx)))
+            .child(section("Review", group(review)))
             .into_any_element()
     }
 
@@ -546,37 +635,46 @@ impl Console {
         } else {
             "Create the site only on the nodes switched on below.".to_string()
         };
-        let mut list = div().flex().flex_col().gap(px(8.));
+        let mut rows = Vec::new();
         for name in self.node_names() {
             let on = replicate || self.create.picked.contains(&name);
             let n = name.clone();
-            let mut row = div()
-                .flex()
-                .items_center()
-                .gap(px(10.))
-                .child(toggle(id("pick", &name), on).on_click(cx.listener(
-                    move |this, _, _, cx| {
-                        if this.create.placement == Placement::Selected
-                            && !this.create.picked.remove(&n)
-                        {
-                            this.create.picked.insert(n.clone());
-                        }
-                        cx.notify();
-                    },
-                )))
-                .child(mono(name.clone()));
-            if replicate {
-                row = row.opacity(0.5);
-            }
-            list = list.child(row);
+            let switch = toggle(id("pick", &name), on)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if this.create.placement == Placement::Selected
+                        && !this.create.picked.remove(&n)
+                    {
+                        this.create.picked.insert(n.clone());
+                    }
+                    cx.notify();
+                }))
+                .into_any_element();
+            let holds = match self.create.tokens.get(&name) {
+                Some(true) => Some("Holds a GitHub token"),
+                Some(false) => Some("No GitHub token of its own"),
+                None => None,
+            };
+            let row = form_row(&name, holds, switch);
+            rows.push(if replicate {
+                div().opacity(0.5).child(row).into_any_element()
+            } else {
+                row
+            });
         }
         div()
             .flex()
             .flex_col()
-            .gap(px(12.))
-            .child(div().flex().child(mode))
-            .child(text_dim(hint).text_size(px(12.)).text_color(c(DIM)))
-            .child(list)
+            .gap(px(GAP))
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap(px(GAP))
+                    .child(mode)
+                    .child(text_dim(hint).text_size(px(12.))),
+            )
+            .child(group(rows))
             .into_any_element()
     }
 }

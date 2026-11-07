@@ -9,7 +9,9 @@ use gpui::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::theme::{ACCENT, BLUE, BORDER, CHIP_RADIUS, DIM, INPUT, MONO, TEXT, c, tint};
+use crate::theme::{
+    ACCENT, BLUE, BORDER, CHIP_RADIUS, DIM, INPUT, MONO, TEXT, c, font, layout, space, tint,
+};
 
 actions!(
     cite_input,
@@ -33,6 +35,62 @@ actions!(
 );
 
 const LINE_HEIGHT: f32 = 18.0;
+
+// A focused single-line field scrolls to keep the caret visible; an unfocused one shows its start.
+fn scroll_for(cursor_x: Pixels, scroll: Pixels, width: Pixels, focused: bool) -> Pixels {
+    if !focused {
+        return px(0.);
+    }
+    let mut scroll = scroll;
+    if cursor_x - scroll > width - px(4.) {
+        scroll = cursor_x - width + px(4.);
+    }
+    if cursor_x < scroll {
+        scroll = cursor_x;
+    }
+    scroll.max(px(0.))
+}
+
+const BULLET: char = '\u{2022}';
+
+// Shaped lines index by byte, and a masked line holds one multi-byte bullet per character.
+fn display_index(text: &str, masked: bool) -> usize {
+    if masked {
+        text.chars().count() * BULLET.len_utf8()
+    } else {
+        text.len()
+    }
+}
+
+fn byte_for_display(text: &str, display: usize, masked: bool) -> usize {
+    if masked {
+        text.char_indices()
+            .nth(display / BULLET.len_utf8())
+            .map_or(text.len(), |(i, _)| i)
+    } else {
+        let mut at = display.min(text.len());
+        while !text.is_char_boundary(at) {
+            at -= 1;
+        }
+        at
+    }
+}
+
+fn utf8_offset(text: &str, utf16: usize) -> usize {
+    let (mut utf8, mut seen) = (0, 0);
+    for ch in text.chars() {
+        if seen >= utf16 {
+            break;
+        }
+        seen += ch.len_utf16();
+        utf8 += ch.len_utf8();
+    }
+    utf8
+}
+
+fn marked_selection(start: usize, new_text: &str, sel_utf16: &Range<usize>) -> Range<usize> {
+    start + utf8_offset(new_text, sel_utf16.start)..start + utf8_offset(new_text, sel_utf16.end)
+}
 
 // Bindings are scoped to the TextInput context so they never fire elsewhere.
 pub fn bind_keys(cx: &mut App) {
@@ -143,6 +201,7 @@ impl TextInput {
         let end = self.content.len();
         self.selected_range = end..end;
         self.marked_range = None;
+        self.scroll_x = px(0.);
         cx.emit(InputEvent::Changed);
         cx.notify();
     }
@@ -169,26 +228,12 @@ impl TextInput {
         }
     }
 
-    // Masked fields draw one bullet per character, so offsets are counted in characters.
     fn to_display(&self, text_start: usize, offset: usize) -> usize {
-        if self.masked {
-            self.content[text_start..offset].chars().count()
-        } else {
-            offset - text_start
-        }
+        display_index(&self.content[text_start..offset], self.masked)
     }
 
     fn offset_for_display(&self, line: &Range<usize>, display: usize) -> usize {
-        if self.masked {
-            let text = &self.content[line.clone()];
-            line.start
-                + text
-                    .char_indices()
-                    .nth(display)
-                    .map_or(text.len(), |(i, _)| i)
-        } else {
-            line.start + display.min(line.len())
-        }
+        line.start + byte_for_display(&self.content[line.clone()], display, self.masked)
     }
 
     fn line_of(&self, offset: usize) -> usize {
@@ -256,10 +301,10 @@ impl TextInput {
         if target < 0 || target as usize >= ranges.len() {
             return;
         }
-        let x = self
-            .layout
-            .get(line)
-            .map_or(px(0.), |l| l.shaped.x_for_index(cur - l.start));
+        let x = self.layout.get(line).map_or(px(0.), |l| {
+            l.shaped
+                .x_for_index(self.to_display(ranges[line].start, cur))
+        });
         let range = ranges[target as usize].clone();
         let local = self
             .layout
@@ -390,15 +435,7 @@ impl TextInput {
     }
 
     fn offset_from_utf16(&self, offset: usize) -> usize {
-        let (mut utf8, mut utf16) = (0, 0);
-        for ch in self.content.chars() {
-            if utf16 >= offset {
-                break;
-            }
-            utf16 += ch.len_utf16();
-            utf8 += ch.len_utf8();
-        }
-        utf8
+        utf8_offset(&self.content, offset)
     }
 
     fn offset_to_utf16(&self, offset: usize) -> usize {
@@ -499,8 +536,7 @@ impl EntityInputHandler for TextInput {
         self.apply(range, new_text, cx);
         self.marked_range = (!new_text.is_empty()).then(|| start..start + new_text.len());
         if let Some(sel) = new_selected_utf16 {
-            let r = self.range_from_utf16(&sel);
-            self.selected_range = r.start + start..r.end + start;
+            self.selected_range = marked_selection(start, new_text, &sel);
         }
     }
 
@@ -512,13 +548,14 @@ impl EntityInputHandler for TextInput {
         _: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
         let range = self.range_from_utf16(&range_utf16);
-        let line = self.layout.get(self.line_of(range.start))?;
+        let row = self.line_of(range.start);
+        let line = self.layout.get(row)?;
+        let text = self.line_ranges()[row].clone();
+        let end = range.end.min(text.end).max(range.start);
         let x0 = line
             .shaped
-            .x_for_index(range.start.saturating_sub(line.start));
-        let x1 = line
-            .shaped
-            .x_for_index(range.end.saturating_sub(line.start));
+            .x_for_index(self.to_display(text.start, range.start));
+        let x1 = line.shaped.x_for_index(self.to_display(text.start, end));
         Some(Bounds::from_corners(
             point(bounds.left() + x0 - self.scroll_x, bounds.top()),
             point(bounds.left() + x1 - self.scroll_x, bounds.bottom()),
@@ -612,7 +649,9 @@ impl Element for TextElement {
             let text: String = if showing_placeholder {
                 input.placeholder.to_string()
             } else if input.masked {
-                "\u{2022}".repeat(input.content[range.clone()].chars().count())
+                BULLET
+                    .to_string()
+                    .repeat(input.content[range.clone()].chars().count())
             } else {
                 input.content[range.clone()].to_string()
             };
@@ -671,17 +710,10 @@ impl Element for TextElement {
             let l = &lines[cursor_line];
             l.shaped.x_for_index(input.to_display(l.start, cursor))
         };
-        // Single-line fields scroll horizontally to keep the cursor visible.
         let mut scroll_x = input.scroll_x;
         if !input.is_multiline() {
-            let width = bounds.size.width;
-            if cursor_x - scroll_x > width - px(4.) {
-                scroll_x = cursor_x - width + px(4.);
-            }
-            if cursor_x < scroll_x {
-                scroll_x = cursor_x;
-            }
-            scroll_x = scroll_x.max(px(0.));
+            let focused = input.focus_handle.is_focused(window);
+            scroll_x = scroll_for(cursor_x, scroll_x, bounds.size.width, focused);
         }
         let mut selections = Vec::new();
         let sel = &input.selected_range;
@@ -796,19 +828,93 @@ impl Render for TextInput {
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .w_full()
+            .min_w(px(layout::INPUT_MIN_W))
             .bg(c(INPUT))
             .border_1()
             .border_color(if focused { c(ACCENT) } else { c(BORDER) })
             .rounded(px(CHIP_RADIUS))
             .px(px(10.))
-            .py(px(6.))
+            .py(px(space::XS + space::XXS))
             .overflow_hidden()
-            .text_size(px(13.))
+            .text_size(px(font::BASE))
             .line_height(px(LINE_HEIGHT))
             .text_color(c(TEXT));
         if self.mono {
             root = root.font_family(MONO);
         }
-        root.child(TextElement { input: cx.entity() })
+        // Clipping on the inner box keeps scrolled text out of the padding.
+        root.child(
+            div()
+                .w_full()
+                .overflow_hidden()
+                .child(TextElement { input: cx.entity() }),
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_unfocused_field_always_shows_its_start() {
+        assert_eq!(scroll_for(px(300.), px(120.), px(100.), false), px(0.));
+    }
+
+    #[test]
+    fn a_focused_field_keeps_the_caret_in_view() {
+        assert_eq!(scroll_for(px(50.), px(0.), px(100.), true), px(0.));
+        assert_eq!(scroll_for(px(300.), px(0.), px(100.), true), px(204.));
+        assert_eq!(scroll_for(px(10.), px(204.), px(100.), true), px(10.));
+        assert_eq!(scroll_for(px(250.), px(204.), px(100.), true), px(204.));
+    }
+
+    #[test]
+    fn a_dead_key_after_existing_text_selects_inside_the_marked_text() {
+        let before = "caf\u{e9} \u{1f600} ";
+        let start = before.len();
+        let sel = marked_selection(start, "\u{b4}", &(1..1));
+        assert_eq!(sel, start + 2..start + 2);
+        let content = format!("{before}\u{b4}");
+        assert!(content.is_char_boundary(sel.start));
+        assert!(sel.end <= content.len());
+    }
+
+    #[test]
+    fn an_ime_selection_counts_utf16_units_of_the_new_text() {
+        let sel = marked_selection(10, "\u{1f600}\u{65e5}a", &(2..3));
+        assert_eq!(sel, 14..17);
+        assert_eq!(marked_selection(10, "\u{65e5}\u{672c}", &(0..2)), 10..16);
+        assert_eq!(marked_selection(0, "ab", &(5..9)), 2..2);
+    }
+
+    #[test]
+    fn masked_offsets_use_bullet_bytes() {
+        let text = "a\u{e9}\u{1f600}";
+        assert_eq!(display_index("", true), 0);
+        assert_eq!(display_index(text, true), 9);
+        assert_eq!(display_index(text, false), text.len());
+        assert_eq!(byte_for_display(text, 0, true), 0);
+        assert_eq!(byte_for_display(text, 3, true), 1);
+        assert_eq!(byte_for_display(text, 6, true), 3);
+        assert_eq!(byte_for_display(text, 9, true), text.len());
+        assert_eq!(byte_for_display(text, 30, true), text.len());
+    }
+
+    #[test]
+    fn masked_offsets_round_trip_every_character_boundary() {
+        let text = "p\u{e4}ss\u{1f511}w";
+        for (i, _) in text.char_indices() {
+            let display = display_index(&text[..i], true);
+            assert_eq!(byte_for_display(text, display, true), i);
+        }
+    }
+
+    #[test]
+    fn plain_display_offsets_stay_on_char_boundaries() {
+        let text = "\u{e9}x";
+        assert_eq!(byte_for_display(text, 1, false), 0);
+        assert_eq!(byte_for_display(text, 2, false), 2);
+        assert_eq!(byte_for_display(text, 99, false), 3);
     }
 }

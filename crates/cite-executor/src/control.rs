@@ -369,9 +369,11 @@ async fn handle_activate(
             return;
         }
         let existing = state.status.lock().await.last_result.clone();
+        let start_failure = state.slot_mgr.take_start_failure(slot).await;
         let reason = existing
             .filter(|r| r.generation == desired.generation && r.outcome == Outcome::Failed)
             .map(|r| r.reason)
+            .or(start_failure)
             .unwrap_or_else(|| format!("health gate failed for {}", slot.as_str()));
         let tail = state.slot_mgr.log_tail(slot).await;
         set_last_result(state, desired.generation, Outcome::Failed, reason, tail).await;
@@ -428,6 +430,13 @@ async fn try_activate_slot(
         Rendering::Ssr => {
             if let Err(err) = state.slot_mgr.start_ssr(slot, &manifest).await {
                 error!(error = %err, "failed to start SSR child");
+                state
+                    .slot_mgr
+                    .note_start_failure(
+                        slot,
+                        format!("the server process could not be started: {err}"),
+                    )
+                    .await;
                 park_stopped(state, slot, blue, green).await;
                 return false;
             }
@@ -540,13 +549,27 @@ async fn health_gate_ssr(state: &SharedState, slot: Slot, manifest: &ReleaseMani
     let need = manifest.health.consecutive.max(1);
     let start = Instant::now();
     let mut ok = 0u32;
+    let mut answered = false;
     while start.elapsed() < timeout {
-        if state.slot_mgr.is_shutting_down() || state.slot_mgr.poll_exit(slot).await.is_some() {
+        if state.slot_mgr.is_shutting_down() {
+            return false;
+        }
+        if let Some(exited) = state.slot_mgr.poll_exit(slot).await {
+            let when = if answered {
+                format!("while its health checks on port {port} were passing")
+            } else {
+                format!("before it listened on port {port}")
+            };
+            state
+                .slot_mgr
+                .note_start_failure(slot, format!("{exited} {when}"))
+                .await;
             return false;
         }
         let left = timeout.saturating_sub(start.elapsed());
         let limit = left.min(PROBE_LIMIT);
         if probe_http_health(port, &manifest.health.path, manifest.health.expect, limit).await {
+            answered = true;
             ok += 1;
             if ok >= need {
                 return true;
@@ -555,6 +578,23 @@ async fn health_gate_ssr(state: &SharedState, slot: Slot, manifest: &ReleaseMani
             ok = 0;
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    if !state.slot_mgr.is_shutting_down() {
+        let reason = if answered {
+            format!(
+                "the server on port {port} did not pass {} health checks of {} in a row within {}s",
+                manifest.health.path,
+                need,
+                timeout.as_secs()
+            )
+        } else {
+            format!(
+                "the server process did not answer {} on port {port} with a status below 500 within {}s; it must listen on the PORT it is given",
+                manifest.health.path,
+                timeout.as_secs()
+            )
+        };
+        state.slot_mgr.note_start_failure(slot, reason).await;
     }
     false
 }

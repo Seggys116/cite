@@ -22,13 +22,22 @@ use crate::scope::Sequence;
 use crate::siteops::has_cap;
 use crate::theme::{BLUE, DIM, GREEN, MONO, RED, Tone, YELLOW, c, tint};
 use crate::ui::bots::{ExportRun, bot_badge, request_detail};
-use crate::ui::chart::{Line, hbar, line_chart};
+use crate::ui::chart::{FIELD_MIN, Line, STAT_MIN, clip_tip, hbar, line_chart, wide, x_axis};
 use crate::ui::input::TextInput;
+use crate::ui::scroll::scroll_area;
 use crate::ui::widgets::{
-    BtnKind, Col, btn, btn_off, card, clip, empty_state, field, id, mono, notice, page_header,
-    pill, seg_item, seg_row, skeleton, stat, strong, table, text_dim, toggle, tone_for_status,
+    BtnKind, Col, btn, btn_off, card, empty_state, field, grid, grid_min, id, mono, notice,
+    page_header, pill, seg_item, seg_row, skeleton, stat, table, text_dim, toggle, tone_for_status,
 };
 const AUTO_TICKS: u64 = 20;
+const LOG_ROWS_KEPT: usize = 500;
+
+// Keeps the request list bounded: a page that pushes it past the cap replaces the newest rows; returns how many went.
+fn trim_log(rows: &mut Vec<(String, LogEvent)>) -> usize {
+    let over = rows.len().saturating_sub(LOG_ROWS_KEPT);
+    rows.drain(..over);
+    over
+}
 
 pub struct FieldInput {
     pub field: Field,
@@ -45,6 +54,8 @@ pub struct LogState {
     pub error: Option<String>,
     pub inspect: Option<(String, LogEvent)>,
     pub seq: Sequence,
+    // Newer rows dropped by trim_log since the last fresh load.
+    pub dropped: usize,
 }
 
 pub struct State {
@@ -345,6 +356,7 @@ impl Console {
             log.error = None;
             if reset {
                 log.rows.clear();
+                log.dropped = 0;
             }
             let mut pages = Vec::new();
             for (name, page) in res.unwrap_or_default() {
@@ -365,6 +377,7 @@ impl Console {
                 }
             }
             merge_pages(&mut log.rows, pages);
+            log.dropped += trim_log(&mut log.rows);
             cx.notify();
         });
     }
@@ -704,21 +717,18 @@ impl Console {
                 div().flex().child(seg_row(range)),
             ));
         if modern && f.custom_range() {
-            body = body.child(
-                div()
-                    .flex()
-                    .gap(px(12.))
-                    .child(div().w(px(230.)).child(field(
+            body = body.child(grid_min(
+                FIELD_MIN,
+                vec![
+                    field(
                         "From (UTC)",
                         Some("2026-11-01 or 2026-11-01 08:30"),
                         a.from.clone(),
-                    )))
-                    .child(div().w(px(230.)).child(field(
-                        "To (UTC)",
-                        Some("Blank means now"),
-                        a.to.clone(),
-                    ))),
-            );
+                    )
+                    .into_any_element(),
+                    field("To (UTC)", Some("Blank means now"), a.to.clone()).into_any_element(),
+                ],
+            ));
         }
         body = body.child(field(
             "Sites",
@@ -863,14 +873,14 @@ impl Console {
                     .into_any_element(),
             );
         }
-        let mut grid = div().flex().flex_wrap().gap(px(12.));
-        for fi in &self.analytics.inputs {
-            grid = grid.child(div().w(px(230.)).child(field(
-                fi.field.label(),
-                None,
-                fi.input.clone(),
-            )));
-        }
+        let typed = grid_min(
+            FIELD_MIN,
+            self.analytics
+                .inputs
+                .iter()
+                .map(|fi| field(fi.field.label(), None, fi.input.clone()).into_any_element())
+                .collect(),
+        );
         div()
             .flex()
             .flex_col()
@@ -883,7 +893,7 @@ impl Console {
                 None,
                 div().flex().child(seg_row(blocked)),
             ))
-            .child(grid)
+            .child(typed)
             .into_any_element()
     }
 
@@ -935,7 +945,12 @@ impl Console {
                     .flex()
                     .items_center()
                     .gap(px(8.))
-                    .child(div().flex_1().child(strong(p.name.clone())))
+                    .child(
+                        div().flex_1().min_w_0().child(
+                            clip_tip(id("an-preset-name", i), p.name.clone())
+                                .font_weight(gpui::FontWeight::SEMIBOLD),
+                        ),
+                    )
                     .child(btn(id("an-preset-use", i), "Use", BtnKind::Plain).on_click(
                         cx.listener(move |this, _, _, cx| {
                             this.use_preset(&apply_q, cx);
@@ -989,7 +1004,12 @@ impl Console {
                     .flex()
                     .items_end()
                     .gap(px(8.))
-                    .child(div().w(px(260.)).child(self.analytics.preset_name.clone()))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(self.analytics.preset_name.clone()),
+                    )
                     .child(save),
             )
             .child(
@@ -997,7 +1017,12 @@ impl Console {
                     .flex()
                     .items_end()
                     .gap(px(8.))
-                    .child(div().w(px(420.)).child(self.analytics.preset_text.clone()))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(self.analytics.preset_text.clone()),
+                    )
                     .child(import),
             );
         if let Some((msg, tone)) = &self.analytics.note {
@@ -1013,9 +1038,11 @@ impl Console {
 
     fn analytics_body(&self, data: &Data, cx: &mut Context<Self>) -> AnyElement {
         let sm = &data.summary;
-        let mut tiles = div().flex().flex_wrap().gap(px(12.));
+        let mut tiles = Vec::new();
         for k in kpis(sm, data.previous.as_ref()) {
-            let mut tile = stat(k.label, k.value, k.sub, Tone::Muted);
+            let mut tile = stat(k.label, k.value, k.sub, Tone::Muted)
+                .min_w_0()
+                .h_full();
             if let Some((text, tone)) = k.delta {
                 tile = tile.child(
                     text_dim(text)
@@ -1023,24 +1050,19 @@ impl Console {
                         .text_color(c(tone.color())),
                 );
             }
-            tiles = tiles.child(tile);
+            tiles.push(tile.into_any_element());
         }
+        let tiles = grid_min(STAT_MIN, tiles);
         let pts = &data.series.points;
-        let axis = div()
-            .flex()
-            .justify_between()
-            .text_size(px(11.))
-            .text_color(c(DIM))
-            .child(
-                pts.first()
-                    .map_or(String::new(), |p| crate::bots::fmt_stamp(p.ts * 1000)),
-            )
-            .child(
-                pts.last()
-                    .map_or(String::new(), |p| crate::bots::fmt_stamp(p.ts * 1000)),
-            );
+        let axis = x_axis(
+            "an-axis",
+            pts.iter()
+                .map(|p| crate::bots::fmt_stamp(p.ts * 1000))
+                .collect(),
+        );
         let legend = div()
             .flex()
+            .flex_wrap()
             .gap(px(14.))
             .text_size(px(12.))
             .child(legend_item("Requests", BLUE))
@@ -1090,22 +1112,22 @@ impl Console {
                 true,
             ),
         );
-        let half = |card: gpui::Div| card.flex_1().min_w(px(300.));
-        let row_a = div()
-            .flex()
-            .flex_wrap()
-            .gap(px(16.))
-            .child(half(card(Some("Status classes"), None, status_bars(data))))
-            .child(half(card(Some("Methods"), None, method_bars(data))))
-            .child(half(card(
+        let half = |card: gpui::Div| card.flex_1().min_w_0().into_any_element();
+        let row_a = grid(vec![
+            half(card(Some("Status classes"), None, status_bars(data))),
+            half(card(Some("Methods"), None, method_bars(data))),
+            half(card(
                 Some("Latency"),
                 Some("Total time per request"),
                 latency_bars(data),
-            )));
-        let mut tops = div().flex().flex_wrap().gap(px(16.));
-        for (kind, items) in &data.tops {
-            tops = tops.child(half(self.top_card(kind, items, cx)));
-        }
+            )),
+        ]);
+        let tops = grid(
+            data.tops
+                .iter()
+                .map(|(kind, items)| half(self.top_card(kind, items, cx)))
+                .collect(),
+        );
         div()
             .flex()
             .flex_col()
@@ -1152,10 +1174,11 @@ impl Console {
                     .cursor_pointer()
                     .hover(|s| s.bg(tint(0xffffff, 0.05)))
                     .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .child(clip(item.key.clone()).font_family(MONO).text_size(px(12.))),
+                        div().flex_1().min_w_0().child(
+                            clip_tip(id("an-top-key", format!("{kind}-{i}")), item.key.clone())
+                                .font_family(MONO)
+                                .text_size(px(12.)),
+                        ),
                     )
                     .child(mono(fmt_int(item.count)))
                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -1243,15 +1266,17 @@ impl Console {
                 cells.extend([
                     pill(&e.status.to_string(), tone_for_status(e.status)).into_any_element(),
                     mono(e.method.clone()).into_any_element(),
-                    clip(e.path.clone())
+                    clip_tip(id("an-log-path", i), e.path.clone())
                         .font_family(MONO)
                         .text_size(px(12.))
                         .into_any_element(),
-                    clip(e.host.clone())
+                    clip_tip(id("an-log-host", i), e.host.clone())
                         .text_size(px(12.))
                         .text_color(c(DIM))
                         .into_any_element(),
-                    mono(e.client_ip.clone())
+                    clip_tip(id("an-log-ip", i), e.client_ip.clone())
+                        .font_family(MONO)
+                        .text_size(px(12.))
                         .text_color(c(DIM))
                         .into_any_element(),
                     mono(fmt_ms(f64::from(e.total_ms))).into_any_element(),
@@ -1298,18 +1323,32 @@ impl Console {
             );
             body = body.child(request_detail(event, close.into_any_element()));
         }
-        body = body.child(table(
-            &cols,
-            rows,
-            Some(empty_state(
-                if log.loading {
-                    "Loading"
-                } else {
-                    "No requests match"
-                },
-                "Requests that match the filter are listed here, newest first.",
-            )),
-        ));
+        if log.dropped > 0 {
+            body = body.child(notice(
+                &format!(
+                    "Only {LOG_ROWS_KEPT} requests are kept in the list: the {} newest were dropped to make room for older pages. Apply the filter again to start from the newest.",
+                    fmt_int(log.dropped as u64)
+                ),
+                Tone::Info,
+            ));
+        }
+        let min_width = cols.iter().filter_map(|col| col.width).sum::<f32>() + 220.;
+        body = body.child(scroll_area("an-log").max_h(px(560.)).child(wide(
+            id("an", "log-table"),
+            min_width,
+            table(
+                &cols,
+                rows,
+                Some(empty_state(
+                    if log.loading {
+                        "Loading"
+                    } else {
+                        "No requests match"
+                    },
+                    "Requests that match the filter are listed here, newest first.",
+                )),
+            ),
+        )));
         if let Some(e) = &log.error {
             body = body.child(notice(e, Tone::Warn));
         }
@@ -1477,4 +1516,38 @@ fn latency_bars(data: &Data) -> gpui::Div {
         col = col.child(hbar(label, v as u64, max, BLUE, fmt_ms(v)));
     }
     col
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rows(count: usize) -> Vec<(String, LogEvent)> {
+        (0..count)
+            .map(|i| {
+                let event = LogEvent {
+                    ts_ms: (count - i) as i64,
+                    ..Default::default()
+                };
+                ("edge".to_string(), event)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_short_request_list_is_left_alone() {
+        let mut list = rows(LOG_ROWS_KEPT);
+        assert_eq!(trim_log(&mut list), 0);
+        assert_eq!(list.len(), LOG_ROWS_KEPT);
+    }
+
+    #[test]
+    fn a_long_request_list_keeps_the_older_pages_just_loaded() {
+        let mut list = rows(LOG_ROWS_KEPT + 50);
+        let oldest = list.last().unwrap().1.ts_ms;
+        assert_eq!(trim_log(&mut list), 50);
+        assert_eq!(list.len(), LOG_ROWS_KEPT);
+        assert_eq!(list.last().unwrap().1.ts_ms, oldest);
+        assert_eq!(list[0].1.ts_ms, LOG_ROWS_KEPT as i64);
+    }
 }

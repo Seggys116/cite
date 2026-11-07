@@ -331,6 +331,285 @@ pub fn validate_site_strict(site: &Site) -> Result<(), ValidationError> {
     if let Some(src) = &site.source {
         validate_source(src).map_err(|e| ValidationError(format!("site {} {}", site.id, e.0)))?;
     }
+    validate_volumes(site)?;
+    validate_outbound_rules(site)
+}
+
+pub const MAX_VOLUMES: usize = 8;
+const MAX_VOLUME_NAME: usize = 31;
+const MAX_MOUNT_PATH: usize = 255;
+
+/// Paths the executor images use or the kernel provides; a volume may not sit on, under or above any of them.
+pub const RESERVED_MOUNT_PATHS: [&str; 19] = [
+    "/var/lib/cite",
+    "/cite-executor",
+    "/nodejs",
+    "/tmp",
+    "/proc",
+    "/sys",
+    "/dev",
+    "/etc",
+    "/run",
+    "/var/run",
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/lib",
+    "/lib32",
+    "/lib64",
+    "/libx32",
+    "/root",
+    "/boot",
+];
+
+pub fn is_valid_volume_name(name: &str) -> bool {
+    let b = name.as_bytes();
+    (1..=MAX_VOLUME_NAME).contains(&b.len())
+        && b.first()
+            .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && b.iter()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-')
+}
+
+fn path_within(inner: &str, outer: &str) -> bool {
+    inner == outer
+        || inner
+            .strip_prefix(outer)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// Why a mount path is refused, or None when it is an acceptable volume target.
+pub fn mount_path_problem(p: &str) -> Option<&'static str> {
+    let shaped = (2..=MAX_MOUNT_PATH).contains(&p.len())
+        && p.starts_with('/')
+        && p.bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'/' | b'-'));
+    if !shaped {
+        return Some("must be an absolute path of 2 to 255 letters, digits, '.', '_', '-' and '/'");
+    }
+    if p.ends_with('/')
+        || p[1..]
+            .split('/')
+            .any(|seg| seg.is_empty() || seg == "." || seg == "..")
+    {
+        return Some("must be normalised: no trailing slash, empty, '.' or '..' segments");
+    }
+    if RESERVED_MOUNT_PATHS
+        .iter()
+        .any(|r| path_within(p, r) || path_within(r, p))
+    {
+        return Some("overlaps a path the executor or the system uses");
+    }
+    None
+}
+
+/// True when the site's runtime runs a server process, the only kind that can write to a volume.
+pub fn runs_server(src: &crate::model::Source) -> bool {
+    let runtime = src.runtime.as_deref().unwrap_or("node");
+    runtime != "static" && src.rendering != Some(crate::model::RenderMode::Static)
+}
+
+pub fn validate_volumes(site: &Site) -> Result<(), ValidationError> {
+    if site.volumes.is_empty() {
+        return Ok(());
+    }
+    let what = format!("site {} volumes", site.id);
+    if !site.source.as_ref().is_some_and(runs_server) {
+        return invalid(format!(
+            "{what}: only sites built from a repository with a server runtime (node, bun, rust SSR or a start command) can have volumes; a static site has no process to write to them"
+        ));
+    }
+    if site.volumes.len() > MAX_VOLUMES {
+        return invalid(format!("{what}: at most {MAX_VOLUMES} volumes per site"));
+    }
+    for (i, v) in site.volumes.iter().enumerate() {
+        if !is_valid_volume_name(&v.name) {
+            return invalid(format!(
+                "{what}: name {:?} must match ^[a-z0-9][a-z0-9-]{{0,30}}$",
+                v.name
+            ));
+        }
+        if let Some(why) = mount_path_problem(&v.mount_path) {
+            return invalid(format!("{what} {}: mount_path {why}", v.name));
+        }
+        for other in &site.volumes[..i] {
+            if other.name == v.name {
+                return invalid(format!("{what}: name {:?} is used twice", v.name));
+            }
+            if path_within(&v.mount_path, &other.mount_path)
+                || path_within(&other.mount_path, &v.mount_path)
+            {
+                return invalid(format!(
+                    "{what}: {} and {} have overlapping mount paths",
+                    other.name, v.name
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Most entries in one egress list, per site or per node setting.
+pub const MAX_EGRESS_ENTRIES: usize = 64;
+
+// Four plain decimal octets; the egress proxy refuses shorthand, octal and hex forms, so they are never stored.
+fn strict_v4(text: &str) -> bool {
+    let parts: Vec<&str> = text.split('.').collect();
+    parts.len() == 4
+        && parts.iter().all(|p| {
+            (1..=3).contains(&p.len())
+                && p.bytes().all(|b| b.is_ascii_digit())
+                && !(p.len() > 1 && p.starts_with('0'))
+                && p.parse::<u16>().is_ok_and(|n| n <= 255)
+        })
+}
+
+/// An IP address or CIDR in the strict form the egress proxy accepts; IPv4-mapped (`::ffff:`) ranges must be written as IPv4.
+pub fn is_egress_cidr(entry: &str) -> bool {
+    let (ip, len) = match entry.split_once('/') {
+        Some((ip, len)) => (ip, Some(len)),
+        None => (entry, None),
+    };
+    let max = if strict_v4(ip) {
+        32
+    } else if ip.contains(':')
+        && ip
+            .parse::<Ipv6Addr>()
+            .is_ok_and(|a| a.to_ipv4_mapped().is_none())
+    {
+        128
+    } else {
+        return false;
+    };
+    len.is_none_or(|l| {
+        (1..=3).contains(&l.len())
+            && l.bytes().all(|b| b.is_ascii_digit())
+            && !(l.len() > 1 && l.starts_with('0'))
+            && l.parse::<u8>().is_ok_and(|n| n <= max)
+    })
+}
+
+/// A lowercase host name, optionally with a leading dot; a name ending in a numeric label reads as an address and is refused.
+pub fn is_egress_host(entry: &str) -> bool {
+    let name = entry.strip_prefix('.').unwrap_or(entry);
+    let last = name.rsplit('.').next().unwrap_or_default();
+    let numeric = last.bytes().all(|b| b.is_ascii_digit())
+        || last
+            .strip_prefix("0x")
+            .is_some_and(|h| h.bytes().all(|b| b.is_ascii_hexdigit()));
+    (1..=253).contains(&name.len())
+        && !numeric
+        && name.split('.').all(|label| {
+            (1..=63).contains(&label.len())
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+        })
+}
+
+/// Trims each entry and rewrites `*.name` as `.name`; run before strict validation on create and update.
+pub fn normalise_outbound_rules(rules: &mut crate::model::OutboundRules) {
+    for list in [&mut rules.allow, &mut rules.deny] {
+        for entry in list.iter_mut() {
+            let trimmed = entry.trim();
+            *entry = match trimmed.strip_prefix("*.") {
+                Some(rest) => format!(".{rest}"),
+                None => trimmed.to_string(),
+            };
+        }
+    }
+}
+
+pub fn validate_outbound_rules(site: &Site) -> Result<(), ValidationError> {
+    let rules = &site.outbound_rules;
+    let what = format!("site {} outbound_rules", site.id);
+    for (name, list) in [("allow", &rules.allow), ("deny", &rules.deny)] {
+        if list.len() > MAX_EGRESS_ENTRIES {
+            return invalid(format!(
+                "{what}: {name} has more than {MAX_EGRESS_ENTRIES} entries"
+            ));
+        }
+        for (i, entry) in list.iter().enumerate() {
+            let entry = entry.as_str();
+            let shaped = entry
+                .strip_prefix('*')
+                .filter(|rest| rest.starts_with('.'))
+                .unwrap_or(entry);
+            if !is_egress_cidr(shaped) && !is_egress_host(shaped) {
+                return invalid(format!(
+                    "{what}: {name} entry {entry:?} must be an IP, a CIDR or a lowercase host name (a leading '.' or '*.' adds subdomains)"
+                ));
+            }
+            if list[..i].iter().any(|other| other == entry) {
+                return invalid(format!("{what}: {name} entry {entry:?} is listed twice"));
+            }
+        }
+    }
+    if rules.mode == crate::model::OutboundMode::Allowlist && rules.allow.is_empty() {
+        return invalid(format!(
+            "{what}: allowlist mode needs at least one allow entry"
+        ));
+    }
+    Ok(())
+}
+
+// Loopback, link-local, unspecified, and IPv6 forms that carry an IPv4 address the proxy judges by.
+const SENSITIVE_EGRESS_NETS: [&str; 7] = [
+    "0.0.0.0/8",
+    "127.0.0.0/8",
+    "169.254.0.0/16",
+    "::/96",
+    "fe80::/10",
+    "64:ff9b::/96",
+    "2002::/16",
+];
+
+fn egress_net(entry: &str) -> Option<IpNet> {
+    if !is_egress_cidr(entry) {
+        return None;
+    }
+    match entry.split_once('/') {
+        Some(_) => IpNet::from_str(entry).ok().map(|n| n.trunc()),
+        None => IpAddr::from_str(entry).ok().map(IpNet::from),
+    }
+}
+
+/// Strict only: a site allow CIDR wider than /8 (IPv4) or /16 (IPv6), or touching loopback, link-local or
+/// unspecified ranges, is refused unless a node `CITE_STACK_EGRESS_ALLOW_CIDRS` entry already covers it.
+pub fn validate_outbound_breadth(
+    site: &Site,
+    node_allow: &[String],
+) -> Result<(), ValidationError> {
+    let node: Vec<IpNet> = node_allow.iter().filter_map(|e| egress_net(e)).collect();
+    let sensitive: Vec<IpNet> = SENSITIVE_EGRESS_NETS
+        .iter()
+        .filter_map(|s| IpNet::from_str(s).ok())
+        .collect();
+    let what = format!("site {} outbound_rules", site.id);
+    for entry in &site.outbound_rules.allow {
+        let Some(net) = egress_net(entry) else {
+            continue;
+        };
+        if node.iter().any(|n| n.contains(&net)) {
+            continue;
+        }
+        let widest = if net.addr().is_ipv4() { 8 } else { 16 };
+        if net.prefix_len() < widest {
+            return invalid(format!(
+                "{what}: allow entry {entry:?} is wider than /{widest}; the node must list it in CITE_STACK_EGRESS_ALLOW_CIDRS"
+            ));
+        }
+        if sensitive
+            .iter()
+            .any(|s| s.contains(&net.network()) || net.contains(&s.network()))
+        {
+            return invalid(format!(
+                "{what}: allow entry {entry:?} reaches loopback, link-local, unspecified or IPv4-in-IPv6 addresses; the node must list it in CITE_STACK_EGRESS_ALLOW_CIDRS"
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -428,6 +707,43 @@ pub fn validate_source(src: &crate::model::Source) -> Result<(), ValidationError
         return source_error(
             "forge",
             "the forge is set for the whole node by the operator (CITE_STACK_FORGE); a per-site forge is not supported",
+        );
+    }
+    if let Some(binding) = &src.doppler {
+        validate_doppler_binding(binding)?;
+    }
+    Ok(())
+}
+
+const MAX_DOPPLER_SLUG: usize = 100;
+
+/// A Doppler project or config name: 1 to 100 of letters, digits, '.', '_' and '-'.
+pub fn is_valid_doppler_slug(s: &str) -> bool {
+    (1..=MAX_DOPPLER_SLUG).contains(&s.len())
+        && s.bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'-'))
+}
+
+// Both names empty means a service token supplies them; whether such a token is stored is checked where tokens are known.
+pub fn validate_doppler_binding(b: &crate::model::DopplerBinding) -> Result<(), ValidationError> {
+    if b.project.is_empty() != b.config.is_empty() {
+        return source_error(
+            "doppler",
+            "project and config must both be set, or both be empty to take them from a service token",
+        );
+    }
+    for (field, value) in [("project", &b.project), ("config", &b.config)] {
+        if !b.token_only() && !is_valid_doppler_slug(value) {
+            return source_error(
+                &format!("doppler {field}"),
+                "must be 1 to 100 characters of letters, digits, '.', '_' and '-'",
+            );
+        }
+    }
+    if !b.build && !b.runtime {
+        return source_error(
+            "doppler",
+            "must feed the build variables, the runtime variables or both",
         );
     }
     Ok(())
@@ -1282,6 +1598,9 @@ pub(crate) mod fixtures {
             source: None,
             history: vec![],
             access: SiteAccess::default(),
+            volumes: Vec::new(),
+            outbound: true,
+            outbound_rules: Default::default(),
         }
     }
 

@@ -1,5 +1,6 @@
 mod common;
 
+use cite_connector::egress::Egress;
 use cite_connector::orchestrator::{SpecSet, StackEnv, stack_specs};
 use cite_dockerproxy::policy::{MAX_BODY, Route};
 use cite_dockerproxy::target::normalise;
@@ -39,6 +40,9 @@ fn site(id: &str, runtime: &str, node_major: Option<u8>) -> Site {
         }),
         history: Vec::new(),
         access: Default::default(),
+        volumes: Vec::new(),
+        outbound: true,
+        outbound_rules: Default::default(),
     }
 }
 
@@ -49,6 +53,7 @@ fn specs(id: &str, runtime: &str, slot: Slot, isolate: bool) -> SpecSet {
         edge_network: "cite_edge",
         isolate,
         github_api_url: None,
+        egress: &Egress::default(),
     };
     stack_specs(&site(id, runtime, None), slot, None, TOKEN, &env).unwrap()
 }
@@ -102,6 +107,7 @@ fn every_spec_the_orchestrator_emits_is_accepted() {
                             edge_network: "cite_edge",
                             isolate,
                             github_api_url: api_url,
+                            egress: &Egress::default(),
                         };
                         for git_ref in [None, Some("release/1.2")] {
                             let s = stack_specs(
@@ -126,6 +132,18 @@ fn every_spec_the_orchestrator_emits_is_accepted() {
                                 });
                                 checked += 1;
                             }
+                            if let Some(proxy) = &s.egress_proxy {
+                                let target = normalise(&format!(
+                                    "/v1.45/containers/create?name={}",
+                                    s.egress_proxy_name
+                                ))
+                                .unwrap();
+                                let route = policy.classify("POST", &target).unwrap();
+                                policy.validate_body(&route, proxy).unwrap_or_else(|e| {
+                                    panic!("{} {runtime}: {e}", s.egress_proxy_name)
+                                });
+                            }
+                            assert_eq!(s.egress_proxy.is_some(), runtime != "static");
                         }
                     }
                 }
@@ -145,6 +163,7 @@ fn the_github_api_url_is_accepted_only_when_it_equals_the_operator_setting() {
             edge_network: "cite_edge",
             isolate: true,
             github_api_url: url,
+            egress: &Egress::default(),
         };
         stack_specs(&site("shop", "node", None), Slot::Blue, None, TOKEN, &env).unwrap()
     };
@@ -219,7 +238,7 @@ fn volume_and_network_bodies_of_the_orchestrator_are_accepted() {
         policy.validate_body(&Route::VolumeCreate, &body).unwrap();
     }
     for network in &s.networks {
-        let internal = network.ends_with("-net");
+        let internal = network.ends_with("-net") || network.ends_with("-xnet");
         let body = json!({ "Name": network, "Driver": "bridge", "Internal": internal, "Labels": labels("network") });
         policy.validate_body(&Route::NetworkCreate, &body).unwrap();
     }
@@ -300,6 +319,9 @@ fn executor_may_join_only_its_own_or_the_edge_network() {
     body["NetworkingConfig"]["EndpointsConfig"] =
         json!({ "cite_edge": {}, "cite-shop-blue-egress": {} });
     denied(accepts(&s.executor_name, &body));
+    let mut other = s.executor.clone();
+    other["NetworkingConfig"]["EndpointsConfig"]["cite-other-blue-egress"] = json!({});
+    denied(accepts(&s.executor_name, &other));
 }
 
 #[test]
@@ -466,15 +488,23 @@ fn accept_all(key: &str, values: &[&str]) {
     }
 }
 
-// Text of exactly `total` bytes whose escaped quotes make it grow the most inside a create body.
+// Text of exactly `total` bytes whose escaped quotes make it grow the most inside a create body; every value stays within 4096 characters.
 fn build_env_json_of(total: usize) -> String {
-    let quotes = "\"".repeat(4096);
-    let fixed = serde_json::to_string(&json!({ "A": quotes, "B": "" }))
-        .unwrap()
-        .len();
-    let rest = total - fixed;
-    let b = format!("{}{}", "\"".repeat(rest / 2), "x".repeat(rest % 2));
-    let text = serde_json::to_string(&json!({ "A": quotes, "B": b })).unwrap();
+    let len = |m: &serde_json::Map<String, Value>| serde_json::to_string(m).unwrap().len();
+    let mut map = serde_json::Map::new();
+    for i in 0.. {
+        let mut next = map.clone();
+        next.insert(format!("K{i}"), json!("\"".repeat(2048)));
+        if len(&next) + ",\"Z\":\"\"".len() > total {
+            break;
+        }
+        map = next;
+    }
+    map.insert("Z".into(), json!(""));
+    let rest = total - len(&map);
+    let tail = format!("{}{}", "\"".repeat(rest / 2), "x".repeat(rest % 2));
+    map.insert("Z".into(), json!(tail));
+    let text = serde_json::to_string(&map).unwrap();
     assert_eq!(text.len(), total);
     text
 }
@@ -729,8 +759,8 @@ fn build_environment_json_is_bounded_and_cannot_set_dangerous_variables() {
         let items: Vec<String> = (0..n).map(|i| format!("\"K{i}\":\"v\"")).collect();
         format!("{{{}}}", items.join(","))
     };
-    assert!(with_entry("CITE_BUILD_ENV_JSON", &keys(64)).is_ok());
-    assert!(with_entry("CITE_BUILD_ENV_JSON", &keys(65)).is_err());
+    assert!(with_entry("CITE_BUILD_ENV_JSON", &keys(128)).is_ok());
+    assert!(with_entry("CITE_BUILD_ENV_JSON", &keys(129)).is_err());
 }
 
 // The quoted literals of one `const NAME: &[&str] = &[...];` in the manager's config source.
@@ -894,17 +924,17 @@ fn create_with_env(env: &[String]) -> (usize, Result<(), String>) {
 #[test]
 fn the_largest_legal_create_body_fits_the_body_cap() {
     assert_eq!(max_github_url().len(), 200);
-    let env = maximal_manager_env(&build_env_json_of(12 * 1024));
+    let env = maximal_manager_env(&build_env_json_of(24 * 1024));
     assert_eq!(env.len(), 29);
     let (size, result) = create_with_env(&env);
     result.unwrap();
     assert!(size < MAX_BODY, "{size} bytes");
-    assert!(size > 30_000, "{size} bytes is not the worst case");
+    assert!(size > 55_000, "{size} bytes is not the worst case");
 }
 
 #[test]
 fn one_byte_more_than_the_largest_legal_build_environment_is_refused() {
-    let (_, result) = create_with_env(&maximal_manager_env(&build_env_json_of(12 * 1024 + 1)));
+    let (_, result) = create_with_env(&maximal_manager_env(&build_env_json_of(24 * 1024 + 1)));
     assert!(result.is_err());
 }
 
@@ -1150,17 +1180,43 @@ fn runtime_environment_json_follows_the_build_environment_rules() {
 fn executor_with_runtime_json(text: &str) -> (usize, Result<(), String>) {
     let s = specs("shop", "node", Slot::Blue, true);
     let mut body = s.executor.clone();
-    body["Env"] = json!([
-        "CITE_LISTEN=0.0.0.0:8080",
-        "CITE_DATA_DIR=/var/lib/cite",
-        "CITE_RELEASES_DIR=/var/lib/cite/releases",
-        "CITE_CONTROL_DIR=/var/lib/cite/control",
-        "CITE_STATUS_DIR=/var/lib/cite/status",
-        "RUST_LOG=info",
-        "CITE_NODE_BIN=/nodejs/bin/node",
-        "CITE_NODE=24",
-        format!("CITE_RUNTIME_ENV_JSON={text}"),
-    ]);
+    let proxy_vars: Vec<Value> = s.executor["Env"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| {
+            let k = e
+                .as_str()
+                .unwrap_or("")
+                .split('=')
+                .next()
+                .unwrap_or("")
+                .to_string();
+            matches!(
+                k.as_str(),
+                "HTTP_PROXY"
+                    | "HTTPS_PROXY"
+                    | "http_proxy"
+                    | "https_proxy"
+                    | "NO_PROXY"
+                    | "NODE_USE_ENV_PROXY"
+            )
+        })
+        .cloned()
+        .collect();
+    let mut env = vec![
+        json!("CITE_LISTEN=0.0.0.0:8080"),
+        json!("CITE_DATA_DIR=/var/lib/cite"),
+        json!("CITE_RELEASES_DIR=/var/lib/cite/releases"),
+        json!("CITE_CONTROL_DIR=/var/lib/cite/control"),
+        json!("CITE_STATUS_DIR=/var/lib/cite/status"),
+        json!("RUST_LOG=info"),
+        json!("CITE_NODE_BIN=/nodejs/bin/node"),
+        json!("CITE_NODE=24"),
+        json!(format!("CITE_RUNTIME_ENV_JSON={text}")),
+    ];
+    env.extend(proxy_vars);
+    body["Env"] = Value::Array(env);
     let bytes = serde_json::to_vec(&body).unwrap();
     let parsed = cite_dockerproxy::strict::parse(&bytes).unwrap();
     let target = normalise(&format!(
@@ -1175,11 +1231,11 @@ fn executor_with_runtime_json(text: &str) -> (usize, Result<(), String>) {
 
 #[test]
 fn the_largest_legal_executor_body_fits_the_body_cap() {
-    let (size, result) = executor_with_runtime_json(&build_env_json_of(12 * 1024));
+    let (size, result) = executor_with_runtime_json(&build_env_json_of(24 * 1024));
     result.unwrap();
     assert!(size < MAX_BODY, "{size} bytes");
-    assert!(size > 20_000, "{size} bytes is not the worst case");
-    let (_, result) = executor_with_runtime_json(&build_env_json_of(12 * 1024 + 1));
+    assert!(size > 45_000, "{size} bytes is not the worst case");
+    let (_, result) = executor_with_runtime_json(&build_env_json_of(24 * 1024 + 1));
     assert!(result.is_err());
 }
 

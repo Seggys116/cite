@@ -22,7 +22,7 @@ The three `/tokens` routes need a session token from login. An API token gets 40
 | Route | Response |
 |---|---|
 | `GET /healthz` | `{ok:true}` |
-| `GET /node` | `{name,version,uptime_secs,haproxy:{running,config_hash,last_reload_at,last_reload_ok,last_error},sites,firewall_rules,orchestrator:{enabled,reachable},analytics}` where `analytics` has the fields of `GET /analytics/stats`, or is `null` when the database cannot be read |
+| `GET /node` | `{name,version,uptime_secs,haproxy:{running,config_hash,last_reload_at,last_reload_ok,last_error},sites,firewall_rules,orchestrator:{enabled,reachable},github:{token_configured,source,api_host},doppler:{configured,source},capabilities,executor_egress,egress_mode,analytics}` where `executor_egress` is true when the orchestrator lets outbound sites make requests (`CITE_STACK_EGRESS_MODE` is `filtered` or `open`; false without an orchestrator), `egress_mode` is `"filtered"`, `"open"` or `"off"` (`null` without an orchestrator), `analytics` has the fields of `GET /analytics/stats`, or is `null` when the database cannot be read, and `source` is `env`, `file` or `none` |
 | `POST /haproxy/reload` | `{ok,config_hash,reloaded}` |
 | `GET /haproxy/config` | `text/plain` rendered haproxy.cfg, with zone secrets and secret header values replaced by `<redacted>` |
 | `GET /haproxy/stats` | `{backends:[{name,status,sessions,bytes_in,bytes_out,servers:[{name,status,check}]}]}` |
@@ -38,7 +38,9 @@ The three `/tokens` routes need a session token from login. An API token gets 40
 | `POST /sites` | `Site` without `history`, plus an optional `github_token` | `Site` |
 | `GET /sites/{id}` | none | `Site` plus `live:{blue:[{addr,status}],green:[...]}` |
 | `PUT /sites/{id}` | `Site` | `Site` |
-| `DELETE /sites/{id}` | none | `{ok:true}` |
+| `DELETE /sites/{id}?purge_volumes=true` | none | `{ok:true}`. Without `purge_volumes=true` the site's persistent volumes are kept. |
+| `GET /sites/{id}/volumes` | none | `[{name,mount_path,size_bytes,mounted,created_at,declared}]`: declared volumes in order, then leftovers (`declared: false`, `mount_path: ""`). `size_bytes` and `created_at` are `null` when Docker does not report them or the volume is not created yet; `mounted` is true when a running executor mounts it. |
+| `DELETE /sites/{id}/volumes/{name}` | none | `{ok:true}` after deleting the volume's data. 409 while the volume is declared and the site has a running container, or while a running slot mounts it; 404 when no such volume exists. |
 | `GET /sites/{id}/zone-secret` | none | `{configured,readable,header:"X-Cite-Origin-Secret",created_at,fingerprint}`; never the secret. `readable` is false when `zone-secrets.json` could not be read at start, in which case `configured: false` means "unknown". `fingerprint` is the first 8 hex digits of its SHA-256, `null` when none is stored. |
 | `POST /sites/{id}/zone-secret` | none | Creates or replaces the secret and returns `{secret,header,created_at,fingerprint}` once, with `Cache-Control: no-store`. 404 for an unknown site, 400 unless the site has `access.zone_lock` (checked again once the change lock is held). 503 when HAProxy is not running or does not confirm the new secret: the old secret is kept and the rotation is audited as `zone_secret.rollback`, or `zone_secret.rollback_failed` / `zone_secret.rollback_unconfirmed` (with `the rollback FAILED` in the error) when the undo fails; rotate again after that. |
 | `POST /sites/{id}/deploy` | `{targets:[Target],note?}` | `Deployment` |
@@ -62,7 +64,32 @@ Every site, firewall, page and settings change uses the same sequence: validate 
 
 `switch` and `rollback` start a stopped slot again on the git ref it last ran, not on the site's current branch.
 
+`Site.volumes` (`[{name,mount_path}]`, left out of the JSON while empty) and `Site.outbound` (default `true`, always returned) are part of the site body and change through `PUT /sites/{id}` like other build settings: the change is stored without a HAProxy reload and takes effect on the next deploy, with the site status reporting the settings as not current meanwhile. Volumes need a server runtime; a static site with volumes is refused with 400. Rules are in [Orchestrator](orchestrator.md#persistent-volumes). Deleting volume data is audited as `site.volume.delete` and a purging site delete as `site.volumes.purge`, with ids only. A node with the orchestrator lists the capabilities `volumes` and `outbound`.
+
+`Site.outbound_rules` (`{mode,allow,deny,block_mail}`, left out of the JSON while it is the default `{mode:"public",allow:[],deny:[],block_mail:true}`) sets where an outbound site may connect when the node's egress mode is `filtered`. `mode` is `public` (the public internet plus private destinations in `allow`) or `allowlist` (only destinations in `allow`, which must then hold at least one entry). `allow` and `deny` each hold at most 64 distinct entries, each an IP, a CIDR, or a lowercase host name of `a-z0-9.-_` up to 253 characters; a leading `.` or `*.` makes a name cover its subdomains and is stored as a leading `.`. `deny` always wins over `allow`, the node's `CITE_STACK_EGRESS_DENY_*` lists win over both, and loopback, link-local and metadata addresses open only through an explicit CIDR. `block_mail` (default `true`) refuses ports 25, 465 and 587. `POST /sites` and `PUT /sites/{id}` validate the rules strictly and answer 400 with the reason; a stored config is loaded without judging them, and a deploy checks them again. A change takes effect on the next deploy, which recreates the site's egress proxy; see [Hardening](hardening.md#per-site-outbound-rules).
+
 `deploy` writes the targets into the idle slot, waits for every target to pass health checks (up to 60 s, or the build wait of 600 s by default for a site built from a repo), flips the active slot through the HAProxy runtime API, and records a `Deployment`. A failed health check leaves the active slot untouched and records `failed`.
+
+## Doppler
+
+A site built from a repository can take build and runtime variables from a Doppler project and config. How syncing, merging and redeploys work is in [Running a node](node.md#doppler). A node with the orchestrator lists the capability `doppler`.
+
+| Route | Body | Response |
+|---|---|---|
+| `GET /doppler/projects` | none | `[{slug,name}]` the node token can see |
+| `GET /doppler/projects/{project}/configs` | none | `[{name,environment}]` |
+| `GET /sites/{id}/doppler` | none | `DopplerBinding` |
+| `PUT /sites/{id}/doppler` | `{project,config,build,runtime,token?}` | `DopplerBinding` after the first sync |
+| `DELETE /sites/{id}/doppler` | none | `DopplerBinding` (unbound) |
+| `POST /sites/{id}/doppler/sync` | none | `DopplerBinding` after the sync |
+
+`DopplerBinding` is `{bound,project,config,build,runtime,token_source,status,last_sync_at,last_error,keys,redeploy_needed,pending_redeploy,skipped:[{name,reason}]}`. `token_source` is `site`, `node` or `none`; `status` is `synced`, `syncing`, `error` or `idle` (unbound, or not synced since the connector started); `keys` counts the distinct synced names. `last_error` holds the last sync error, otherwise a note naming the skipped variables or saying the synced values wait for a deploy. Values and tokens are never returned.
+
+`project` and `config` are 1 to 100 characters from letters, digits, `.`, `_` and `-`, or both empty to bind through a service token alone: then the site needs a token starting with `dp.st.`, sent in this request or already stored for the site (the node token is not enough), the secrets download names no project or config, and `project` and `config` read `null` in `DopplerBinding`. Setting only one of them is refused. At least one of `build` and `runtime` must be true; `token` is 1 to 512 printable ASCII characters. Unknown fields are refused and the body is capped at 4 KiB (413 above). The routes answer 400 for a site without a `source`, 404 for an unknown site, and 400 with "No Doppler token: set CITE_DOPPLER_TOKEN on the connector or pass a token for this site" when no token is available. The project routes use the node token only.
+
+`PUT` stores the binding through the normal site update path (with the strict source validation), stores the optional token as the site's own, then syncs once. When that sync fails the error is returned (400 for a rejected token or an unknown project or config, 429 when Doppler rate limits, 503 when it cannot be reached) and the previous binding, token and synced values are put back. A successful bind redeploys the site. `DELETE` removes the binding, the site's Doppler token and the synced values, keeps the manual variables and does not redeploy; the answer has `redeploy_needed: true` while the running site still holds Doppler values. `POST /sites/{id}/doppler/sync` is 400 for an unbound site; it redeploys only when the values changed.
+
+Binding, restoring and removing are audited as `site.doppler.bind` (site, project, config and the two flags), `site.doppler.restore` and `site.doppler.unbind`; a new site token as `site.doppler.token.set`; a requested sync as `site.doppler.sync.request`; and a sync that changed the values as `site.doppler.sync` with the counts. No entry holds a value or a token.
 
 ## Maintenance pages
 

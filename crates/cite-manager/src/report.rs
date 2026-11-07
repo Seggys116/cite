@@ -3,7 +3,7 @@
 use std::time::Instant;
 
 use cite_core::schema::{ExecutorStatus, ManagerState, Rendering, now_rfc3339};
-use cite_core::{Detection, Redactor};
+use cite_core::{Detection, Redactor, render_argv};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 
@@ -11,6 +11,11 @@ use serde_json::{Map, Value, json};
 pub const REPORT_MAX_BYTES: usize = 3500;
 const ERROR_FLOOR_BYTES: usize = 64;
 const DETECTED_FIELD_BYTES: usize = 64;
+const DETECTED_NOTE_BYTES: usize = 160;
+const DETECTED_NOTES: usize = 4;
+/// Output lines of a failing command kept in its failure reason.
+pub const FAILURE_TAIL_LINES: usize = 40;
+const FAILURE_LINE_CHARS: usize = 300;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -32,10 +37,39 @@ pub struct Detected {
     pub node: Option<String>,
     pub install_command: String,
     pub build_command: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_dir: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start: Option<String>,
+    /// `high`, `medium` or `low`; anything below high comes with notes saying why.
+    pub confidence: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
 }
 
 impl Detected {
     pub fn from_detection(det: &Detection, rendering: Rendering) -> Self {
+        let notes = det
+            .notes
+            .iter()
+            .chain(det.warnings.iter())
+            .take(DETECTED_NOTES)
+            .map(|note| ellipsize(note, DETECTED_NOTE_BYTES))
+            .collect();
+        let confidence = if det.confidence >= 0.8 {
+            "high"
+        } else if det.confidence >= 0.6 {
+            "medium"
+        } else {
+            "low"
+        };
+        let (output_dir, start) = match rendering {
+            Rendering::Static => (Some(det.output_dir.clone()), None),
+            Rendering::Ssr => (
+                det.ssr_root.clone(),
+                (!det.start_argv.is_empty()).then(|| render_argv(&det.start_argv)),
+            ),
+        };
         Self {
             framework: det.framework.clone(),
             package_manager: det.package_manager.clone(),
@@ -47,14 +81,108 @@ impl Detected {
             node: det.node_major.clone(),
             install_command: det.install_command.clone(),
             build_command: det.build_command.clone(),
+            output_dir,
+            start,
+            confidence: confidence.into(),
+            notes,
         }
     }
+}
+
+/// What a terminal would show for one output line: the text after the last carriage return, without ANSI escapes or control characters, capped at 300 characters.
+pub fn clean_output_line(line: &str) -> String {
+    cap_output_line(&strip_terminal(line))
+}
+
+/// The visible text of a line, uncapped, so a secret split by colour codes reads whole before redaction.
+fn strip_terminal(line: &str) -> String {
+    let visible = line
+        .rsplit('\r')
+        .find(|segment| !segment.trim().is_empty())
+        .unwrap_or("");
+    let mut out = String::with_capacity(visible.len());
+    let mut chars = visible.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            match chars.next() {
+                Some('[') => {
+                    for n in chars.by_ref() {
+                        if ('@'..='~').contains(&n) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    while let Some(n) = chars.next() {
+                        if n == '\u{7}' {
+                            break;
+                        }
+                        if n == '\u{1b}' {
+                            chars.next_if_eq(&'\\');
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        } else if c == '\t' {
+            out.push(' ');
+        } else if !c.is_control() {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn cap_output_line(out: &str) -> String {
+    let trimmed = out.trim_end();
+    if trimmed.chars().count() <= FAILURE_LINE_CHARS {
+        return trimmed.to_string();
+    }
+    let mut clipped: String = trimmed.chars().take(FAILURE_LINE_CHARS - 3).collect();
+    clipped.push_str("...");
+    clipped
+}
+
+/// `first` names what failed; the last 40 non-blank output lines follow it, each stripped of terminal codes, then redacted, then capped.
+pub fn failure_reason(
+    first: &str,
+    output: &[String],
+    redactor: &Redactor,
+    max_bytes: usize,
+) -> String {
+    let shown = |line: &str| cap_output_line(&redactor.redact_line(&strip_terminal(line)));
+    let mut lines: Vec<String> = output
+        .iter()
+        .map(|line| shown(line.as_str()))
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    if lines.len() > FAILURE_TAIL_LINES {
+        lines.drain(..lines.len() - FAILURE_TAIL_LINES);
+    }
+    let mut text = shown(first);
+    for line in &lines {
+        text.push('\n');
+        text.push_str(line);
+    }
+    ellipsize_lines(&text, max_bytes)
+}
+
+/// The step a failure reason belongs to, read from the wording every failure starts with.
+pub fn failure_phase(reason: &str) -> &'static str {
+    let head = reason.trim_start();
+    for phase in ["fetch", "install", "pack", "start"] {
+        if head.starts_with(phase) {
+            return phase;
+        }
+    }
+    "build"
 }
 
 /// Steps inside a build that the deployer turns into phases.
 #[derive(Debug, Clone)]
 pub enum BuildEvent {
-    Detected(Detected),
+    Detected(Box<Detected>),
     Packing,
 }
 
@@ -139,10 +267,11 @@ fn report_map(parts: &ReportParts<'_>, redactor: &Redactor) -> Map<String, Value
         map.insert("sha".into(), json!(sha));
     }
     if let Some(outcome) = &state.last_outcome {
-        map.insert(
-            "deploy".into(),
-            json!({"id": outcome.deploy_id, "result": outcome.result}),
-        );
+        let mut deploy = json!({"id": outcome.deploy_id, "result": outcome.result});
+        if let Some(phase) = &outcome.phase {
+            deploy["phase"] = json!(phase);
+        }
+        map.insert("deploy".into(), deploy);
     }
     let optional = [
         (
@@ -177,6 +306,9 @@ fn report_map(parts: &ReportParts<'_>, redactor: &Redactor) -> Map<String, Value
         .filter(|r| !r.is_empty())
     {
         map.insert("last_error".into(), json!(redactor.redact_line(reason)));
+        if let Some(phase) = &state.last_failed_phase {
+            map.insert("failed_phase".into(), json!(phase));
+        }
     }
     // A persisted rejection only counts for the token it was recorded against.
     let rejected_current = state.token_invalid
@@ -213,7 +345,7 @@ pub fn fit_report(mut map: Map<String, Value>, cap: usize) -> String {
     if let Some(Value::String(full)) = map.get("last_error").cloned() {
         let mut budget = full.len();
         loop {
-            map.insert("last_error".into(), json!(ellipsize(&full, budget)));
+            map.insert("last_error".into(), json!(ellipsize_lines(&full, budget)));
             let len = rendered_len(&map);
             if len <= cap {
                 return render(&map);
@@ -228,8 +360,17 @@ pub fn fit_report(mut map: Map<String, Value>, cap: usize) -> String {
 
     if let Some(Value::Object(mut detected)) = map.get("detected").cloned() {
         for value in detected.values_mut() {
-            if let Value::String(text) = value {
-                *text = ellipsize(text, DETECTED_FIELD_BYTES);
+            match value {
+                Value::String(text) => *text = ellipsize(text, DETECTED_FIELD_BYTES),
+                Value::Array(items) => {
+                    items.truncate(2);
+                    for item in items.iter_mut() {
+                        if let Value::String(text) = item {
+                            *text = ellipsize(text, DETECTED_NOTE_BYTES / 2);
+                        }
+                    }
+                }
+                _ => {}
             }
         }
         map.insert("detected".into(), Value::Object(detected.clone()));
@@ -238,6 +379,11 @@ pub fn fit_report(mut map: Map<String, Value>, cap: usize) -> String {
         }
         detected.remove("install_command");
         detected.remove("build_command");
+        map.insert("detected".into(), Value::Object(detected.clone()));
+        if fits(&map) {
+            return render(&map);
+        }
+        detected.remove("notes");
         map.insert("detected".into(), Value::Object(detected));
         if fits(&map) {
             return render(&map);
@@ -254,6 +400,7 @@ pub fn fit_report(mut map: Map<String, Value>, cap: usize) -> String {
         "last_build_secs",
         "token_expires_at",
         "last_failed_sha",
+        "failed_phase",
         "last_error",
         "head_sha",
         "live_sha",
@@ -295,6 +442,41 @@ pub fn ellipsize(text: &str, max_bytes: usize) -> String {
     format!("{}...{}", &text[..head_end], &text[tail_start..])
 }
 
+/// For multi-line text, keeps the first line and as many whole last lines as fit in `max_bytes`, with a `...` line where the middle was cut.
+pub fn ellipsize_lines(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let Some((first, rest)) = text.split_once('\n') else {
+        return ellipsize(text, max_bytes);
+    };
+    if max_bytes < 32 {
+        return ellipsize(text, max_bytes);
+    }
+    let first = ellipsize(first, max_bytes / 2);
+    let mut budget = max_bytes - first.len() - "\n...".len();
+    let mut kept: Vec<String> = Vec::new();
+    for line in rest.split('\n').rev() {
+        let cost = line.len() + 1;
+        if cost <= budget {
+            budget -= cost;
+            kept.push(line.to_string());
+            continue;
+        }
+        if kept.is_empty() && budget > 4 {
+            kept.push(ellipsize(line, budget - 1));
+        }
+        break;
+    }
+    let mut out = first;
+    out.push_str("\n...");
+    for line in kept.iter().rev() {
+        out.push('\n');
+        out.push_str(line);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -308,6 +490,10 @@ mod tests {
             node: Some("22".into()),
             install_command: "i".repeat(size),
             build_command: "b".repeat(size),
+            output_dir: None,
+            start: Some("node server.js".into()),
+            confidence: "medium".into(),
+            notes: vec!["n".repeat(size), "second note".into()],
         }
     }
 
@@ -334,6 +520,7 @@ mod tests {
             result: DeployResult::Failed,
             sha: Some("a".repeat(40)),
             reason: "boom".into(),
+            phase: Some("build".into()),
             started_at: "2026-01-01T00:00:00Z".into(),
             finished_at: "2026-01-01T00:01:00Z".into(),
         }
@@ -593,5 +780,172 @@ mod tests {
         assert_eq!(ellipsize("short", 10), "short");
         let cut = ellipsize("abcdefghijklmnop", 9);
         assert_eq!(cut, "abc...nop");
+    }
+
+    fn output(lines: usize, width: usize) -> Vec<String> {
+        (0..lines)
+            .map(|i| format!("line-{i:03} {}", "w".repeat(width)))
+            .collect()
+    }
+
+    #[test]
+    fn failure_reason_keeps_the_command_line_and_the_last_forty_output_lines() {
+        let reason = failure_reason(
+            "build failed: exit status 1 (pnpm run build)",
+            &output(100, 10),
+            &Redactor::new(),
+            cite_core::MAX_OUTCOME_REASON,
+        );
+        let lines: Vec<&str> = reason.lines().collect();
+        assert_eq!(lines[0], "build failed: exit status 1 (pnpm run build)");
+        assert_eq!(lines.len(), 1 + FAILURE_TAIL_LINES);
+        assert!(lines[1].starts_with("line-060"), "{}", lines[1]);
+        assert!(lines.last().unwrap().starts_with("line-099"));
+        assert_eq!(failure_phase(&reason), "build");
+        assert_eq!(
+            failure_phase("install failed: exit status 1 (npm ci)"),
+            "install"
+        );
+        assert_eq!(failure_phase("pack failed: too large"), "pack");
+        assert_eq!(failure_phase("start failed: exited"), "start");
+        assert_eq!(failure_phase("static output not found"), "build");
+    }
+
+    #[test]
+    fn failure_output_is_redacted_ansi_stripped_and_capped_per_line() {
+        let mut redactor = Redactor::new();
+        redactor.push_secret("hunter2-build-secret");
+        let token = format!("ghp_{}", "B".repeat(36));
+        let long_secret_line = format!("{}hunter2-build-secret", "x ".repeat(400));
+        let lines = vec![
+            "\u{1b}[31mERR!\u{1b}[0m Failed to compile".to_string(),
+            format!("using {token}"),
+            "progress 10%\rprogress 100%\r".to_string(),
+            "\u{1b}]8;;https://x\u{7}link\u{1b}]8;;\u{7} text\tafter".to_string(),
+            long_secret_line,
+            "\u{7}\u{8}".to_string(),
+            "caf\u{e9} \u{4e16}\u{754c} ".repeat(200),
+        ];
+        let reason = failure_reason(
+            "install failed: exit status 1 (npm ci)",
+            &lines,
+            &redactor,
+            8192,
+        );
+        assert!(!reason.contains('\u{1b}') && !reason.contains('\r') && !reason.contains('\t'));
+        assert!(!reason.contains(&token), "{reason}");
+        assert!(!reason.contains("hunter2"), "{reason}");
+        let shown: Vec<&str> = reason.lines().collect();
+        assert_eq!(shown[1], "ERR! Failed to compile");
+        assert_eq!(shown[2], "using [REDACTED]");
+        assert_eq!(shown[3], "progress 100%");
+        assert_eq!(shown[4], "link text after");
+        assert_eq!(
+            shown.len(),
+            7,
+            "the control-only line is dropped: {shown:?}"
+        );
+        for line in &shown {
+            assert!(line.chars().count() <= 300, "{line}");
+        }
+        assert!(shown[6].ends_with("..."));
+    }
+
+    #[test]
+    fn secrets_split_by_colour_codes_or_glued_to_text_are_redacted() {
+        let mut redactor = Redactor::new();
+        redactor.push_secret("SECRET");
+        let lines = vec![
+            "\u{1b}[31mSECRET\u{1b}[0m".to_string(),
+            "SEC\u{1b}[1mRET".to_string(),
+            "abcSECRET_9".to_string(),
+        ];
+        let reason = failure_reason("build failed: exit status 1", &lines, &redactor, 8192);
+        assert!(
+            !reason.contains("SECRET") && !reason.contains("SEC"),
+            "{reason}"
+        );
+        let shown: Vec<&str> = reason.lines().collect();
+        assert_eq!(shown[1..], ["[REDACTED]", "[REDACTED]", "abc[REDACTED]_9"]);
+    }
+
+    #[test]
+    fn long_failure_reasons_keep_the_first_line_and_the_last_lines_within_the_byte_caps() {
+        for width in [10, 290, 2_000] {
+            let reason = failure_reason(
+                "build failed: exit status 1 (npm run build)",
+                &output(60, width),
+                &Redactor::new(),
+                cite_core::MAX_OUTCOME_REASON,
+            );
+            assert!(reason.len() <= cite_core::MAX_OUTCOME_REASON);
+            assert!(reason.starts_with("build failed: exit status 1 (npm run build)\n"));
+            assert!(reason.lines().last().unwrap().starts_with("line-059"));
+
+            let mut progress = Progress::default();
+            progress.begin(&"d".repeat(40));
+            progress.detected = Some(detected(40));
+            let state = ManagerState {
+                last_failed_reason: Some(reason.clone()),
+                last_failed_phase: Some("build".into()),
+                last_outcome: Some(outcome("01ARZ3NDEKTSV4RRFFQ69G5FAV")),
+                ..ManagerState::default()
+            };
+            let line = parts_with(&progress, &state, None);
+            assert!(line.len() <= REPORT_MAX_BYTES, "{}", line.len());
+            let v: Value = serde_json::from_str(&line).unwrap();
+            let kept = v["last_error"].as_str().unwrap();
+            assert!(
+                kept.starts_with("build failed: exit status 1 (npm run build)\n"),
+                "{kept}"
+            );
+            assert!(
+                kept.lines().last().unwrap().starts_with("line-059"),
+                "{kept}"
+            );
+            assert!(kept.contains("\n...\n") || kept.len() == reason.len());
+            assert_eq!(v["failed_phase"], "build");
+            assert_eq!(v["deploy"]["phase"], "build");
+        }
+    }
+
+    #[test]
+    fn ellipsize_lines_is_utf8_safe_and_within_budget() {
+        let text = format!(
+            "first \u{4e16}\u{754c}\n{}",
+            "\u{e9}\u{4e16}x\n".repeat(500)
+        );
+        for max in [0usize, 5, 31, 32, 33, 64, 100, 777, 3000] {
+            let cut = ellipsize_lines(&text, max);
+            assert!(cut.len() <= max, "max {max}: {}", cut.len());
+        }
+        assert_eq!(ellipsize_lines("a\nb", 10), "a\nb");
+    }
+
+    #[test]
+    fn detected_reports_confidence_notes_and_the_start_command() {
+        let det = cite_core::detect_site(&{
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(
+                dir.path().join("package.json"),
+                r#"{"devDependencies":{"@sveltejs/kit":"2"}}"#,
+            )
+            .unwrap();
+            dir.keep()
+        })
+        .unwrap();
+        let detected = Detected::from_detection(&det, Rendering::Ssr);
+        assert_eq!(detected.confidence, "low");
+        assert_eq!(detected.start.as_deref(), Some("node build/index.js"));
+        assert!(detected.notes.iter().any(|n| n.contains("adapter")));
+        assert!(
+            detected
+                .notes
+                .iter()
+                .all(|n| n.len() <= DETECTED_NOTE_BYTES)
+        );
+        let json = serde_json::to_value(&detected).unwrap();
+        assert_eq!(json["confidence"], "low");
+        assert!(json.get("output_dir").is_none());
     }
 }

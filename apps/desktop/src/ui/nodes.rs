@@ -5,11 +5,13 @@ use crate::api::{Credential, enroll};
 use crate::app::{Confirm, Console, Load, new_input};
 use crate::config::DesktopNode;
 use crate::model::token_name;
-use crate::theme::{DIM, Tone, c};
+use crate::theme::{DIM, DIVIDER, MONO, Tone, c, chip_fill, chip_stroke};
+use crate::ui::chart::{FIELD_MIN, clip_tip, split, wide};
 use crate::ui::input::TextInput;
+use crate::ui::settings::{GAP, SPACE};
 use crate::ui::widgets::{
-    BtnKind, Col, btn, card, empty_state, field, id, mono, notice, page_header, pill, seg_item,
-    seg_row, skeleton, strong, table,
+    BtnKind, Col, btn, btn_off, card, empty_state, field, grid_min, id, mono, notice, page_header,
+    pill, seg_item, seg_row, strong, table, text_dim,
 };
 
 pub struct State {
@@ -167,27 +169,61 @@ impl Console {
         self.say(format!("Node {name} removed"), Tone::Ok);
     }
 
+    fn add_toggle(&self, key: &str, cx: &mut Context<Self>) -> AnyElement {
+        let (label, kind) = if self.nodes.adding {
+            ("Cancel", BtnKind::Plain)
+        } else {
+            ("Add node", BtnKind::Primary)
+        };
+        btn(id("nodes-add", key), label, kind)
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.nodes.adding = !this.nodes.adding;
+                this.nodes.error = None;
+                cx.notify();
+            }))
+            .into_any_element()
+    }
+
     pub fn render_nodes(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let add = btn(
-            id("nodes", "add"),
-            if self.nodes.adding {
-                "Cancel"
-            } else {
-                "Add node"
-            },
-            BtnKind::Primary,
-        )
-        .on_click(cx.listener(|this, _, _, cx| {
-            this.nodes.adding = !this.nodes.adding;
-            this.nodes.error = None;
-            cx.notify();
-        }));
         let header = page_header(
             "Nodes",
             "Connectors this console manages",
-            vec![add.into_any_element()],
+            vec![self.add_toggle("page", cx)],
         );
-        let mut col = div().flex().flex_col().gap(px(16.)).child(header);
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(SPACE))
+            .child(header)
+            .child(self.nodes_body(cx))
+            .into_any_element()
+    }
+
+    // The Nodes tab of Settings: the same list and form, with the add action inline since there is no page header.
+    pub fn nodes_panel(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let bar = div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap(px(GAP))
+            .child(
+                text_dim("Connectors are stored in the config file; their tokens in the keychain.")
+                    .text_size(px(12.))
+                    .flex_1()
+                    .min_w_0(),
+            )
+            .child(self.add_toggle("tab", cx));
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(SPACE))
+            .child(bar)
+            .child(self.nodes_body(cx))
+            .into_any_element()
+    }
+
+    fn nodes_body(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let mut col = div().flex().flex_col().gap(px(SPACE));
         if self.nodes.adding {
             col = col.child(self.add_form(cx));
         }
@@ -225,14 +261,23 @@ impl Console {
                     },
                 ));
                 vec![
-                    strong(n.name.clone()).into_any_element(),
-                    mono(n.url.clone()).text_color(c(DIM)).into_any_element(),
+                    clip_tip(id("node-name", &n.name), n.name.clone())
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .into_any_element(),
+                    clip_tip(id("node-url", &n.name), n.url.clone())
+                        .font_family(MONO)
+                        .text_size(px(12.))
+                        .text_color(c(DIM))
+                        .into_any_element(),
                     state.into_any_element(),
                     mono(version).into_any_element(),
                     remove.into_any_element(),
                 ]
             })
             .collect();
+        if rows.is_empty() && !self.nodes.adding {
+            return col.child(self.nodes_empty(cx)).into_any_element();
+        }
         let cols = [
             Col::fixed("Name", 160.),
             Col::flex("Connector"),
@@ -240,19 +285,55 @@ impl Console {
             Col::fixed("Version", 90.),
             Col::fixed("", 100.),
         ];
-        let body = table(
-            &cols,
-            rows,
-            Some(empty_state(
-                "No nodes yet",
-                "Add a node to start managing sites.",
-            )),
+        let body = wide(
+            id("nodes", "table"),
+            640.,
+            table(
+                &cols,
+                rows,
+                Some(empty_state(
+                    "No nodes yet",
+                    "Fill in the form above to connect the first one.",
+                )),
+            ),
         );
         col = col.child(card(None, None, body));
         if loading && !self.config.nodes.is_empty() {
-            col = col.child(skeleton(30.));
+            col = col.child(text_dim("Checking each node...").text_size(px(12.)));
         }
         col.into_any_element()
+    }
+
+    fn nodes_empty(&self, cx: &mut Context<Self>) -> AnyElement {
+        card(
+            None,
+            None,
+            div()
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap(px(GAP))
+                .py(px(36.))
+                .px(px(SPACE))
+                .child(strong("No nodes yet").text_size(px(16.)))
+                .child(
+                    text_dim(
+                        "A node is a Cite connector running on a server. Add one with its URL and an API token or your username, password and TOTP code.",
+                    )
+                    .text_size(px(12.))
+                    .max_w(px(460.))
+                    .text_center(),
+                )
+                .child(
+                    btn(id("nodes-add", "empty"), "Add your first node", BtnKind::Primary)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.nodes.adding = true;
+                            this.nodes.error = None;
+                            cx.notify();
+                        })),
+                ),
+        )
+        .into_any_element()
     }
 
     fn add_form(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -276,9 +357,19 @@ impl Console {
             div()
                 .flex()
                 .flex_col()
-                .gap(px(12.))
-                .child(div().flex().gap(px(12.)).child(div().flex_1().child(field("Username", None, n.user.clone()))).child(div().flex_1().child(field("Password", None, n.pass.clone()))))
-                .child(field("TOTP code", Some("The app signs in once, mints a token named for this computer and discards the password."), n.totp.clone()))
+                .gap(px(GAP))
+                .child(grid_min(
+                    FIELD_MIN,
+                    vec![
+                        field("Username", None, n.user.clone()).into_any_element(),
+                        field("Password", None, n.pass.clone()).into_any_element(),
+                    ],
+                ))
+                .child(field(
+                    "TOTP code",
+                    Some("The app signs in once, mints a token named for this computer and discards the password."),
+                    n.totp.clone(),
+                ))
                 .into_any_element()
         } else {
             field(
@@ -288,48 +379,78 @@ impl Console {
             )
             .into_any_element()
         };
+        let connector = split(
+            "nodes-connector",
+            560.,
+            GAP,
+            field(
+                "Name",
+                Some("Lowercase letters, digits and dashes."),
+                n.name.clone(),
+            )
+            .into_any_element(),
+            field(
+                "Connector URL",
+                Some("The node's API address, including the port."),
+                n.url.clone(),
+            )
+            .into_any_element(),
+        );
+        let step_one = div()
+            .flex()
+            .flex_col()
+            .gap(px(GAP))
+            .child(connector)
+            .child(field(
+                "CA certificate",
+                Some("Path to a PEM file, or leave empty to trust public roots."),
+                n.ca.clone(),
+            ));
+        let step_two = div()
+            .flex()
+            .flex_col()
+            .gap(px(GAP))
+            .child(div().flex().child(mode))
+            .child(creds);
         let mut form = div()
             .flex()
             .flex_col()
-            .gap(px(12.))
-            .child(
-                div()
-                    .flex()
-                    .gap(px(12.))
-                    .child(div().w(px(220.)).child(field(
-                        "Name",
-                        Some("Lowercase letters, digits and dashes."),
-                        n.name.clone(),
-                    )))
-                    .child(
-                        div()
-                            .flex_1()
-                            .child(field("Connector URL", None, n.url.clone())),
-                    ),
-            )
-            .child(field(
-                "CA certificate",
-                Some("Path to a PEM file or leave empty to trust public roots."),
-                n.ca.clone(),
-            ))
-            .child(field("Authentication", None, mode))
-            .child(creds);
+            .gap(px(SPACE))
+            .child(step(1, "Connector", "Where the node listens.", step_one))
+            .child(step(
+                2,
+                "Sign in",
+                "How this console proves who it is.",
+                step_two,
+            ));
         if let Some(err) = &n.error {
             form = form.child(notice(err, Tone::Bad));
         }
-        let label = if n.busy {
-            "Connecting..."
+        let save = if n.busy {
+            btn_off("Connecting...").into_any_element()
         } else {
-            "Validate and save"
-        };
-        form = form.child(div().flex().child(
-            btn(id("nodes", "save"), label, BtnKind::Primary).on_click(cx.listener(
-                |this, _, _, cx| {
+            btn(id("nodes", "save"), "Validate and save", BtnKind::Primary)
+                .on_click(cx.listener(|this, _, _, cx| {
                     this.submit_node(cx);
                     cx.notify();
-                },
-            )),
-        ));
+                }))
+                .into_any_element()
+        };
+        form = form.child(
+            div()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap(px(GAP))
+                .pt(px(GAP))
+                .border_t_1()
+                .border_color(c(DIVIDER))
+                .child(save)
+                .child(
+                    text_dim("Nothing is saved until the node answers with these details.")
+                        .text_size(px(12.)),
+                ),
+        );
         card(
             Some("Add node"),
             Some("Register a connector the console can manage."),
@@ -337,6 +458,40 @@ impl Console {
         )
         .into_any_element()
     }
+}
+
+// A numbered step of a setup form: badge and title on top, the step's fields indented beneath.
+pub(crate) fn step(n: usize, title: &str, detail: &str, body: impl IntoElement) -> AnyElement {
+    let badge = div()
+        .flex()
+        .items_center()
+        .justify_center()
+        .flex_none()
+        .size(px(22.))
+        .rounded_full()
+        .border_1()
+        .border_color(chip_stroke())
+        .bg(chip_fill())
+        .text_size(px(11.))
+        .font_weight(gpui::FontWeight::SEMIBOLD)
+        .child(n.to_string());
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(GAP))
+        .min_w_0()
+        .child(
+            div().flex().items_center().gap(px(10.)).child(badge).child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .min_w_0()
+                    .child(strong(title.to_string()).text_size(px(13.)))
+                    .child(text_dim(detail.to_string()).text_size(px(11.))),
+            ),
+        )
+        .child(div().pl(px(32.)).min_w_0().child(body))
+        .into_any_element()
 }
 
 // The host name only labels the minted token, so a failed lookup is harmless.

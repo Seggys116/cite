@@ -1,9 +1,9 @@
 ARG NODE_MAJOR=22
-ARG NODE_IMAGE=docker.io/library/node:22-bookworm-slim@sha256:de170b39439eb0e5a3444ad7d60b015614a381e10fecae2e30ec9e735122f38d
+ARG NODE_IMAGE=docker.io/library/node:22-bookworm-slim@sha256:5ec23b7c622b00547753bc6ffd78085dd868a68aeb41c8e0a1418f033e13d96d
 ARG RUST_IMAGE=docker.io/library/rust:1.98-bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
-ARG BUN_VERSION=1.4.2
-ARG BUN_SHA256_AMD64=36368faef7527875d5ffa52e53cd48021741f2a83eb6208a8dd64068d422a913
-ARG BUN_SHA256_ARM64=54328bbc2d9c8e0c9f892c544d66c57a83b84139e34909e5ee81758f1ac8fda7
+ARG BUN_VERSION=1.4.4
+ARG BUN_SHA256_AMD64=bf8ccbfb2b0b80159e0f9a6d15c55317add8077534dbc6130a3edb52fccb395c
+ARG BUN_SHA256_ARM64=baa6bb36f51d6e58561e02bbea825038a9df454f673d6d776e8bbf86f8c7850e
 
 FROM ${RUST_IMAGE} AS build
 
@@ -58,7 +58,7 @@ RUN set -eux; \
     apt-get install -y --no-install-recommends ca-certificates libssl3; \
     rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*; \
     corepack enable; \
-    corepack prepare pnpm@12.8.1 --activate; \
+    corepack prepare pnpm@12.18.0 --activate; \
     groupadd --system --gid 10002 citebuild; \
     useradd --system --uid 10002 --gid 10002 --home-dir /var/lib/cite/work --no-create-home citebuild; \
     mkdir -p /var/lib/cite/releases /var/lib/cite/control /var/lib/cite/status \

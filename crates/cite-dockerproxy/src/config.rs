@@ -1,6 +1,8 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
+use crate::envval;
+
 const MAX_GITHUB_URL_LEN: usize = 200;
 pub const FORGES: [&str; 3] = ["github", "gitlab", "gitea"];
 pub const MIN_STACK_MEMORY: i64 = 256 << 20;
@@ -23,6 +25,107 @@ pub struct Config {
     pub edge_network: String,
     pub max_conns: usize,
     pub github_api_url: Option<String>,
+    /// How executors of outbound sites reach the internet (CITE_STACK_EGRESS_MODE, default filtered).
+    pub egress_mode: EgressMode,
+    /// The bridge that holds only egress proxies (CITE_STACK_EGRESS_BRIDGE, default cite-egress).
+    pub egress_bridge: String,
+    /// The node-wide CITE_EGRESS_* entries every egress proxy must carry, in the order the connector writes them.
+    pub egress_env: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EgressMode {
+    /// Executors join an internal network and reach the internet only through their stack's egress proxy.
+    Filtered,
+    /// Executors join their stack's egress bridge directly.
+    Open,
+    /// No executor gets an outbound network.
+    Off,
+}
+
+/// One node-level egress list: node setting, key in the egress proxy and the rule each entry must pass.
+pub type EgressNodeKey = (&'static str, &'static str, fn(&str) -> bool);
+
+/// The node-level lists, in the order the connector emits them.
+pub const EGRESS_NODE_KEYS: [EgressNodeKey; 4] = [
+    (
+        "CITE_STACK_EGRESS_ALLOW_CIDRS",
+        "CITE_EGRESS_ALLOW_CIDRS",
+        envval::egress_cidr,
+    ),
+    (
+        "CITE_STACK_EGRESS_DENY_CIDRS",
+        "CITE_EGRESS_DENY_CIDRS",
+        envval::egress_cidr,
+    ),
+    (
+        "CITE_STACK_EGRESS_DENY_HOSTS",
+        "CITE_EGRESS_DENY_HOSTS",
+        envval::egress_host,
+    ),
+    (
+        "CITE_STACK_EGRESS_ALLOW_PORTS",
+        "CITE_EGRESS_ALLOW_PORTS",
+        envval::egress_port_range,
+    ),
+];
+
+/// Trims entries and drops empty ones; the result is what both the connector and the proxy compare.
+pub fn egress_setting(key: &str, raw: &str, entry_ok: fn(&str) -> bool) -> Result<String, String> {
+    let entries: Vec<&str> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+        .collect();
+    let joined = entries.join(",");
+    if joined.is_empty() || envval::egress_list(&joined, entry_ok) {
+        Ok(joined)
+    } else {
+        Err(format!(
+            "{key} must be a comma list of at most 64 distinct valid entries"
+        ))
+    }
+}
+
+/// The node's own public addresses, appended to CITE_EGRESS_DENY_CIDRS exactly as the connector does.
+pub const NODE_IPS_KEY: &str = "CITE_NODE_PUBLIC_IPS";
+
+fn with_node_ips(key: &str, deny: &str, own: &str) -> Result<String, String> {
+    let mut entries: Vec<&str> = deny.split(',').filter(|e| !e.is_empty()).collect();
+    for ip in own.split(',').filter(|e| !e.is_empty()) {
+        if !entries.contains(&ip) {
+            entries.push(ip);
+        }
+    }
+    let joined = entries.join(",");
+    if joined.is_empty() || envval::egress_list(&joined, envval::egress_cidr) {
+        Ok(joined)
+    } else {
+        Err(format!(
+            "{key} and {NODE_IPS_KEY} together must have at most 64 entries"
+        ))
+    }
+}
+
+fn egress_mode(optional: impl Fn(&str) -> Option<String>) -> Result<EgressMode, String> {
+    if let Some(mode) = optional("CITE_STACK_EGRESS_MODE") {
+        return match mode.as_str() {
+            "filtered" => Ok(EgressMode::Filtered),
+            "open" => Ok(EgressMode::Open),
+            "off" => Ok(EgressMode::Off),
+            other => Err(format!(
+                "CITE_STACK_EGRESS_MODE {other:?} must be filtered, open or off"
+            )),
+        };
+    }
+    match optional("CITE_STACK_EXECUTOR_EGRESS").as_deref() {
+        None => Ok(EgressMode::Filtered),
+        Some(v) if v.eq_ignore_ascii_case("true") || v == "1" => Ok(EgressMode::Filtered),
+        Some(v) if v.eq_ignore_ascii_case("false") || v == "0" => Ok(EgressMode::Off),
+        Some(v) => Err(format!(
+            "CITE_STACK_EXECUTOR_EGRESS {v:?} must be true or false"
+        )),
+    }
 }
 
 // Names end up in regexes and Docker paths, so only plain name characters are accepted.
@@ -226,7 +329,32 @@ impl Config {
             validate_github_api_url(url)
                 .map_err(|e| format!("CITE_STACK_FORGE_API_URL {url:?} {e}"))?;
         }
+        let egress_mode = egress_mode(optional)?;
+        let egress_bridge = text("CITE_STACK_EGRESS_BRIDGE", "cite-egress");
+        if !chars_ok(&egress_bridge, &[]) || egress_bridge.starts_with("cite-vol-") {
+            return Err(format!(
+                "CITE_STACK_EGRESS_BRIDGE {egress_bridge:?} is not valid"
+            ));
+        }
+        let own = egress_setting(
+            NODE_IPS_KEY,
+            &get(NODE_IPS_KEY).unwrap_or_default(),
+            envval::egress_cidr,
+        )?;
+        let mut egress_env = Vec::new();
+        for (key, env_key, entry_ok) in EGRESS_NODE_KEYS {
+            let mut value = egress_setting(key, &get(key).unwrap_or_default(), entry_ok)?;
+            if env_key == "CITE_EGRESS_DENY_CIDRS" {
+                value = with_node_ips(key, &value, &own)?;
+            }
+            if !value.is_empty() {
+                egress_env.push(format!("{env_key}={value}"));
+            }
+        }
         Ok(Config {
+            egress_mode,
+            egress_bridge,
+            egress_env,
             forge,
             forge_api_url,
             max_memory,
@@ -265,6 +393,116 @@ mod tests {
         assert_eq!(c.edge_network, "cite_edge");
         assert_eq!(c.max_conns, 64);
         assert_eq!(c.github_api_url, None);
+        assert_eq!(c.egress_mode, EgressMode::Filtered);
+        assert_eq!(c.egress_bridge, "cite-egress");
+        assert!(c.egress_env.is_empty());
+    }
+
+    #[test]
+    fn egress_mode_reads_the_new_setting_then_the_old_boolean() {
+        for (raw, want) in [
+            ("filtered", EgressMode::Filtered),
+            ("open", EgressMode::Open),
+            ("off", EgressMode::Off),
+        ] {
+            assert_eq!(
+                cfg(&[("CITE_STACK_EGRESS_MODE", raw)]).unwrap().egress_mode,
+                want
+            );
+        }
+        for (raw, want) in [
+            ("false", EgressMode::Off),
+            ("0", EgressMode::Off),
+            ("TRUE", EgressMode::Filtered),
+            ("1", EgressMode::Filtered),
+        ] {
+            let c = cfg(&[("CITE_STACK_EXECUTOR_EGRESS", raw)]).unwrap();
+            assert_eq!(c.egress_mode, want, "{raw}");
+        }
+        let both = cfg(&[
+            ("CITE_STACK_EGRESS_MODE", "open"),
+            ("CITE_STACK_EXECUTOR_EGRESS", "false"),
+        ])
+        .unwrap();
+        assert_eq!(both.egress_mode, EgressMode::Open, "the new setting wins");
+        assert!(cfg(&[("CITE_STACK_EXECUTOR_EGRESS", "off")]).is_err());
+        assert!(cfg(&[("CITE_STACK_EGRESS_MODE", "Filtered")]).is_err());
+        assert!(cfg(&[("CITE_STACK_EGRESS_MODE", "on")]).is_err());
+    }
+
+    #[test]
+    fn egress_lists_are_normalised_and_validated() {
+        let c = cfg(&[
+            (
+                "CITE_STACK_EGRESS_ALLOW_CIDRS",
+                " 192.168.10.0/24 , fd00::/8,",
+            ),
+            ("CITE_STACK_EGRESS_DENY_HOSTS", "evil.example,.ads.example"),
+            ("CITE_STACK_EGRESS_ALLOW_PORTS", "80,443,8000-8100"),
+            ("CITE_STACK_EGRESS_BRIDGE", "my-egress"),
+        ])
+        .unwrap();
+        assert_eq!(
+            c.egress_env,
+            vec![
+                "CITE_EGRESS_ALLOW_CIDRS=192.168.10.0/24,fd00::/8",
+                "CITE_EGRESS_DENY_HOSTS=evil.example,.ads.example",
+                "CITE_EGRESS_ALLOW_PORTS=80,443,8000-8100",
+            ]
+        );
+        assert_eq!(c.egress_bridge, "my-egress");
+        for pairs in [
+            [("CITE_STACK_EGRESS_ALLOW_CIDRS", "10.0.0.0/33")],
+            [("CITE_STACK_EGRESS_ALLOW_CIDRS", "010.0.0.0/8")],
+            [("CITE_STACK_EGRESS_ALLOW_CIDRS", "example.com")],
+            [("CITE_STACK_EGRESS_DENY_CIDRS", "10.0.0.1,10.0.0.1")],
+            [("CITE_STACK_EGRESS_DENY_HOSTS", "Evil.example")],
+            [("CITE_STACK_EGRESS_DENY_HOSTS", "10.0.0.1")],
+            [("CITE_STACK_EGRESS_ALLOW_PORTS", "0")],
+            [("CITE_STACK_EGRESS_ALLOW_PORTS", "443-80")],
+            [("CITE_STACK_EGRESS_BRIDGE", "a b")],
+        ] {
+            assert!(cfg(&pairs).is_err(), "{pairs:?}");
+        }
+    }
+
+    #[test]
+    fn node_public_ips_join_the_deny_list_like_the_connector() {
+        let c = cfg(&[
+            (
+                "CITE_STACK_EGRESS_DENY_CIDRS",
+                "198.51.100.0/24,203.0.113.10",
+            ),
+            ("CITE_NODE_PUBLIC_IPS", " 203.0.113.10 , 203.0.113.11"),
+        ])
+        .unwrap();
+        assert_eq!(
+            c.egress_env,
+            vec!["CITE_EGRESS_DENY_CIDRS=198.51.100.0/24,203.0.113.10,203.0.113.11"]
+        );
+        let alone = cfg(&[("CITE_NODE_PUBLIC_IPS", "2001:db8::10")]).unwrap();
+        assert_eq!(
+            alone.egress_env,
+            vec!["CITE_EGRESS_DENY_CIDRS=2001:db8::10"]
+        );
+        for bad in ["example.com", "::ffff:1.2.3.4", "1.2.3.4,1.2.3.4"] {
+            assert!(cfg(&[("CITE_NODE_PUBLIC_IPS", bad)]).is_err(), "{bad}");
+        }
+        let many = (0..40)
+            .map(|i| format!("10.0.{i}.1"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let more = (0..40)
+            .map(|i| format!("10.1.{i}.1"))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(
+            cfg(&[
+                ("CITE_STACK_EGRESS_DENY_CIDRS", many.as_str()),
+                ("CITE_NODE_PUBLIC_IPS", more.as_str())
+            ])
+            .is_err()
+        );
     }
 
     #[test]

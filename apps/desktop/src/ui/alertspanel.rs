@@ -526,7 +526,7 @@ impl Console {
                 )
                 .child(div().child("Send alerts")),
         );
-        body = body.child(div().w(px(220.)).child(field(
+        body = body.child(div().w_full().max_w(px(260.)).child(field(
             "Cooldown (seconds)",
             Some("How long to wait before the same alert is sent again. 900 is 15 minutes."),
             form.cooldown.clone(),
@@ -723,7 +723,8 @@ impl Console {
         Self::panel_shell()
             .child(
                 div()
-                    .w(px(320.))
+                    .w_full()
+                    .max_w(px(420.))
                     .child(field("Name", None, row.name.clone())),
             )
             .child(field(
@@ -801,7 +802,7 @@ impl Console {
                 Some("The SMTP host that sends the message."),
                 mail.host.clone(),
             ))
-            .child(div().w(px(160.)).child(field(
+            .child(div().w_full().max_w(px(200.)).child(field(
                 "Port",
                 Some(port_hint.as_str()),
                 mail.port.clone(),
