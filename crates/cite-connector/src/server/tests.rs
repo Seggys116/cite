@@ -13,6 +13,8 @@ use crate::store::testing::test_config;
 mod analytics_filters;
 mod archive_api;
 mod certificates_api;
+mod data_api;
+mod data_transfer_api;
 mod doppler_api;
 mod firewall_bulk;
 mod site_ops_api;
@@ -100,7 +102,7 @@ async fn start_with(tweak: impl FnOnce(&mut ConnectorConfig)) -> Harness {
     let addr = listener.local_addr().expect("addr");
     let task = tokio::spawn(serve(listener, Arc::clone(&state), acceptor));
     // Tests block the runtime for long stretches, so a pooled connection can go stale and be reset on reuse.
-    let http = Client::builder()
+    let http = cite_tls::client_builder()
         .redirect(reqwest::redirect::Policy::none())
         .pool_max_idle_per_host(0)
         .build()
@@ -1735,7 +1737,7 @@ async fn fake_haproxy(refuse_first: bool) -> FakeHaproxy {
             let _ = BufReader::new(&mut stream).read_line(&mut line).await;
             let n = count.fetch_add(1, Ordering::SeqCst) + 1;
             let skip = skipping
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_sub(1))
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_sub(1))
                 .is_ok();
             let reply = if refusing.load(Ordering::SeqCst) || skip || (refuse_first && n == 1) {
                 "Success=0\n--\n[ALERT] refused\n"

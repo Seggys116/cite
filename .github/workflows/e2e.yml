@@ -67,8 +67,49 @@ jobs:
         run: |
           docker build -f images/manager/Dockerfile -t cite-manager:dev-node24 \
             --build-arg NODE_MAJOR=24 \
-            --build-arg NODE_IMAGE=docker.io/library/node:24-bookworm-slim@sha256:01d566e8d94d8c619591d78652babfccd3c6992a3dffa9ed5ab39e11cf6c70e9 .
+            --build-arg NODE_IMAGE=docker.io/library/node:24-bookworm-slim@sha256:dc26ae92c9fb15cf6b1d63e20f0944b2efe0f115b20e00be48fb23fceb061c54 .
           docker build -f images/executor-node/Dockerfile -t cite-executor-node:e2e-node24 \
             --build-arg NODE_MAJOR=24 \
-            --build-arg EXECUTOR_IMAGE=gcr.io/distroless/nodejs24-debian13:nonroot@sha256:b8cec4b2f2126ff7bd034ec9ac207ffb3272667dfdc48376e3b035d3270549ba .
+            --build-arg EXECUTOR_IMAGE=gcr.io/distroless/nodejs24-debian13:nonroot@sha256:6abfcb367ebc291572c774c1592a986be2ab26a2486f73093401327495a5962a .
       - run: ./scripts/e2e-runtimes.sh ${{ matrix.scenario }}
+
+  data:
+    # Builds eight images and runs two nodes, so it only runs when dispatched by hand.
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Run the site data services end to end script
+        run: CITE_VERSION=0.0.1 bash scripts/e2e-data.sh
+      - if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-data-logs
+          path: target/e2e-data-logs
+          if-no-files-found: ignore
+
+  upgrade:
+    # Pulls the previous release, builds the current images and upgrades a node in place, so it only runs when dispatched by hand.
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Upgrade a 0.4.1 node in place
+        run: E2E_LOG_DIR=target/e2e-upgrade-logs bash scripts/e2e-upgrade.sh
+      - if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-upgrade-logs
+          path: target/e2e-upgrade-logs
+          if-no-files-found: ignore

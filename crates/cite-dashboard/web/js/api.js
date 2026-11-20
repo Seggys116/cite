@@ -10,8 +10,10 @@ export class ApiError extends Error {
   }
 }
 
+// The in-memory demo console is a development aid: a crafted ?mock=1 link on a real host must not show an operator fake data.
+const localHost = ['localhost', '127.0.0.1', '[::1]'].includes(location.hostname) || location.hostname.endsWith('.localhost');
 const mockParam = new URLSearchParams(location.search).get('mock');
-export const isMock = Boolean(mockParam) && mockParam !== '0';
+export const isMock = localHost && Boolean(mockParam) && mockParam !== '0';
 
 let csrfToken = '';
 
@@ -42,7 +44,10 @@ async function send(method, path, body) {
 function failure({ res, data }) {
   if (res.status === 401) apiEvents.dispatchEvent(new Event('unauthorized'));
   const message = (data && typeof data === 'object' && data.error) || res.statusText || 'Request failed';
-  return new ApiError(res.status, message);
+  const err = new ApiError(res.status, message);
+  // Structured refusals (such as link conflicts) carry details the view shows.
+  if (data && typeof data === 'object') err.data = data;
+  return err;
 }
 
 const isCsrfFailure = ({ res, data }) => res.status === 403 && data && typeof data === 'object' && /csrf/i.test(String(data.error || ''));

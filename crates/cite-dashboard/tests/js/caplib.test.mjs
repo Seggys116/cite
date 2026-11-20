@@ -21,7 +21,8 @@ test('an older node lists nothing so everything stays hidden', () => {
 });
 
 test('every known capability name has a feature key', () => {
-  const names = ['site-status', 'site-logs', 'source-build', 'site-github-token', 'site-build-env', 'site-runtime-env', 'deploy-async', 'cert-generate', 'cert-origin-ca', 'cert-acme', 'alerts', 'forges'];
+  const names = ['site-status', 'site-logs', 'source-build', 'site-github-token', 'site-build-env', 'site-runtime-env', 'deploy-async', 'cert-generate', 'cert-origin-ca', 'cert-acme', 'alerts', 'forges',
+    'data-postgres', 'data-shared', 'data-external', 'data-s3', 'data-backups', 'data-links', 'data-transfer'];
   assert.deepEqual(Object.values(FEATURES).sort(), [...names].sort());
   assert.ok(Object.values(siteFeatures({ capabilities: names })).every(Boolean));
 });

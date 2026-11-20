@@ -5,7 +5,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use cite_edge::model::{DeployAction, Site, Slot};
+use cite_edge::model::{
+    DeployAction, LinkSource, LinkTarget, PgMode, Site, Slot, pg_superuser_secret_name,
+};
 use cite_edge::runtime::BackendStat;
 use cite_edge::status::{
     BuildEnvNames, BuildEnvPatch, LastFailure, LogLine, LogsResponse, ManagerReport, OperationInfo,
@@ -18,6 +20,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::sleep;
 use zeroize::Zeroizing;
 
+use crate::data::env::{DataBindings, linked_vars};
 use crate::deploy::{Deployer, detach, secret_name, site_mut, upstream};
 use crate::doppler;
 use crate::error::{ConnectorError, Result};
@@ -87,6 +90,17 @@ impl EnvKind {
             EnvKind::Build => patch.validate(),
             EnvKind::Runtime => patch.validate_runtime(),
         }
+    }
+}
+
+// Names the source of a link for error messages; never a value.
+fn describe_link(source: &LinkSource) -> String {
+    match source {
+        LinkSource::Postgres { database, user, .. } => format!("postgres {database}/{user}"),
+        LinkSource::External { name, .. } => format!("external database {name}"),
+        LinkSource::S3 { name, .. } => format!("s3 attachment {name}"),
+        LinkSource::Secret { name } => format!("generated secret {name}"),
+        LinkSource::SiteUrl => "the site URL".to_string(),
     }
 }
 
@@ -624,6 +638,12 @@ impl Deployer {
             }
             out.extend(self.doppler_snapshot(&site.id, kind).await.into_values());
         }
+        // Database passwords (both alternates), generated secrets, external URLs and S3 keys.
+        if !site.data.is_empty()
+            && let Some(service) = self.data_service()
+        {
+            out.extend(service.redactions(site).await);
+        }
         out.retain(|s| !s.is_empty());
         out.sort();
         out.dedup();
@@ -704,11 +724,54 @@ impl Deployer {
                 .and_then(|seen| env_value(&seen.env, DEPLOY_ID_ENV)),
             None => None,
         };
+        let (data, db_password) = self.data_inputs(site).await?;
         Ok(StackOpts {
             deploy_id,
             build_env: self.env_opt(&site.id, EnvKind::Build).await?,
             runtime_env: self.env_opt(&site.id, EnvKind::Runtime).await?,
+            data,
+            db_password,
         })
+    }
+
+    // The link credentials and, for a dedicated database, its superuser password; both reach only the
+    // orchestrator call that needs them. A site with data cannot start without its service.
+    pub(crate) async fn data_inputs(
+        &self,
+        site: &Site,
+    ) -> Result<(Option<DataBindings>, Option<Zeroizing<String>>)> {
+        if site.data.is_empty() {
+            return Ok((None, None));
+        }
+        let service = self.data_service().ok_or_else(|| {
+            ConnectorError::Unavailable(format!(
+                "site {} has data services, but they are not available on this node",
+                site.id
+            ))
+        })?;
+        let bindings = service.bindings(site).await?;
+        let password = match site.data.postgres.as_ref().map(|p| p.mode) {
+            Some(PgMode::Dedicated) => Some(self.dedicated_password(&site.id).await?),
+            _ => None,
+        };
+        Ok((bindings, password))
+    }
+
+    // `site-<id>.data.pg-su` holds `{"password": ...}`; it is never returned by any route.
+    async fn dedicated_password(&self, id: &str) -> Result<Zeroizing<String>> {
+        let name = pg_superuser_secret_name(id);
+        let missing = || {
+            ConnectorError::Conflict(format!(
+                "the database superuser secret of {id} is missing or unreadable"
+            ))
+        };
+        let text = Zeroizing::new(self.store.get_secret(&name).await.ok_or_else(missing)?);
+        let value: serde_json::Value = serde_json::from_str(&text).map_err(|_| missing())?;
+        value["password"]
+            .as_str()
+            .filter(|p| !p.is_empty())
+            .map(|p| Zeroizing::new(p.to_string()))
+            .ok_or_else(missing)
     }
 
     pub(crate) async fn env_map(
@@ -833,6 +896,24 @@ impl Deployer {
             return Err(ConnectorError::BadRequest(format!(
                 "site {id} is not built from a repository, so it has no {}",
                 kind.label()
+            )));
+        }
+        // A linked variable is owned by its link: a manual value of the same name would be shadowed anyway.
+        let target = match kind {
+            EnvKind::Build => LinkTarget::Build,
+            EnvKind::Runtime => LinkTarget::Runtime,
+        };
+        let linked = linked_vars(&site.data, target);
+        if let Some(var) = patch.set.keys().find(|k| linked.contains(k)) {
+            let from = site
+                .data
+                .links
+                .iter()
+                .find(|l| l.target == target && l.var == *var)
+                .map_or_else(|| "a data link".to_string(), |l| describe_link(&l.source));
+            return Err(ConnectorError::BadRequest(format!(
+                "{var} is linked from {from} ({}); remove the link first",
+                target.as_str()
             )));
         }
         let next = apply_patch(self.env_map(id, kind).await?, &patch, kind.label())?;

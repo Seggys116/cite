@@ -462,6 +462,357 @@ fn log_requests_need_a_stack_name_and_the_get_method() {
     );
 }
 
+const DATA_CONTAINERS: [&str; 4] = [
+    "cite-shop-db",
+    "cite-shop-dbjob",
+    "cite-pg-shared",
+    "cite-pg-shared-job",
+];
+const DATA_VOLUMES: [&str; 3] = [
+    "cite-shop-db-data",
+    "cite-pg-shared-data",
+    "cite-pg-shared-conf",
+];
+const DATA_NETWORKS: [&str; 2] = ["cite-shop-dbnet", "cite-pg-shared-admin"];
+
+fn classify_with(
+    policy: &cite_dockerproxy::policy::Policy,
+    method: &str,
+    target: &str,
+) -> Result<Route, String> {
+    policy.classify(method, &normalise(target)?)
+}
+
+#[test]
+fn every_data_name_is_routable_for_the_lifecycle_calls() {
+    for name in DATA_CONTAINERS {
+        assert_eq!(
+            allowed("POST", &format!("/v1.45/containers/create?name={name}")),
+            Route::ContainerCreate(name.to_string())
+        );
+        for (method, suffix) in [
+            ("GET", "/json"),
+            ("POST", "/start"),
+            ("POST", "/stop?t=10"),
+            ("POST", "/restart"),
+            ("POST", "/wait?condition=not-running"),
+            ("GET", "/logs?stdout=1&stderr=1&tail=200"),
+        ] {
+            allowed(method, &format!("/v1.45/containers/{name}{suffix}"));
+        }
+        allowed("DELETE", &format!("/v1.45/containers/{name}?force=true"));
+        assert_eq!(
+            allowed("POST", &format!("/v1.45/containers/{name}/start")),
+            Route::ContainerStart(name.to_string())
+        );
+        // None of the routes the engine offers beyond the lifecycle.
+        for (method, suffix) in [
+            ("POST", "/exec"),
+            ("POST", "/attach"),
+            ("POST", "/kill"),
+            ("PUT", "/archive?path=/"),
+            ("GET", "/archive?path=/"),
+            ("GET", "/export"),
+            ("POST", "/update"),
+        ] {
+            refused(method, &format!("/v1.45/containers/{name}{suffix}"));
+        }
+    }
+    for name in DATA_VOLUMES {
+        allowed("GET", &format!("/v1.45/volumes/{name}"));
+        assert_eq!(
+            allowed("DELETE", &format!("/v1.45/volumes/{name}")),
+            Route::VolumeDelete(name.to_string())
+        );
+    }
+    for name in DATA_NETWORKS {
+        allowed("GET", &format!("/v1.45/networks/{name}"));
+        assert_eq!(
+            allowed("DELETE", &format!("/v1.45/networks/{name}")),
+            Route::NetworkDelete(name.to_string())
+        );
+    }
+    assert_eq!(
+        allowed("DELETE", "/v1.45/containers/cite-shop-db").check(),
+        Some(Check::Container("cite-shop-db".to_string()))
+    );
+    assert_eq!(
+        allowed("DELETE", "/v1.45/volumes/cite-shop-db-data").check(),
+        Some(Check::Volume("cite-shop-db-data".to_string()))
+    );
+}
+
+#[test]
+fn names_near_the_data_scheme_are_denied() {
+    for name in [
+        "cite-pg-shared-db",
+        "cite-pg-shared-jobs",
+        "cite-pg-shared-admin",
+        "cite-pg-shared2",
+        "cite-pg-shared-",
+        "cite-Shop-db",
+        "cite-shop-dbjobs",
+        "cite--db",
+        "cite-shop-db-blue",
+        "cite-backups",
+    ] {
+        // cite-pg-shared-db is a site named pg-shared, which is allowed; the rest are not names at all.
+        if name == "cite-pg-shared-db" {
+            allowed("POST", &format!("/v1.45/containers/create?name={name}"));
+        } else {
+            refused("POST", &format!("/v1.45/containers/create?name={name}"));
+        }
+    }
+    for name in [
+        "cite-shop-db-datax",
+        "cite-pg-shared-data2",
+        "cite-pg-shared-logs",
+        "cite-shop-db",
+        "cite-backups",
+        "cite-vol-shop_db",
+    ] {
+        if name == "cite-vol-shop_db" {
+            allowed("GET", &format!("/v1.45/volumes/{name}"));
+        } else {
+            refused("GET", &format!("/v1.45/volumes/{name}"));
+        }
+    }
+    for name in [
+        "cite-shop-dbnets",
+        "cite-pg-shared-net",
+        "cite-pg-shared",
+        "cite-shop-db",
+    ] {
+        refused("GET", &format!("/v1.45/networks/{name}"));
+    }
+    // The backup volume is mounted by jobs but never created, inspected or deleted through the proxy.
+    refused("DELETE", "/v1.45/volumes/cite-backups");
+    refused("GET", "/v1.45/volumes/cite-backups");
+}
+
+#[test]
+fn no_name_belongs_to_two_schemes() {
+    let policy = common::policy();
+    let ids = [
+        "shop",
+        "a",
+        "a-db",
+        "x-blue",
+        "pg-shared",
+        "db",
+        "dbnet",
+        "blue-db",
+    ];
+    for id in ids {
+        let names = [
+            format!("cite-{id}-db"),
+            format!("cite-{id}-dbjob"),
+            format!("cite-{id}-db-data"),
+            format!("cite-{id}-dbnet"),
+            format!("cite-{id}-blue-manager"),
+            format!("cite-{id}-green-executor"),
+            format!("cite-{id}-blue-init"),
+            format!("cite-{id}-blue-egress-proxy"),
+            format!("cite-{id}-blue-data"),
+            format!("cite-{id}-green-work"),
+            format!("cite-{id}-blue-cache"),
+            format!("cite-{id}-blue-net"),
+            format!("cite-{id}-green-xnet"),
+            format!("cite-{id}-blue-egress"),
+        ];
+        for name in &names {
+            let kinds = [
+                policy.container(name).is_ok() || policy.data_container(name).is_some(),
+                policy.volume(name).is_ok() || policy.data_volume(name).is_some(),
+                policy.network(name).is_ok() || policy.data_network(name).is_some(),
+            ];
+            assert!(kinds.iter().filter(|k| **k).count() <= 1, "{name}");
+            assert!(
+                !(policy.container(name).is_ok() && policy.data_container(name).is_some()),
+                "{name}"
+            );
+            assert!(
+                !(policy.volume(name).is_ok() && policy.data_volume(name).is_some()),
+                "{name}"
+            );
+            assert!(
+                !(policy.network(name).is_ok() && policy.data_network(name).is_some()),
+                "{name}"
+            );
+        }
+    }
+    for shared in [
+        "cite-pg-shared",
+        "cite-pg-shared-job",
+        "cite-pg-shared-data",
+        "cite-pg-shared-conf",
+        "cite-pg-shared-admin",
+    ] {
+        assert!(policy.container(shared).is_err(), "{shared}");
+        assert!(policy.volume(shared).is_err(), "{shared}");
+        assert!(policy.network(shared).is_err(), "{shared}");
+        assert!(policy.site_volume(shared).is_err(), "{shared}");
+    }
+    // A site cannot be named so that its data names land on a shared name.
+    for id in ids {
+        for name in [
+            format!("cite-{id}-db"),
+            format!("cite-{id}-dbjob"),
+            format!("cite-{id}-db-data"),
+            format!("cite-{id}-dbnet"),
+        ] {
+            assert!(!name.starts_with("cite-pg-shared") || id.starts_with("pg-shared"));
+            assert_ne!(name, "cite-pg-shared");
+            assert_ne!(name, "cite-pg-shared-job");
+            assert_ne!(name, "cite-pg-shared-data");
+            assert_ne!(name, "cite-pg-shared-admin");
+        }
+    }
+}
+
+#[test]
+fn postgres_images_may_be_inspected_and_pulled_only_with_a_pg_tag() {
+    let image = "ghcr.io/seggys116/cite-postgres";
+    allowed("GET", &format!("/v1.45/images/{image}:0.5.0-pg18/json"));
+    allowed("GET", &format!("/v1.45/images/{image}:0.5.0-pg17/json"));
+    allowed(
+        "POST",
+        &format!("/v1.45/images/create?fromImage={image}&tag=0.5.0-pg18"),
+    );
+    for tag in [
+        "0.5.0",
+        "0.5.0-pg16",
+        "0.5.0-pg19",
+        "0.5.0-pg18x",
+        "0.5.0-node22",
+        "latest",
+    ] {
+        refused(
+            "POST",
+            &format!("/v1.45/images/create?fromImage={image}&tag={tag}"),
+        );
+    }
+    // The pg tag does not carry over to the other repositories.
+    refused(
+        "POST",
+        "/v1.45/images/create?fromImage=ghcr.io/seggys116/cite-manager&tag=0.5.0-pg18",
+    );
+    refused(
+        "POST",
+        "/v1.45/images/create?fromImage=ghcr.io/seggys116/cite-egress&tag=0.5.0-pg18",
+    );
+    refused(
+        "POST",
+        "/v1.45/images/create?fromImage=evil.io/cite-postgres&tag=0.5.0-pg18",
+    );
+    refused("GET", "/v1.45/images/postgres:18/json");
+    refused("GET", &format!("/v1.45/images/{image}:0.5.0/json"));
+}
+
+#[test]
+fn only_the_shared_instance_connects_to_a_site_dbnet() {
+    let target = |action: &str| format!("/v1.45/networks/cite-shop-dbnet/{action}");
+    for action in ["connect", "disconnect"] {
+        let route = allowed("POST", &target(action));
+        assert_eq!(route.body(), BodyKind::Json);
+        assert_eq!(
+            route.check(),
+            Some(Check::Network("cite-shop-dbnet".to_string()))
+        );
+    }
+    // The shared admin network and the stack networks of other kinds stay closed.
+    refused("POST", "/v1.45/networks/cite-pg-shared-admin/connect");
+    refused("POST", "/v1.45/networks/cite-pg-shared-admin/disconnect");
+    refused("POST", "/v1.45/networks/cite-shop-blue-xnet/connect");
+    refused("POST", "/v1.45/networks/cite-shop-dbnet/connect?force=1");
+    refused("POST", "/v1.45/networks/cite-shop-dbnet/rename");
+}
+
+#[test]
+fn attach_bodies_for_a_dbnet_name_only_the_shared_instance() {
+    use cite_dockerproxy::spec::validate_attach;
+    let policy = common::policy();
+    let ok = serde_json::json!({ "Container": "cite-pg-shared" });
+    validate_attach(&policy, "cite-shop-dbnet", &ok).unwrap();
+    for body in [
+        serde_json::json!({ "Container": "cite-shop-db" }),
+        serde_json::json!({ "Container": common::HAPROXY }),
+        serde_json::json!({ "Container": "cite-pg-shared-job" }),
+        serde_json::json!({ "Container": "cite-other-db" }),
+        serde_json::json!({ "Container": "cite-pg-shared", "EndpointConfig": {} }),
+        serde_json::json!({ "Container": ["cite-pg-shared"] }),
+        serde_json::json!({}),
+        serde_json::json!([]),
+    ] {
+        assert!(
+            validate_attach(&policy, "cite-shop-dbnet", &body).is_err(),
+            "{body}"
+        );
+    }
+    // The shared instance does not become attachable to the stack networks, and the proxy still serves haproxy there.
+    assert!(validate_attach(&policy, "cite-shop-blue-net", &ok).is_err());
+    assert!(validate_attach(&policy, "cite-pg-shared-admin", &ok).is_err());
+    validate_attach(
+        &policy,
+        "cite-shop-blue-net",
+        &serde_json::json!({ "Container": common::HAPROXY }),
+    )
+    .unwrap();
+    assert!(
+        validate_attach(
+            &policy,
+            "cite-shop-dbnet",
+            &serde_json::json!({ "Container": common::HAPROXY })
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn data_names_are_refused_everywhere_when_data_services_are_off() {
+    let off = common::policy_with(&[("CITE_PROXY_DATA", "false")]);
+    for name in DATA_CONTAINERS {
+        for (method, target) in [
+            ("POST", format!("/v1.45/containers/create?name={name}")),
+            ("GET", format!("/v1.45/containers/{name}/json")),
+            ("POST", format!("/v1.45/containers/{name}/start")),
+            ("DELETE", format!("/v1.45/containers/{name}")),
+            (
+                "GET",
+                format!("/v1.45/containers/{name}/logs?stdout=1&tail=5"),
+            ),
+        ] {
+            let err = classify_with(&off, method, &target).unwrap_err();
+            assert!(err.contains("CITE_PROXY_DATA=false"), "{target}: {err}");
+        }
+    }
+    for name in DATA_VOLUMES {
+        assert!(classify_with(&off, "GET", &format!("/v1.45/volumes/{name}")).is_err());
+        assert!(classify_with(&off, "DELETE", &format!("/v1.45/volumes/{name}")).is_err());
+    }
+    for name in DATA_NETWORKS {
+        assert!(classify_with(&off, "GET", &format!("/v1.45/networks/{name}")).is_err());
+        assert!(classify_with(&off, "DELETE", &format!("/v1.45/networks/{name}")).is_err());
+    }
+    assert!(classify_with(&off, "POST", "/v1.45/networks/cite-shop-dbnet/connect").is_err());
+    assert!(
+        classify_with(
+            &off,
+            "POST",
+            "/v1.45/images/create?fromImage=ghcr.io/seggys116/cite-postgres&tag=0.5.0-pg18"
+        )
+        .is_err()
+    );
+    // Stack names keep working.
+    classify_with(&off, "GET", "/v1.45/containers/cite-shop-blue-manager/json").unwrap();
+    classify_with(
+        &off,
+        "POST",
+        "/v1.45/images/create?fromImage=ghcr.io/seggys116/cite-manager&tag=0.2.0-node22",
+    )
+    .unwrap();
+}
+
 #[test]
 fn registry_comes_from_configuration() {
     let cfg = cite_dockerproxy::config::Config::from_lookup(|k| {

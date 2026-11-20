@@ -4,7 +4,7 @@ name: cite-node
 
 services:
   init:
-    image: ghcr.io/seggys116/cite-connector:${CITE_VERSION:-0.4.1}
+    image: ghcr.io/seggys116/cite-connector:${CITE_VERSION:-0.5.0}
     restart: "no"
     user: "0:0"
     read_only: true
@@ -107,7 +107,7 @@ services:
         max-file: "3"
 
   connector:
-    image: ghcr.io/seggys116/cite-connector:${CITE_VERSION:-0.4.1}
+    image: ghcr.io/seggys116/cite-connector:${CITE_VERSION:-0.5.0}
     restart: unless-stopped
     depends_on:
       init:
@@ -130,6 +130,8 @@ services:
       CITE_HAPROXY_MASTER: unix:/run/cite/master.sock
       CITE_LOG_LISTEN: unix:/run/cite/log.sock
       CITE_LOG_ADDR: /run/cite/log.sock
+      # Secrets at rest: a key file mounted into the connector (empty means the managed /conf/secrets.key).
+      CITE_SECRETS_KEY_FILE: ${CITE_SECRETS_KEY_FILE:-}
       RUST_LOG: ${RUST_LOG:-info}
     volumes:
       - type: volume

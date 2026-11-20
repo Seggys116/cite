@@ -1,13 +1,14 @@
 import { h } from '../dom.js';
 import { nodeApi } from '../api.js';
-import { currentNode, state, themeMode, setTheme } from '../state.js';
+import { state, themeMode, setTheme } from '../state.js';
 import {
   pageHeader, button, iconButton, loadInto, card, pill, dataTable, emptyState, field, toggle, segmented, routeTabs,
   openModal, confirmDialog, toast, withBusy, formatError, copyText, kvList, fmtInt, fmtBytes, fmtDate, relTime, skeletonRows, skeletonBlock,
 } from '../ui.js';
-import { noNodes, nodeNotice, healthKind, healthDots } from './common.js';
+import { noNodes, healthKind, healthDots } from './common.js';
+import { chooseNodeNotice, nodeScopeBar, rememberScope, scopeFor } from './nodeScope.js';
 import {
-  ARCHIVE_NOTE, DELETE_WARNING, FOREVER_NOTE, MAX_RETENTION_DAYS, applyRetentionForm, deletesWithoutArchive, retentionFormFrom,
+  ARCHIVE_NOTE, FOREVER_NOTE, MAX_RETENTION_DAYS, applyRetentionForm, deletesWithoutArchive, retentionFormFrom,
 } from '../archivelib.js';
 import { certificatesPanel, cloudflarePanel } from './certificates.js';
 import { alertsPanel } from './alerts.js';
@@ -24,10 +25,13 @@ const TABS = [
   { id: 'dashboard', label: 'Dashboard', icon: 'user' },
 ];
 
+// The hint is a tooltip on the input so the form stays free of help paragraphs
 function numberField(label, value, { hint, nullable = false, min = 0 } = {}) {
-  const input = h('input', { class: 'input mono', type: 'number', min: String(min), value: value === null || value === undefined ? '' : String(value), placeholder: nullable ? 'No limit' : '', 'aria-label': label });
+  const input = h('input', {
+    class: 'input mono', type: 'number', min: String(min), value: value === null || value === undefined ? '' : String(value), placeholder: nullable ? 'No limit' : '', 'aria-label': label, title: hint || null,
+  });
   return {
-    el: field(label, input, hint),
+    el: field(label, input),
     read() {
       if (input.value === '' && nullable) return null;
       return Math.max(min, Math.floor(Number(input.value) || 0));
@@ -43,7 +47,7 @@ function keepDataControl(retention) {
   const days = h('input', { class: 'input mono', type: 'number', min: '1', max: String(MAX_RETENTION_DAYS), inputmode: 'numeric', 'aria-label': 'Days to keep data' });
   days.value = form.days;
   const archive = h('input', { type: 'checkbox', checked: form.archive });
-  const warn = h('p', { class: 'notice warn', role: 'status', 'aria-live': 'polite', hidden: true }, DELETE_WARNING);
+  const warn = h('p', { class: 'notice warn', role: 'status', 'aria-live': 'polite', hidden: true }, 'Archiving is off: data past the limit is deleted for good.');
   const read = () => ({ mode: limit.checked ? 'limit' : 'forever', days: days.value, archive: archive.checked });
   const sync = () => {
     const now = read();
@@ -51,15 +55,14 @@ function keepDataControl(retention) {
     warn.hidden = !deletesWithoutArchive(now);
   };
   for (const el of [forever, limit, archive]) el.addEventListener('change', sync);
-  const option = (input, title, text, extra) => h('label', { class: 'radio-card' }, input,
-    h('div', { class: 'stack-sm' }, h('b', {}, title), h('p', { class: 'muted' }, text), extra || null));
+  const option = (input, title, tip, extra) => h('label', { class: 'radio-card', title: tip || null }, input,
+    h('div', { class: 'stack-sm' }, h('b', {}, title), extra || null));
   const el = h('div', { class: 'stack-sm' },
     h('div', { class: 'field-label', id: 'keep-data-label' }, 'Keep data'),
     h('div', { class: 'stack-sm', role: 'radiogroup', 'aria-labelledby': 'keep-data-label' },
       option(forever, 'Forever', FOREVER_NOTE),
       option(limit, 'Delete data older than', 'Older hourly history is removed once it passes the limit.', days)),
-    h('label', { class: 'check-row' }, archive, h('span', {}, 'Archive old data before deleting it')),
-    h('p', { class: 'hint' }, ARCHIVE_NOTE),
+    h('label', { class: 'check-row', title: ARCHIVE_NOTE }, archive, h('span', {}, 'Archive old data before deleting it')),
     warn);
   sync();
   return { el, read };
@@ -76,7 +79,7 @@ function settingsForm(node, { title, subtitle, build }) {
         const body = collect(settings);
         if (beforeSave && !(await beforeSave())) return;
         await withBusy(save, () => nodeApi(node).put('/settings', body));
-        toast('Settings saved', 'success');
+        toast(`Settings saved on ${node}`, 'success');
       } catch (ex) {
         toast(formatError(ex), 'error');
       }
@@ -89,7 +92,6 @@ function settingsForm(node, { title, subtitle, build }) {
 function retentionPanel(node) {
   return settingsForm(node, {
     title: 'Data retention',
-    subtitle: 'How much traffic history the node keeps, and what each event records.',
     build(settings) {
       const r = settings.retention;
       const recent = numberField('Recent events kept in memory', r.recent_events, { hint: 'Powers the live request log.', min: 100 });
@@ -103,8 +105,8 @@ function retentionPanel(node) {
         h('div', { class: 'two-col narrow' }, recent.el, persist.el),
         h('div', { class: 'two-col narrow' }, minutes.el, audit.el),
         keep.el,
-        h('div', { class: 'switch-row' }, ua, h('div', {}, h('b', {}, 'Store user agents'), h('p', { class: 'muted' }, 'Needed for the user agent report and rules built from it.'))),
-        h('div', { class: 'switch-row' }, ip, h('div', {}, h('b', {}, 'Store client IPs'), h('p', { class: 'muted' }, 'Needed for the top IP report and one-click IP blocking. Turn off to keep visitors anonymous.'))),
+        h('div', { class: 'switch-row', title: 'Needed for the user agent report and rules built from it.' }, ua, h('b', {}, 'Store user agents')),
+        h('div', { class: 'switch-row', title: 'Needed for the top IP report and one-click IP blocking. Turn off to keep visitors anonymous.' }, ip, h('b', {}, 'Store client IPs')),
       ];
       const collect = (current) => {
         const kept = applyRetentionForm(current.retention, keep.read());
@@ -125,7 +127,7 @@ function retentionPanel(node) {
       const beforeSave = () => (deletesWithoutArchive(keep.read())
         ? confirmDialog({
           title: 'Delete old data permanently',
-          message: 'Archiving is off, so data older than the limit is deleted for good and cannot be recovered. Save anyway?',
+          message: `Archiving is off, so data older than the limit is deleted from ${node} for good. Save anyway?`,
           confirmLabel: 'Save and delete old data',
           danger: true,
         })
@@ -138,7 +140,7 @@ function retentionPanel(node) {
 function limitsPanel(node) {
   return settingsForm(node, {
     title: 'Connection limits',
-    subtitle: 'Protect the edge from overload. Changes apply on the next HAProxy reload.',
+    subtitle: 'Applied on the next HAProxy reload.',
     build(settings) {
       const maxConn = numberField('Max connections', settings.max_conn, { min: 1 });
       const rate = numberField('Per-IP rate limit', settings.per_ip_rate_limit, { nullable: true, hint: 'Requests allowed per client address before throttling.' });
@@ -167,11 +169,11 @@ function limitsPanel(node) {
 }
 
 // The connector returns the token value once, so it is shown in a modal with a copy button
-function showNewToken(token) {
+function showNewToken(token, node) {
   const modal = openModal({
     title: 'Copy your new token',
     content: h('div', { class: 'stack-sm' },
-      h('p', { class: 'muted' }, 'This is the only time the token is shown. Store it somewhere safe.'),
+      h('p', { class: 'muted' }, `Created on ${node}. It is shown only once.`),
       h('div', { class: 'secret' }, h('code', { class: 'mono wrap-any' }, token.token),
         iconButton('copy', 'Copy token', () => copyText(token.token, 'Token copied')))),
     actions: [button('Done', { kind: 'primary', onClick: () => modal.close() })],
@@ -192,7 +194,8 @@ function tokensPanel(node) {
     try {
       const token = await withBusy(create, () => nodeApi(node).post('/tokens', { name: nameIn.value.trim() }));
       nameIn.value = '';
-      showNewToken(token);
+      toast(`Token created on ${node}`, 'success');
+      showNewToken(token, node);
       reload();
     } catch (ex) {
       toast(formatError(ex), 'error');
@@ -219,11 +222,11 @@ function tokensPanel(node) {
         label: '',
         align: 'right',
         render: (t) => iconButton('trash', 'Revoke token ' + t.name, async () => {
-          const ok = await confirmDialog({ title: 'Revoke token', message: `Revoke ${t.name}? Anything using it stops working immediately.`, confirmLabel: 'Revoke', danger: true });
+          const ok = await confirmDialog({ title: 'Revoke token', message: `Revoke ${t.name} on ${node}? Anything using it stops working immediately.`, confirmLabel: 'Revoke', danger: true });
           if (!ok) return;
           try {
             await nodeApi(node).del('/tokens/' + encodeURIComponent(t.id));
-            toast('Token revoked', 'success');
+            toast(`Token revoked on ${node}`, 'success');
             again();
           } catch (ex) {
             toast(formatError(ex), 'error');
@@ -232,7 +235,7 @@ function tokensPanel(node) {
       },
     ],
     rows: tokens,
-    empty: emptyState({ iconName: 'key', title: 'No API tokens', text: 'Create a long-lived token for scripts and CI pipelines.' }),
+    empty: emptyState({ iconName: 'key', title: 'No API tokens' }),
   })));
   return h('div', { class: 'stack' }, createCard, card({ title: 'Tokens', flush: true, body }));
 }
@@ -242,7 +245,7 @@ function restrictedTokens(createCard) {
   return emptyState({
     iconName: 'key',
     title: 'Tokens are managed on the node',
-    text: 'This console signs in to the node with an API token, and the connector does not let an API token create or revoke tokens. Sign in to the node itself to manage them.',
+    text: 'This console uses an API token, which cannot manage tokens. Sign in to the node itself.',
   });
 }
 
@@ -256,7 +259,7 @@ function auditPanel(node) {
       { label: 'Detail', render: (r) => r.detail },
     ],
     rows,
-    empty: emptyState({ iconName: 'file', title: 'Audit log is empty', text: 'Changes made through the API are recorded here.' }),
+    empty: emptyState({ iconName: 'file', title: 'Audit log is empty' }),
   }), { skeleton: () => skeletonRows(8) });
   return card({ title: 'Audit log', subtitle: 'Most recent 200 entries', flush: true, body });
 }
@@ -283,7 +286,7 @@ function haproxyPanel(node) {
   reloadBtn.addEventListener('click', async () => {
     try {
       const res = await withBusy(reloadBtn, () => n.post('/haproxy/reload'));
-      toast(res && res.ok === false ? 'Reload reported a problem' : 'HAProxy reloaded', res && res.ok === false ? 'error' : 'success');
+      toast(res && res.ok === false ? `Reload reported a problem on ${node}` : `HAProxy reloaded on ${node}`, res && res.ok === false ? 'error' : 'success');
       reload();
     } catch (ex) {
       toast(formatError(ex), 'error');
@@ -320,7 +323,7 @@ function haproxyPanel(node) {
             { label: 'Out', align: 'right', render: (b) => h('span', { class: 'mono muted' }, fmtBytes(b.bytes_out)) },
           ],
           rows: backends,
-          empty: emptyState({ iconName: 'terminal', title: 'No backends reported', text: 'Backends appear once a site exists and HAProxy is running.' }),
+          empty: emptyState({ iconName: 'terminal', title: 'No backends reported' }),
         }),
       }));
   });
@@ -335,10 +338,10 @@ function dashboardPanel(ctx) {
     onChange: setTheme,
   });
   return h('div', { class: 'stack' },
-    card({ title: 'Appearance', body: h('div', { class: 'form' }, field('Theme', theme, 'System follows your operating system setting.', { group: true })) }),
+    card({ title: 'Appearance', body: h('div', { class: 'form' }, field('Theme', theme, null, { group: true })) }),
     card({
       title: 'Session',
-      body: h('div', { class: 'danger-row' }, h('div', {}, h('b', {}, 'Signed in as ' + (state.user || 'admin')), h('p', { class: 'muted' }, 'Signing out ends this browser session only.')),
+      body: h('div', { class: 'danger-row' }, h('div', {}, h('b', {}, 'Signed in as ' + (state.user || 'admin'))),
         button('Sign out', { iconName: 'logout', onClick: ctx.signOut })),
     }));
 }
@@ -349,45 +352,64 @@ export function settingsView(ctx) {
   const allTabs = [...TABS.slice(0, 5), ALERTS_TAB, ...TABS.slice(5)];
   const tab = allTabs.some((t) => t.id === ctx.params[0]) ? ctx.params[0] : 'retention';
   ctx.setCrumbs([{ label: 'Settings' }, { label: allTabs.find((t) => t.id === tab).label }]);
-  const node = currentNode();
+  let node = scopeFor('settings', state);
   const perNode = tab !== 'dashboard';
   const holder = h('div', { class: 'tab-panel' });
   const tabsNav = h('div', {}, routeTabs(TABS, tab, (t) => '#/settings/' + t));
-  ctx.root.append(...[
-    pageHeader({ title: 'Settings', subtitle: perNode && node ? 'Configuration of ' + node : 'Console preferences' }),
-    tabsNav,
-    perNode ? nodeNotice(node) : null,
-    holder,
-  ].filter(Boolean));
-  // The Alerts tab appears only for a node that lists the feature
-  const alertsOk = node ? nodeInfoCached(node, () => nodeApi(node).get('/node')).then((info) => hasFeature(info, 'alerts'), () => false) : Promise.resolve(false);
-  alertsOk.then((ok) => {
-    if (ok) tabsNav.replaceChildren(routeTabs(allTabs, tab, (t) => '#/settings/' + t));
-  });
-  if (tab === 'alerts' && node) {
-    holder.appendChild(skeletonBlock(120));
+  const scope = perNode && state.nodes.length
+    ? nodeScopeBar({
+      nodes: state.nodes,
+      selected: node,
+      onChange: (name) => {
+        node = name;
+        rememberScope('settings', state, name);
+        mount();
+      },
+    })
+    : null;
+  ctx.root.append(...[pageHeader({ title: 'Settings' }), scope, tabsNav, holder].filter(Boolean));
+
+  // A newer choice of node makes an older answer about alerts support stale
+  let mounted = 0;
+  function mount() {
+    mounted += 1;
+    const ticket = mounted;
+    const target = node;
+    holder.replaceChildren();
+    if (!perNode) {
+      holder.appendChild(dashboardPanel(ctx));
+      return;
+    }
+    if (!target) {
+      tabsNav.replaceChildren(routeTabs(TABS, tab, (t) => '#/settings/' + t));
+      holder.appendChild(state.nodes.length ? chooseNodeNotice() : noNodes());
+      return;
+    }
+    // The Alerts tab appears only for a node that lists the feature
+    const alertsOk = nodeInfoCached(target, () => nodeApi(target).get('/node')).then((info) => hasFeature(info, 'alerts'), () => false);
+    tabsNav.replaceChildren(routeTabs(TABS, tab, (t) => '#/settings/' + t));
     alertsOk.then((ok) => {
-      holder.replaceChildren(ok
-        ? alertsPanel(node)
-        : emptyState({ iconName: 'alert', title: 'Alerts are not available on this node', text: 'Update the connector to configure alerts.' }));
+      if (ticket === mounted && ok) tabsNav.replaceChildren(routeTabs(allTabs, tab, (t) => '#/settings/' + t));
     });
-    return;
+    if (tab === 'alerts') {
+      holder.appendChild(skeletonBlock(120));
+      alertsOk.then((ok) => {
+        if (ticket !== mounted) return;
+        holder.replaceChildren(ok
+          ? alertsPanel(target)
+          : emptyState({ iconName: 'alert', title: 'Alerts are not available on this node', text: 'Update the connector to configure alerts.' }));
+      });
+      return;
+    }
+    switch (tab) {
+      case 'limits': holder.appendChild(limitsPanel(target)); break;
+      case 'certificates': holder.appendChild(certificatesPanel(target)); break;
+      case 'cloudflare': holder.appendChild(cloudflarePanel(target)); break;
+      case 'tokens': holder.appendChild(tokensPanel(target)); break;
+      case 'audit': holder.appendChild(auditPanel(target)); break;
+      case 'haproxy': holder.appendChild(haproxyPanel(target)); break;
+      default: holder.appendChild(retentionPanel(target));
+    }
   }
-  if (!perNode) {
-    holder.appendChild(dashboardPanel(ctx));
-    return;
-  }
-  if (!node) {
-    holder.appendChild(noNodes());
-    return;
-  }
-  switch (tab) {
-    case 'limits': holder.appendChild(limitsPanel(node)); break;
-    case 'certificates': holder.appendChild(certificatesPanel(node)); break;
-    case 'cloudflare': holder.appendChild(cloudflarePanel(node)); break;
-    case 'tokens': holder.appendChild(tokensPanel(node)); break;
-    case 'audit': holder.appendChild(auditPanel(node)); break;
-    case 'haproxy': holder.appendChild(haproxyPanel(node)); break;
-    default: holder.appendChild(retentionPanel(node));
-  }
+  mount();
 }

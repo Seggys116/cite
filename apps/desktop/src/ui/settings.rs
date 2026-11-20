@@ -2,17 +2,19 @@ use cite_client::TokenMeta;
 use cite_edge::model::EdgeSettings;
 use gpui::{AnyElement, ClipboardItem, Context, Div, Entity, FontWeight, div, prelude::*, px};
 
+use crate::api::NodeHandle;
 use crate::app::{Confirm, Console, Load, new_input};
 use crate::archive::retention_warning;
 use crate::certs::ensure_same_node;
 use crate::config::KEYCHAIN_SERVICE;
 use crate::demo::now_ms;
 use crate::model::{SettingsDraft, parse_rfc3339_ms, rel_time};
-use crate::scope::{TokenShelf, foreign_notice};
+use crate::scope::TokenShelf;
 use crate::theme::{CARD_RADIUS, DIM, DIVIDER, MONO, SURFACE, TEXT, Tone, c, chip_stroke};
 use crate::ui::chart::{FIELD_MIN, clip_tip, wide};
 use crate::ui::input::TextInput;
 use crate::ui::nodes::hostname;
+use crate::ui::nodescope::{NodeScope, choose_node_notice, failed_on, no_node_notice};
 use crate::ui::widgets::{
     BtnKind, Col, btn, card, empty_state, field, grid_min, id, mono, notice, page_header, seg_item,
     seg_row, skeleton, strong, tab_bar, tab_item, table, text_dim, toggle,
@@ -66,6 +68,8 @@ pub struct State {
     pub data: Load<Data>,
     // The node the loaded data came from; saves are refused for any other node.
     pub data_node: String,
+    // The node every tab that needs one writes to; certificates, alerts and tokens follow it too.
+    pub scope: NodeScope,
     pub error: Option<String>,
     pub store_ua: bool,
     pub store_ip: bool,
@@ -88,6 +92,7 @@ impl State {
             tab: Tab::default(),
             data: Load::Idle,
             data_node: String::new(),
+            scope: NodeScope::default(),
             error: None,
             store_ua: true,
             store_ip: true,
@@ -106,9 +111,44 @@ impl State {
 }
 
 impl Console {
+    // The node the Settings tabs act on, and its connection when it is reachable.
+    pub(crate) fn settings_node(&self) -> Option<String> {
+        self.scoped_node(&self.settings.scope)
+    }
+
+    pub(crate) fn settings_handle(&self) -> Option<NodeHandle> {
+        self.scoped_handle(&self.settings.scope)
+    }
+
+    // Picking a node on the bar drops everything loaded for the old one and loads the new one.
+    fn choose_settings_node(&mut self, name: String, cx: &mut Context<Self>) {
+        if self.settings_node().as_deref() == Some(name.as_str()) {
+            return;
+        }
+        let selected = self.selected.clone();
+        self.settings.scope.choose(&name, selected.as_deref());
+        self.close_panel(cx);
+        self.settings.data = Load::Idle;
+        self.settings.data_node.clear();
+        self.settings.error = None;
+        self.certs.note = None;
+        self.certs.ranges_note = None;
+        self.certs.list = Load::Idle;
+        self.certs.ranges = Load::Idle;
+        self.certs.unsupported = false;
+        self.certs.ranges_unsupported = false;
+        self.certs
+            .ranges_input
+            .update(cx, |input, cx| input.set_text("", cx));
+        self.certtools_reset(cx);
+        self.alerts_reset(cx);
+        self.scope.advance();
+        self.load_settings(cx);
+    }
+
     pub fn load_settings(&mut self, cx: &mut Context<Self>) {
         self.settings.data = Load::Loading;
-        let Some(h) = self.active_handle() else {
+        let Some(h) = self.settings_handle() else {
             self.settings.data = Load::Idle;
             return;
         };
@@ -168,21 +208,24 @@ impl Console {
 
     // The draft is applied over the loaded settings and validated before sending.
     fn save_settings(&mut self, cx: &mut Context<Self>) {
-        let (Some(h), Some(data)) = (self.active_handle(), self.settings.data.ready()) else {
+        let (Some(h), Some(data)) = (self.settings_handle(), self.settings.data.ready()) else {
             return;
         };
-        if let Err(msg) = ensure_same_node(&self.settings.data_node, self.active_name().as_deref())
-        {
+        let node = h.name().to_string();
+        if let Err(msg) = ensure_same_node(&self.settings.data_node, Some(&node)) {
             self.settings.error = Some(msg);
             return;
         }
         match self.current_draft(cx).apply(&data.settings) {
             Ok(next) => {
                 self.settings.error = None;
-                self.mutate(
+                self.mutate_on(
                     cx,
+                    &node,
+                    Self::settings_node,
                     async move { h.put_settings(&next).await },
-                    "Settings saved".into(),
+                    "Settings saved",
+                    "Saving settings",
                 );
             }
             Err(e) => self.settings.error = Some(e),
@@ -191,7 +234,7 @@ impl Console {
 
     // The token value is kept in memory only until the user dismisses the notice.
     fn create_token(&mut self, cx: &mut Context<Self>) {
-        let Some(h) = self.active_handle() else {
+        let Some(h) = self.settings_handle() else {
             return;
         };
         let name = self.settings.token_name.read(cx).text().trim().to_string();
@@ -204,10 +247,13 @@ impl Console {
             .token_name
             .update(cx, |i, cx| i.set_text("", cx));
         let node = h.name().to_string();
-        self.fetch_origin(
+        let target = node.clone();
+        self.fetch_on(
             cx,
+            &target,
+            Self::settings_node,
             async move { h.create_token(&name).await },
-            move |this, res, here, origin, cx| {
+            move |this, res, here, cx| {
                 match res {
                     Ok(created) => {
                         this.settings.created.put(&node, created.token);
@@ -222,9 +268,8 @@ impl Console {
                             );
                         }
                     }
-                    Err(e) if here => this.say(e.to_string(), Tone::Bad),
                     Err(e) => this.say(
-                        foreign_notice("Create token", origin, &e.to_string()),
+                        failed_on("Creating the token", &node, &e.to_string()),
                         Tone::Bad,
                     ),
                 }
@@ -234,11 +279,11 @@ impl Console {
     }
 
     pub fn render_settings(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let subtitle = match self.active_name() {
-            Some(n) => format!("Configuration of {n}"),
-            None => "Console preferences".into(),
-        };
         let tab = self.settings.tab;
+        let subtitle = match self.settings_node() {
+            Some(n) if tab.needs_node() => format!("Configuration of {n}"),
+            _ => "Console preferences".into(),
+        };
         let mut strip = Vec::new();
         for t in Tab::ALL {
             strip.push(
@@ -250,11 +295,25 @@ impl Console {
                     .into_any_element(),
             );
         }
+        let bar = if tab.needs_node() {
+            self.scope_bar_for(
+                "set-node",
+                &self.settings.scope,
+                Self::choose_settings_node,
+                cx,
+            )
+        } else {
+            None
+        };
         let col = div()
             .flex()
             .flex_col()
             .gap(px(SPACE))
-            .child(page_header("Settings", &subtitle, Vec::new()))
+            .child(page_header(
+                "Settings",
+                &subtitle,
+                bar.into_iter().collect(),
+            ))
             .child(tab_bar(strip));
         let body = self.settings_tab_body(tab, cx);
         col.child(body).into_any_element()
@@ -273,7 +332,13 @@ impl Console {
         if self.handles.is_empty() {
             return col.child(self.no_nodes_block(cx)).into_any_element();
         }
-        col = col.children(self.scope_note());
+        // No loads, polling or cards until a node is chosen; the bar in the header does that.
+        let Some(node) = self.settings_node() else {
+            return col.child(choose_node_notice()).into_any_element();
+        };
+        if self.settings_handle().is_none() {
+            return col.child(no_node_notice(Some(&node))).into_any_element();
+        }
         match &self.settings.data {
             Load::Idle | Load::Loading => {
                 return col
@@ -345,11 +410,7 @@ impl Console {
                 None,
                 value("version", env!("CARGO_PKG_VERSION").to_string()),
             ),
-            form_row(
-                "Appearance",
-                Some("The console follows a single dark theme."),
-                value("theme", "Dark".to_string()),
-            ),
+            form_row("Appearance", None, value("theme", "Dark".to_string())),
         ]);
         div()
             .flex()
@@ -402,7 +463,7 @@ impl Console {
         }
         let mut history_rows = vec![form_row(
             "Keep data",
-            Some("Hourly history is kept forever unless you choose a limit."),
+            Some("Hourly history."),
             seg_row(keep).into_any_element(),
         )];
         if !s.keep_forever {
@@ -423,7 +484,7 @@ impl Console {
             "archive",
             s.archive_before_delete,
             "Archive before deleting",
-            "Saves a copy of old data before it is removed.",
+            "Saves a copy of old data first.",
             |c| &mut c.settings.archive_before_delete,
             cx,
         ));
@@ -457,7 +518,7 @@ impl Console {
                 "ua",
                 ua,
                 "Store user agents",
-                "Needed for bot detection detail and the agent lists.",
+                "Needed for bot detection detail and agent lists.",
                 |c| &mut c.settings.store_ua,
                 cx,
             ),
@@ -465,7 +526,7 @@ impl Console {
                 "ip",
                 ip,
                 "Store client IPs",
-                "Needed for the client lists and IP filters.",
+                "Needed for client lists and IP filters.",
                 |c| &mut c.settings.store_ip,
                 cx,
             ),
@@ -501,47 +562,42 @@ impl Console {
                     ),
                 ),
         );
-        div()
-            .flex()
-            .flex_col()
-            .gap(px(GAP))
-            .child(
-                text_dim(
-                    "History is kept forever by default. Choose a limit only if old data may be removed, and keep archiving on to save a copy first.",
-                )
-                .text_size(px(12.)),
-            )
-            .child(body)
-            .into_any_element()
+        body.into_any_element()
     }
 
     // A created token is displayed once with a copy button, as the node never shows it again.
     fn tokens_card(&self, data: &Data, cx: &mut Context<Self>) -> AnyElement {
+        let active = self.settings_node().unwrap_or_default();
         let rows: Vec<Vec<AnyElement>> = data
             .tokens
             .iter()
             .map(|t| {
-                let (tid, name) = (t.id.clone(), t.name.clone());
+                let (tid, name, node) = (t.id.clone(), t.name.clone(), active.clone());
                 let revoke = btn(id("tok-del", &t.id), "Revoke", BtnKind::Danger).on_click(
                     cx.listener(move |this, _, _, cx| {
-                        let (tid, label) = (tid.clone(), name.clone());
+                        let (tid, label, node) = (tid.clone(), name.clone(), node.clone());
                         this.ask(Confirm {
-                            title: "Revoke token".into(),
-                            message: format!(
-                                "Revoke {label}? Anything using it stops working immediately."
-                            ),
-                            label: "Revoke".into(),
-                            danger: true,
-                            action: Box::new(move |this, cx| {
-                                if let Some(h) = this.active_handle() {
-                                    this.mutate(
-                                        cx,
-                                        async move { h.delete_token(&tid).await },
-                                        format!("Token {label} revoked"),
-                                    );
-                                }
-                            }),
-                        });
+                        title: "Revoke token".into(),
+                        message: format!(
+                            "Revoke {label} on {node}? Anything using it stops working immediately."
+                        ),
+                        label: "Revoke".into(),
+                        danger: true,
+                        action: Box::new(move |this, cx| {
+                            let Some(h) = this.handle_named(&node) else {
+                                this.say(format!("{node} is not connected."), Tone::Bad);
+                                return;
+                            };
+                            this.mutate_on(
+                                cx,
+                                &node,
+                                Self::settings_node,
+                                async move { h.delete_token(&tid).await },
+                                &format!("Token {label} revoked"),
+                                "Revoking the token",
+                            );
+                        }),
+                    });
                         cx.notify();
                     }),
                 );
@@ -564,7 +620,6 @@ impl Console {
             Col::fixed("", 90.),
         ];
         let mut body = div().flex().flex_col().gap(px(12.));
-        let active = self.active_name().unwrap_or_default();
         let shown = self.settings.created.for_node(&active).map(str::to_string);
         if let Some(token) = shown {
             let (copy_node, done_node) = (active.clone(), active.clone());
@@ -584,9 +639,9 @@ impl Console {
                             .flex_col()
                             .flex_1()
                             .min_w_0()
-                            .child(strong("Copy your new token"))
+                            .child(strong(format!("Copy your new token for {active}")))
                             .child(
-                                text_dim("It is shown once and cannot be retrieved later.")
+                                text_dim("Shown once; it cannot be retrieved later.")
                                     .text_size(px(12.)),
                             )
                             .child(
@@ -656,19 +711,14 @@ impl Console {
                     rows,
                     Some(empty_state(
                         "No API tokens",
-                        "Create a long-lived token for scripts and CI pipelines.",
+                        "Create one for scripts and CI.",
                     )),
                 ),
             ));
         if let Some(err) = &self.settings.error {
             body = body.child(notice(err, Tone::Bad));
         }
-        card(
-            Some("API tokens"),
-            Some("Long-lived tokens for scripts and CI pipelines on this node."),
-            body,
-        )
-        .into_any_element()
+        card(Some("API tokens"), None, body).into_any_element()
     }
 }
 

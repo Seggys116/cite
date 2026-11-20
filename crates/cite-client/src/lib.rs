@@ -5,6 +5,7 @@ pub mod archive;
 pub mod certificate;
 pub mod client;
 pub mod config;
+pub mod data;
 pub mod doppler;
 pub mod error;
 pub mod export;
@@ -13,6 +14,7 @@ pub mod fleet;
 pub mod fsio;
 pub mod site_ops;
 pub mod tokens;
+pub mod transfer;
 pub mod zone;
 
 pub use analytics::{
@@ -31,12 +33,18 @@ pub use certificate::{
 };
 pub use cite_edge::model::{OutboundMode, OutboundRules, Volume};
 pub use client::{
-    AuditEntry, CreatedToken, DeployRequest, Forwarded, GithubInfo, LoginResponse, NodeClient,
-    NodeInfo, PresetInfo, ReloadResult, RequestQuery, SiteDetail, TokenMeta, VolumeInfo,
+    AuditEntry, CLIENT_HEADER, CLIENT_VERSION, CreatedToken, DeployRequest, Forwarded, GithubInfo,
+    LoginResponse, NodeClient, NodeInfo, PresetInfo, ReloadResult, RequestQuery, SiteDetail,
+    TokenMeta, VolumeInfo,
 };
 pub use config::{
     CONFIG_VERSION, ConfigFile, DEFAULT_LISTEN, DashboardConfig, MAX_NODES, NodeConfig,
     is_loopback_host, parse_node_url,
+};
+pub use data::{
+    BACKUP_SHA256_HEADER, BackupStream, LinksOutcome, backup_download_name,
+    instance_backup_download_name, validate_backup_id, validate_data_name, validate_database_ref,
+    validate_pg_name, validate_target_id,
 };
 pub use doppler::{
     DOPPLER_SERVICE_TOKEN_PREFIX, DopplerBindRequest, DopplerBinding, DopplerConfig, DopplerInfo,
@@ -58,4 +66,8 @@ pub use site_ops::{
     TokenStatus, validate_env_name, validate_job_id,
 };
 pub use tokens::{JsonTokenStore, MemoryTokenStore, TokenStore};
+pub use transfer::{
+    CHUNK_SHA256_HEADER, CancelFlag, CountDiff, ExportChunk, MemoryTransferStore, TransferEnv,
+    TransferError, TransferPhase, TransferPlan, TransferState, TransferStore, compare_counts,
+};
 pub use zone::{ZoneSecret, ZoneSecretStatus, validate_site_id};

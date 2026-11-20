@@ -11,9 +11,10 @@ use crate::alertcfg::{
 use crate::app::{Console, new_input};
 use crate::bots::is_unsupported;
 use crate::certs::ensure_same_node;
-use crate::scope::{Sequence, foreign_notice};
+use crate::scope::Sequence;
 use crate::theme::{BORDER, ROW_RADIUS, Tone, c};
 use crate::ui::input::TextInput;
+use crate::ui::nodescope::{failed_on, on_node};
 use crate::ui::widgets::{
     BtnKind, btn, btn_off, card, checkbox, field, id, notice, pill, section_title, seg_item,
     seg_row, skeleton, strong, text_dim, toggle,
@@ -227,7 +228,7 @@ impl Console {
     }
 
     fn load_alerts(&mut self, cx: &mut Context<Self>) {
-        let Some(h) = self.active_handle() else {
+        let Some(h) = self.settings_handle() else {
             return;
         };
         self.alerts.requested = true;
@@ -238,7 +239,7 @@ impl Console {
             cx,
             async move { h.tools_alerts_load().await },
             move |this, res, cx| {
-                if this.active_name().as_deref() != Some(node.as_str())
+                if this.settings_node().as_deref() != Some(node.as_str())
                     || !this.alerts.seq.accept(seq)
                 {
                     return;
@@ -297,6 +298,7 @@ impl Console {
     fn run_alert_op<T, F>(
         &mut self,
         cx: &mut Context<Self>,
+        node: &str,
         busy: Busy,
         noun: String,
         fut: F,
@@ -310,28 +312,35 @@ impl Console {
         }
         self.alerts.busy = Some(busy);
         self.alerts.note = None;
-        self.fetch_origin(cx, fut, move |this, res, here, origin, cx| {
-            this.alerts.busy = None;
-            match (res, here) {
-                (Ok(v), true) => done(this, v, cx),
-                (Err(e), true) => this.al_note(op_error(&e), Tone::Bad),
-                (Ok(_), false) => {
-                    this.alerts.requested = false;
-                    this.say(foreign_notice(&noun, origin, "done"), Tone::Ok);
+        let name = node.to_string();
+        self.fetch_on(
+            cx,
+            node,
+            Self::settings_node,
+            fut,
+            move |this, res, here, cx| {
+                this.alerts.busy = None;
+                match (res, here) {
+                    (Ok(v), true) => done(this, v, cx),
+                    (Err(e), true) => {
+                        this.al_note(failed_on(&noun, &name, &op_error(&e)), Tone::Bad)
+                    }
+                    (Ok(_), false) => {
+                        this.alerts.requested = false;
+                        this.say(on_node(&format!("{noun} finished"), &name), Tone::Ok);
+                    }
+                    (Err(e), false) => this.say(failed_on(&noun, &name, &op_error(&e)), Tone::Bad),
                 }
-                (Err(e), false) => {
-                    this.say(foreign_notice(&noun, origin, &op_error(&e)), Tone::Bad)
-                }
-            }
-            cx.notify();
-        });
+                cx.notify();
+            },
+        );
     }
 
     fn form_still_here(&mut self) -> bool {
         let Some(form) = self.alerts.form.as_ref() else {
             return false;
         };
-        match ensure_same_node(&form.node, self.active_name().as_deref()) {
+        match ensure_same_node(&form.node, self.settings_node().as_deref()) {
             Ok(()) => true,
             Err(msg) => {
                 self.al_note(msg, Tone::Bad);
@@ -344,7 +353,7 @@ impl Console {
         if self.alerts.busy.is_some() {
             return;
         }
-        let Some(h) = self.active_handle() else {
+        let Some(h) = self.settings_handle() else {
             return;
         };
         if !self.form_still_here() {
@@ -362,14 +371,16 @@ impl Console {
         };
         drop(draft);
         let node = h.name().to_string();
+        let target = node.clone();
         self.run_alert_op(
             cx,
+            &target,
             Busy::Saving,
             "Saving alert settings".into(),
             async move { h.tools_alerts_save(request).await },
             move |this, cfg, cx| {
                 this.apply_alerts(&cfg, &node, cx);
-                this.al_note("Alert settings saved.", Tone::Ok);
+                this.al_note(on_node("Alert settings saved.", &node), Tone::Ok);
             },
         );
     }
@@ -379,7 +390,7 @@ impl Console {
         if self.alerts.busy.is_some() {
             return;
         }
-        let Some(h) = self.active_handle() else {
+        let Some(h) = self.settings_handle() else {
             return;
         };
         if !self.form_still_here() {
@@ -387,14 +398,17 @@ impl Console {
         }
         let noun = format!("Alert test to {label}");
         let busy = Busy::Testing(label.clone());
+        let node = h.name().to_string();
+        let target_node = node.clone();
         self.run_alert_op(
             cx,
+            &target_node,
             busy,
             noun,
             async move { h.tools_alerts_test(&target).await },
             move |this, result, _| {
                 let (text, tone) = test_note(&label, &result);
-                this.al_note(text, tone);
+                this.al_note(format!("{node}: {text}"), tone);
             },
         );
     }
@@ -465,18 +479,14 @@ impl Console {
     }
 
     pub(crate) fn alerts_card(&mut self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        if !self.alerts.requested && self.active_handle().is_some() {
+        if !self.alerts.requested && self.settings_handle().is_some() {
             self.load_alerts(cx);
         }
-        let subtitle = format!(
-            "Webhook and email messages {} sends when something needs attention",
-            self.active_name().unwrap_or_default()
-        );
         let s = &self.alerts;
         if s.unsupported {
             return card(
                 Some("Alerts"),
-                Some(subtitle.as_str()),
+                None,
                 div()
                     .flex()
                     .items_center()
@@ -509,7 +519,7 @@ impl Console {
                         .child(notice(err, Tone::Bad)),
                 )
                 .child(retry);
-            return card(Some("Alerts"), Some(subtitle.as_str()), body).into_any_element();
+            return card(Some("Alerts"), None, body).into_any_element();
         }
         let Some(form) = &s.form else {
             return skeleton(160.).into_any_element();
@@ -540,9 +550,7 @@ impl Console {
                 .max_w(px(260.))
                 .child(field(
                     "Cooldown (seconds)",
-                    Some(
-                        "How long to wait before the same alert is sent again. 900 is 15 minutes.",
-                    ),
+                    Some("Wait before the same alert repeats; 900 is 15 minutes."),
                     form.cooldown.clone(),
                 )),
         );
@@ -621,7 +629,7 @@ impl Console {
         if let Some((text, tone)) = &s.note {
             body = body.child(notice(text, *tone));
         }
-        card(Some("Alerts"), Some(subtitle.as_str()), body).into_any_element()
+        card(Some("Alerts"), None, body).into_any_element()
     }
 
     fn panel_shell() -> gpui::Div {
@@ -704,13 +712,10 @@ impl Console {
         }
         let url_hint = match &row.id {
             Some(_) => format!(
-                "Stored as {}. Leave blank to keep it, or paste a new address to replace it.",
+                "Stored as {}. Leave blank to keep it.",
                 display_url(&row.stored_url)
             ),
-            None => {
-                "Where Cite posts the message. Must start with https://. It is hidden once saved."
-                    .to_string()
-            }
+            None => "Must start with https://.".to_string(),
         };
         let mut actions = div().flex().gap(px(8.));
         if let (Some(stored), true) = (&row.id, idle) {
@@ -744,11 +749,7 @@ impl Console {
                     .max_w(px(420.))
                     .child(field("Name", None, row.name.clone())),
             )
-            .child(field(
-                "Type",
-                Some("Discord and Slack get a message in their own format."),
-                div().flex().child(seg_row(kinds)),
-            ))
+            .child(field("Type", None, div().flex().child(seg_row(kinds))))
             .child(field(
                 "Webhook address",
                 Some(url_hint.as_str()),
@@ -787,9 +788,9 @@ impl Console {
             default_port(mail.tls)
         );
         let password_hint = if mail.password_set {
-            "A password is stored on the node. Leave blank to keep it, or type a new one to replace it."
+            "Stored on the node. Leave blank to keep it."
         } else {
-            "Hidden here and sent once. The node never shows it again."
+            "Sent once; the node never shows it again."
         };
         let mut actions = div().flex().gap(px(8.));
         if idle && mail.stored {
@@ -814,11 +815,7 @@ impl Console {
         });
         Self::panel_shell()
             .child(strong("Email"))
-            .child(field(
-                "Mail server",
-                Some("The SMTP host that sends the message."),
-                mail.host.clone(),
-            ))
+            .child(field("Mail server", None, mail.host.clone()))
             .child(
                 div()
                     .flex()

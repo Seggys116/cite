@@ -123,6 +123,169 @@ pub fn egress_rules(v: &str) -> bool {
     egress_list(v, |e| egress_cidr(e) || egress_host(e))
 }
 
+/// A strict IPv4 address or an IPv6 address, written without a prefix.
+pub fn ip_literal(v: &str) -> bool {
+    !v.contains('/') && egress_cidr(v)
+}
+
+fn plain_port(p: &str) -> Option<u16> {
+    let shaped = (1..=5).contains(&p.len())
+        && p.bytes().all(|b| b.is_ascii_digit())
+        && !(p.len() > 1 && p.starts_with('0'));
+    if shaped {
+        p.parse::<u16>().ok().filter(|n| *n != 0)
+    } else {
+        None
+    }
+}
+
+const FORWARD_PORTS: std::ops::RangeInclusive<u16> = 15432..=15439;
+const MAX_FORWARDS: usize = 8;
+const MAX_AUTO_ALLOW: usize = 16;
+
+/// Exactly what the egress proxy's CITE_EGRESS_FORWARDS parser accepts, written the way the connector writes it:
+/// `<listen>=<host>:<port>` entries, listen 15432..=15439 and unique, host a lowercase name, strict IPv4 or `[v6]`.
+pub fn egress_forwards(v: &str) -> bool {
+    let entries: Vec<&str> = v.split(',').collect();
+    if v.is_empty() || entries.len() > MAX_FORWARDS {
+        return false;
+    }
+    let mut listens: Vec<u16> = Vec::new();
+    let mut targets: Vec<String> = Vec::new();
+    for entry in entries {
+        let Some((listen, target)) = entry.split_once('=') else {
+            return false;
+        };
+        let Some(listen) = plain_port(listen).filter(|p| FORWARD_PORTS.contains(p)) else {
+            return false;
+        };
+        // The destination is compared in canonical form so two spellings of one IPv6 address still collide.
+        let (key, port) = if let Some(rest) = target.strip_prefix('[') {
+            let Some((inner, port)) = rest.split_once("]:") else {
+                return false;
+            };
+            let Ok(addr) = inner.parse::<std::net::Ipv6Addr>() else {
+                return false;
+            };
+            if !ip_literal(inner) {
+                return false;
+            }
+            (format!("[{addr}]"), port)
+        } else {
+            let Some((host, port)) = target.rsplit_once(':') else {
+                return false;
+            };
+            if !(strict_v4(host) || (!host.starts_with('.') && egress_host(host))) {
+                return false;
+            }
+            (host.to_string(), port)
+        };
+        let Some(port) = plain_port(port) else {
+            return false;
+        };
+        let key = format!("{key}:{port}");
+        if listens.contains(&listen) || targets.contains(&key) {
+            return false;
+        }
+        listens.push(listen);
+        targets.push(key);
+    }
+    true
+}
+
+/// CITE_EGRESS_AUTO_ALLOW: 1 to 16 distinct exact host names (no leading dot, no IP literal).
+pub fn egress_hosts(v: &str) -> bool {
+    let count = v.split(',').count();
+    count <= MAX_AUTO_ALLOW && egress_list(v, |e| !e.starts_with('.') && egress_host(e))
+}
+
+// ---- Values of the Postgres data containers ----
+
+const MAX_PG_HBA: usize = 24 * 1024;
+const MAX_PG_HBA_ENTRIES: usize = 256;
+
+/// A lowercase `[a-z][a-z0-9]{0,15}` name, the shape of database and user names.
+pub fn pg_name(v: &str) -> bool {
+    let b = v.as_bytes();
+    (1..=16).contains(&b.len())
+        && b[0].is_ascii_lowercase()
+        && b.iter()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+}
+
+/// `t<10 hex>_<db>`: the role and database prefix of one site database.
+pub fn role_tag(v: &str) -> bool {
+    let Some(rest) = v.strip_prefix('t') else {
+        return false;
+    };
+    let Some((tag, db)) = rest.split_once('_') else {
+        return false;
+    };
+    tag.len() == 10 && tag.bytes().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f')) && pg_name(db)
+}
+
+/// `<tag>_job`: the login a job inside the tenant database `<tag>` runs as (the connector's
+/// `orchestrator::data::job_login_role`). Every other role of the tag ends in a group name or `_a`/`_b`.
+pub fn job_login_role(tag: &str) -> String {
+    format!("{tag}_job")
+}
+
+/// A decimal number without sign, spaces or leading zeros inside the range.
+pub fn dec_in(v: &str, min: u32, max: u32) -> bool {
+    (1..=10).contains(&v.len())
+        && v.bytes().all(|b| b.is_ascii_digit())
+        && (v == "0" || !v.starts_with('0'))
+        && v.parse::<u32>().is_ok_and(|n| (min..=max).contains(&n))
+}
+
+/// Printable text of a bounded byte length: no control characters at all.
+pub fn printable(v: &str, max: usize) -> bool {
+    (1..=max).contains(&v.len()) && !v.chars().any(char::is_control)
+}
+
+/// A login name for an external database: plain identifier characters only.
+pub fn pg_ident(v: &str) -> bool {
+    (1..=63).contains(&v.len())
+        && v.bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.' | b'$'))
+}
+
+/// A generated database password: 43 URL-safe base64 characters.
+pub fn generated_password(v: &str) -> bool {
+    v.len() == 43
+        && v.bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-'))
+}
+
+// A network written with its prefix length, at least /8 for IPv4 and /48 for IPv6.
+fn hba_cidr(v: &str) -> bool {
+    let Some((ip, len)) = v.split_once('/') else {
+        return false;
+    };
+    let min = if strict_v4(ip) { 8 } else { 48 };
+    egress_cidr(v) && len.parse::<u8>().is_ok_and(|n| n >= min)
+}
+
+/// `;`-joined `<db>|<cidr>` entries for the shared instance's pg_hba.conf. The first entry may name the
+/// admin network with the database `_admin`; every other entry names a tenant database.
+pub fn pg_hba(v: &str) -> bool {
+    if v.is_empty() || v.len() > MAX_PG_HBA {
+        return false;
+    }
+    let entries: Vec<&str> = v.split(';').collect();
+    if entries.len() > MAX_PG_HBA_ENTRIES {
+        return false;
+    }
+    entries.iter().enumerate().all(|(i, entry)| {
+        let Some((db, cidr)) = entry.split_once('|') else {
+            return false;
+        };
+        (role_tag(db) || (i == 0 && db == "_admin"))
+            && hba_cidr(cidr)
+            && !entries[..i].contains(entry)
+    })
+}
+
 pub fn rel_path(v: &str) -> bool {
     !v.is_empty()
         && v.len() <= MAX_REL_PATH
@@ -697,5 +860,210 @@ mod tests {
         let over = of_size(MAX_BUILD_ENV_JSON + 1);
         assert_eq!(over.len(), MAX_BUILD_ENV_JSON + 1);
         assert!(!build_env_json(&over));
+    }
+
+    #[test]
+    fn egress_forwards_follow_the_egress_proxy_grammar() {
+        for ok in [
+            "15432=db.example.com:5432",
+            "15439=203.0.113.9:6543",
+            "15432=[2001:db8::5]:5432",
+            "15432=db.example.com:5432,15433=other.example.com:5432",
+            "15432=db.example.com:5432,15433=db.example.com:5433",
+            "15432=a_b.example:1",
+            "15432=localdb:65535",
+        ] {
+            assert!(egress_forwards(ok), "{ok}");
+        }
+        let eight: Vec<String> = (0..8)
+            .map(|i| format!("{}=h{i}.example:5432", 15432 + i))
+            .collect();
+        assert!(egress_forwards(&eight.join(",")));
+        for bad in [
+            "",
+            "15431=db.example.com:5432",
+            "15440=db.example.com:5432",
+            "5432=db.example.com:5432",
+            "015432=db.example.com:5432",
+            "15432=db.example.com",
+            "15432=db.example.com:0",
+            "15432=db.example.com:65536",
+            "15432=db.example.com:05432",
+            "15432=db.example.com:",
+            "15432=:5432",
+            "15432=.example.com:5432",
+            "15432=*.example.com:5432",
+            "15432=DB.example.com:5432",
+            "15432=db.example.com.:5432",
+            "15432=2001:db8::5:5432",
+            "15432=[2001:db8::5]",
+            "15432=[::ffff:1.2.3.4]:5432",
+            "15432=[2001:db8::5/64]:5432",
+            "15432=10.0.0:5432",
+            "15432=010.0.0.1:5432",
+            "15432=2130706433:5432",
+            "15432=db.example.com:5432,",
+            ",15432=db.example.com:5432",
+            "15432=db.example.com:5432, 15433=other.example.com:5432",
+            "15432=db.example.com:5432,15432=other.example.com:5432",
+            "15432=db.example.com:5432,15433=db.example.com:5432",
+            "15432=[2001:db8::5]:5432,15433=[2001:db8:0::5]:5432",
+            "15432=db.example.com:5432;15433=x.example:1",
+            "15432=user@db.example.com:5432",
+            "15432=db.example.com:5432/x",
+            " 15432=db.example.com:5432",
+        ] {
+            assert!(!egress_forwards(bad), "{bad:?}");
+        }
+        let nine: Vec<String> = (0..9)
+            .map(|i| format!("{}=h{i}.example:5432", 15432 + i))
+            .collect();
+        assert!(!egress_forwards(&nine.join(",")));
+    }
+
+    #[test]
+    fn egress_hosts_are_exact_distinct_names() {
+        for ok in [
+            "db.example.com",
+            "db.example.com,s3.example.com",
+            "a_b.example",
+        ] {
+            assert!(egress_hosts(ok), "{ok}");
+        }
+        let sixteen: Vec<String> = (0..16).map(|i| format!("h{i}.example")).collect();
+        assert!(egress_hosts(&sixteen.join(",")));
+        for bad in [
+            "",
+            ".example.com",
+            "*.example.com",
+            "DB.example.com",
+            "db.example.com.",
+            "203.0.113.9",
+            "[::1]",
+            "db.example.com,db.example.com",
+            "db.example.com, s3.example.com",
+            "db.example.com,",
+            "db.example.com:5432",
+        ] {
+            assert!(!egress_hosts(bad), "{bad:?}");
+        }
+        let seventeen: Vec<String> = (0..17).map(|i| format!("h{i}.example")).collect();
+        assert!(!egress_hosts(&seventeen.join(",")));
+    }
+
+    #[test]
+    fn the_job_login_is_the_tag_with_a_job_suffix_and_never_a_user_login() {
+        assert_eq!(job_login_role("t0123456789_app"), "t0123456789_app_job");
+        // A user login is <tag>_<user>_a|b, so no user name can produce the job login.
+        assert!(!job_login_role("t0123456789_app").ends_with("_a"));
+        assert!(!job_login_role("t0123456789_app").ends_with("_b"));
+    }
+
+    #[test]
+    fn role_tags_and_names_have_the_connector_shape() {
+        for ok in [
+            "t0123456789_app",
+            "tabcdef0123_a",
+            "t0123456789_abcdefghijklmnop",
+        ] {
+            assert!(role_tag(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            "t0123456789",
+            "t0123456789_",
+            "t0123456789_App",
+            "t0123456789_1app",
+            "t0123456789_app_owner",
+            "t0123456789_abcdefghijklmnopq",
+            "T0123456789_app",
+            "t012345678_app",
+            "t01234567890_app",
+            "t012345678g_app",
+            "t0123456789-app",
+            "t0123456789_app\n",
+            "0123456789_app",
+        ] {
+            assert!(!role_tag(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn pg_hba_entries_need_a_tenant_database_and_a_real_network() {
+        let t = "t0123456789_app";
+        assert!(pg_hba(&format!("{t}|172.20.0.0/16")));
+        assert!(pg_hba(&format!(
+            "_admin|172.19.0.0/16;{t}|172.20.0.0/16;{t}|172.21.0.0/16"
+        )));
+        assert!(pg_hba(&format!("{t}|fd00:1:2::/48")));
+        assert!(pg_hba(&format!("{t}|10.0.0.0/8")));
+        for bad in [
+            String::new(),
+            "_admin|172.19.0.0/16;_admin|172.20.0.0/16".to_string(),
+            format!("{t}|172.19.0.0/16;_admin|172.20.0.0/16"),
+            format!("{t}|172.20.0.0/7"),
+            format!("{t}|fd00::/47"),
+            format!("{t}|172.20.0.0"),
+            format!("{t}|172.20.0.0/016"),
+            format!("{t}|example.com/16"),
+            format!("{t}|::ffff:10.0.0.0/104"),
+            format!("{t}|172.20.0.0/16;{t}|172.20.0.0/16"),
+            format!("{t}|172.20.0.0/16;"),
+            format!("{t} |172.20.0.0/16"),
+            "all|172.20.0.0/16".to_string(),
+            format!("{t}|172.20.0.0/16\nhost all all 0.0.0.0/0 trust"),
+        ] {
+            assert!(!pg_hba(&bad), "{bad:?}");
+        }
+        let entry = |i: usize| format!("t{i:010x}_app|172.20.0.0/16");
+        let many = |n: usize| (0..n).map(entry).collect::<Vec<_>>().join(";");
+        assert!(pg_hba(&many(256)));
+        assert!(!pg_hba(&many(257)));
+    }
+
+    #[test]
+    fn data_job_values_are_bounded() {
+        assert!(dec_in("20", 1, 500) && dec_in("500", 1, 500) && dec_in("0", 0, 5));
+        for bad in [
+            "",
+            "0",
+            "501",
+            "020",
+            "+5",
+            "-1",
+            "1e2",
+            " 5",
+            "5 ",
+            "99999999999",
+        ] {
+            assert!(!dec_in(bad, 1, 500), "{bad:?}");
+        }
+        assert!(!dec_in("00", 0, 5));
+        assert!(printable("pass word \u{e9}!", 256));
+        assert!(!printable("", 256) && !printable("a\nb", 256) && !printable("a\0", 256));
+        assert!(!printable(&"x".repeat(257), 256));
+        assert!(pg_ident("report-user.1") && pg_ident("u$"));
+        for bad in ["", "a b", "a;b", "a'b", "a\"b", "caf\u{e9}"] {
+            assert!(!pg_ident(bad), "{bad:?}");
+        }
+        assert!(!pg_ident(&"a".repeat(64)));
+        assert!(generated_password(&"aB3_-".repeat(9)[..43]));
+        for bad in [
+            &"a".repeat(42),
+            &"a".repeat(44),
+            &format!("{}=", "a".repeat(42)),
+        ] {
+            assert!(!generated_password(bad), "{bad:?}");
+        }
+        assert!(ip_literal("203.0.113.9") && ip_literal("2001:db8::1"));
+        for bad in [
+            "203.0.113.0/24",
+            "010.1.1.1",
+            "db.example.com",
+            "[::1]",
+            "::ffff:1.2.3.4",
+        ] {
+            assert!(!ip_literal(bad), "{bad:?}");
+        }
     }
 }

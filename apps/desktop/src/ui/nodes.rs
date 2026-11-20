@@ -1,3 +1,5 @@
+use std::sync::OnceLock;
+
 use cite_client::NodeConfig;
 use gpui::{AnyElement, Context, Entity, div, prelude::*, px};
 
@@ -204,14 +206,8 @@ impl Console {
         let bar = div()
             .flex()
             .items_center()
-            .justify_between()
+            .justify_end()
             .gap(px(GAP))
-            .child(
-                text_dim("Connectors are stored in the config file; their tokens in the keychain.")
-                    .text_size(px(12.))
-                    .flex_1()
-                    .min_w_0(),
-            )
             .child(self.add_toggle("tab", cx));
         div()
             .flex()
@@ -317,20 +313,22 @@ impl Console {
                 .px(px(SPACE))
                 .child(strong("No nodes yet").text_size(px(16.)))
                 .child(
-                    text_dim(
-                        "A node is a Cite connector running on a server. Add one with its URL and an API token or your username, password and TOTP code.",
-                    )
-                    .text_size(px(12.))
-                    .max_w(px(460.))
-                    .text_center(),
+                    text_dim("Add a Cite connector by its URL and a token or a login.")
+                        .text_size(px(12.))
+                        .max_w(px(460.))
+                        .text_center(),
                 )
                 .child(
-                    btn(id("nodes-add", "empty"), "Add your first node", BtnKind::Primary)
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.nodes.adding = true;
-                            this.nodes.error = None;
-                            cx.notify();
-                        })),
+                    btn(
+                        id("nodes-add", "empty"),
+                        "Add your first node",
+                        BtnKind::Primary,
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.nodes.adding = true;
+                        this.nodes.error = None;
+                        cx.notify();
+                    })),
                 ),
         )
         .into_any_element()
@@ -367,14 +365,14 @@ impl Console {
                 ))
                 .child(field(
                     "TOTP code",
-                    Some("The app signs in once, mints a token named for this computer and discards the password."),
+                    Some("Signs in once, then discards the password."),
                     n.totp.clone(),
                 ))
                 .into_any_element()
         } else {
             field(
                 "API token",
-                Some("Stored only in the operating system keychain, never in the config file."),
+                Some("Stored in the system keychain only."),
                 n.token.clone(),
             )
             .into_any_element()
@@ -416,13 +414,8 @@ impl Console {
             .flex()
             .flex_col()
             .gap(px(SPACE))
-            .child(step(1, "Connector", "Where the node listens.", step_one))
-            .child(step(
-                2,
-                "Sign in",
-                "How this console proves who it is.",
-                step_two,
-            ));
+            .child(step(1, "Connector", "", step_one))
+            .child(step(2, "Sign in", "", step_two));
         if let Some(err) = &n.error {
             form = form.child(notice(err, Tone::Bad));
         }
@@ -445,18 +438,9 @@ impl Console {
                 .pt(px(GAP))
                 .border_t_1()
                 .border_color(c(DIVIDER))
-                .child(save)
-                .child(
-                    text_dim("Nothing is saved until the node answers with these details.")
-                        .text_size(px(12.)),
-                ),
+                .child(save),
         );
-        card(
-            Some("Add node"),
-            Some("Register a connector the console can manage."),
-            form,
-        )
-        .into_any_element()
+        card(Some("Add node"), None, form).into_any_element()
     }
 }
 
@@ -475,27 +459,39 @@ pub(crate) fn step(n: usize, title: &str, detail: &str, body: impl IntoElement) 
         .text_size(px(11.))
         .font_weight(gpui::FontWeight::SEMIBOLD)
         .child(n.to_string());
+    let mut heading = div()
+        .flex()
+        .flex_col()
+        .min_w_0()
+        .child(strong(title.to_string()).text_size(px(13.)));
+    if !detail.is_empty() {
+        heading = heading.child(text_dim(detail.to_string()).text_size(px(11.)));
+    }
     div()
         .flex()
         .flex_col()
         .gap(px(GAP))
         .min_w_0()
         .child(
-            div().flex().items_center().gap(px(10.)).child(badge).child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .min_w_0()
-                    .child(strong(title.to_string()).text_size(px(13.)))
-                    .child(text_dim(detail.to_string()).text_size(px(11.))),
-            ),
+            div()
+                .flex()
+                .items_center()
+                .gap(px(10.))
+                .child(badge)
+                .child(heading),
         )
         .child(div().flex().flex_col().pl(px(32.)).min_w_0().child(body))
         .into_any_element()
 }
 
-// The host name only labels the minted token, so a failed lookup is harmless.
+// The host name only labels the minted token, so a failed lookup is harmless. Settings asks on
+// every paint, so the lookup, which may start a process, runs once.
 pub fn hostname() -> String {
+    static HOST: OnceLock<String> = OnceLock::new();
+    HOST.get_or_init(lookup_hostname).clone()
+}
+
+fn lookup_hostname() -> String {
     std::env::var("HOSTNAME")
         .ok()
         .filter(|h| !h.is_empty())

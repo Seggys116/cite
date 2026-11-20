@@ -68,6 +68,8 @@ Default host port is **8080** (container listens on 8080). Set `CITE_PORT=80` if
 
 This page covers single-site mode. To run HAProxy, the connector and many sites on one host, use `scripts/setup.sh` or `docker-compose.node.yml`; see [Running a node](node.md).
 
+Upgrading a node that already runs the connector seals its secret files under a node key on the first start. Export and store that key before you rely on the node: see [Upgrading](node.md#secrets-are-sealed-site-data-services-release). The orchestrator overlay also adds the `cite-backups` volume and the settings for [site data services](data.md) (managed Postgres, backups and S3); set `CITE_DATA=false` in `.env` to keep the Docker proxy from creating any data container. Single-site mode is unchanged.
+
 ## Development install
 
 ```bash

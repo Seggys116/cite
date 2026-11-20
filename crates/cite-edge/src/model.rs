@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+pub use crate::datamodel::*;
+
 pub const CONFIG_VERSION: u32 = 1;
 
 // deny_unknown_fields on the config types makes a misspelled key an error instead of a silently ignored setting.
@@ -82,6 +84,9 @@ pub struct Site {
     /// Where an outbound site may connect when the node filters egress; omitted while it is the default.
     #[serde(default, skip_serializing_if = "OutboundRules::is_default")]
     pub outbound_rules: OutboundRules,
+    /// Databases, object storage, generated secrets and env links; only the data routes change it.
+    #[serde(default, skip_serializing_if = "SiteData::is_empty")]
+    pub data: SiteData,
 }
 
 fn default_true() -> bool {

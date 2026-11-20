@@ -166,8 +166,14 @@ async fn the_secret_goes_when_the_lock_is_turned_off_or_the_site_is_deleted() {
 
     assert_eq!(h.delete(&t, "/sites/blog").await.0, 200);
     assert!(!h.state.haproxy.zones().has_any());
-    let file = std::fs::read_to_string(secret_file(&h)).unwrap();
-    assert_eq!(file.trim(), "{}");
+    // The file is sealed at rest under the node key, so the raw bytes are not the plaintext "{}".
+    let raw = std::fs::read(secret_file(&h)).unwrap();
+    assert_ne!(raw.trim_ascii(), b"{}");
+    let ring = h.state.store.keyring().expect("the store has a node key");
+    let read = crate::seal::read_path(Some(&*ring), &secret_file(&h), 1024 * 1024)
+        .expect("open the sealed file")
+        .expect("the file exists");
+    assert_eq!(read.plaintext.trim_ascii(), b"{}");
 }
 
 #[tokio::test]

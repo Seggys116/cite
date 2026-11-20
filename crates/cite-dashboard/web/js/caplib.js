@@ -12,6 +12,13 @@ export const FEATURES = {
   certAcme: 'cert-acme',
   alerts: 'alerts',
   forges: 'forges',
+  dataPostgres: 'data-postgres',
+  dataShared: 'data-shared',
+  dataExternal: 'data-external',
+  dataS3: 'data-s3',
+  dataBackups: 'data-backups',
+  dataLinks: 'data-links',
+  dataTransfer: 'data-transfer',
 };
 
 export function capabilitiesOf(info) {

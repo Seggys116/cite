@@ -1,8 +1,12 @@
 import { h } from '../dom.js';
 import { nodeApi } from '../api.js';
+import { state } from '../state.js';
 import {
   button, field, iconButton, kvList, openDrawer, toast, formatError, newId,
 } from '../ui.js';
+import { applyToNodes, resultKind, resultMessage } from '../targetlib.js';
+import { writableNodes } from '../firewalllib.js';
+import { pickTargets } from './targetDialog.js';
 import {
   KINDS, STEPS, buildRule, emptyForm, reviewLines, ruleToForm, stepProblem,
 } from '../rulebuilder.js';
@@ -123,8 +127,10 @@ function corsDetails(form, refresh) {
   return el;
 }
 
-// Opens the rule builder in a drawer; an existing rule loads into the same four steps
-export function openRuleBuilder({ node, rule, sites, onSaved }) {
+// Opens the rule builder in a drawer; an existing rule loads into the same four steps.
+// Nothing is written until Save, which asks which nodes to write to. `holders` is [{ node, enabled }] for an edit,
+// and `sitesByNode` maps node name to its sites so a site-scoped rule is only offered to nodes that have that site.
+export function openRuleBuilder({ rule, holders = [], sites, sitesByNode = {}, onSaved }) {
   const form = rule ? ruleToForm(rule) : emptyForm();
   const siteName = (id) => (sites.find((s) => s.id === id) || { name: id }).name;
   const err = h('p', { class: 'form-error', role: 'alert', hidden: true });
@@ -168,7 +174,7 @@ export function openRuleBuilder({ node, rule, sites, onSaved }) {
         const name = h('input', { class: 'input', type: 'text', value: form.name, placeholder: 'Block WordPress probes', 'aria-label': 'Rule name' });
         const label = h('input', { class: 'input mono', type: 'text', value: form.label, placeholder: 'Defaults to the rule id', spellcheck: 'false', autocomplete: 'off', 'aria-label': 'Rule label' });
         const scope = h('select', { class: 'select', 'aria-label': 'Scope', value: form.site },
-          option('', 'All sites on this node'), sites.map((x) => option(x.id, x.name)));
+          option('', 'All sites'), sites.map((x) => option(x.id, x.name)));
         const review = h('div', {});
         const drawReview = () => review.replaceChildren(kvList(reviewLines(form, siteName).map(([k, v]) => [k, h('span', { class: 'wrap-any' }, v)])));
         name.addEventListener('input', () => { form.name = name.value; refresh(); });
@@ -195,16 +201,32 @@ export function openRuleBuilder({ node, rule, sites, onSaved }) {
         flow.go(built.step);
         return;
       }
-      try {
-        const body = built.rule;
-        await (rule ? nodeApi(node).put('/firewall/rules/' + encodeURIComponent(rule.id), body) : nodeApi(node).post('/firewall/rules', body));
-        toast(`Rule ${body.name} saved`, 'success');
+      const body = built.rule;
+      // A rule scoped to a site can only go to nodes that hold that site; an edit only goes to nodes that already hold the rule
+      const able = writableNodes(state.nodes, sitesByNode, body.site);
+      const held = new Map(holders.map((x) => [x.node, x]));
+      const only = rule ? able.filter((name) => held.has(name)) : able;
+      if (!only.length) {
+        err.textContent = body.site ? 'No online node has that site, so the rule cannot be saved.' : 'No node is online to take the rule.';
+        err.hidden = false;
+        return;
+      }
+      const verb = rule ? 'Save rule' : 'Add rule';
+      const picked = await pickTargets({ title: verb, message: `${body.name}`, verb, scope: state.node, only });
+      if (!picked) return;
+      // Saving keeps each node's own on/off state
+      const results = await applyToNodes(picked, (name) => (rule
+        ? nodeApi(name).put('/firewall/rules/' + encodeURIComponent(rule.id), { ...body, enabled: held.get(name).enabled })
+        : nodeApi(name).post('/firewall/rules', body)));
+      const message = resultMessage(rule ? 'Saved' : 'Added', results, formatError);
+      if (results.some((r) => r.ok)) {
+        toast(message, resultKind(results));
         drawer.close();
         onSaved();
-      } catch (ex) {
-        err.textContent = formatError(ex);
-        err.hidden = false;
+        return;
       }
+      err.textContent = message;
+      err.hidden = false;
     },
   });
 

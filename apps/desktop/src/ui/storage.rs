@@ -3,8 +3,8 @@ use std::future::Future;
 use cite_client::{ArchiveEntry, ArchiveKind, ArchiveList, ClientError};
 use gpui::{AnyElement, Context, Entity, div, prelude::*, px};
 
-use crate::api::run_archive_download;
-use crate::app::{Confirm, Console, Load, new_input};
+use crate::api::{NodeHandle, run_archive_download};
+use crate::app::{Confirm, Console, Load, View, new_input};
 use crate::archive::{
     Busy, CutBasis, CutForm, CutGate, CutSpec, Preview, cut_done_text, download_name, fmt_dir,
     fmt_range, fmt_rows, kind_label, needs_confirm, preview_text, short_sha,
@@ -12,9 +12,11 @@ use crate::archive::{
 use crate::bots::{downloads_dir, fmt_stamp, is_unsupported};
 use crate::demo::now_ms;
 use crate::model::{fmt_bytes, fmt_int};
-use crate::scope::{Sequence, foreign_notice};
+use crate::scope::Sequence;
 use crate::theme::{DIM, Tone, c};
+use crate::ui::bots::ExportRun;
 use crate::ui::input::TextInput;
+use crate::ui::nodescope::{choose_node_notice, failed_on, no_node_notice, on_node};
 use crate::ui::widgets::{
     BtnKind, Col, btn, btn_off, card, checkbox, clip, field, id, mono, notice, pill, seg_item,
     seg_row, skeleton, table, text_dim, toggle,
@@ -63,21 +65,67 @@ fn op_error(err: &ClientError) -> String {
     }
 }
 
+// What an operation is called in a message that names the node it ran on.
+fn busy_noun(busy: &Busy) -> &'static str {
+    match busy {
+        Busy::Idle => "Operation",
+        Busy::Backup => "Backup",
+        Busy::Preview => "Cut preview",
+        Busy::Cut => "Cut",
+        Busy::Restore(_) => "Restore",
+        Busy::Delete(_) => "Archive deletion",
+        Busy::Download(_) => "Download",
+    }
+}
+
 impl Console {
+    // The node the Explore and Export tabs act on, and its connection when it is reachable.
+    pub(crate) fn explore_node(&self) -> Option<String> {
+        self.scoped_node(&self.bots.scope)
+    }
+
+    pub(crate) fn explore_handle(&self) -> Option<NodeHandle> {
+        self.scoped_handle(&self.bots.scope)
+    }
+
+    // Picking a node on the bar drops what was loaded or previewed for the old one.
+    pub(crate) fn choose_explore_node(&mut self, name: String, cx: &mut Context<Self>) {
+        if self.explore_node().as_deref() == Some(name.as_str()) {
+            return;
+        }
+        let selected = self.selected.clone();
+        self.bots.scope.choose(&name, selected.as_deref());
+        self.archives.list = Load::Idle;
+        self.archives.unsupported = false;
+        self.archives.note = None;
+        self.archives.gate.clear();
+        self.archives.understood = false;
+        if !matches!(self.bots.export.run, ExportRun::Running { .. }) {
+            self.bots.export.run = ExportRun::Idle;
+        }
+        // Nothing on the Explore tab loads until a node is chosen, so a pick loads all of it.
+        if self.view == View::Explore {
+            self.load_explore(cx);
+        }
+    }
+
     pub fn load_archives(&mut self, cx: &mut Context<Self>) {
-        let Some(h) = self.active_handle() else {
+        let Some(h) = self.explore_handle() else {
             self.archives.list = Load::Idle;
             return;
         };
         if !matches!(self.archives.list, Load::Ready(_)) {
             self.archives.list = Load::Loading;
         }
+        let node = h.name().to_string();
         let seq = self.archives.list_seq.issue();
         self.fetch_scoped(
             cx,
             async move { h.archives().await },
             move |this, res, cx| {
-                if !this.archives.list_seq.accept(seq) {
+                if this.explore_node().as_deref() != Some(node.as_str())
+                    || !this.archives.list_seq.accept(seq)
+                {
                     return;
                 }
                 this.archives.unsupported = false;
@@ -98,6 +146,7 @@ impl Console {
     fn run_archive_op<T, F>(
         &mut self,
         cx: &mut Context<Self>,
+        node: &str,
         busy: Busy,
         fut: F,
         done: impl FnOnce(&mut Self, T, &mut Context<Self>) + 'static,
@@ -108,28 +157,35 @@ impl Console {
         if !self.archives.busy.is_idle() {
             return;
         }
+        let (noun, name) = (busy_noun(&busy), node.to_string());
         self.archives.busy = busy;
         self.archives.note = None;
-        self.fetch_origin(cx, fut, move |this, res, here, origin, cx| {
-            this.archives.busy = Busy::Idle;
-            if !here {
-                let (text, tone) = match res {
-                    Ok(_) => ("done".to_string(), Tone::Ok),
-                    Err(e) => (op_error(&e), Tone::Bad),
-                };
-                this.say(
-                    foreign_notice("Backup or archive task", origin, &text),
-                    tone,
-                );
+        self.fetch_on(
+            cx,
+            node,
+            Self::explore_node,
+            fut,
+            move |this, res, here, cx| {
+                this.archives.busy = Busy::Idle;
+                if !here {
+                    let (text, tone) = match res {
+                        Ok(_) => (on_node(&format!("{noun} finished"), &name), Tone::Ok),
+                        Err(e) => (failed_on(noun, &name, &op_error(&e)), Tone::Bad),
+                    };
+                    this.say(text, tone);
+                    cx.notify();
+                    return;
+                }
+                match res {
+                    Ok(v) => done(this, v, cx),
+                    Err(e) => {
+                        this.archives.note =
+                            Some((failed_on(noun, &name, &op_error(&e)), Tone::Bad))
+                    }
+                }
                 cx.notify();
-                return;
-            }
-            match res {
-                Ok(v) => done(this, v, cx),
-                Err(e) => this.archives.note = Some((op_error(&e), Tone::Bad)),
-            }
-            cx.notify();
-        });
+            },
+        );
     }
 
     fn archive_note(&mut self, text: impl Into<String>, tone: Tone) {
@@ -152,17 +208,20 @@ impl Console {
     }
 
     fn start_backup(&mut self, cx: &mut Context<Self>) {
-        let Some(h) = self.active_handle() else {
+        let Some(h) = self.explore_handle() else {
             return;
         };
+        let node = h.name().to_string();
+        let target = node.clone();
         self.run_archive_op(
             cx,
+            &target,
             Busy::Backup,
             async move { h.backup().await },
-            |this, entry, cx| {
+            move |this, entry, cx| {
                 this.archive_note(
                     format!(
-                        "Backup {} created ({}).",
+                        "Backup {} created on {node} ({}).",
                         entry.name,
                         fmt_bytes(entry.bytes)
                     ),
@@ -181,12 +240,14 @@ impl Console {
                 return;
             }
         };
-        let Some(h) = self.active_handle() else {
+        let Some(h) = self.explore_handle() else {
             return;
         };
+        let node = h.name().to_string();
         self.archives.gate.clear();
         self.run_archive_op(
             cx,
+            &node,
             Busy::Preview,
             async move { h.cut(&spec, true).await },
             move |this, report, _| {
@@ -208,40 +269,47 @@ impl Console {
             self.archive_note(block.hint(), Tone::Warn);
             return;
         }
+        let Some(node) = self.explore_node() else {
+            return;
+        };
         if !needs_confirm(&spec) {
-            self.do_cut(spec, cx);
+            self.do_cut(spec, node, cx);
             return;
         }
         let rows = self.archives.gate.preview().map_or(0, |p| p.rows);
         self.ask(Confirm {
             title: "Delete old data permanently".into(),
             message: format!(
-                "{} rows older than {} will be deleted and no copy is kept. This cannot be undone.",
+                "{} rows older than {} will be deleted from {node} and no copy is kept. This cannot be undone.",
                 fmt_int(rows),
                 fmt_stamp(spec.cutoff_ms(now))
             ),
             label: "Delete data".into(),
             danger: true,
-            action: Box::new(move |this, cx| this.do_cut(spec, cx)),
+            action: Box::new(move |this, cx| this.do_cut(spec, node, cx)),
         });
     }
 
-    fn do_cut(&mut self, spec: CutSpec, cx: &mut Context<Self>) {
-        let Some(h) = self.active_handle() else {
+    // The node is the one the preview and any confirmation named, looked up by name.
+    fn do_cut(&mut self, spec: CutSpec, node: String, cx: &mut Context<Self>) {
+        let Some(h) = self.handle_named(&node) else {
+            self.say(format!("{node} is not connected."), Tone::Bad);
             return;
         };
+        let named = node.clone();
         self.run_archive_op(
             cx,
+            &node,
             Busy::Cut,
             async move { h.cut(&spec, false).await },
-            |this, report, cx| {
+            move |this, report, cx| {
                 let text = cut_done_text(
                     report.rows,
                     report.archived_rows,
                     &report.files,
                     report.archive,
                 );
-                this.archive_note(text, Tone::Ok);
+                this.archive_note(on_node(&text, &named), Tone::Ok);
                 this.archives.gate.clear();
                 this.archives.understood = false;
                 this.refresh_storage(cx);
@@ -250,14 +318,17 @@ impl Console {
     }
 
     fn confirm_restore(&mut self, entry: ArchiveEntry) {
+        let Some(node) = self.explore_node() else {
+            return;
+        };
         let name = entry.name.clone();
         let message = if entry.kind == ArchiveKind::Backup {
             format!(
-                "Restore the analytics database from {name}? Data recorded after the backup was made may be lost."
+                "Restore the analytics database on {node} from {name}? Data recorded after the backup was made may be lost."
             )
         } else {
             format!(
-                "Restore {name}? Its {} rows are added back to the analytics database.",
+                "Restore {name} on {node}? Its {} rows are added back to the analytics database.",
                 fmt_rows(entry.rows)
             )
         };
@@ -267,17 +338,23 @@ impl Console {
             label: "Restore".into(),
             danger: false,
             action: Box::new(move |this, cx| {
-                let Some(h) = this.active_handle() else {
+                let Some(h) = this.handle_named(&node) else {
+                    this.say(format!("{node} is not connected."), Tone::Bad);
                     return;
                 };
                 let (call, label) = (name.clone(), name.clone());
+                let named = node.clone();
                 this.run_archive_op(
                     cx,
+                    &node,
                     Busy::Restore(name),
                     async move { h.restore(&call).await },
                     move |this, report, cx| {
                         this.archive_note(
-                            format!("Restored {} rows from {label}.", fmt_int(report.rows)),
+                            format!(
+                                "Restored {} rows from {label} on {named}.",
+                                fmt_int(report.rows)
+                            ),
                             Tone::Ok,
                         );
                         this.refresh_storage(cx);
@@ -288,24 +365,30 @@ impl Console {
     }
 
     fn confirm_delete(&mut self, name: String) {
+        let Some(node) = self.explore_node() else {
+            return;
+        };
         self.ask(Confirm {
-            title: "Delete from the node".into(),
+            title: "Delete archive".into(),
             message: format!(
-                "Delete {name} from the node? The file is removed and cannot be recovered."
+                "Delete {name} from {node}? The file is removed and cannot be recovered."
             ),
             label: "Delete".into(),
             danger: true,
             action: Box::new(move |this, cx| {
-                let Some(h) = this.active_handle() else {
+                let Some(h) = this.handle_named(&node) else {
+                    this.say(format!("{node} is not connected."), Tone::Bad);
                     return;
                 };
                 let (call, label) = (name.clone(), name.clone());
+                let named = node.clone();
                 this.run_archive_op(
                     cx,
+                    &node,
                     Busy::Delete(name),
                     async move { h.delete_archive(&call).await },
                     move |this, _, cx| {
-                        this.archive_note(format!("Deleted {label}."), Tone::Ok);
+                        this.archive_note(format!("Deleted {label} from {named}."), Tone::Ok);
                         this.load_archives(cx);
                     },
                 );
@@ -315,9 +398,10 @@ impl Console {
 
     // The file goes to the Downloads folder under a name built from the kind, never from the node's extension.
     fn start_download(&mut self, entry: ArchiveEntry, cx: &mut Context<Self>) {
-        let Some(h) = self.active_handle() else {
+        let Some(h) = self.explore_handle() else {
             return;
         };
+        let node = h.name().to_string();
         let local = download_name(entry.kind, &entry.name);
         let Some(dir) = downloads_dir() else {
             self.archive_note(
@@ -327,14 +411,16 @@ impl Console {
             return;
         };
         let name = entry.name.clone();
+        let target = node.clone();
         self.run_archive_op(
             cx,
+            &target,
             Busy::Download(name.clone()),
             run_archive_download(h, name, dir, local),
-            |this, report, _| {
+            move |this, report, _| {
                 this.archive_note(
                     format!(
-                        "Saved {} to {}",
+                        "Saved {} from {node} to {}",
                         fmt_bytes(report.bytes),
                         report.path.display()
                     ),
@@ -346,10 +432,16 @@ impl Console {
 
     pub fn archive_card(&self, cx: &mut Context<Self>) -> AnyElement {
         let a = &self.archives;
+        let Some(node) = self.explore_node() else {
+            return choose_node_notice().into_any_element();
+        };
+        if self.explore_handle().is_none() {
+            return no_node_notice(Some(&node)).into_any_element();
+        }
         if a.unsupported {
             return card(
                 Some("Backups and archives"),
-                Some("Keep copies of old analytics data"),
+                None,
                 div()
                     .flex()
                     .items_center()
@@ -411,10 +503,7 @@ impl Console {
             body = body.child(notice(text, *tone));
         }
         body = body.child(self.archive_table(list, cx));
-        let subtitle = format!(
-            "Copies of the analytics database and of data cut from it, on {}",
-            self.active_name().unwrap_or_default()
-        );
+        let subtitle = format!("Stored on {node}");
         card(Some("Backups and archives"), Some(subtitle.as_str()), body).into_any_element()
     }
 
@@ -528,11 +617,7 @@ impl Console {
             );
         }
         let input = match a.basis {
-            CutBasis::Days => field(
-                "Days to keep",
-                Some("Data older than this is cut. 1 to 3650."),
-                a.days.clone(),
-            ),
+            CutBasis::Days => field("Days to keep", Some("1 to 3650."), a.days.clone()),
             CutBasis::Date => field(
                 "Cut data before (UTC)",
                 Some("YYYY-MM-DD or YYYY-MM-DD HH:MM"),
@@ -640,5 +725,33 @@ impl Console {
                     .children(hint.map(|h| text_dim(h).text_size(px(12.)))),
             )
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_operation_has_a_name_for_messages() {
+        let all = [
+            Busy::Backup,
+            Busy::Preview,
+            Busy::Cut,
+            Busy::Restore("a".into()),
+            Busy::Delete("a".into()),
+            Busy::Download("a".into()),
+        ];
+        let mut nouns: Vec<&str> = all.iter().map(busy_noun).collect();
+        nouns.sort_unstable();
+        nouns.dedup();
+        assert_eq!(nouns.len(), all.len());
+        assert_eq!(busy_noun(&Busy::Idle), "Operation");
+    }
+
+    #[test]
+    fn a_failed_operation_names_the_node_it_ran_on() {
+        let text = failed_on(busy_noun(&Busy::Cut), "edge-fra", "refused");
+        assert_eq!(text, "Cut failed on edge-fra: refused");
     }
 }

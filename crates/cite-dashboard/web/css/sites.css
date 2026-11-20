@@ -1,0 +1,39 @@
+/* sites styles: uses the tokens defined in app.css only */
+
+.sites-bar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; }
+.sites-bar .input.search { flex: 1 1 220px; max-width: 360px; }
+
+.site-name { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+
+.host-lines { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.host-line { font-size: 12px; overflow-wrap: anywhere; }
+
+.node-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.node-chip {
+  display: inline-flex; align-items: center; gap: 6px; padding: 2px 10px 2px 8px;
+  border: 1px solid var(--border); border-radius: var(--r-pill); background: var(--chip-fill);
+  color: var(--text); font-size: 12px; text-decoration: none; white-space: nowrap;
+}
+.node-chip:hover { border-color: var(--text-faint); }
+.node-chip:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+.load-cell { display: flex; align-items: center; gap: 8px; white-space: nowrap; }
+.load-spark { display: inline-block; flex: none; width: 44px; height: 18px; }
+.load-spark .spark { width: 44px; height: 18px; }
+.load-rate { min-width: 5ch; font-size: 12px; color: var(--text-dim); }
+
+/* the load line on an overview node card */
+.node-load { display: flex; align-items: baseline; gap: 8px; margin: 0; font-size: 12px; color: var(--text-dim); }
+
+/* site detail: the nodes that hold the site, and the per node maintenance switches */
+.site-holders { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.site-holder.current { border-color: var(--accent); cursor: default; }
+
+.maint-list { display: flex; flex-direction: column; gap: var(--s2); }
+.maint-row { display: flex; align-items: center; gap: var(--s3); min-width: 0; }
+.maint-state { min-width: 9ch; font-size: 13px; color: var(--text-dim); }
+.maint-state.on { color: var(--warn); }
+.maint-node { font-size: 13px; color: var(--text); overflow-wrap: anywhere; }
+.site-holder.differs { border-color: var(--warn); }
+.maint-different { font-size: 12px; color: var(--warn); overflow-wrap: anywhere; }
+.maint-actions { display: flex; flex-wrap: wrap; gap: var(--s2); }

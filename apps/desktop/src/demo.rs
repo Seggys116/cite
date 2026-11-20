@@ -28,6 +28,10 @@ use crate::zone::{ZONE_HEADER, ZoneReveal, ZoneStatus};
 
 type Res<T> = Result<T, ClientError>;
 
+// The demo node's database, backup and link services live beside this file; they extend DemoNode.
+#[path = "demo_data.rs"]
+mod demo_data;
+
 pub const HOUR_MS: i64 = 3_600_000;
 const DEMO_ROWS: u64 = 1_284_906;
 const DEMO_DB_BYTES: u64 = 436_207_616;
@@ -703,7 +707,7 @@ fn hist(now: i64, rows: &[(i64, Slot, DeployAction, &str)]) -> Vec<Deployment> {
         .collect()
 }
 
-// Two sites run on both slots; the third carries a repository source and a failed deploy.
+// Two sites run on both slots; docs carries a repository source and a failed deploy, and the API is built from a Rust repository.
 fn seed_sites(node: i64, now: i64) -> Vec<Site> {
     let health = HealthCheck {
         path: "/healthz".into(),
@@ -715,7 +719,7 @@ fn seed_sites(node: i64, now: i64) -> Vec<Site> {
             name: name.into(),
             hosts: hosts.iter().map(|h| (*h).to_string()).collect(),
             path_regexes: if id == "api" {
-                vec!["^/v1/".to_string()]
+                vec!["^/v1/(quote|price)$".to_string()]
             } else {
                 Vec::new()
             },
@@ -739,14 +743,25 @@ fn seed_sites(node: i64, now: i64) -> Vec<Site> {
                 page_id: (id == "docs").then(|| "scheduled".to_string()),
             },
             health: health.clone(),
-            source: (id == "docs").then(|| Source {
-                repo: "acme/docs".into(),
-                branch: Some("main".into()),
-                runtime: Some("node".into()),
-                node_major: Some(22),
-                poll_interval: Some("5m".into()),
-                ..Default::default()
-            }),
+            source: match id {
+                "docs" => Some(Source {
+                    repo: "acme/docs".into(),
+                    branch: Some("main".into()),
+                    runtime: Some("node".into()),
+                    node_major: Some(22),
+                    poll_interval: Some("5m".into()),
+                    ..Default::default()
+                }),
+                // A single Rust endpoint, so the topology shows an API with its runtime.
+                "api" => Some(Source {
+                    repo: "acme/api".into(),
+                    branch: Some("main".into()),
+                    runtime: Some("rust".into()),
+                    poll_interval: Some("5m".into()),
+                    ..Default::default()
+                }),
+                _ => None,
+            },
             history,
             access: SiteAccess {
                 cloudflare_only: id == "api",
@@ -768,6 +783,7 @@ fn seed_sites(node: i64, now: i64) -> Vec<Site> {
             },
             outbound: true,
             outbound_rules: Default::default(),
+            data: Default::default(),
         };
     use DeployAction::{Failed, Promote, Rollback, Switch};
     vec![
@@ -1173,6 +1189,8 @@ pub struct DemoNode {
     index: i64,
     started: Instant,
     state: Mutex<DemoState>,
+    // Locked after `state` is released, never while it is held.
+    data: Mutex<demo_data::DemoData>,
 }
 
 impl DemoNode {
@@ -1236,6 +1254,7 @@ impl DemoNode {
                 ranges_stamp: iso(now - 12 * DAY_MS),
                 ops: crate::demo_ops::DemoOps::seeded(),
             }),
+            data: Mutex::new(demo_data::DemoData::seeded(now)),
         }
     }
 
@@ -1265,7 +1284,7 @@ impl DemoNode {
         );
         Ok(NodeInfo {
             name: self.name.clone(),
-            version: if self.index == 0 { "0.4.1" } else { "0.3.1" }.into(),
+            version: if self.index == 0 { "0.5.0" } else { "0.3.1" }.into(),
             // The second node plays a release from before the capability list, so the new cards stay hidden there.
             capabilities: if self.index == 0 {
                 let mut caps: Vec<String> = cite_edge::status::CAPABILITIES
@@ -1405,13 +1424,20 @@ impl DemoNode {
     pub fn an_facets(&self, q: &cite_client::AnalyticsQuery) -> Res<cite_client::Facets> {
         let (window, f, now) = self.an_parts(q);
         let total = demo_summary(self.seed(), self.scale(), window, now).requests;
-        let sites: Vec<(String, Vec<String>)> = self
+        // Each node carries its own mix of sites, and a site in maintenance takes no traffic.
+        let (sites, shares): (Vec<(String, Vec<String>)>, Vec<f64>) = self
             .st()
             .sites
             .iter()
-            .map(|s| (s.id.clone(), s.hosts.clone()))
-            .collect();
-        let mut facets = crate::demo_analytics::facets_for((total as f64 * f) as u64, &sites);
+            .map(|s| {
+                (
+                    (s.id.clone(), s.hosts.clone()),
+                    crate::demo_analytics::site_share(self.index, &s.id, s.maintenance.enabled),
+                )
+            })
+            .unzip();
+        let mut facets =
+            crate::demo_analytics::facets_with((total as f64 * f) as u64, &sites, &shares);
         facets.meta = self.an_meta(q, now);
         Ok(facets)
     }
@@ -2333,6 +2359,10 @@ fn find_mut<'a>(sites: &'a mut [Site], id: &str) -> Res<&'a mut Site> {
         .ok_or_else(|| status_err(404, format!("site {id} not found")))
 }
 
+// The third demo node is configured but never answers, so pages show how an unreachable node looks.
+const DEMO_OFFLINE_NODE: &str = "edge-ams";
+const DEMO_OFFLINE_REASON: &str = "connection timed out";
+
 pub fn demo_config() -> DesktopConfig {
     let node = |name: &str, url: &str| DesktopNode {
         name: name.into(),
@@ -2345,9 +2375,18 @@ pub fn demo_config() -> DesktopConfig {
         nodes: vec![
             node("edge-fra", "https://fra.edge.example.com:7443"),
             node("edge-iad", "https://iad.edge.example.com:7443"),
+            node(DEMO_OFFLINE_NODE, "https://ams.edge.example.com:7443"),
         ],
         analytics_presets: Vec::new(),
     }
+}
+
+// The configured demo nodes that have no client, with the reason a connection attempt would give.
+pub fn demo_offline() -> Vec<(String, String)> {
+    vec![(
+        DEMO_OFFLINE_NODE.to_string(),
+        DEMO_OFFLINE_REASON.to_string(),
+    )]
 }
 
 // Each demo node keeps its own mutable state so switches and edits persist while the app runs.
@@ -2355,6 +2394,7 @@ pub fn demo_nodes() -> Vec<(String, std::sync::Arc<DemoNode>)> {
     demo_config()
         .nodes
         .iter()
+        .filter(|n| n.name != DEMO_OFFLINE_NODE)
         .enumerate()
         .map(|(i, n)| {
             (
@@ -2920,6 +2960,42 @@ mod tests {
         let wp = rules.iter().find(|r| r.id == "r-wp-login").expect("wp");
         assert_eq!(wp.matchers.path_regexes.len(), 2);
         assert!(rules.iter().filter(|r| r.redirect.is_some()).count() >= 3);
+    }
+
+    #[test]
+    fn the_demo_api_is_one_rust_endpoint_behind_a_path_pattern() {
+        let node = &demo_nodes()[0].1;
+        let api = node.get_site("api").expect("api").site;
+        assert_eq!(api.kind, SiteKind::Api);
+        assert_eq!(api.path_regexes, vec!["^/v1/(quote|price)$".to_string()]);
+        let source = api.source.expect("source");
+        assert_eq!(source.runtime.as_deref(), Some("rust"));
+    }
+
+    #[test]
+    fn demo_facets_differ_by_node_and_leave_out_a_site_in_maintenance() {
+        let q = cite_client::AnalyticsQuery::new().window("15m");
+        let nodes = demo_nodes();
+        let first = nodes[0].1.an_facets(&q).expect("facets");
+        let second = nodes[1].1.an_facets(&q).expect("facets");
+        assert_eq!(first.site[0].key, "shop");
+        assert_eq!(second.site[0].key, "api");
+        assert!(second.site.iter().all(|v| v.key != "docs"));
+        assert!(first.site.iter().any(|v| v.key == "docs"));
+        assert!(first.site[0].count > 0 && second.site[0].count > 0);
+    }
+
+    #[test]
+    fn the_third_demo_node_is_configured_but_has_no_client() {
+        let configured: Vec<String> = demo_config().nodes.into_iter().map(|n| n.name).collect();
+        assert_eq!(configured.len(), 3);
+        let live: Vec<String> = demo_nodes().into_iter().map(|(n, _)| n).collect();
+        assert_eq!(live, vec!["edge-fra".to_string(), "edge-iad".to_string()]);
+        let offline = demo_offline();
+        assert_eq!(offline.len(), 1);
+        assert!(configured.contains(&offline[0].0));
+        assert!(!live.contains(&offline[0].0));
+        assert!(!offline[0].1.is_empty());
     }
 
     #[test]

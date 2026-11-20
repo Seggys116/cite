@@ -1,0 +1,5 @@
+{
+  "name": "cite-e2e-data",
+  "private": true,
+  "scripts": { "build": "bun migrate.js", "start": "bun server.js" }
+}

@@ -33,6 +33,7 @@ fn site(id: &str, runtime: &str) -> Site {
         volumes: Vec::new(),
         outbound: true,
         outbound_rules: Default::default(),
+        data: Default::default(),
     }
 }
 

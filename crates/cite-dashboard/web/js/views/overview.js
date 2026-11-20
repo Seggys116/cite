@@ -7,6 +7,7 @@ import {
   fmtNum, fmtPct, fmtUptime, relTime,
 } from '../ui.js';
 import { actionPill, slotPill, settledValue, listOf } from './common.js';
+import { LOAD_WINDOW_SECS, fmtRps } from '../topologylib.js';
 
 const count = (v) => (Array.isArray(v) ? v.length : Number(v) || 0);
 
@@ -58,7 +59,7 @@ function render({ entries, extra }) {
   const stats = h('div', { class: 'grid-stats' },
     statCard('server', 'Nodes online', `${online}/${entries.length}`, online === entries.length ? 'All nodes reachable' : `${entries.length - online} unreachable`, online < entries.length ? 'warn' : ''),
     statCard('globe', 'Sites', fmtNum(totalSites), 'Across all nodes'),
-    statCard('activity', 'Requests / min', fmtNum(requests / 15), 'Averaged over 15 minutes'),
+    statCard('activity', 'Requests / min', fmtNum(requests / 15), '15 minute average'),
     statCard('alert', 'Error rate', requests ? fmtPct(errors / requests, 2) : '0.00%', `${fmtNum(errors)} 4xx and 5xx responses`, requests && errors / requests > 0.05 ? 'bad' : ''),
     statCard('ban', 'Blocked', fmtNum(blocked), 'Stopped by the firewall'));
 
@@ -77,20 +78,25 @@ function render({ entries, extra }) {
           h('div', {}, h('span', { class: 'muted' }, 'Rules'), h('b', { class: 'mono' }, String(e.rules))),
           h('div', {}, h('span', { class: 'muted' }, 'HAProxy'), hap ? pill(hap.running ? 'running' : 'stopped', hap.running ? 'ok' : 'bad') : pill('unknown', 'muted')))
         : h('p', { class: 'muted' }, e.error || 'The connector did not respond.'),
+      // The summary is already fetched for the stat cards, so the node's load costs no extra request
+      e.online && ex && ex.summary
+        ? h('p', { class: 'node-load', title: 'Requests per second, averaged over the last 15 minutes' },
+          h('span', {}, 'Load'), h('b', { class: 'mono' }, fmtRps((Number(ex.summary.requests) || 0) / LOAD_WINDOW_SECS)))
+        : null,
       e.online ? h('div', { class: 'node-spark' }, sparkline(points.map((p) => p.requests || 0), { width: 280, height: 40 }), h('span', { class: 'muted' }, 'requests, last hour')) : null,
       h('footer', {}, h('a', {
         class: 'link',
         href: '#/sites',
         onClick: () => selectNode(e.name),
       }, 'Open sites')));
-  })) : emptyState({ iconName: 'server', title: 'No nodes yet', text: 'Add a node to start managing sites.', action: h('a', { class: 'btn btn-primary', href: '#/nodes' }, 'Add a node') });
+  })) : emptyState({ iconName: 'server', title: 'No nodes yet', text: 'Add a node to manage sites.', action: h('a', { class: 'btn btn-primary', href: '#/nodes' }, 'Add a node') });
 
   const deployments = extra.flatMap((e) => e.sites.flatMap((site) => (site.history || []).map((d) => ({ ...d, node: e.name, site: site.name }))))
     .sort((a, b) => String(b.at).localeCompare(String(a.at))).slice(0, 8);
 
   const recent = card({
     title: 'Recent deployments',
-    subtitle: 'Latest activity across nodes',
+    subtitle: 'Latest on every node',
     flush: true,
     body: dataTable({
       columns: [
@@ -114,6 +120,6 @@ export function overviewView(ctx) {
   const body = h('div', {});
   let reload = null;
   const refresh = button('Refresh', { iconName: 'refresh', onClick: () => reload && reload() });
-  ctx.root.append(pageHeader({ title: 'Overview', subtitle: 'Health and traffic across every connected node', actions: refresh }), body);
+  ctx.root.append(pageHeader({ title: 'Overview', subtitle: 'Health and traffic on every node', actions: refresh }), body);
   reload = loadInto(body, load, render, { skeleton: () => h('div', { class: 'stack' }, skeletonCards(5), skeletonBlock(180), skeletonBlock(220)) });
 }

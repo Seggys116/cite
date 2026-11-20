@@ -382,8 +382,8 @@ impl Limiter {
     pub fn sweep(&self, now: Instant) {
         let idle = self.idle_after();
         let mut ended = Vec::new();
-        for idx in 0..SHARDS {
-            let mut shard = lock(&self.shards[idx]);
+        for shard in &self.shards {
+            let mut shard = lock(shard);
             for (key, entry) in shard.map.iter_mut() {
                 if entry.banned_until.is_some_and(|until| until <= now) {
                     entry.banned_until = None;

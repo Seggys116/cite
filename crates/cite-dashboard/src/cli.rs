@@ -186,12 +186,12 @@ pub async fn healthcheck(settings: &Settings) -> Result<()> {
         "http"
     };
     // The probe pins the listener's own certificate file, since a self-signed one has no CA to chain to.
-    let mut builder = reqwest::Client::builder()
+    let mut builder = cite_tls::client_builder()
         .timeout(HEALTHCHECK_TIMEOUT)
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy();
     if let Some(tls) = &settings.tls {
-        builder = builder.use_preconfigured_tls(pinned_client_config(&tls.cert)?);
+        builder = builder.tls_backend_preconfigured(pinned_client_config(&tls.cert)?);
     }
     let client = builder.build().map_err(setup_err)?;
     let resp = client

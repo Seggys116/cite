@@ -91,14 +91,16 @@ jobs:
       matrix:
         variant:
           - { key: manager-node22, name: cite-manager, dockerfile: images/manager/Dockerfile, node: "22", args: "NODE_MAJOR=22" }
-          - { key: manager-node24, name: cite-manager, dockerfile: images/manager/Dockerfile, node: "24", args: "NODE_MAJOR=24\nNODE_IMAGE=docker.io/library/node:24-bookworm-slim@sha256:01d566e8d94d8c619591d78652babfccd3c6992a3dffa9ed5ab39e11cf6c70e9" }
+          - { key: manager-node24, name: cite-manager, dockerfile: images/manager/Dockerfile, node: "24", args: "NODE_MAJOR=24\nNODE_IMAGE=docker.io/library/node:24-bookworm-slim@sha256:dc26ae92c9fb15cf6b1d63e20f0944b2efe0f115b20e00be48fb23fceb061c54" }
           - { key: executor-node22, name: cite-executor-node, dockerfile: images/executor-node/Dockerfile, node: "22", args: "NODE_MAJOR=22" }
-          - { key: executor-node24, name: cite-executor-node, dockerfile: images/executor-node/Dockerfile, node: "24", args: "NODE_MAJOR=24\nEXECUTOR_IMAGE=gcr.io/distroless/nodejs24-debian13:nonroot@sha256:b8cec4b2f2126ff7bd034ec9ac207ffb3272667dfdc48376e3b035d3270549ba" }
+          - { key: executor-node24, name: cite-executor-node, dockerfile: images/executor-node/Dockerfile, node: "24", args: "NODE_MAJOR=24\nEXECUTOR_IMAGE=gcr.io/distroless/nodejs24-debian13:nonroot@sha256:6abfcb367ebc291572c774c1592a986be2ab26a2486f73093401327495a5962a" }
           - { key: executor-bun, name: cite-executor-bun, dockerfile: images/executor-bun/Dockerfile, node: "", args: "" }
           - { key: executor-static, name: cite-executor-static, dockerfile: images/executor-static/Dockerfile, node: "", args: "" }
           - { key: manager-rust, name: cite-manager-rust, dockerfile: images/manager-rust/Dockerfile, node: "", args: "" }
           - { key: executor-rust, name: cite-executor-rust, dockerfile: images/executor-rust/Dockerfile, node: "", args: "" }
           - { key: egress, name: cite-egress, dockerfile: images/egress/Dockerfile, node: "", args: "" }
+          - { key: postgres-pg17, name: cite-postgres, dockerfile: images/postgres/Dockerfile, pg: "17", args: "" }
+          - { key: postgres-pg18, name: cite-postgres, dockerfile: images/postgres/Dockerfile, pg: "18", args: "" }
         platform:
           - { arch: amd64, runner: ubuntu-latest }
           - { arch: arm64, runner: ubuntu-24.04-arm }
@@ -117,6 +119,26 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      # The Postgres base image and its digest live only in images/images.toml.
+      - id: pg
+        if: startsWith(matrix.variant.key, 'postgres-')
+        env:
+          PG_MAJOR: ${{ matrix.variant.pg }}
+        run: |
+          image="$(awk -v major="$PG_MAJOR" '
+            function done_block() { if (inpg && m == major && img != "" && dg != "") { print img "@" dg; found = 1; exit } }
+            /^\[/ { done_block(); inpg = ($0 == "[[postgres]]"); m = ""; img = ""; dg = ""; next }
+            inpg && $1 == "major" { m = $3 }
+            inpg && $1 == "image" { gsub(/"/, "", $3); img = $3 }
+            inpg && $1 == "digest" { gsub(/"/, "", $3); dg = $3 }
+            END { if (!found) done_block() }
+          ' images/images.toml)"
+          digest="${image##*@}"
+          if [[ -z "$image" || ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::images/images.toml has no pinned digest for postgres ${PG_MAJOR}" >&2
+            exit 1
+          fi
+          echo "image=${image}" >> "$GITHUB_OUTPUT"
       - id: build
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
@@ -127,6 +149,7 @@ jobs:
             VERSION=${{ needs.version.outputs.version }}
             REVISION=${{ github.sha }}
             ${{ matrix.variant.args }}
+            ${{ steps.pg.outputs.image != '' && format('PG_IMAGE={0}', steps.pg.outputs.image) || '' }}
           outputs: type=image,name=${{ env.IMAGE_PREFIX }}/${{ matrix.variant.name }},push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha,scope=${{ matrix.variant.key }}-${{ matrix.platform.arch }}
           cache-to: type=gha,mode=max,scope=${{ matrix.variant.key }}-${{ matrix.platform.arch }}
@@ -155,6 +178,8 @@ jobs:
           - { key: manager-rust, name: cite-manager-rust, suffix: "" }
           - { key: executor-rust, name: cite-executor-rust, suffix: "" }
           - { key: egress, name: cite-egress, suffix: "" }
+          - { key: postgres-pg17, name: cite-postgres, suffix: "-pg17" }
+          - { key: postgres-pg18, name: cite-postgres, suffix: "-pg18" }
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:

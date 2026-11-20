@@ -15,13 +15,16 @@ mod demo_ops;
 mod diagnose;
 mod keychain;
 mod model;
+mod pages_union;
 mod repo;
 mod rules;
 mod scope;
 mod siteops;
+mod targets;
 #[cfg(test)]
 mod testkit;
 mod theme;
+mod topology;
 mod ui;
 mod window_state;
 mod wizard;

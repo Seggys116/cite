@@ -23,11 +23,20 @@ const DEFAULT_API_HOST: &str = "api.github.com";
 const ORCHESTRATED: [&str; 7] = [
     "logs", "token", "env", "build", "doppler", "volumes", "outbound",
 ];
+// Every data-* capability needs the running data service (the orchestrator plus a backup volume): without it the
+// data routes answer 404.
+const DATA_PREFIX: &str = "data-";
 
-pub(super) fn capabilities(orchestrated: bool) -> Vec<String> {
+/// `data` is true only while the data service runs, which itself needs the orchestrator.
+pub(super) fn capabilities(orchestrated: bool, data: bool) -> Vec<String> {
     CAPABILITIES
         .iter()
-        .filter(|cap| orchestrated || !ORCHESTRATED.iter().any(|needle| cap.contains(needle)))
+        .filter(|cap| {
+            if cap.starts_with(DATA_PREFIX) {
+                return orchestrated && data;
+            }
+            orchestrated || !ORCHESTRATED.iter().any(|needle| cap.contains(needle))
+        })
         .map(|cap| (*cap).to_string())
         .collect()
 }
@@ -264,6 +273,40 @@ pub(super) async fn patch_runtime_env(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn data_capabilities_are_advertised_only_while_the_data_service_runs() {
+        let on = capabilities(true, true);
+        let no_data = capabilities(true, false);
+        let off = capabilities(false, false);
+        let data: Vec<&str> = CAPABILITIES
+            .iter()
+            .copied()
+            .filter(|c| c.starts_with("data-"))
+            .collect();
+        assert!(!data.is_empty());
+        for cap in &data {
+            assert!(
+                on.iter().any(|c| c == cap),
+                "{cap} missing with the data service"
+            );
+            assert!(
+                !no_data.iter().any(|c| c == cap),
+                "{cap} offered with the orchestrator but no data service"
+            );
+            assert!(!off.iter().any(|c| c == cap), "{cap} offered without one");
+        }
+        assert_eq!(on.len(), CAPABILITIES.len());
+        assert_eq!(no_data.len(), CAPABILITIES.len() - data.len());
+        // The data service never runs without the orchestrator.
+        assert_eq!(capabilities(false, true), off);
+        for cap in ["cert-generate", "alerts", "analytics-filters"] {
+            assert!(
+                off.iter().any(|c| c == cap),
+                "{cap} should always be offered"
+            );
+        }
+    }
 
     #[test]
     fn the_api_host_is_the_bare_lowercase_host() {

@@ -95,10 +95,11 @@ function seedSites(nodeIdx, now) {
       history: hist([[170, 'green', 'promote', 'Release 2.13.4'], [52, 'blue', 'promote', 'Release 2.14.0-rc1'], [51, 'green', 'rollback', 'Checkout regression'], [6, 'blue', 'promote', 'Release 2.14.0']]),
     },
     {
-      id: 'api', name: 'Public API', hosts: ['api.example.com'], path_prefixes: ['/v2'], path_regexes: ['^/v1/'], kind: 'api',
+      id: 'api', name: 'Public API', hosts: ['api.example.com'], path_prefixes: [], path_regexes: ['^/v1/(quote|price)$'], kind: 'api',
       blue: { targets: [target(2, 11, 9000)], label: null },
       green: { targets: [target(2, 21, 9000)], label: null },
-      active: 'green', maintenance: { enabled: false, page_id: null }, health: { ...health, path: '/v1/health' }, source: null,
+      // A Rust API built from its repository; the repo is set so the site still passes the source checks when it is edited
+      active: 'green', maintenance: { enabled: false, page_id: null }, health: { ...health, path: '/v1/health' }, source: { repo: 'acme/quote-api', branch: 'main', runtime: 'rust', poll_interval: '5m' },
       access: { cloudflare_only: true, tls: 'full', bots: 'block_bad', zone_lock: true },
       history: hist([[300, 'blue', 'promote', 'Initial deploy'], [28, 'green', 'promote', 'Add pagination to orders'], [27, 'blue', 'switch', 'Manual flip while testing'], [26, 'green', 'switch', 'Back to green']]),
     },
@@ -387,7 +388,8 @@ function seedNode(name, url, idx) {
     events: [],
     lastTick: now,
     hap: { configHash: '9f2c41ab77e0', lastReload: now - 6 * 3600 * 1000, ok: true, error: '' },
-    down: new Set(idx === 1 ? ['10.1.1.22:8080'] : []),
+    // On the second node one storefront target of the live slot is down, matching its unhealthy status
+    down: new Set(idx === 1 ? ['10.1.1.22:8080', '10.1.1.11:8080'] : []),
   };
   const actors = ['admin', 'ci-deploy'];
   const entries = [['site.deploy', 'shop promoted green to blue'], ['firewall.create', 'rule r-env added'], ['settings.update', 'retention changed'], ['site.maintenance', 'docs maintenance toggled'], ['token.create', 'token ci-deploy created'], ['haproxy.reload', 'config reloaded']];
@@ -400,6 +402,13 @@ function seedNode(name, url, idx) {
 // Events come from a generator seeded by the node name, so each node keeps a recognisable traffic mix.
 
 const SITE_SHARE = { shop: 0.55, api: 0.35, docs: 0.1 };
+// Where each replicated site's traffic really lands differs by node: the storefront is busiest in Frankfurt, the API in New York
+const NODE_SHARE = [
+  { shop: 0.62, api: 0.2, docs: 0.06, legacy: 0.12 },
+  { shop: 0.28, api: 0.67, docs: 0.05 },
+];
+const loadShare = (node, id) => (NODE_SHARE[node.idx] || {})[id] ?? SITE_SHARE[id] ?? 0.05;
+const WINDOW_SECS = { '15m': 900, '1h': 3600, '24h': 86400, '7d': 604800, '30d': 2592000 };
 const WINDOWS = { '15m': [15, 60], '1h': [60, 60], '24h': [96, 900], '7d': [168, 3600], '30d': [120, 21600] };
 const IPS = ['198.51.100.23', '203.0.113.77', '192.0.2.14', '198.51.100.88', '192.0.2.201', '2001:db8::7a', '203.0.113.5', '198.51.100.140'];
 const AGENTS = [
@@ -491,7 +500,7 @@ function noise(i, salt) {
 
 function timeseries(node, win, siteId) {
   const [count, step] = WINDOWS[win] || WINDOWS['24h'];
-  const factor = siteId ? SITE_SHARE[siteId] || 0.05 : 1;
+  const factor = siteId ? loadShare(node, siteId) : 1;
   const salt = hashString(node.name + (siteId || ''));
   const base = (node.idx ? 330 : 470) * factor;
   const end = Math.floor(Date.now() / 1000 / step) * step;
@@ -523,6 +532,49 @@ function timeseries(node, win, siteId) {
     left -= 1;
   }
   return { step_secs: step, points };
+}
+
+// /analytics/facets: request counts per value of each dimension for a window. A site in maintenance serves its
+// maintenance page, so it has no requests of its own; the counts drift slowly so a refresh shows movement.
+function facets(node, win) {
+  const secs = WINDOW_SECS[win] || WINDOW_SECS['24h'];
+  const now = Date.now();
+  const hour = ((now / 3600000) % 24 + 24) % 24;
+  const diurnal = 0.62 + 0.38 * Math.sin(((hour - 8) / 24) * Math.PI * 2);
+  const nodeRps = ((node.idx ? 330 : 470) / 60) * diurnal;
+  const perSite = node.sites.map((site) => {
+    const drift = 1 + 0.12 * Math.sin(now / 47000 + (hashString(node.name) % 13) + (hashString(site.id) % 7));
+    const idle = Boolean(site.maintenance && site.maintenance.enabled);
+    return { site, count: idle ? 0 : Math.max(0, Math.round(nodeRps * loadShare(node, site.id) * drift * secs)) };
+  });
+  const total = perSite.reduce((t, e) => t + e.count, 0);
+  const byCount = (list) => list.filter((e) => e.count > 0).sort((a, b) => b.count - a.count);
+  const split = (weights) => {
+    const sum = weights.reduce((t, [, w]) => t + w, 0);
+    const parts = weights.map(([key, w]) => ({ key, count: Math.round((total * w) / sum) }));
+    return byCount(parts);
+  };
+  const hosts = new Map();
+  for (const { site, count } of perSite) {
+    const weights = site.hosts.map((_, i) => (i === 0 ? 3 : 1));
+    const sum = weights.reduce((t, w) => t + w, 0);
+    site.hosts.forEach((host, i) => hosts.set(host, (hosts.get(host) || 0) + Math.round((count * weights[i]) / sum)));
+  }
+  const api = perSite.find((e) => e.site.id === 'api');
+  const apiRatio = total && api ? api.count / total : 0;
+  const post = 0.06 + 0.3 * apiRatio;
+  const put = 0.01 + 0.05 * apiRatio;
+  const del = 0.005 + 0.03 * apiRatio;
+  const options = 0.003 + 0.02 * apiRatio;
+  const head = 0.02;
+  const e5 = 0.006 + 0.01 * node.idx;
+  return {
+    site: byCount(perSite.map((e) => ({ key: e.site.id, count: e.count }))),
+    host: byCount(Array.from(hosts, ([key, count]) => ({ key, count }))),
+    method: split([['GET', 1 - post - put - del - options - head], ['POST', post], ['HEAD', head], ['PUT', put], ['DELETE', del], ['OPTIONS', options]]),
+    status_class: split([['2xx', 0.89 - e5], ['3xx', 0.06], ['4xx', 0.044], ['5xx', e5]]),
+    bot_class: split([['human', 0.7], ['crawler', 0.1 + 0.02 * node.idx], ['tool', 0.08], ['bot', 0.08], ['suspect', Math.max(0.005, 0.04 - 0.02 * node.idx)]]),
+  };
 }
 
 function share(total, entries, scale = 1) {
@@ -1060,6 +1112,7 @@ async function nodeRoute(node, method, seg, q, body) {
     const win = q.get('window') || '24h';
     if (b === 'summary') return summary(node, win, q.get('site'));
     if (b === 'timeseries') return timeseries(node, win, q.get('site'));
+    if (b === 'facets') return facets(node, win);
     if (b === 'requests') return clone(filterEvents(node, q));
     if (b === 'bots') return botSummary(eventsIn(node, win, q.get('site')));
     if (b === 'top') {
@@ -1162,7 +1215,7 @@ async function dashboardRoute(method, seg, q, body) {
   if (!state.loggedIn) throw new ApiError(401, 'not signed in');
   if (a === 'nodes') {
     if (!b) {
-      if (method === 'GET') return state.nodes.map((n) => ({ name: n.name, url: n.url, online: true, version: n.version }));
+      if (method === 'GET') return state.nodes.map((n) => ({ name: n.name, url: n.url, online: !n.offline, version: n.version }));
       if (method === 'POST') {
         if (!body.name || !body.url || !body.token) throw new ApiError(400, 'name, url and token are required');
         if (state.nodes.some((n) => n.name === body.name)) throw new ApiError(409, `node ${body.name} already exists`);
@@ -1170,13 +1223,19 @@ async function dashboardRoute(method, seg, q, body) {
         return { ok: true };
       }
     }
-    if (b === 'summary') return state.nodes.map((n) => ({ name: n.name, online: true, node: nodeInfo(n) }));
+    if (b === 'summary') {
+      return state.nodes.map((n) => (n.offline
+        ? { name: n.name, online: false, error: 'The connector did not respond.', node: null }
+        : { name: n.name, online: true, node: nodeInfo(n) }));
+    }
     if (seg.length === 2 && method === 'DELETE') {
       findNode(b);
       state.nodes = state.nodes.filter((n) => n.name !== b);
       return { ok: true };
     }
-    return nodeRoute(findNode(b), method, seg.slice(2), q, body);
+    const target = findNode(b);
+    if (target.offline) throw new ApiError(502, `node ${b} did not respond`);
+    return nodeRoute(target, method, seg.slice(2), q, body);
   }
   if (a === 'deployments' && method === 'POST') {
     const results = [];
@@ -1184,6 +1243,7 @@ async function dashboardRoute(method, seg, q, body) {
       const node = state.nodes.find((n) => n.name === name);
       try {
         if (!node) throw new ApiError(404, `node ${name} is not configured`);
+        if (node.offline) throw new ApiError(502, `node ${name} did not respond`);
         checkSiteShape(body.site);
         if (typeof body.github_token === 'string' && body.github_token.trim() && !body.site.source) throw new ApiError(400, 'github_token needs a site with a source');
         if (node.sites.some((s) => s.id === body.site.id)) throw new ApiError(409, `site ${body.site.id} already exists`);
@@ -1202,7 +1262,10 @@ async function dashboardRoute(method, seg, q, body) {
 
 export async function mockRequest(method, rawPath, body) {
   if (!state.nodes.length) {
-    state.nodes.push(seedNode('edge-fra', 'https://fra.edge.example.com:8443', 0), seedNode('edge-nyc', 'https://nyc.edge.example.com:8443', 1));
+    // The third node does not answer, so the offline paths on the sites list, topology and overview can be seen
+    const offline = seedNode('edge-ams', 'https://ams.edge.example.com:8443', 2);
+    offline.offline = true;
+    state.nodes.push(seedNode('edge-fra', 'https://fra.edge.example.com:8443', 0), seedNode('edge-nyc', 'https://nyc.edge.example.com:8443', 1), offline);
   }
   await ready;
   await sleep(70 + Math.random() * 190);

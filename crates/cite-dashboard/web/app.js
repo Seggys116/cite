@@ -11,6 +11,8 @@ import { nodesView, openAddNode } from './js/views/nodes.js';
 import { sitesView } from './js/views/sites.js';
 import { newSiteView } from './js/views/siteForm.js';
 import { siteDetailView } from './js/views/siteDetail.js';
+import { topologyView } from './js/views/topology.js';
+import { databasesView } from './js/views/databases.js';
 import { trafficView } from './js/views/traffic.js';
 import { firewallView } from './js/views/firewall.js';
 import { redirectsView } from './js/views/redirects.js';
@@ -21,6 +23,8 @@ const NAV = [
   { id: 'overview', label: 'Overview', icon: 'home' },
   { id: 'nodes', label: 'Nodes', icon: 'server' },
   { id: 'sites', label: 'Sites', icon: 'globe' },
+  { id: 'topology', label: 'Topology', icon: 'layers' },
+  { id: 'databases', label: 'Databases', icon: 'layers' },
   { id: 'traffic', label: 'Traffic', icon: 'chart' },
   { id: 'firewall', label: 'Firewall', icon: 'shield' },
   { id: 'maintenance', label: 'Maintenance', navLabel: 'Pages', icon: 'wrench' },
@@ -30,6 +34,8 @@ const NAV = [
 const VIEWS = {
   overview: overviewView,
   nodes: nodesView,
+  topology: topologyView,
+  databases: databasesView,
   traffic: trafficView,
   firewall: firewallView,
   redirects: redirectsView,

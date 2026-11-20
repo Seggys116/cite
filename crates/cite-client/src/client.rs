@@ -44,6 +44,11 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 pub const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
+/// Sent on every request to a connector; a connector hides newer site fields from clients that do not send it.
+pub const CLIENT_HEADER: &str = "x-cite-client";
+/// The workspace version, which is the release the client belongs to.
+pub const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 // The connector gives a deploy up to 700 s end to end; create, switch and rollback wait for health too.
 const DEPLOY_TIMEOUT: Duration = Duration::from_secs(700);
 const ACTION_TIMEOUT: Duration = Duration::from_secs(120);
@@ -219,17 +224,17 @@ impl RequestQuery {
 }
 
 #[derive(Clone, Copy)]
-struct Opts {
-    auth: bool,
-    timeout: Option<Duration>,
+pub(crate) struct Opts {
+    pub(crate) auth: bool,
+    pub(crate) timeout: Option<Duration>,
 }
 
-const DEFAULT_OPTS: Opts = Opts {
+pub(crate) const DEFAULT_OPTS: Opts = Opts {
     auth: true,
     timeout: None,
 };
 
-const ACTION_OPTS: Opts = Opts {
+pub(crate) const ACTION_OPTS: Opts = Opts {
     auth: true,
     timeout: Some(ACTION_TIMEOUT),
 };
@@ -259,7 +264,7 @@ impl fmt::Debug for NodeClient {
 }
 
 // Path segments come from callers, so everything outside the unreserved set is escaped.
-fn enc(segment: &str) -> String {
+pub(crate) fn enc(segment: &str) -> String {
     let mut out = String::with_capacity(segment.len());
     for b in segment.bytes() {
         if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
@@ -271,11 +276,11 @@ fn enc(segment: &str) -> String {
     out
 }
 
-fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Res<T> {
+pub(crate) fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Res<T> {
     serde_json::from_slice(bytes).map_err(|e| ClientError::Decode(e.to_string()))
 }
 
-fn body_of<B: Serialize + ?Sized>(body: &B) -> Res<Option<Value>> {
+pub(crate) fn body_of<B: Serialize + ?Sized>(body: &B) -> Res<Option<Value>> {
     serde_json::to_value(body)
         .map(Some)
         .map_err(|e| ClientError::Config(format!("cannot encode request: {e}")))
@@ -291,7 +296,7 @@ fn create_site_body(site: &Site, github_token: Option<&str>) -> Res<Option<Value
     Ok(Some(body))
 }
 
-fn error_message(bytes: &[u8], status: reqwest::StatusCode) -> String {
+pub(crate) fn error_message(bytes: &[u8], status: reqwest::StatusCode) -> String {
     let parsed = serde_json::from_slice::<Value>(bytes).ok();
     let text = parsed
         .as_ref()
@@ -303,7 +308,7 @@ fn error_message(bytes: &[u8], status: reqwest::StatusCode) -> String {
     text.chars().take(MAX_ERROR_CHARS).collect()
 }
 
-async fn read_capped(
+pub(crate) async fn read_capped(
     mut resp: reqwest::Response,
 ) -> Res<(reqwest::StatusCode, Option<String>, Vec<u8>)> {
     let status = resp.status();
@@ -345,7 +350,7 @@ struct TopItems {
     items: Vec<TopItem>,
 }
 
-async fn open_stream(req: reqwest::RequestBuilder) -> Res<ExportStream> {
+pub(crate) async fn open_stream(req: reqwest::RequestBuilder) -> Res<ExportStream> {
     let resp = req.send().await.map_err(ClientError::from_reqwest)?;
     if resp.status().is_success() {
         return Ok(ExportStream::new(resp));
@@ -369,21 +374,31 @@ impl NodeClient {
     pub fn new(node: &NodeConfig, token: String) -> Res<Self> {
         let url = parse_node_url(&node.url, node.insecure_http)
             .map_err(|e| ClientError::Config(e.to_string()))?;
-        let mut builder = reqwest::Client::builder()
+        let mut default_headers = reqwest::header::HeaderMap::new();
+        default_headers.insert(
+            reqwest::header::HeaderName::from_static(CLIENT_HEADER),
+            reqwest::header::HeaderValue::from_static(CLIENT_VERSION),
+        );
+        let node_ca = match &node.ca_pem {
+            Some(pem) => Some(
+                reqwest::Certificate::from_pem(pem.as_bytes())
+                    .map_err(|e| ClientError::Config(format!("invalid ca_pem: {e}")))?,
+            ),
+            None => None,
+        };
+        // A pinned CA replaces the public roots entirely so no other issuer can vouch for the node.
+        let builder = match node_ca {
+            Some(cert) => cite_tls::client_builder_with_roots([cert]),
+            None => cite_tls::client_builder(),
+        };
+        let builder = builder
+            .default_headers(default_headers)
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(REQUEST_TIMEOUT)
             .redirect(reqwest::redirect::Policy::none())
             .pool_idle_timeout(Duration::from_secs(60))
             .tcp_keepalive(Duration::from_secs(30))
             .user_agent(concat!("cite-client/", env!("CARGO_PKG_VERSION")));
-        // A pinned CA replaces the public roots entirely so no other issuer can vouch for the node.
-        if let Some(pem) = &node.ca_pem {
-            let cert = reqwest::Certificate::from_pem(pem.as_bytes())
-                .map_err(|e| ClientError::Config(format!("invalid ca_pem: {e}")))?;
-            builder = builder
-                .tls_built_in_root_certs(false)
-                .add_root_certificate(cert);
-        }
         let http = builder
             .build()
             .map_err(|e| ClientError::Config(format!("cannot build http client: {e}")))?;
@@ -403,14 +418,14 @@ impl NodeClient {
         &self.base
     }
 
-    async fn exec(
+    fn request(
         &self,
         method: Method,
         path: &str,
         query: &[(&str, String)],
         body: Option<Value>,
         opts: Opts,
-    ) -> Res<Vec<u8>> {
+    ) -> reqwest::RequestBuilder {
         let url = format!("{}/api/v1{path}", self.base);
         let mut req = self.http.request(method, url);
         if !query.is_empty() {
@@ -425,11 +440,39 @@ impl NodeClient {
         if let Some(timeout) = opts.timeout {
             req = req.timeout(timeout);
         }
-        Self::finish(req).await
+        req
+    }
+
+    pub(crate) async fn exec(
+        &self,
+        method: Method,
+        path: &str,
+        query: &[(&str, String)],
+        body: Option<Value>,
+        opts: Opts,
+    ) -> Res<Vec<u8>> {
+        Self::finish(self.request(method, path, query, body, opts)).await
+    }
+
+    // Like `exec` but hands back the status and body of a refusal too, for callers that read a structured error.
+    pub(crate) async fn exec_status(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<Value>,
+        opts: Opts,
+    ) -> Res<(reqwest::StatusCode, Vec<u8>)> {
+        let resp = self
+            .request(method, path, &[], body, opts)
+            .send()
+            .await
+            .map_err(ClientError::from_reqwest)?;
+        let (status, _, buf) = read_capped(resp).await?;
+        Ok((status, buf))
     }
 
     // For bodies that hold a secret and were serialised straight from borrowed fields.
-    async fn exec_json_bytes(
+    pub(crate) async fn exec_json_bytes(
         &self,
         method: Method,
         path: &str,
@@ -496,7 +539,7 @@ impl NodeClient {
         })
     }
 
-    async fn json<T: DeserializeOwned>(
+    pub(crate) async fn json<T: DeserializeOwned>(
         &self,
         method: Method,
         path: &str,
@@ -507,7 +550,7 @@ impl NodeClient {
         decode(&bytes)
     }
 
-    async fn unit(&self, method: Method, path: &str) -> Res<()> {
+    pub(crate) async fn unit(&self, method: Method, path: &str) -> Res<()> {
         self.exec(method, path, &[], None, DEFAULT_OPTS)
             .await
             .map(|_| ())
@@ -1327,7 +1370,7 @@ impl NodeClient {
         open_stream(self.authed_get(url).timeout(EXPORT_TIMEOUT)).await
     }
 
-    fn authed_get(&self, url: String) -> reqwest::RequestBuilder {
+    pub(crate) fn authed_get(&self, url: String) -> reqwest::RequestBuilder {
         let req = self.http.get(url);
         if self.token.is_empty() {
             req

@@ -143,7 +143,7 @@ export function logsPanel({ node, site }) {
 
   const el = card({
     title: 'Logs',
-    subtitle: 'Manager logs show fetching, installing and building. Executor logs show what the running site prints. Secrets are masked by the node.',
+    subtitle: `From ${node}. Manager covers fetch and build, Executor the running site. Secrets are masked.`,
     body: h('div', { class: 'stack-sm' },
       h('div', { class: 'log-tools' }, tabs, slotSelect, h('label', { class: 'check-row' }, follower, h('span', {}, 'Follow')), searchBox, filter, copy, clear),
       note, view, count),

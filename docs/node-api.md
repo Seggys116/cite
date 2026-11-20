@@ -38,7 +38,7 @@ The three `/tokens` routes need a session token from login. An API token gets 40
 | `POST /sites` | `Site` without `history`, plus an optional `github_token` | `Site` |
 | `GET /sites/{id}` | none | `Site` plus `live:{blue:[{addr,status}],green:[...]}` |
 | `PUT /sites/{id}` | `Site` | `Site` |
-| `DELETE /sites/{id}?purge_volumes=true` | none | `{ok:true}`. Without `purge_volumes=true` the site's persistent volumes are kept. |
+| `DELETE /sites/{id}?purge_volumes=true&purge_data=true` | none | `{ok:true}`. Without `purge_volumes=true` the site's persistent volumes are kept; without `purge_data=true` its databases, backups and data secrets are kept (see [data](data.md)). With `purge_data=true` the answer also carries `s3_objects_left`. |
 | `GET /sites/{id}/volumes` | none | `[{name,mount_path,size_bytes,mounted,created_at,declared}]`: declared volumes in order, then leftovers (`declared: false`, `mount_path: ""`). `size_bytes` and `created_at` are `null` when Docker does not report them or the volume is not created yet; `mounted` is true when a running executor mounts it. |
 | `DELETE /sites/{id}/volumes/{name}` | none | `{ok:true}` after deleting the volume's data. 409 while the volume is declared and the site has a running container, or while a running slot mounts it; 404 when no such volume exists. |
 | `GET /sites/{id}/zone-secret` | none | `{configured,readable,header:"X-Cite-Origin-Secret",created_at,fingerprint}`; never the secret. `readable` is false when `zone-secrets.json` could not be read at start, in which case `configured: false` means "unknown". `fingerprint` is the first 8 hex digits of its SHA-256, `null` when none is stored. |
@@ -210,7 +210,7 @@ The node watches its sites and can send a message to webhooks (Discord, Slack or
 }
 ```
 
-`kind` is `generic`, `discord` or `slack`. `events` is any of `site_unhealthy`, `site_recovered`, `build_failed`, `deploy_succeeded`, `cert_expiring` and `node_error`; an empty list means all of them. `tls` is `starttls` (default, port 587), `tls` (implicit TLS, usually port 465) or `none`; `none` cannot be combined with a username, so credentials never travel in the clear. `cooldown_secs` (default 900, at most 7 days) is the minimum gap between two messages for the same site and event. At most 10 webhooks and 5 recipients; ids are 1 to 32 characters from `a-z`, `0-9` and `-` (and not `email`); names are 1 to 64 characters. The body is limited to 16 KiB, and unknown fields are ignored.
+`kind` is `generic`, `discord` or `slack`. `events` is any of `site_unhealthy`, `site_recovered`, `build_failed`, `deploy_succeeded`, `cert_expiring`, `node_error` and `backup_failed` (a failed scheduled backup of a site database, or a failed copy of one to S3); an empty list means all of them. `tls` is `starttls` (default, port 587), `tls` (implicit TLS, usually port 465) or `none`; `none` cannot be combined with a username, so credentials never travel in the clear. `cooldown_secs` (default 900, at most 7 days) is the minimum gap between two messages for the same site and event. At most 10 webhooks and 5 recipients; ids are 1 to 32 characters from `a-z`, `0-9` and `-` (and not `email`); names are 1 to 64 characters. The body is limited to 16 KiB, and unknown fields are ignored.
 
 Secrets are write-only. Webhook URLs are returned as `https://host/...` and the SMTP password is never returned, only `password_set`. On `PUT`, a webhook whose `url` is blank or equal to the masked value keeps the URL stored for the same `id`, and a blank `password` keeps the stored one only while `host`, `port`, `tls` and `username` are unchanged (otherwise the `PUT` is refused and the password must be entered again, so a stored password is never sent to another server); a webhook with a new id needs a URL. Removing `email` deletes the stored password. Setting `username` to blank also clears the password. The settings live in `alerts.json` in the data directory (mode 0600). If that file cannot be read at start, alerts stay off, the file is left untouched and `PUT` answers 500 until it is fixed.
 
@@ -305,6 +305,119 @@ Backups, cuts (dry runs included), restores, downloads and deletes are recorded 
 Analytics read failures return 500 `{error:"internal error"}`; the cause is in the connector log.
 
 The `sizes` buckets are cumulative: `count` is the number of responses up to and including `le` bytes, and the final bucket (`le` null) equals the total, so clients subtract the previous bucket to draw a histogram.
+
+## Site data services
+
+Managed and external Postgres, S3 attachments, generated secrets, env links, backups, and moves between modes and nodes. What each does is in [Site data services](data.md). A node lists the capabilities `data-postgres`, `data-shared`, `data-external`, `data-s3`, `data-backups`, `data-links` and `data-transfer` only when the orchestrator is on and the data service is running.
+
+These routes answer 404 `data services are not enabled on this node` when the connector has no backup volume (`CITE_DATA_BACKUP_DIR`) or no Docker access; `GET /data` answers `enabled: false` instead. JSON bodies are at most 64 KiB (an import's manifest 4 MiB, a transfer chunk 8 MiB) and refuse unknown fields. A refusal that is the node's policy, such as an egress mode that forbids an attachment, is 422. No response contains a password, an external URL, an S3 key, a generated secret or the node key.
+
+A route that starts work answers 202 `{job_id, redeploy_needed?}`. `GET /data/jobs/{job}` returns `{id,kind,site,state,step,error,result}` with `state` `running`, `ok` or `failed`; the connector keeps the last 200 jobs in memory. `redeploy_needed` is true when the change reaches running containers only after the next deploy. At most two data jobs run at once; starting a third answers 429. Audit entries hold names and ids only. `Site.data` is not part of a site body you write: `POST /sites` and `PUT /sites/{id}` ignore it, and the data routes below are the only way to change it. Site responses include `data` only for a client that sends `X-Cite-Client` with the connector's version or newer; `DELETE /sites/{id}` accepts `?purge_data=true`, which also deletes the site's databases, backups and data secrets and answers `{ok,s3_objects_left}` (S3 copies are never deleted by a purge, and a site with data cannot be purged while data services are off).
+
+### Node level
+
+| Route | Body | Response | Audit |
+|---|---|---|---|
+| `GET /data` | none | `{enabled,backup_volume_ok,key:{kid,source},pg_majors,shared,targets,orphans}`; `key.source` is `env`, `file` or `managed` | none |
+| `GET /data/jobs/{job}` | none | `{id,kind,site,state,step,error,result}`; 404 for an unknown job | none |
+| `GET /data/targets` | none | `[{id,name,endpoint,bucket,region,path_style,prefix,encrypt}]` | none |
+| `POST /data/targets` | `{name,endpoint,bucket,region,path_style?,prefix?,encrypt?,access_key_id,secret_access_key}` | 201 target | `data.target.create` |
+| `PUT /data/targets/{tid}` | the same; omitted keys keep the stored ones | target | `data.target.update` |
+| `DELETE /data/targets/{tid}` | none | `{ok:true}` | `data.target.delete` |
+| `POST /data/targets/{tid}/test` | none | `{ok,error?}` | `data.target.test` |
+| `GET /data/shared` | none | `{enabled,major,memory_mb,nano_cpus,max_connections,health,size_bytes,tenants:[{site,databases:[{name,size_bytes}]}]}` | none |
+| `PUT /data/shared` | `{major?,memory_mb,cpus,max_connections}` | 202 job | `data.shared.enable` or `data.shared.update` |
+| `POST /data/shared/restart` | none | 202 job | `data.shared.restart` |
+| `DELETE /data/shared?force=&purge=` | none | 202 job. Refused (409) while sites use it unless both `force` and `purge` are `true`. | `data.shared.delete` |
+| `GET /data/shared/backups` | none | `[{id,created_at,parts:[{database,size_bytes,sha256}],status}]` | none |
+| `POST /data/shared/backups` | none | 202 job | `data.shared.backup` |
+| `GET /data/shared/backups/{bid}/download` | none | `application/x-tar` of the decrypted parts | `data.shared.backup.download` |
+| `DELETE /data/shared/backups/{bid}` | none | `{ok:true}` | `data.shared.backup.delete` |
+| `GET /data/orphans` | none | `[{site,dedicated_volume,shared_databases,backups,secrets}]`: data kept from deleted sites | none |
+| `DELETE /data/orphans/{id}` | none | 202 job; 409 while the site still exists | `data.orphan.purge` |
+
+`memory_mb` is 256 to 65536, `cpus` 0.25 to 64, `max_connections` 10 to 1000; `major` (17 or 18, default 18) cannot change once the instance exists. Target `endpoint` must be https, or http to an RFC 1918, ULA or 100.64.0.0/10 address with `CITE_DATA_S3_ALLOW_PRIVATE=true`; the test returns `{ok,error?}` with `error` one of `auth_failed`, `bucket_missing`, `unreachable`, `tls_error`, `refused_address`, `http_<status>` or `request_failed`; `encrypt` cannot be `false`; at most 16 targets.
+
+### Postgres, databases and users
+
+| Route | Body | Response | Audit |
+|---|---|---|---|
+| `GET /sites/{id}/data` | none | `{postgres,external,s3,secrets,links,redeploy_needed,shadowed,capabilities,conversion?,transfers?}`. `postgres` is `{mode,major,memory_mb,max_connections,databases:[{name,size_bytes,users:[{name,level,connection_limit,statement_timeout_ms,idle_in_transaction_timeout_ms,disabled,active,retiring,rotated_at,linked_by}]}],backup,health,retired}`; `conversion` is the unfinished conversion session and `transfers` the open exports and imports. | none |
+| `PUT /sites/{id}/data/postgres` | `{mode,major?,memory_mb?,max_connections?,preset?}` | 202 job | `data.postgres.enable` or `data.postgres.update` |
+| `DELETE /sites/{id}/data/postgres?purge=` | none | 202 job with `redeploy_needed` when links were removed | `data.postgres.disable` or `data.postgres.purge` |
+| `PUT /sites/{id}/data/postgres/policy` | `{schedule?:{every_hours,minute},local:{keep_all_hours,daily_days,weekly_weeks,monthly_months,pre_restore_days},s3?:{target,retention}}` | the policy | `data.policy.update` |
+| `POST /sites/{id}/data/postgres/databases` | `{name}` | 202 job | `data.database.create` |
+| `DELETE /sites/{id}/data/postgres/databases/{db}?purge=` | none | 202 job with `redeploy_needed` | `data.database.delete` |
+| `POST /sites/{id}/data/postgres/databases/{db}/users` | `{name,level,connection_limit?,statement_timeout_ms?,idle_in_transaction_timeout_ms?}` | 202 job | `data.user.create` |
+| `PATCH /sites/{id}/data/postgres/databases/{db}/users/{user}` | any of `{level,connection_limit,statement_timeout_ms,idle_in_transaction_timeout_ms,disabled}` | 202 job | `data.user.disable`, `data.user.enable` (when `disabled` is the only field) or `data.user.update` |
+| `POST /sites/{id}/data/postgres/databases/{db}/users/{user}/rotate` | none | 202 job with `redeploy_needed` | `data.user.rotate`, then `data.user.rotated`, and `data.user.retired` by `scheduler` |
+| `DELETE /sites/{id}/data/postgres/databases/{db}/users/{user}` | none | 202 job | `data.user.delete` |
+
+`level` is `owner`, `readwrite` or `readonly`; `mode` is `dedicated` or `shared`; `preset` on enable is only `generic`. Turning Postgres off or deleting a database removes the links that read from it. A site needs at least one database, a database at least one user, and the last owner cannot be demoted or deleted.
+
+### External Postgres, S3, secrets and links
+
+| Route | Body | Response | Audit |
+|---|---|---|---|
+| `PUT /sites/{id}/data/external/{name}` | `{url}` | `{name,host,port,database,sslmode,forward_port,warnings}`; the URL is never returned | `data.external.put` |
+| `DELETE /sites/{id}/data/external/{name}` | none | `{ok:true}`; 409 while a link reads from it | `data.external.delete` |
+| `PUT /sites/{id}/data/s3/{name}` | `{endpoint,bucket,region,path_style?,access_key_id?,secret_access_key?}` | `{name,endpoint,bucket,region,path_style,has_keys,linked_by}` | `data.s3.put` |
+| `DELETE /sites/{id}/data/s3/{name}` | none | `{ok:true}`; 409 while linked | `data.s3.delete` |
+| `POST /sites/{id}/data/secrets` | `{name,bytes?,encoding?}` | 201 `{name,bytes,encoding,rotated_at,linked_by}` | `data.secret.create` |
+| `POST /sites/{id}/data/secrets/{name}/rotate` | none | the secret with `redeploy_needed` | `data.secret.rotate` |
+| `DELETE /sites/{id}/data/secrets/{name}` | none | `{ok:true}`; 409 while linked | `data.secret.delete` |
+| `GET /sites/{id}/data/links` | none | `[{var,target,source,label,shadows_doppler}]` | none |
+| `POST /sites/{id}/data/links` | `{links:[{var,target,source}],override?}` | the stored links. 409 `{error,conflicts:[{var,target,set_by}]}` when a variable is already set by hand (`manual`) or linked to another source (`link`) | `data.link.create` |
+| `POST /sites/{id}/data/links/preset` | `{preset,database?,runtime_user?,migrate_user?,auth_database?,override_manual?}` | `{links,created_users,created_secrets,job_id?}`, 202 when it started a job, else 200 | `data.link.preset` |
+| `DELETE /sites/{id}/data/links/{target}/{var}` | none | `{ok:true}`; `target` is `runtime` or `build` | `data.link.delete` |
+
+`target` of a link request is `runtime`, `build` or `both`; `source` is one of `{kind:"postgres",database,user,field}`, `{kind:"external",name,field}`, `{kind:"s3",name,field}`, `{kind:"secret",name}` and `{kind:"site_url"}`. `preset` is `generic`, `prisma`, `drizzle`, `authjs` or `better-auth`. `encoding` of a secret is `base64url` or `hex`, `bytes` 32 to 128. On an S3 attachment the endpoint must be https and omitted keys keep the stored ones; both are required for a new one. External URLs and S3 keys are write-only. Linking, `PATCH` of linked variables on `build-env` and `runtime-env`, and the other rules are in [Site data services](data.md#env-links).
+
+### Backups
+
+| Route | Body | Response | Audit |
+|---|---|---|---|
+| `GET /sites/{id}/data/backups?database=` | none | `[BackupRecord]`, newest first; `database` is `pg:<db>` or `ext:<name>` | none |
+| `POST /sites/{id}/data/backups` | `{database,label?,push_s3?}` | 202 `{job_id,backup_id}` | `data.backup.create` |
+| `GET /sites/{id}/data/backups/{bid}` | none | `BackupRecord` | none |
+| `PATCH /sites/{id}/data/backups/{bid}` | `{label?,pinned?}`; `label: null` clears it | `BackupRecord` | `data.backup.label`, `data.backup.pin`, `data.backup.unpin` |
+| `DELETE /sites/{id}/data/backups/{bid}?from=local\|s3\|all` | none | `{ok:true}`; 409 while pinned or running | `data.backup.delete` |
+| `GET /sites/{id}/data/backups/{bid}/download` | none | the decrypted dump, `application/octet-stream`, with `X-Backup-Sha256`; supports one `Range`; 429 when too many downloads run | `data.backup.download` |
+| `POST /sites/{id}/data/backups/{bid}/restore` | `{confirm,database?}` | 202 `{job_id,pre_restore_backup_id}`; `confirm` must equal the site id | `data.backup.restore` |
+| `POST /sites/{id}/data/backups/{bid}/push` | `{target?}` or no body | 202 job; 409 when the backup has no local copy | `data.backup.push` |
+| `GET /sites/{id}/data/prune-preview` | none | `[{database,local:{keep:[{id,reason}],delete:[id]},s3:{...}}]` | none |
+| `POST /sites/{id}/data/prune` | none | `{deleted}` | `data.backup.prune` |
+
+`BackupRecord` is `{id,database,version,created_at,completed_at,trigger,label,pinned,size_bytes,sha256,server_version,format,encryption:{scheme,kid},local:{file,stored_bytes},s3:{target,key,etag,version_id,uploaded_at,delete_error},status,error,actor,source}`. `trigger` is `manual`, `scheduled`, `pre_restore`, `transfer` or `import`; `status` is `running`, `ok` or `failed`; `reason` in a preview is `pinned`, `newest`, `undated`, `recent`, `pre_restore`, `daily`, `weekly` or `monthly`. `size_bytes` and `sha256` describe the plaintext dump. The retention rule is in [Site data services](data.md#retention). A failed scheduled backup raises the `backup_failed` alert event.
+
+### Conversion and transfer
+
+A conversion runs on one node. A transfer is an export on the source node and an import on the target node, driven by a client (the dashboard server or the desktop app); its chunk and manifest routes are not exposed through the dashboard's browser proxy. A session is `{id,kind,site,database,state,freeze,created_at,updated_at,backup_id,size_bytes,sha256,chunk_size,chunks,received,counts,peer_counts,pre_restore_backup,error,actor}` with `kind` `convert`, `export` or `import`. `state` is one of `pending`, `freezing`, `dumping`, `ready`, `receiving`, `restoring`, `verifying`, `awaiting_cutover`, `cutover`, `done`, `failed` or `rolled_back`. `freeze` is `maintenance` (default), `read_only` or `none`.
+
+| Route | Body | Response | Audit |
+|---|---|---|---|
+| `POST /sites/{id}/data/postgres/convert` | `{to,freeze?}` | 202 `{session}` | `data.convert.start` |
+| `GET /sites/{id}/data/postgres/convert/{sid}` | none | session | none |
+| `POST /sites/{id}/data/postgres/convert/{sid}/cutover` | none | session; 409 when the row counts differ | `data.convert.cutover` |
+| `POST /sites/{id}/data/postgres/convert/{sid}/abort` | none | session | `data.convert.abort` |
+| `DELETE /sites/{id}/data/postgres/retired` | none | 202 job; 409 when there is no retired database | `data.postgres.retired.delete` |
+| `POST /sites/{id}/data/exports` | `{database,freeze?,mode?}`; `mode` `staged` (default) or `live` (501) | 202 `{session}` | `data.export.create` |
+| `GET /sites/{id}/data/exports/{sid}` | none | session | none |
+| `GET /sites/{id}/data/exports/{sid}/chunks/{n}` | none | chunk `n` (8 MiB; the last may be shorter) as `application/octet-stream` with `X-Chunk-Sha256`, `Cache-Control: no-store` | none |
+| `GET /sites/{id}/data/exports/{sid}/manifest` | none | `{site,database,server_version,size_bytes,sha256,chunk_size,chunks,counts,users,links,generated_secrets}`, `no-store`; only while the export is `ready` | `data.export.manifest` (with the number of secrets) |
+| `POST /sites/{id}/data/exports/{sid}/finish` | `{outcome:"cutover"\|"abort"}` | session | `data.export.finish` |
+| `POST /sites/{id}/data/exports/{sid}/retry` | none | 202 `{session}`; only a failed export | `data.export.retry` |
+| `DELETE /sites/{id}/data/exports/{sid}` | none | `{ok:true}`; only a finished session | `data.export.delete` |
+| `POST /sites/{id}/data/imports` | `{manifest,replace?}` | 201 `{session}` | `data.import.create` |
+| `GET /sites/{id}/data/imports/{sid}` | none | session | none |
+| `PUT /sites/{id}/data/imports/{sid}/chunks/{n}` | the chunk bytes, header `X-Chunk-Sha256` | 204; a repeat of a received chunk is 204, a different body for it 409 | none |
+| `POST /sites/{id}/data/imports/{sid}/commit` | `{override?}` or no body | 202 job with `redeploy_needed: true` | `data.import.commit` |
+| `POST /sites/{id}/data/imports/{sid}/finish` | `{outcome:"cutover"\|"abort"}` | session | `data.import.finish` |
+| `DELETE /sites/{id}/data/imports/{sid}` | none | `{ok:true}`; a finished session, or an import still `receiving` | `data.import.delete` |
+
+An import needs managed Postgres enabled on the target site, answers 409 (at creation and again at commit) when a link in the manifest reads from anything but a user or secret the import creates, unless the target already has an identical link, refuses a dump larger than 2 TiB or from a newer Postgres major, answers 507 when the backup volume lacks twice the dump plus 1 GiB, and commits only after every chunk has arrived. `commit` also creates the users, the links and the carried secrets. The flow and its guarantees are in [Site data services](data.md#moving-a-database-to-another-node).
+
+The data service also writes `data.import.secret` and `data.import.link` for the secrets and links an import creates, `data.postgres.purge` for each tenant of a shared instance deleted with `purge`, and `data.link.create` for the default links of a new database. All name sites, variables and ids, never values. `cite-connector secrets rotate-key` writes `secrets.key_rotated` with key ids.
 
 ## Dashboard server
 

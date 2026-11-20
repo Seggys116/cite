@@ -84,13 +84,11 @@ impl GithubClient {
         branch: &str,
         token: &cite_core::GithubToken,
     ) -> Result<Self> {
-        let http = Client::builder()
-            .use_rustls_tls()
+        let http = cite_tls::client_builder()
             .timeout(Duration::from_secs(120))
             .connect_timeout(Duration::from_secs(30))
             .build()?;
-        let download = Client::builder()
-            .use_rustls_tls()
+        let download = cite_tls::client_builder()
             .connect_timeout(Duration::from_secs(30))
             .read_timeout(TARBALL_IDLE_TIMEOUT)
             .build()?;

@@ -6,9 +6,9 @@ This page covers installing, configuring and operating one Cite node: HAProxy pl
 
 | Service | Image | Role |
 |---|---|---|
-| `init` | `ghcr.io/seggys116/cite-connector:${CITE_VERSION:-0.4.1}` | One-shot. Creates `/conf/haproxy`, `/conf/certs` and `/conf/state` in the `cite_conf` volume owned by uid 10001, and sets the owner and mode of the `cite_run` volume at `/run/cite`, then exits. No network. |
+| `init` | `ghcr.io/seggys116/cite-connector:${CITE_VERSION:-0.5.0}` | One-shot. Creates `/conf/haproxy`, `/conf/certs` and `/conf/state` in the `cite_conf` volume owned by uid 10001, and sets the owner and mode of the `cite_run` volume at `/run/cite`, then exits. No network. |
 | `haproxy` | `docker.io/library/haproxy:3.2-bookworm` | Public listener on ports 80 and 443. Reads its config from the `haproxy` and `certs` subpaths of `cite_conf`, mounted read-only. It cannot see the connector's credentials, tokens, secrets or TLS keys. |
-| `connector` | `ghcr.io/seggys116/cite-connector:${CITE_VERSION:-0.4.1}` | Authenticated API on 7443, renders the HAProxy config, receives HAProxy's logs, runs the optional orchestrator. |
+| `connector` | `ghcr.io/seggys116/cite-connector:${CITE_VERSION:-0.5.0}` | Authenticated API on 7443, renders the HAProxy config, receives HAProxy's logs, runs the optional orchestrator. |
 
 The two containers do not share a process namespace. They share one small volume, `cite_run`, mounted at `/run/cite` in both, which holds three unix sockets: HAProxy's admin socket (`admin.sock`), the master CLI (`master.sock`, from `-S /run/cite/master.sock,level,admin` on the HAProxy command) and the log datagram socket the connector binds (`log.sock`). The directory is owned by uid 10001 with mode 0750, the admin and log sockets are mode 0600, and no admin listener exists on any network. The connector reloads HAProxy by connecting to the master socket, sending `reload` and reading the reply: `Success=1` or `Success=0` followed by the loader output. It then checks that `show info` on the admin socket reports a new pid. A config counts as applied only after that check passes, so a refused or unconfirmed reload is retried on the next apply and fails the change that caused it. If the master CLI is unreachable (HAProxy is not up yet at first boot), applying a config still succeeds with `reloaded` false and the reason in the status `last_error`. Both containers run as uid 10001 with a read-only root filesystem, `no-new-privileges` and all capabilities dropped.
 
@@ -51,7 +51,7 @@ HAProxy needs a config file to start, and only the connector writes the real one
 
 ## Connector settings
 
-The compose file passes only `CITE_CONNECTOR_ALLOW`, `CITE_CONNECTOR_LISTEN` and `RUST_LOG` into the connector. To set any other variable in the table, add it under `environment:` for the `connector` service in an override file.
+The compose file passes only `CITE_CONNECTOR_ALLOW`, `CITE_CONNECTOR_LISTEN`, `CITE_SECRETS_KEY_FILE` and `RUST_LOG` into the connector, plus the HAProxy and log socket paths. The orchestrator overlay adds the data settings. To set any other variable in the table, add it under `environment:` for the `connector` service in an override file.
 
 ```yaml
 # docker-compose.override.yml
@@ -92,6 +92,12 @@ Compose reads `docker-compose.override.yml` automatically only when you run `doc
 | `CITE_DOPPLER_TOKEN_FILE` | unset | Path of a file holding the Doppler token, for secret mounts. `CITE_DOPPLER_TOKEN` wins when both are set. |
 | `CITE_DOPPLER_POLL_SECS` | `300` | Seconds between Doppler syncs of each bound site. 60 to 86400. |
 | `CITE_STACK_GITHUB_API_URL` | unset (managers use `https://api.github.com`) | GitHub API base URL passed to every orchestrated manager as `CITE_GITHUB_API_URL`, for GitHub Enterprise Server. An `http` or `https` URL of at most 200 characters, with no user name, query or fragment. The Docker proxy must have the same value in `CITE_PROXY_GITHUB_API_URL`, or it refuses to create the managers. The overlay sets both from `CITE_GITHUB_API_URL` in `.env`. See [Orchestrator](orchestrator.md#github-enterprise-server-and-the-api-url). |
+| `CITE_DATA_BACKUP_DIR` | unset | Where the connector sees the backup volume. Site data services run only when this is set and the orchestrator is on. The overlay sets `/backups`. See [Site data services](data.md). |
+| `CITE_DATA_BACKUP_VOLUME` | `cite-backups` | Docker volume behind that directory. |
+| `CITE_DATA_S3_ALLOW_PRIVATE` | `false` | Allow RFC 1918, ULA and CGNAT addresses (and http to them) for S3 backup targets; loopback and link-local stay refused. |
+| `CITE_DATA_JOB_TIMEOUT` | `21600` | Seconds a database job may run, 60 to 86400. |
+| `CITE_SECRETS_KEY`, `CITE_SECRETS_KEY_FILE` | unset | The key that seals the connector's secret files and backups. With neither, the connector uses the managed `/conf/secrets.key`. See [Upgrading](#upgrading-from-an-older-release) and [Configuration](config.md#site-data-services-node-mode). |
+| `CITE_SECRETS_KEY_PREVIOUS`, `CITE_SECRETS_KEY_PREVIOUS_FILE` | unset | The key before a rotation, until the connector reports it is no longer needed. |
 | `RUST_LOG` | `info` | Log level. |
 
 Boolean values accept `1`, `true`, `yes`, `on`, `0`, `false`, `no`, `off`. The connector refuses to start on a malformed value.
@@ -100,13 +106,16 @@ Boolean values accept `1`, `true`, `yes`, `on`, `0`, `false`, `no`, `off`. The c
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `CITE_VERSION` | `0.4.1` | Connector image tag. |
+| `CITE_VERSION` | `0.5.0` | Connector image tag. |
 | `CITE_HTTP_PORT` | `80` | Host port for HTTP. |
 | `CITE_HTTPS_PORT` | `443` | Host port for HTTPS. |
 | `CITE_PUBLIC_BIND` | `0.0.0.0` | Host IP for the two public ports. |
 | `CITE_CONNECTOR_PORT` | `7443` | Host port for the connector API. |
 | `CITE_HAPROXY_MEM`, `CITE_HAPROXY_CPUS`, `CITE_HAPROXY_PIDS` | `1g`, `2.0`, `512` | HAProxy limits. |
 | `CITE_CONNECTOR_MEM`, `CITE_CONNECTOR_CPUS`, `CITE_CONNECTOR_PIDS` | `512m`, `1.0`, `256` | Connector limits. |
+| `CITE_SECRETS_KEY_FILE` | empty | Path of a node key file mounted into the connector. Empty uses the managed key in `cite_conf`. |
+| `CITE_DATA` | `true` | Overlay only. `false` makes the Docker proxy refuse every data container. |
+| `CITE_DATA_S3_ALLOW_PRIVATE`, `CITE_DATA_JOB_TIMEOUT` | `false`, `21600` | Overlay only. Passed to the connector. |
 
 HAProxy binds HTTPS only when `settings.https_port` is set in the node's configuration and `/conf/certs` holds at least one certificate. The bind loads every certificate in that directory and requires TLS 1.2 or newer. See [Certificates](#certificates).
 
@@ -209,6 +218,16 @@ A site built from a repository can take its build and runtime variables from a [
 
 **Limits.** A build or runtime environment holds at most 128 variables and 24 KiB of JSON, counting the Doppler values and the manual ones together. A sync that would go over is refused and keeps the previous values; a manual change that would go over is refused as well.
 
+## Docker address pools
+
+The orchestrator gives every site its own Docker networks: per slot an internal network to HAProxy, an internal network to its egress proxy and a bridge for the build, plus one database network when the site has managed Postgres, and the shared instance adds one more. Docker's default address pools hand out about 30 networks in total, so a node with more than a handful of orchestrated sites fails with `all predefined address pools have been fully subnetted`. Give the daemon pools of small networks in `/etc/docker/daemon.json` (Docker Desktop: Settings, Docker Engine) and restart it, for example:
+
+```json
+{ "default-address-pools": [ { "base": "10.200.0.0/16", "size": 24 } ] }
+```
+
+That allows 256 networks. Pick a base that does not overlap your LAN or VPN ranges.
+
 ## Persistent volumes and outbound access
 
 Both need the orchestrator; the node lists the capabilities `volumes` and `outbound` only when it is on.
@@ -218,6 +237,25 @@ Both need the orchestrator; the node lists the capabilities `volumes` and `outbo
 **Outbound access.** Every site has `outbound`, on by default, which lets server-side code call external APIs. By default (`CITE_STACK_EGRESS_MODE=filtered`) that means the public internet only: each outbound stack gets a small egress proxy, and private, internal and cloud metadata addresses, the proxy's own Docker networks and their gateways (the host's bridge address) are blocked, as are the mail ports unless the site turns `block_mail` off. The node's own public address is a public address, so the proxy cannot tell it apart: set `CITE_NODE_PUBLIC_IPS` to the node's public IPs on any internet-facing node so sites cannot reach its other services (SSH, admin ports, anything bound to `0.0.0.0`) through it. Server code reaches the internet through the `HTTP_PROXY` and `HTTPS_PROXY` variables the executor sets (Node fetch, Bun, curl, axios, undici, reqwest and requests honour them); a client that ignores them has no route out. Per site, `outbound_rules` adds allowed or denied destinations or switches to an allowlist. To let every site reach a LAN service, list its range in `CITE_STACK_EGRESS_ALLOW_CIDRS`; to block destinations for every site, use `CITE_STACK_EGRESS_DENY_CIDRS` and `CITE_STACK_EGRESS_DENY_HOSTS`. `CITE_STACK_EGRESS_MODE=open` restores the unfiltered bridge, and `off` forbids outbound access for every site (`GET /api/v1/node` reports `egress_mode` and `executor_egress`; the older `CITE_STACK_EXECUTOR_EGRESS=false` still means `off`). Turn `outbound` off per site for code that never needs the internet. See [Hardening](hardening.md#executor-egress) for exactly what is blocked. The single-site compose stack keeps executors without egress; add `docker-compose.egress.yml` there to give its executor a route out.
 
 ## Upgrading from an older release
+
+### Secrets are sealed (site data services release)
+
+On its first start with write access, the new connector seals its secret files under a node key: `secrets.json`, `credentials.json`, `alerts.json`, `zone-secrets.json`, `acme-account.pem`, `tls/ca.key` and `tls/server.key`. If you set neither `CITE_SECRETS_KEY` nor `CITE_SECRETS_KEY_FILE`, it creates the managed key `/conf/secrets.key`.
+
+1. **Back up the key.** Run `docker compose -f docker-compose.node.yml run --rm --no-deps -T connector secrets export-key > cite-node.key` and keep the file off the node. Without the key the sealed files and every backup are unreadable, and the connector refuses to start rather than make a new key (`sealed secrets found ... but no key`, or `... is sealed under key <id>, but this node has key <id>`). Restore `secrets.key`, or point `CITE_SECRETS_KEY_FILE` at the key, to recover.
+2. **Plaintext copies.** Each file sealed this way is first copied, once, to `<name>.pre-seal` (mode 0600). The next start that finds the file already sealed deletes the copy. Restart the connector once after checking the node, or delete the copies by hand. Volume backups taken before the upgrade still hold the plaintext.
+3. **Check it.** `docker compose -f docker-compose.node.yml run --rm --no-deps connector secrets status` prints the key id, where the key comes from and whether each file is absent, plaintext, sealed (and under which key) or unreadable.
+4. **Rotate it.** `... connector secrets rotate-key` replaces a managed key; the old one stays as `secrets.key.previous` until the next start has re-sealed everything. For a key from the environment or a file, put the new key in `CITE_SECRETS_KEY` or `CITE_SECRETS_KEY_FILE` and the old one in `CITE_SECRETS_KEY_PREVIOUS` or `CITE_SECRETS_KEY_PREVIOUS_FILE` until the connector logs that it is no longer needed.
+
+Sealing does not go backwards: an older connector cannot read sealed files. To return to an older release, restore a volume backup taken before the upgrade. A key kept on the same volume protects copies of single files and the backup volume, not a copy of the whole `cite_conf` volume; see [Security model](security-model.md#secrets-at-rest) for key placement.
+
+### Data services and older clients
+
+- Update the connector and the Docker proxy together (same `CITE_VERSION`) and run `up -d` with the overlay again; the overlay now creates the `cite-backups` volume. An older proxy refuses the data containers.
+- Update the dashboard and the desktop app before you attach data to a site. An older client reads a site strictly and cannot parse the new `data` field. To keep them working, the connector leaves `data` out of site responses unless the request carries `X-Cite-Client` with a version equal to or newer than the connector's; the new dashboard and desktop app, and `cite-client`, send it. An older client therefore sees sites without their data settings, and a write from it never removes them: the connector keeps the stored `data` whatever the body says. Only the data routes change it.
+- Sites without data are unchanged.
+
+### Firewall grammar and `edge.json`
 
 The firewall grammar is stricter than before: regexes are checked for patterns HAProxy can never match or that match too much (for example a leading `.*`, as in `.*bot.*`). At start the connector reads `edge.json` and repairs what it can:
 
@@ -242,20 +280,27 @@ Everything lives in the `cite_conf` volume, mounted at `/conf`.
 |---|---|---|
 | `edge.json` | 0600 | The node's configuration: sites, maintenance pages, firewall rules, settings. |
 | `edge.json.pre-migration` | 0600 | Only after an upgrade that rewrote `edge.json`: the original, written once and never removed. It holds the pre-migration header-secret values; delete it after checking the migration. |
-| `credentials.json` | 0600 | Username, Argon2id password hash, TOTP secret. |
+| `credentials.json` | 0600 | Username, Argon2id password hash, TOTP secret. Sealed. |
 | `tokens.json` | 0600 | API token ids, Argon2id hashes, names and last-used times. At most 64 tokens. |
-| `secrets.json` | 0600 | GitHub tokens for orchestrated sites, their build and runtime variables, per-site Doppler tokens and the synced Doppler values. |
-| `zone-secrets.json` | 0600 | One Cloudflare zone-lock secret per locked site. Not part of `edge.json` or any backup the API produces; the secrets reach `haproxy/haproxy.cfg`, which HAProxy reads. |
+| `secrets.json` | 0600 | GitHub tokens for orchestrated sites, their build and runtime variables, per-site Doppler tokens and the synced Doppler values, and the credentials, S3 keys and generated secrets of site data services. Sealed. |
+| `alerts.json` | 0600 | Alert settings with the webhook URLs and the SMTP password. Sealed. |
+| `acme-account.pem` | 0600 | The ACME account key. Sealed. |
+| `secrets.key` | 0600 | The managed node key that seals the files above and the backups. Created on first start unless `CITE_SECRETS_KEY` or `CITE_SECRETS_KEY_FILE` is set. Back it up away from the node. |
+| `secrets.key.previous` | 0600 | Only during a key rotation: the old key, deleted once the next start has re-sealed everything. |
+| `<name>.pre-seal` | 0600 | Only after an upgrade: the plaintext original of a file that was just sealed, deleted by the next start that finds the file sealed. |
+| `data/targets.json` | 0600 | Site data services: the S3 backup destinations (no keys; those are in `secrets.json`). |
+| `data/pg-shared.json` | 0600 | Site data services: the shared Postgres instance's settings. |
+| `zone-secrets.json` | 0600 | One Cloudflare zone-lock secret per locked site. Sealed. Not part of `edge.json` or any backup the API produces; the secrets reach `haproxy/haproxy.cfg`, which HAProxy reads in plain text. |
 | `audit.jsonl`, `audit.jsonl.1` | 0600 | Audit log of changes and logins. |
 | `analytics/analytics.db` | 0600 | SQLite analytics database, with its `-wal` and `-shm` files. An old `analytics.json` is imported once and then deleted. |
-| `tls/` | 0700 | `ca.pem`, `ca.key`, `server.pem` and the server key. |
+| `tls/` | 0700 | `ca.pem`, `ca.key`, `server.pem` and the server key. The two keys are sealed. |
 | `certs/` | 0750 | Uploaded certificates, one `<id>.pem` file each (0600, or 0640 with `CITE_CERTS_MODE`) holding the chain and the private key. |
 | `haproxy/haproxy.cfg` | 0644 | Rendered config. Overwritten on every change, do not edit it. |
 | `haproxy/maps/cloudflare.lst` | 0644 | One CIDR per line: the Cloudflare ranges, written when a site depends on them. |
 | `haproxy/maps/active.map`, `maint.map` | 0644 | Active slot and maintenance flag per site. `active.map` also carries `<host>@<run>` keys that route runs of four or more plain sites (exact hosts, no path regex) with one lookup. |
 | `haproxy/pages/` | 0644 | Maintenance pages, including `_default.html`. |
 
-Back up the volume to keep sites, rules and credentials. Treat the backup as a secret.
+Back up the volume to keep sites, rules and credentials. Treat the backup as a secret. With data services the databases and their backups live in other volumes (`cite-<id>-db-data`, `cite-pg-shared-data`, `cite-backups`); the sealed files in a `cite_conf` backup need their key to be read. The managed `secrets.key` is on the same volume, so a volume backup includes it; a key from `CITE_SECRETS_KEY_FILE` is not, so keep a copy of it too.
 
 ## Operating it
 

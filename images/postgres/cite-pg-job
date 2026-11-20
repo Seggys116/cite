@@ -1,0 +1,844 @@
+#!/bin/sh
+# cite-pg-job: one-shot Postgres maintenance for the Cite connector.
+#
+# Usage: cite-pg-job <op>
+#   superuser ops (PGUSER=postgres, maintenance database only):
+#     provision deprovision joblogin freeze unfreeze user hba sizes globals
+#   job-login ops (PGUSER=<tag>_job, the tenant database):
+#     backup restore counts regrant
+#   backup without CITE_ROLE_TAG dumps an external database with its own credentials.
+#
+# Trust model. Owner-level logins are held by site code, so everything inside a tenant database is
+# tenant-controlled: functions, operators, views, ALTER DATABASE ... SET. The superuser therefore never
+# connects to a tenant database. Superuser sessions open only the `postgres` maintenance database, which
+# tenants cannot reach (CONNECT is revoked and hba refuses it), and do role, database and hba
+# administration there plus reads of cluster-wide views. Work inside a tenant database runs as that
+# database's job login, `<tag>_job`: a NOSUPERUSER member of the owner group that is NOLOGIN outside
+# jobs. Whatever tenant code it ends up running yields only rights the tenant's owner logins hold already.
+#
+# Every connection starts with search_path pinned through PGOPTIONS. Startup options take precedence
+# over ALTER DATABASE / ALTER ROLE ... SET, and pg_temp is listed last so temporary objects cannot shadow
+# catalog names. Names in the SQL below are schema-qualified as well, as defence in depth.
+#
+# Every input arrives in the environment (CITE_*, PG*). Each value is checked against a strict
+# character set before use, and SQL identifiers and literals reach psql as variables (-v, \getenv)
+# that the SQL quotes with :"x" and :'x'. Nothing is ever spliced into SQL or evaluated by the shell,
+# and no secret is placed on a command line.
+#
+# Files in /backup (named after CITE_JOB_ID):
+#   backup  -> <id>.dump, <id>.version     restore -> reads <id>.dump
+#   counts  -> <id>.counts (TSV)           sizes   -> <id>.sizes (TSV)
+#   globals -> <id>.globals
+#
+# Login locks. A tenant login that Cite switched to NOLOGIN while it was LOGIN carries the role comment
+# 'cite:locked'; the login group of a frozen database carries 'cite:frozen'. Role comments live in the
+# shared catalog and only a superuser (or a CREATEROLE holder with ADMIN on the role) can change them,
+# so tenants cannot forge or clear them, and they survive a connector restart.
+#
+# Exit codes: 0 ok, 2 bad input, 3 hba rejected by the server, other: the failing tool's code.
+
+set -eu
+umask 077
+PATH=/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin
+export PATH
+PGCONNECT_TIMEOUT=10
+PGAPPNAME=cite-pg-job
+PGOPTIONS='-c search_path=pg_catalog,pg_temp'
+export PGCONNECT_TIMEOUT PGAPPNAME PGOPTIONS
+
+die() {
+  printf 'cite-pg-job: %s\n' "$*" >&2
+  exit 2
+}
+
+# ---- input checks (case patterns only; no regex engine, no eval) ----
+
+# 1..63 of letters, digits, '_', '.', '-', not starting with '-'. Excludes '=', '/', ':' and spaces, so
+# the value can never be read as a connection string.
+valid_dbname() {
+  case $1 in
+    '' | -* | *[!A-Za-z0-9_.-]*) return 1 ;;
+  esac
+  [ "${#1}" -le 63 ]
+}
+
+# 1..16 of a-z0-9 starting with a letter.
+valid_name16() {
+  case $1 in
+    '' | [!a-z]* | *[!a-z0-9]*) return 1 ;;
+  esac
+  [ "${#1}" -le 16 ]
+}
+
+# t<10 hex>_<database>
+valid_tag() {
+  case $1 in
+    t??????????_*) ;;
+    *) return 1 ;;
+  esac
+  v_rest=${1#t}
+  v_hex=${v_rest%%_*}
+  case $v_hex in
+    '' | *[!0-9a-f]*) return 1 ;;
+  esac
+  [ "${#v_hex}" -eq 10 ] || return 1
+  valid_name16 "${v_rest#*_}"
+}
+
+valid_number() {
+  case $1 in
+    '' | *[!0-9]*) return 1 ;;
+  esac
+  [ "${#1}" -le 10 ]
+}
+
+# Only the characters of host names and IP literals; no '/' (sockets) and no ',' (several hosts).
+valid_host() {
+  case $1 in
+    '' | -* | *[!A-Za-z0-9.:_-]*) return 1 ;;
+  esac
+  [ "${#1}" -le 253 ]
+}
+
+# digits, hex letters, '.', ':' and one '/<prefix>'
+valid_cidr() {
+  case $1 in
+    '' | /* | */ | */*/* | *[!0-9a-fA-F:./]*) return 1 ;;
+  esac
+  case $1 in
+    */*) ;;
+    *) return 1 ;;
+  esac
+  v_prefix=${1#*/}
+  valid_number "$v_prefix" && [ "${#v_prefix}" -le 3 ]
+}
+
+# ---- common environment ----
+
+[ "$#" -eq 1 ] || die "usage: cite-pg-job <op>"
+op=$1
+
+job=${CITE_JOB_ID:-}
+case $job in
+  '' | *[!0-9A-Za-z]*) die "CITE_JOB_ID is missing or invalid" ;;
+esac
+[ "${#job}" -eq 26 ] || die "CITE_JOB_ID is missing or invalid"
+f=/backup/$job
+
+valid_host "${PGHOST:-}" || die "PGHOST must be a host name or address"
+valid_number "${PGPORT:-}" || die "PGPORT must be a number"
+[ -n "${PGUSER:-}" ] || die "PGUSER is required"
+[ -n "${PGPASSWORD:-}" ] || die "PGPASSWORD is required"
+case ${PGSSLMODE:-} in
+  '' | disable | allow | prefer | require | verify-ca | verify-full) ;;
+  *) die "PGSSLMODE is not a known mode" ;;
+esac
+
+# ---- sessions ----
+#
+# These four helpers are the only places that start psql. The superuser ones always open the
+# maintenance database; the database ones open PGDATABASE and refuse the superuser. No SQL below
+# switches databases.
+
+need_superuser() {
+  [ "$PGUSER" = postgres ] || die "this operation runs as the superuser"
+}
+
+# Superuser, maintenance database, results discarded.
+su_psql() {
+  need_superuser
+  psql -X -q -v ON_ERROR_STOP=1 -o /dev/null -d postgres "$@"
+}
+
+# Superuser, maintenance database, unaligned tuples on stdout.
+su_query() {
+  need_superuser
+  psql -X -q -At -v ON_ERROR_STOP=1 -d postgres "$@"
+}
+
+# PGDATABASE as a login checked by need_job_login or need_external_login, results discarded.
+db_psql() {
+  [ "${db_login_checked:-0}" = 1 ] || die "the database login was not checked"
+  psql -X -q -v ON_ERROR_STOP=1 -o /dev/null -d "$PGDATABASE" "$@"
+}
+
+# PGDATABASE as a checked login, unaligned tuples on stdout.
+db_query() {
+  [ "${db_login_checked:-0}" = 1 ] || die "the database login was not checked"
+  psql -X -q -At -v ON_ERROR_STOP=1 -d "$PGDATABASE" "$@"
+}
+
+need_db() {
+  valid_dbname "${PGDATABASE:-}" || die "PGDATABASE is missing or invalid"
+}
+
+need_tag() {
+  valid_tag "${CITE_ROLE_TAG:-}" || die "CITE_ROLE_TAG is missing or invalid"
+}
+
+# Work inside a tenant database runs as that database's job login and never as the superuser.
+need_job_login() {
+  job_role=$1_job
+  [ "$PGUSER" != postgres ] && [ "$PGUSER" = "$job_role" ] \
+    || die "PGUSER must be the job login of this database"
+  db_login_checked=1
+}
+
+# An external database is dumped with its own credentials; a managed server is never reached this way.
+need_external_login() {
+  case $PGHOST in
+    cite-pg-shared | cite-*-db) die "a managed database is dumped as its job login (CITE_ROLE_TAG)" ;;
+  esac
+  db_login_checked=1
+}
+
+# <tag>_login must be the login group of a valid tag.
+need_login_role() {
+  login_role=${CITE_LOGIN_ROLE:-}
+  login_tag=${login_role%_login}
+  valid_tag "$login_tag" && [ "${login_tag}_login" = "$login_role" ] \
+    || die "CITE_LOGIN_ROLE is missing or invalid"
+}
+
+# ---- SQL fragments (constant text; they read only psql variables) ----
+#
+# Variables they expect: tag, db, and the names derived by sql_names.
+
+sql_names() {
+  cat <<'SQL'
+\set owner :tag _owner
+\set rw :tag _rw
+\set ro :tag _ro
+\set login :tag _login
+\set job :tag _job
+\set prefix :tag _
+SQL
+}
+
+# Locks every tenant login of the database that can log in now: NOLOGIN plus the 'cite:locked' mark.
+# Runs inside a transaction; the sessions are ended by sql_end_login_sessions after the commit.
+sql_lock_logins() {
+  cat <<'SQL'
+SELECT pg_catalog.format('COMMENT ON ROLE %I IS %L', r.rolname, 'cite:locked'),
+       pg_catalog.format('ALTER ROLE %I NOLOGIN', r.rolname)
+  FROM pg_catalog.pg_roles r
+ WHERE r.rolcanlogin
+   AND pg_catalog.starts_with(r.rolname::pg_catalog.text, :'prefix')
+   AND pg_catalog.right(r.rolname::pg_catalog.text, 2) OPERATOR(pg_catalog.=) ANY (ARRAY['_a', '_b'])
+ ORDER BY r.rolname
+\gexec
+SQL
+}
+
+# Gives LOGIN back to every login carrying the 'cite:locked' mark, unless the database is frozen.
+sql_unlock_logins() {
+  cat <<'SQL'
+SELECT pg_catalog.format('ALTER ROLE %I LOGIN', r.rolname),
+       pg_catalog.format('COMMENT ON ROLE %I IS NULL', r.rolname)
+  FROM pg_catalog.pg_roles r
+ WHERE pg_catalog.starts_with(r.rolname::pg_catalog.text, :'prefix')
+   AND pg_catalog.right(r.rolname::pg_catalog.text, 2) OPERATOR(pg_catalog.=) ANY (ARRAY['_a', '_b'])
+   AND pg_catalog.shobj_description(r.oid, 'pg_authid') OPERATOR(pg_catalog.=) 'cite:locked'
+   AND NOT EXISTS (
+         SELECT 1 FROM pg_catalog.pg_roles g
+          WHERE g.rolname OPERATOR(pg_catalog.=) :'login'
+            AND pg_catalog.shobj_description(g.oid, 'pg_authid') OPERATOR(pg_catalog.=) 'cite:frozen')
+ ORDER BY r.rolname
+\gexec
+SQL
+}
+
+# Ends the sessions of the database's tenant logins, found from the maintenance database.
+sql_end_login_sessions() {
+  cat <<'SQL'
+SELECT pg_catalog.pg_terminate_backend(a.pid)
+  FROM pg_catalog.pg_stat_activity a
+ WHERE a.datname OPERATOR(pg_catalog.=) :'db'
+   AND pg_catalog.starts_with(a.usename::pg_catalog.text, :'prefix')
+   AND pg_catalog.right(a.usename::pg_catalog.text, 2) OPERATOR(pg_catalog.=) ANY (ARRAY['_a', '_b']);
+SQL
+}
+
+# Creates the job login when it is missing (databases provisioned by an older release) and puts it in
+# its resting state: NOLOGIN, no password, no settings of its own, a member of the owner group only.
+# Runs inside a transaction.
+sql_job_rest() {
+  cat <<'SQL'
+SELECT pg_catalog.format('CREATE ROLE %I NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION BYPASSRLS INHERIT', :'job')
+ WHERE NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname OPERATOR(pg_catalog.=) :'job')
+\gexec
+ALTER ROLE :"job" NOLOGIN PASSWORD NULL NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION BYPASSRLS INHERIT CONNECTION LIMIT 2;
+ALTER ROLE :"job" RESET ALL;
+SELECT pg_catalog.format('ALTER ROLE %I IN DATABASE %I RESET ALL', :'job', :'db')
+ WHERE EXISTS (SELECT 1 FROM pg_catalog.pg_database WHERE datname OPERATOR(pg_catalog.=) :'db')
+\gexec
+SELECT DISTINCT pg_catalog.format('REVOKE %I FROM %I', g.rolname, :'job')
+  FROM pg_catalog.pg_auth_members m
+  JOIN pg_catalog.pg_roles g ON g.oid OPERATOR(pg_catalog.=) m.roleid
+  JOIN pg_catalog.pg_roles j ON j.oid OPERATOR(pg_catalog.=) m.member
+ WHERE j.rolname OPERATOR(pg_catalog.=) :'job'
+   AND g.rolname OPERATOR(pg_catalog.<>) :'owner'
+\gexec
+GRANT :"owner" TO :"job" WITH INHERIT TRUE, SET TRUE;
+SQL
+}
+
+# Ends any session of the job login (a job that died, or one this job replaces).
+sql_end_job_sessions() {
+  cat <<'SQL'
+SELECT pg_catalog.pg_terminate_backend(a.pid)
+  FROM pg_catalog.pg_stat_activity a
+ WHERE a.datname OPERATOR(pg_catalog.=) :'db'
+   AND a.usename OPERATOR(pg_catalog.=) :'job';
+SQL
+}
+
+# Re-applies the privilege layout of a tenant database as the job login: what provision sets up inside
+# the database, grants on what a restore (or a user's DDL) left behind, and ownership moved from the
+# logins to the owner group. A tenant can shadow nothing here (search_path is pinned, names are
+# qualified), and if it could, the code would run as the job login and gain only owner rights it holds.
+sql_regrant() {
+  cat <<'SQL'
+ALTER SCHEMA public OWNER TO :"owner";
+REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+GRANT USAGE ON SCHEMA public TO :"rw", :"ro";
+SELECT pg_catalog.format('GRANT CREATE ON SCHEMA %I TO %I', n.nspname, :'owner')
+  FROM pg_catalog.pg_namespace n
+  JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) n.nspowner
+ WHERE r.rolname OPERATOR(pg_catalog.=) :'job'
+    OR (pg_catalog.starts_with(r.rolname::pg_catalog.text, :'prefix')
+        AND pg_catalog.right(r.rolname::pg_catalog.text, 2) OPERATOR(pg_catalog.=) ANY (ARRAY['_a', '_b']))
+ ORDER BY n.nspname
+\gexec
+SELECT pg_catalog.format('REASSIGN OWNED BY %I TO %I', r.rolname, :'owner')
+  FROM pg_catalog.pg_roles r
+ WHERE r.rolname OPERATOR(pg_catalog.=) :'job'
+    OR (pg_catalog.starts_with(r.rolname::pg_catalog.text, :'prefix')
+        AND pg_catalog.right(r.rolname::pg_catalog.text, 2) OPERATOR(pg_catalog.=) ANY (ARRAY['_a', '_b']))
+ ORDER BY r.rolname
+\gexec
+\if :{?user}
+DROP OWNED BY :"user";
+\endif
+ALTER DEFAULT PRIVILEGES FOR ROLE :"owner" IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO :"rw";
+ALTER DEFAULT PRIVILEGES FOR ROLE :"owner" IN SCHEMA public GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO :"rw";
+ALTER DEFAULT PRIVILEGES FOR ROLE :"owner" IN SCHEMA public GRANT SELECT ON TABLES TO :"ro";
+ALTER DEFAULT PRIVILEGES FOR ROLE :"owner" IN SCHEMA public GRANT SELECT ON SEQUENCES TO :"ro";
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO :"rw";
+GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO :"rw";
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO :"ro";
+GRANT SELECT ON ALL SEQUENCES IN SCHEMA public TO :"ro";
+SQL
+}
+
+# ---- operations ----
+
+op_backup() {
+  need_db
+  if [ -n "${CITE_ROLE_TAG:-}" ]; then
+    need_tag
+    need_job_login "$CITE_ROLE_TAG"
+  else
+    need_external_login
+  fi
+  trap 'rm -f "$f.partial" "$f.version.partial"' EXIT
+  db_query -c 'show server_version' >"$f.version.partial"
+  pg_dump -Fc -Z 6 -f "$f.partial"
+  mv "$f.version.partial" "$f.version"
+  mv "$f.partial" "$f.dump"
+}
+
+# $1 is a valid tag; $2, when set, is a login whose remaining privileges are dropped as well.
+regrant_sql() {
+  if [ "$#" -gt 1 ]; then
+    { sql_names; sql_regrant; } | db_psql -v tag="$1" -v user="$2"
+  else
+    { sql_names; sql_regrant; } | db_psql -v tag="$1"
+  fi
+}
+
+# The connector locks the database's logins (joblogin lock) before this runs and unlocks them after.
+# pg_restore runs as the job login with --role=<owner group>: a RESET ROLE in the dump, or in a function
+# the dump calls, returns to the job login, which is not a superuser.
+op_restore() {
+  need_db
+  owner_role=${CITE_OWNER_ROLE:-}
+  restore_tag=${owner_role%_owner}
+  valid_tag "$restore_tag" && [ "${restore_tag}_owner" = "$owner_role" ] \
+    || die "CITE_OWNER_ROLE is missing or invalid"
+  [ "${CITE_LOGIN_ROLE:-}" = "${restore_tag}_login" ] || die "CITE_LOGIN_ROLE does not match CITE_OWNER_ROLE"
+  need_job_login "$restore_tag"
+  [ -f "$f.dump" ] || die "no dump is staged for this job"
+
+  errs=/tmp/cite-restore.err
+  restore_rc=0
+  pg_restore --clean --if-exists --exit-on-error --single-transaction --no-owner --no-acl \
+    --role="$owner_role" -d "$PGDATABASE" "$f.dump" 2>"$errs" || restore_rc=$?
+  cat "$errs" >&2
+  if [ "$restore_rc" -ne 0 ]; then
+    if grep -q 'permission denied to create extension' "$errs"; then
+      printf '%s\n' 'cite-pg-job: the dump creates an extension that only a superuser can create; restores run without superuser rights, so only trusted extensions (for example pgcrypto, citext, hstore) can be restored' >&2
+    fi
+    rm -f "$errs"
+    exit "$restore_rc"
+  fi
+  rm -f "$errs"
+  regrant_sql "$restore_tag"
+}
+
+op_counts() {
+  need_db
+  need_tag
+  need_job_login "$CITE_ROLE_TAG"
+  tab=$(printf '\t')
+  trap 'rm -f "$f.counts.partial"' EXIT
+  db_query -F "$tab" -o "$f.counts.partial" <<'SQL'
+SELECT n.nspname,
+       c.relname,
+       (pg_catalog.xpath('/row/c/text()',
+              pg_catalog.query_to_xml(
+                pg_catalog.format('select pg_catalog.count(*) as c from %I.%I', n.nspname, c.relname),
+                false, true, '')))[1]::pg_catalog.text
+  FROM pg_catalog.pg_class c
+  JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) c.relnamespace
+ WHERE c.relkind OPERATOR(pg_catalog.=) 'r'
+   AND n.nspname OPERATOR(pg_catalog.<>) ALL (ARRAY['pg_catalog', 'information_schema'])
+   AND NOT pg_catalog.starts_with(n.nspname::pg_catalog.text, 'pg_toast')
+   AND NOT pg_catalog.starts_with(n.nspname::pg_catalog.text, 'pg_temp')
+ ORDER BY 1, 2;
+SQL
+  mv "$f.counts.partial" "$f.counts"
+}
+
+# Opens or closes the job login of one database for one job.
+#   open:  fresh password (CITE_JOB_PASSWORD), LOGIN, a member of the owner group and of every tenant login
+#          (INHERIT, no SET) so it can read, drop and reassign what those logins own.
+#   lock:  open, and lock the tenant logins and end their sessions (restore).
+#   close: back to rest (NOLOGIN, no password, owner group only), unlock what a lock left, end its sessions.
+# A close that never ran (the connector stopped) is repaired by the next open or close of that database.
+op_joblogin() {
+  need_db
+  need_tag
+  need_superuser
+  action=${CITE_JOB_ACTION:-}
+  case $action in
+    open | lock) [ -n "${CITE_JOB_PASSWORD:-}" ] || die "CITE_JOB_PASSWORD is required" ;;
+    close) [ -z "${CITE_JOB_PASSWORD:-}" ] || die "CITE_JOB_PASSWORD is only for open and lock" ;;
+    *) die "CITE_JOB_ACTION is not a known action" ;;
+  esac
+  set -- -v db="$PGDATABASE" -v tag="$CITE_ROLE_TAG"
+  case $action in
+    open | lock)
+      if [ "$action" = lock ]; then lock=1; else lock=0; fi
+      {
+        sql_names
+        cat <<'SQL'
+\getenv pw CITE_JOB_PASSWORD
+SET log_min_error_statement = panic;
+BEGIN;
+SQL
+        sql_job_rest
+        cat <<'SQL'
+GRANT CONNECT ON DATABASE :"db" TO :"job";
+SELECT pg_catalog.format('GRANT %I TO %I WITH INHERIT TRUE, SET FALSE', r.rolname, :'job')
+  FROM pg_catalog.pg_roles r
+ WHERE pg_catalog.starts_with(r.rolname::pg_catalog.text, :'prefix')
+   AND pg_catalog.right(r.rolname::pg_catalog.text, 2) OPERATOR(pg_catalog.=) ANY (ARRAY['_a', '_b'])
+ ORDER BY r.rolname
+\gexec
+\if :lock
+SQL
+        sql_lock_logins
+        cat <<'SQL'
+\endif
+ALTER ROLE :"job" LOGIN PASSWORD :'pw';
+COMMIT;
+SQL
+        sql_end_job_sessions
+        cat <<'SQL'
+\if :lock
+SQL
+        sql_end_login_sessions
+        cat <<'SQL'
+\endif
+SQL
+      } | su_psql "$@" -v lock="$lock"
+      ;;
+    close)
+      {
+        sql_names
+        printf '%s\n' 'BEGIN;'
+        sql_job_rest
+        sql_unlock_logins
+        printf '%s\n' 'COMMIT;'
+        sql_end_job_sessions
+      } | su_psql "$@"
+      ;;
+  esac
+}
+
+# Read-only for the database setting, and every tenant login that can log in now is locked so no
+# session can turn it off (SET, BEGIN READ WRITE, ALTER ROLE ... SET). The job login is not touched.
+op_freeze() {
+  need_db
+  need_login_role
+  {
+    sql_names
+    cat <<'SQL'
+BEGIN;
+ALTER DATABASE :"db" SET default_transaction_read_only = on;
+COMMENT ON ROLE :"login" IS 'cite:frozen';
+SQL
+    sql_lock_logins
+    printf '%s\n' 'COMMIT;'
+    sql_end_login_sessions
+  } | su_psql -v db="$PGDATABASE" -v tag="$login_tag"
+}
+
+# Gives LOGIN back to exactly the logins the freeze (or an interrupted restore) locked.
+op_unfreeze() {
+  need_db
+  need_login_role
+  {
+    sql_names
+    cat <<'SQL'
+BEGIN;
+COMMENT ON ROLE :"login" IS NULL;
+SQL
+    sql_unlock_logins
+    cat <<'SQL'
+ALTER DATABASE :"db" RESET default_transaction_read_only;
+COMMIT;
+SQL
+  } | su_psql -v db="$PGDATABASE" -v tag="$login_tag"
+}
+
+# Roles, the job login and the database. What provision sets up inside the database is applied by a
+# regrant job that runs as the job login right after this one.
+op_provision() {
+  need_db
+  need_tag
+  {
+    sql_names
+    cat <<'SQL'
+SELECT pg_catalog.format('CREATE ROLE %I NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS', r)
+  FROM pg_catalog.unnest(ARRAY[:'owner', :'rw', :'ro', :'login']) AS r
+ WHERE NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname OPERATOR(pg_catalog.=) r)
+\gexec
+SELECT pg_catalog.format('CREATE DATABASE %I OWNER %I', :'db', :'owner')
+ WHERE NOT EXISTS (SELECT 1 FROM pg_catalog.pg_database WHERE datname OPERATOR(pg_catalog.=) :'db')
+\gexec
+ALTER DATABASE :"db" OWNER TO :"owner";
+REVOKE ALL ON DATABASE :"db" FROM PUBLIC;
+GRANT CONNECT, TEMPORARY ON DATABASE :"db" TO :"login";
+REVOKE CONNECT ON DATABASE postgres, template1 FROM PUBLIC;
+BEGIN;
+SQL
+    sql_job_rest
+    cat <<'SQL'
+GRANT CONNECT ON DATABASE :"db" TO :"job";
+COMMIT;
+SQL
+  } | su_psql -v db="$PGDATABASE" -v tag="$CITE_ROLE_TAG"
+}
+
+op_deprovision() {
+  need_db
+  need_tag
+  su_psql -v db="$PGDATABASE" -v tag="$CITE_ROLE_TAG" <<'SQL'
+\set prefix :tag _
+DROP DATABASE IF EXISTS :"db" WITH (FORCE);
+SELECT pg_catalog.format('DROP ROLE %I', rolname)
+  FROM pg_catalog.pg_roles
+ WHERE pg_catalog.starts_with(rolname::pg_catalog.text, :'prefix')
+ ORDER BY rolcanlogin DESC, rolname
+\gexec
+SQL
+}
+
+# CITE_USER_ROLE, when set, also drops what that login still holds (the step before `user drop`).
+op_regrant() {
+  need_db
+  need_tag
+  need_job_login "$CITE_ROLE_TAG"
+  user_role=${CITE_USER_ROLE:-}
+  if [ -n "$user_role" ]; then
+    case $user_role in
+      "${CITE_ROLE_TAG}"_*_a | "${CITE_ROLE_TAG}"_*_b) ;;
+      *) die "CITE_USER_ROLE does not belong to this database" ;;
+    esac
+    user_name=${user_role#"${CITE_ROLE_TAG}"_}
+    valid_name16 "${user_name%_?}" || die "CITE_USER_ROLE is invalid"
+    regrant_sql "$CITE_ROLE_TAG" "$user_role"
+  else
+    regrant_sql "$CITE_ROLE_TAG"
+  fi
+}
+
+# While the database is frozen a login that would get LOGIN stays NOLOGIN with the lock mark instead, so
+# unfreeze gives it LOGIN. Runs inside a transaction.
+sql_hold_if_frozen() {
+  cat <<'SQL'
+SELECT pg_catalog.format('ALTER ROLE %I NOLOGIN', :'role'),
+       pg_catalog.format('COMMENT ON ROLE %I IS %L', :'role', 'cite:locked')
+ WHERE EXISTS (
+         SELECT 1 FROM pg_catalog.pg_roles g
+          WHERE g.rolname OPERATOR(pg_catalog.=) :'login'
+            AND pg_catalog.shobj_description(g.oid, 'pg_authid') OPERATOR(pg_catalog.=) 'cite:frozen')
+\gexec
+SQL
+}
+
+# Ends the sessions of one login in its database.
+sql_end_role_sessions() {
+  cat <<'SQL'
+SELECT pg_catalog.pg_terminate_backend(a.pid)
+  FROM pg_catalog.pg_stat_activity a
+ WHERE a.datname OPERATOR(pg_catalog.=) :'db'
+   AND a.usename OPERATOR(pg_catalog.=) :'role';
+SQL
+}
+
+# Every action is role administration, so it runs in the maintenance database. `drop` expects the
+# connector to have run `regrant` with CITE_USER_ROLE first, which clears what the login owns inside
+# the tenant database.
+op_user() {
+  need_db
+  need_tag
+  user_role=${CITE_USER_ROLE:-}
+  case $user_role in
+    "${CITE_ROLE_TAG}"_*_a | "${CITE_ROLE_TAG}"_*_b) ;;
+    *) die "CITE_USER_ROLE does not belong to this database" ;;
+  esac
+  user_name=${user_role#"${CITE_ROLE_TAG}"_}
+  user_name=${user_name%_?}
+  valid_name16 "$user_name" || die "CITE_USER_ROLE is invalid"
+
+  level=${CITE_USER_LEVEL:-readwrite}
+  case $level in
+    owner) group=owner ;;
+    readwrite) group=rw ;;
+    readonly) group=ro ;;
+    *) die "CITE_USER_LEVEL is not a known level" ;;
+  esac
+  owner_role=${CITE_ROLE_TAG}_owner
+  rw_role=${CITE_ROLE_TAG}_rw
+  ro_role=${CITE_ROLE_TAG}_ro
+  login_group=${CITE_ROLE_TAG}_login
+  level_role=${CITE_ROLE_TAG}_${group}
+
+  conn=${CITE_USER_CONN_LIMIT:-20}
+  stmt=${CITE_USER_STMT_MS:-0}
+  idle=${CITE_USER_IDLE_MS:-60000}
+  valid_number "$conn" || die "CITE_USER_CONN_LIMIT must be a number"
+  valid_number "$stmt" || die "CITE_USER_STMT_MS must be a number"
+  valid_number "$idle" || die "CITE_USER_IDLE_MS must be a number"
+
+  action=${CITE_USER_ACTION:-}
+  case $action in
+    create | password) [ -n "${CITE_USER_PASSWORD:-}" ] || die "CITE_USER_PASSWORD is required" ;;
+  esac
+
+  # Statements that carry the password run in a session that never logs a failing statement's text.
+  case $action in
+    create)
+      {
+        cat <<'SQL'
+\getenv pw CITE_USER_PASSWORD
+SET log_min_error_statement = panic;
+BEGIN;
+CREATE ROLE :"role" LOGIN PASSWORD :'pw' NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS
+  CONNECTION LIMIT :conn IN ROLE :"login", :"lvl";
+ALTER ROLE :"role" SET statement_timeout = :stmt;
+ALTER ROLE :"role" SET idle_in_transaction_session_timeout = :idle;
+SQL
+        sql_hold_if_frozen
+        printf '%s\n' 'COMMIT;'
+      } | su_psql -v role="$user_role" -v login="$login_group" -v lvl="$level_role" \
+        -v conn="$conn" -v stmt="$stmt" -v idle="$idle"
+      user_role_setting
+      ;;
+    password)
+      {
+        cat <<'SQL'
+\getenv pw CITE_USER_PASSWORD
+SET log_min_error_statement = panic;
+BEGIN;
+ALTER ROLE :"role" LOGIN PASSWORD :'pw';
+COMMENT ON ROLE :"role" IS NULL;
+SQL
+        sql_hold_if_frozen
+        printf '%s\n' 'COMMIT;'
+      } | su_psql -v role="$user_role" -v login="$login_group"
+      ;;
+    settings)
+      su_psql -v role="$user_role" -v owner="$owner_role" -v rw="$rw_role" \
+        -v ro="$ro_role" -v lvl="$level_role" -v conn="$conn" -v stmt="$stmt" -v idle="$idle" <<'SQL'
+REVOKE :"owner", :"rw", :"ro" FROM :"role";
+GRANT :"lvl" TO :"role";
+ALTER ROLE :"role" CONNECTION LIMIT :conn;
+ALTER ROLE :"role" SET statement_timeout = :stmt;
+ALTER ROLE :"role" SET idle_in_transaction_session_timeout = :idle;
+SQL
+      user_role_setting
+      ;;
+    disable | retire)
+      {
+        cat <<'SQL'
+BEGIN;
+ALTER ROLE :"role" NOLOGIN;
+COMMENT ON ROLE :"role" IS NULL;
+COMMIT;
+SQL
+        sql_end_role_sessions
+      } | su_psql -v role="$user_role" -v db="$PGDATABASE"
+      ;;
+    enable)
+      {
+        cat <<'SQL'
+BEGIN;
+ALTER ROLE :"role" LOGIN;
+COMMENT ON ROLE :"role" IS NULL;
+SQL
+        sql_hold_if_frozen
+        printf '%s\n' 'COMMIT;'
+      } | su_psql -v role="$user_role" -v login="$login_group"
+      ;;
+    drop)
+      {
+        cat <<'SQL'
+ALTER ROLE :"role" NOLOGIN;
+SQL
+        sql_end_role_sessions
+        cat <<'SQL'
+DROP ROLE :"role";
+SQL
+      } | su_psql -v role="$user_role" -v db="$PGDATABASE"
+      ;;
+    *) die "CITE_USER_ACTION is not a known action" ;;
+  esac
+}
+
+# Owner-level logins run as the owner group so every object belongs to it; the others must not.
+user_role_setting() {
+  if [ "$group" = owner ]; then
+    su_psql -v role="$user_role" -v owner="$owner_role" <<'SQL'
+ALTER ROLE :"role" SET role = :'owner';
+SQL
+  else
+    su_psql -v role="$user_role" <<'SQL'
+ALTER ROLE :"role" RESET role;
+SQL
+  fi
+}
+
+op_hba() {
+  [ -d /conf ] || die "/conf is not mounted"
+  entries=${CITE_PG_HBA:-}
+  [ -n "$entries" ] || die "CITE_PG_HBA is required"
+  [ "${#entries}" -le 24576 ] || die "CITE_PG_HBA is too long"
+  case ${CITE_PG_RELOAD:-0} in
+    0 | 1) ;;
+    *) die "CITE_PG_RELOAD must be 0 or 1" ;;
+  esac
+
+  new=/conf/pg_hba.conf.new
+  prev=/conf/pg_hba.conf.prev
+  trap 'rm -f "$new"' EXIT
+  {
+    printf '%s\n' '# Written by cite-pg-job; do not edit.'
+    printf '%s\n' 'local all all peer'
+  } >"$new"
+
+  # Split on ';' without expanding globs, then restore the shell's defaults.
+  old_ifs=$IFS
+  IFS=';'
+  set -f
+  # shellcheck disable=SC2086
+  set -- $entries
+  set +f
+  IFS=$old_ifs
+
+  [ "$#" -le 256 ] || die "CITE_PG_HBA has too many entries"
+  first=1
+  admin_cidr=
+  for entry in "$@"; do
+    case $entry in
+      *'|'*'|'*) die "an hba entry has more than one '|'" ;;
+      *'|'*) ;;
+      *) die "an hba entry needs <database>|<cidr>" ;;
+    esac
+    entry_db=${entry%%|*}
+    entry_cidr=${entry#*|}
+    valid_cidr "$entry_cidr" || die "an hba entry has an invalid CIDR"
+    if [ "$first" -eq 1 ]; then
+      first=0
+      [ "$entry_db" = "_admin" ] || die "the first hba entry must be the admin network"
+      admin_cidr=$entry_cidr
+      printf 'host postgres postgres %s scram-sha-256\n' "$entry_cidr" >>"$new"
+    else
+      valid_tag "$entry_db" || die "an hba entry has an invalid database"
+      # The job login reaches its own database only, and only from the admin network the jobs use.
+      printf 'host %s %s_job %s scram-sha-256\n' "$entry_db" "$entry_db" "$admin_cidr" >>"$new"
+      printf 'host %s +%s_login %s scram-sha-256\n' "$entry_db" "$entry_db" "$entry_cidr" >>"$new"
+    fi
+  done
+  [ "$first" -eq 0 ] || die "CITE_PG_HBA has no entries"
+  {
+    printf '%s\n' 'host all all 0.0.0.0/0 reject'
+    printf '%s\n' 'host all all ::/0 reject'
+  } >>"$new"
+
+  # The server runs as another user and only reads this file; it holds no secrets.
+  chmod 0644 "$new"
+  if [ -f /conf/pg_hba.conf ]; then
+    cp -p /conf/pg_hba.conf "$prev"
+  fi
+  mv "$new" /conf/pg_hba.conf
+
+  if [ "${CITE_PG_RELOAD:-0}" = 1 ]; then
+    su_psql -c 'select pg_catalog.pg_reload_conf()'
+    bad=$(su_query -c 'select pg_catalog.count(*) from pg_catalog.pg_hba_file_rules where error is not null')
+    if [ "$bad" != 0 ]; then
+      if [ -f "$prev" ]; then
+        mv "$prev" /conf/pg_hba.conf
+        su_psql -c 'select pg_catalog.pg_reload_conf()' || true
+      fi
+      printf 'cite-pg-job: the server rejected the generated pg_hba.conf; the previous file was restored\n' >&2
+      exit 3
+    fi
+  fi
+  rm -f "$prev"
+}
+
+op_sizes() {
+  trap 'rm -f "$f.sizes.partial"' EXIT
+  tab=$(printf '\t')
+  su_query -F "$tab" -o "$f.sizes.partial" \
+    -c 'select datname, pg_catalog.pg_database_size(oid) from pg_catalog.pg_database where not datistemplate order by 1'
+  mv "$f.sizes.partial" "$f.sizes"
+}
+
+op_globals() {
+  need_superuser
+  trap 'rm -f "$f.globals.partial"' EXIT
+  pg_dumpall --globals-only --no-role-passwords -l postgres -f "$f.globals.partial"
+  mv "$f.globals.partial" "$f.globals"
+}
+
+case $op in
+  backup) op_backup ;;
+  restore) op_restore ;;
+  counts) op_counts ;;
+  joblogin) op_joblogin ;;
+  freeze) op_freeze ;;
+  unfreeze) op_unfreeze ;;
+  provision) op_provision ;;
+  deprovision) op_deprovision ;;
+  regrant) op_regrant ;;
+  user) op_user ;;
+  hba) op_hba ;;
+  sizes) op_sizes ;;
+  globals) op_globals ;;
+  *) die "unknown operation" ;;
+esac

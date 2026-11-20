@@ -536,6 +536,7 @@ mod tests {
             volumes: Vec::new(),
             outbound: true,
             outbound_rules: Default::default(),
+            data: Default::default(),
         }
     }
 

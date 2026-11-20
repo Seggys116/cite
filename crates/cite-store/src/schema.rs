@@ -492,7 +492,7 @@ pub(crate) fn open_writer(path: &Path) -> Result<Connection> {
 
 pub(crate) fn open_reader(path: &Path) -> Result<Reader> {
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-    let conn = open_conn(path, flags)?;
+    let mut conn = open_conn(path, flags)?;
     conn.busy_timeout(BUSY_TIMEOUT)?;
     conn.execute_batch(READER_PRAGMAS)?;
     limit_memory(&conn)?;
@@ -507,7 +507,7 @@ pub(crate) fn open_reader(path: &Path) -> Result<Reader> {
             let at = armed.load(Ordering::Relaxed);
             at != 0 && u64::try_from(base.elapsed().as_nanos()).unwrap_or(u64::MAX) >= at
         }),
-    );
+    )?;
     Ok(Reader {
         conn,
         base,

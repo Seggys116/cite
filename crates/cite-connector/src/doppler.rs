@@ -254,7 +254,7 @@ impl DopplerClient {
     }
 
     fn build(base: &str, plain_http: bool) -> crate::Result<Self> {
-        let http = reqwest::Client::builder()
+        let http = cite_tls::client_builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(TIMEOUT)
             .connect_timeout(TIMEOUT)

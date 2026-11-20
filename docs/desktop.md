@@ -4,7 +4,9 @@ This page covers `apps/desktop`, the native console for Cite nodes: how to get i
 
 ## What it is
 
-The desktop app is a client for the connector API with the same views as the web console: Overview, Nodes, Sites (with a site page and a create form), Traffic, Firewall, Maintenance and Settings. It talks to each connector directly over HTTPS. It does not need the dashboard container, and the dashboard does not need it.
+The desktop app is a client for the connector API. Its views are Overview, Nodes, Sites (with a site page and a create form), Topology, Databases, Traffic, Analytics, Firewall, Maintenance and Settings. The web console has no Analytics view, and the app has no Redirects table. The app talks to each connector directly over HTTPS. It does not need the dashboard container, and the dashboard does not need it.
+
+The app uses a neutral ink palette with one accent colour and pill-shaped buttons, and its text is sentence case. It is dark only for now and does not follow the OS light or dark setting.
 
 It is built with GPUI and lives in its own Cargo workspace, outside the root `Cargo.toml`, so `cargo build` at the repository root does not build it.
 
@@ -20,7 +22,7 @@ Every run of the `apps` workflow uploads desktop builds as artifacts, and each `
 
 The builds are unsigned and not notarised. On macOS, Gatekeeper blocks the first launch: right-click `Cite.app` and choose Open. On Windows, SmartScreen warns about an unknown publisher: choose More info, then Run anyway. The Windows build is marked experimental in CI. On Linux, put `cite-desktop` on your `PATH` and copy `cite.desktop` to `~/.local/share/applications/`.
 
-To build from source you need Rust 1.88 or newer:
+To build from source you need Rust 1.100 or newer:
 
 ```bash
 cd apps/desktop
@@ -39,9 +41,53 @@ cite-desktop [--demo] [--view <name>] [--node <name>]
 | Flag | Effect |
 |---|---|
 | `--demo` | Runs against built-in sample data instead of real nodes, for trying the app. |
-| `--view <name>` | Opens on a view: `overview`, `nodes`, `sites`, `site-detail`, `site-new`, `traffic`, `request-detail`, `bots`, `explore`, `export`, `firewall`, `maintenance` or `settings`. The default is `overview`. |
+| `--view <name>` | Opens on a view: `overview`, `nodes`, `sites`, `site-detail`, `site-new`, `topology`, `databases`, `traffic`, `request-detail`, `analytics`, `bots`, `explore`, `export`, `firewall`, `maintenance` or `settings`. The default is `overview`. |
 | `--node <name>` | Selects a node on start. |
 | `-h`, `--help` | Prints the usage and exits. |
+
+## Choosing nodes
+
+The node switcher picks one node or All nodes. It sets which nodes a page reads. It never chooses where a write goes.
+
+| Screen | Reads | Writes |
+|---|---|---|
+| Sites, Firewall | Every node in the switcher scope | Firewall uses the node picker. |
+| Maintenance, Topology | Every node | Maintenance uses per-node switches, confirmed bulk actions and the node picker for Delete page. |
+| Site page | The node it was opened on | That node. Saving the form asks which nodes when several hold the site. |
+| Settings (tabs that need a node), Traffic Explore and Export, Analytics export | One node, chosen on a node bar | That node. |
+
+The node picker opens before a firewall change, a page delete and a save on a site that several nodes hold.
+
+- Under All nodes nothing is ticked. With one node selected in the switcher, that node is ticked.
+- Offline nodes are listed but cannot be ticked.
+- The confirm button names the target, for example "Apply for edge-nyc", and stays disabled until a node is ticked.
+- One toast reports each node.
+
+A node bar has one button per node, and an offline node cannot be picked. Under All nodes the screen shows "Choose a node to continue" and loads nothing until a node is picked. The bar appears only with two or more nodes. With one node there is nothing to choose, and that node is used. Moving the switcher drops a pick made under another switcher value.
+
+## Sites and Topology
+
+Sites has one row per site across nodes, with a status chip per node, a load sparkline and rate, and one state pill (Serving, Maintenance, Deploy failed or Needs attention). A scope control offers All nodes, one button per node and Needs attention. The rate comes from one facets call per node over 15 minutes.
+
+Topology shows entries (host plus path prefix or regex), nodes and sites with requests per second on each link, drawn as line width.
+
+- The busiest path is highlighted. Links with no traffic now are dashed.
+- An offline node stays on the chart.
+- Click a node to dim the routes that do not pass through it. Click it again to clear.
+- A single-endpoint Rust API appears as a site with its path regex.
+- It refreshes about every 10 seconds while the view is on screen in an active window.
+
+## Maintenance
+
+Maintenance has one page library across nodes and a site by node matrix.
+
+- Pages are stored per node and compared across nodes. A card per page shows a chip for each node that holds it and a `differs` pill when copies differ.
+- Bring nodes in line lists the changes per node, then on confirmation creates missing pages and replaces differing copies with the version most nodes hold. Nothing is written when the page loads.
+- Saving a page that reaches several nodes, or replaces a differing copy, lists the per-node changes first.
+- A node that is offline or unreadable is never treated as missing a page.
+- The matrix has one switch per site and node, plus Drain and Restore per node, each after confirmation.
+- A node cannot serve a page it does not hold, so turning maintenance on creates the page on that node first.
+- Delete page opens the node picker, limited to nodes that hold the page.
 
 ## Analytics page
 
@@ -49,19 +95,19 @@ Analytics in the sidebar is a filtered view of traffic, separate from the Traffi
 
 The page shows headline tiles with the change against the previous equal-length period (a rise in errors or latency is red), requests, errors and blocked over time, bandwidth, status classes, methods, latency percentiles, top paths, hosts, referers, user agents, client IPs and statuses (click a row to filter by it), bot share and classes (click a class to filter), and a request log that loads fifty at a time per node with "Load more" and a detail panel. A "Partial result" banner appears when the node read only the newest part of a large range. Auto refresh runs every ten seconds while the page and the window are active and never overlaps a running load.
 
-Saved filters are stored in the app's config file as a name and a plain `key=value&key=value` text; nothing secret is in them. Copy puts the text on the clipboard so a colleague can paste it under "Use pasted filter". Export saves CSV or NDJSON of requests or hourly totals to the Downloads folder through the existing export route. That route takes one site, one method, one bot class, a status range and a plain client address, so the page lists any filter it cannot apply before you export. The node offers no country breakdown, so there is none.
+Saved filters are stored in the app's config file as a name and a plain `key=value&key=value` text; nothing secret is in them. Copy puts the text on the clipboard so a colleague can paste it under "Use pasted filter". Export saves CSV or NDJSON of requests or hourly totals to the Downloads folder through the existing export route, from the node chosen on the filter bar. Under All nodes the Export card shows "Choose a node to continue". That route takes one site, one method, one bot class, a status range and a plain client address, so the page lists any filter it cannot apply before you export. The node offers no country breakdown, so there is none.
 
 ## Bot analytics and export
 
 Traffic has four tabs that share the window picker. Requests lists recent requests with a bot class badge and score, and Details opens the captured headers and the signals behind the verdict. Bots shows the bot share, the split by class (human, suspect, crawler, tool, bot), the score distribution, the top signals and the top bot agents. Detection reads the headers first and then the user agent, and the score is a heuristic, not proof. Explore has a top-value explorer for any field and a Storage card with the analytics database size and the oldest and newest record on each node. A node that predates these endpoints shows as "needs an update" instead of failing the page.
 
-Export streams a file from the node (requests, hourly rollups, the bot summary or a top list) as CSV or NDJSON, for the current window or a custom UTC range, with optional site, status, bot class, score, host, path, client IP, method and row limit filters. The app has no native save dialog, so the file goes to the `Downloads` folder under your home directory, named by the node, and an existing file is never replaced: a number is added to the name instead. With "All nodes" selected the export comes from the first node, as on the other single-node screens.
+Export streams a file from the node (requests, hourly rollups, the bot summary or a top list) as CSV or NDJSON, for the current window or a custom UTC range, with optional site, status, bot class, score, host, path, client IP, method and row limit filters. The app has no native save dialog, so the file goes to the `Downloads` folder under your home directory, named by the node, and an existing file is never replaced: a number is added to the name instead. The Explore and Export tabs read and write one node, chosen on a node bar. Until a node is chosen they show "Choose a node to continue".
 
 ## Retention, backups and archives
 
 Analytics history is kept forever by default. Settings has a "Keep data" choice: Forever, or "Delete data older than N days" with a limit from 1 to 3650. "Archive old data before deleting it" is on by default, and choosing a limit with archiving off shows a warning that the deleted data cannot be recovered.
 
-The Explore tab has a Backups and archives card for the selected node (the first node when "All nodes" is selected). Back up now writes a copy of the analytics database on the node. Cut old data removes everything older than a number of days or a UTC date: Preview shows how many rows would go and the oldest date, and Cut stays disabled until a preview of exactly those settings has succeeded. With archiving on, the rows are written to an archive file before they are deleted. With it off, Cut also needs the "I understand this deletes data permanently" box and a confirmation dialog.
+The Explore tab has a Backups and archives card for the node chosen on its node bar. Back up now writes a copy of the analytics database on the node. Cut old data removes everything older than a number of days or a UTC date: Preview shows how many rows would go and the oldest date, and Cut stays disabled until a preview of exactly those settings has succeeded. With archiving on, the rows are written to an archive file before they are deleted. With it off, Cut also needs the "I understand this deletes data permanently" box and a confirmation dialog.
 
 The list shows each file's name, kind, size, creation time, short SHA-256 and row count. Download saves the file into the `Downloads` folder, never replacing an existing file, with an extension chosen by the app from the file kind (`.db` for backups, `.ndjson.gz` or `.csv.gz` for archives) rather than taken from the node. Restore and Delete ask for confirmation first. A node that predates these endpoints shows as "needs an update".
 
@@ -84,9 +130,9 @@ Create site is a step-by-step wizard with a step indicator, Back and Next. Next 
 
 ## Certificates and Access
 
-Settings has a Certificates card for the selected node (the first node when "All nodes" is selected). It lists each certificate with its subject, issuer, validity dates, key type, short SHA-256 fingerprint, the number of names it carries and the site hosts it covers. The days left show as a chip: muted above 30 days, yellow under 30, red under 7 and once expired. A note lists site hosts that no certificate covers, other than sites set to Flexible, which need none. When the node has no HTTPS port, the card says so and offers an inline port field with Enable HTTPS; until a port is set the node stores certificates but serves nothing over TLS. If the node reports its certificate directory as not ready, Upload is turned off.
+Settings has a Certificates card for the node chosen on the Settings node bar. It lists each certificate with its subject, issuer, validity dates, key type, short SHA-256 fingerprint, the number of names it carries and the site hosts it covers. The days left show as a chip: muted above 30 days, yellow under 30, red under 7 and once expired. A note lists site hosts that no certificate covers, other than sites set to Flexible, which need none. When the node has no HTTPS port, the card says so and offers an inline port field with Enable HTTPS; until a port is set the node stores certificates but serves nothing over TLS. If the node reports its certificate directory as not ready, Upload is turned off.
 
-Upload and Replace share one panel with a name and either pasted PEM text or the paths of two files, one for the certificate chain and one for the private key. The certificate and key together are capped at 100 KiB, files must be regular files, names use letters, digits, spaces, dots, dashes and underscores and start with a letter or a digit, and the app checks the PEM markers before sending: a swapped pair, an encrypted key or a cut-off block is refused with a message. Files are read on a background task. The private key is hidden while you paste it, sent once in the request, never written to the config file or logged, and cleared from its input as soon as the request is sent, and from every input when the upload succeeds, the panel closes, you switch between pasting and files, you change the selected node or you leave Settings. A panel opened for one node refuses to send anything if another node is selected when you submit. The app zeroes the copies it makes of the key itself: the form copy, the file read buffer (also when the read fails or the file is not text), the text before and after line-ending normalisation, the upload plan and the request when it is dropped. It does not zero what it cannot reach: the text typed or pasted into the input box (emptying the box frees that text without overwriting it), the clipboard, the HTTP client's internal buffers and the allocator's freed memory. Errors from the node are shown as received. Replace asks for the key again. Delete asks for confirmation and names the hosts that would lose coverage. Certificates a person placed directly in the node's certificate directory are listed with the note "Placed by hand on the node: read-only"; the node refuses to change them through the API, so Replace and Delete are not offered for them. Any warning the node reports for a certificate appears under it. A node that predates certificate management shows as "needs an update".
+Upload and Replace share one panel with a name and either pasted PEM text or the paths of two files, one for the certificate chain and one for the private key. The certificate and key together are capped at 100 KiB, files must be regular files, names use letters, digits, spaces, dots, dashes and underscores and start with a letter or a digit, and the app checks the PEM markers before sending: a swapped pair, an encrypted key or a cut-off block is refused with a message. Files are read on a background task. The private key is hidden while you paste it, sent once in the request, never written to the config file or logged, and cleared from its input as soon as the request is sent, and from every input when the upload succeeds, the panel closes, you switch between pasting and files, you choose another node or you leave Settings. A panel opened for one node refuses to send anything if another node is chosen when you submit. The app zeroes the copies it makes of the key itself: the form copy, the file read buffer (also when the read fails or the file is not text), the text before and after line-ending normalisation, the upload plan and the request when it is dropped. It does not zero what it cannot reach: the text typed or pasted into the input box (emptying the box frees that text without overwriting it), the clipboard, the HTTP client's internal buffers and the allocator's freed memory. Errors from the node are shown as received. Replace asks for the key again. Delete asks for confirmation and names the hosts that would lose coverage. Certificates a person placed directly in the node's certificate directory are listed with the note "Placed by hand on the node: read-only"; the node refuses to change them through the API, so Replace and Delete are not offered for them. Any warning the node reports for a certificate appears under it. A node that predates certificate management shows as "needs an update".
 
 The Cloudflare ranges card shows whether the node uses its built-in list or a custom one, the date of that list and the ranges themselves in an editor with one CIDR range per line. Save ranges checks every line before sending (bare addresses are accepted; a prefix of `/0` is refused because it would trust every address). Use built-in list clears the custom list.
 
@@ -98,11 +144,33 @@ When the zone lock is switched on and saved (on the create form, for every node 
 
 ## Editing a site
 
-The site page shows the same form sections as the wizard, filled from the node: General (kind, name, hosts, routing paths; the id is shown but cannot change), Source (for sites built from GitHub: repository, branch, runtime, Node version, poll interval), Health check (path, interval, timeout, rise, fall) and Access. Each field is checked with the node's own rules as you type, and one Save sends the whole site through the normal update. The stored GitHub token is never sent and never shown; the node keeps it. A "Unsaved changes" chip and Discard changes appear while the form differs from the node, and a reload (for example after a failed save) keeps your edits.
+The site page shows the same form sections as the wizard, filled from the node: General (kind, name, hosts, routing paths; the id is shown but cannot change), Source (for sites built from GitHub: repository, branch, runtime, Node version, poll interval), Health check (path, interval, timeout, rise, fall) and Access. Each field is checked with the node's own rules as you type, and one Save writes the form. The stored GitHub token is never sent and never shown; the node keeps it. A "Unsaved changes" chip and Discard changes appear while the form differs from the node, and a reload (for example after a failed save) keeps your edits.
 
 The node stores source settings on Save but only builds them on a deploy. When the repository, branch, runtime, Node version or poll interval changed, a second button, Save and redeploy, saves and then starts a deploy so the change takes effect; the line under the buttons says so. Routing, hosts, paths, health check and access apply as soon as they are saved. A source-built site is redeployed with its own "Redeploy from GitHub" card, which takes only a note; the client library always sends a target list, so the app sends a placeholder that the node ignores for source-built sites.
 
 The node ignores the blue and green target lists in a site update (they only change through a deploy), so for a server site the targets are edited in the "Deploy new version" card, not in the form.
+
+The same site id can exist on several nodes, and each node stores its own copy. The nodes that hold it are listed on the site page, and each links to its own page for the site.
+
+- A site on one node saves to that node.
+- A site on several nodes opens the node picker on Save, with this node ticked and no other. A node that holds a site with the same id but different hosts is named in the dialog.
+- This node takes the whole edited form. Another node takes only name, kind, hosts, paths, health check and access on top of its own copy, so it keeps its own upstream targets, active slot, source, volumes and stored GitHub token.
+- Save and redeploy redeploys on this node only. Deploy, switch, rollback and delete also stay on the node of the page.
+- Maintenance has one switch per node that holds the site. Turn on everywhere and Turn off everywhere confirm first and cover only nodes that hold the same site.
+
+## Volumes
+
+The Volumes tab appears for a site the node runs as a server (not a static build) on a node with the `volumes` capability. It lists each volume with its mount path, size, state and creation time. Add and Remove edit the site's volume list, which Save writes. Delete removes the data the node keeps for a volume the site no longer lists, after confirmation. The app can list and delete volumes only. It cannot browse their files.
+
+## Data and databases
+
+The features are described in [Site data services](data.md). The app shows them for a node that lists the matching `data-*` capabilities, so a node without them keeps the pages it had. Passwords, external database URLs and S3 keys are write-only: nothing in the app shows one, and the masked inputs that take them are emptied after use.
+
+**Data tab.** It sits between Volumes and Logs and appears for a site built from a repository, on a node that lists the data capabilities. Its cards cover Postgres (the mode choice with the trade-off table between dedicated and shared, resources, health, backup policy), databases and their users with the owner, read and write and read only levels and password rotation, environment links with the presets (Generic, Prisma, Drizzle, Auth.js, Better Auth), generated secrets, external Postgres, S3 attachments, and backups with their schedule and retention numbers, labels, pins, download, restore, push to S3 and prune preview. A change that starts a connector job shows the job's progress, and a banner says when a redeploy is needed.
+
+**Databases view.** It sits between Topology and Traffic and lists the node's data status, the shared Postgres instance (enable, edit limits, restart, delete) with its tenants, whole-instance backups, S3 backup targets (add, edit, test, delete) and data left behind by deleted sites (purge).
+
+**Conversion and moves.** The Data tab has a Convert card for switching a site between dedicated and shared on its node (with a freeze choice, then Cut over or Abort) and a "Move to another node" card for the staged transfer described in [Site data services](data.md#moving-a-database-to-another-node). A move needs a second node in the app. The form takes the database, the target node, how the site behaves during the final copy, and whether to replace a database of the same name on the target, replace manual variables of the same name, and cut over by itself when every row count matches. The app drives the transfer itself and keeps its state in `transfers.json` beside `desktop.json` (mode 0600, no secrets), writing it after every phase, so a move survives a restart of the app and can be resumed. A row shows the phase and offers Cancel, Resume, Cut over (refused while row counts differ) and Roll back. The Databases view has a Transfers card with the same rows.
 
 ## Status, logs and build settings (nodes 0.4.0 and newer)
 
@@ -111,7 +179,7 @@ A node lists what it can do in `GET /node` (`capabilities`), and the site page s
 - Status (`site-status`): the phase (fetching, building, packing, promoting, idle, failed, unhealthy), a red box with the reason and a Copy button, a "Pending changes" chip when saved settings are not in the running build, a Redeploy button, and a table with one row per slot (container, health, restarts, exit code or out of memory, manager phase, live and head commit, HAProxy state). While a build runs the card refreshes every three seconds.
 - Build settings (`source-build`): root directory, package manager, install and build commands, output directory, rendering (static or ssr), framework, start command, single-page fallback, prune, and the resource limits (serving and build memory in MiB and CPUs; the node defaults are 2 GiB and 2 CPUs for serving and 4 GiB and 2 CPUs for builds). A blank field means "let the node decide", and the hint reads "Auto (detected: X)" when a manager has detected a value. With `forges` the node's forge host is shown read-only. Saving a change the running build does not have asks "This change needs a rebuild" with Redeploy now or Later; resource changes apply on the next redeploy.
 - GitHub token (`site-github-token`): where the token comes from (site, node or none), whether the node has one, verification and expiry, Set or Change token (write-only, wiped after sending) and Use the node token.
-- Build and runtime environment (`site-build-env`, `site-runtime-env`): the variable names, Remove, and a Name and Value form. Values are never shown again and are wiped from the form after sending.
+- Build and runtime environment (`site-build-env`, `site-runtime-env`): the variable names, Remove, and a Name and "Value (write-only)" form. No route returns a value, so the lists show names only. A value is wiped from the form after sending.
 - Builds (`site-status`, `deploy-async`): the last build each manager reports (commit, result, reason) and a "Deploy this commit" box that starts a build of a branch, tag or commit without waiting.
 - Logs (`site-logs`): manager or executor, blue or green, Follow (polls every two seconds with the node's cursor, only while the site page is on screen and the window is active), search, Copy, colour by level, ANSI codes removed, newest first, the last 5000 lines kept.
 - Bot policy: under the Access card, "No bot blocking is active for this site" appears when the policy is Allow and no enabled firewall rule matches user agents; otherwise the rules that could block bots are listed.
@@ -128,7 +196,17 @@ Actions that finish after you have moved to another node, site or page never cha
 
 Add rule has three kinds. Block keeps the Deny, Drop silently and Tarpit actions. Redirect sends matching requests to a target, either an absolute http or https URL or a path starting with `/`, with the placeholders `{scheme}`, `{host}`, `{www_host}`, `{apex_host}`, `{path}` and `{query}` and a status of 301, 302, 307 or 308; example buttons fill in common targets. Headers and CORS lets matching requests through while setting, adding or removing request or response headers (up to 16 changes, proxy-managed and identity headers are refused by the node) and optionally answering CORS with up to 32 origins, methods and headers, a max age up to 86400 seconds and credentials. The form refuses the origin `*` together with credentials before anything is sent, and the connector's own validation runs on the finished rule, so what the form accepts is what the node accepts.
 
-Each matcher takes several values: values of one matcher are alternatives (any one may match) and different matchers must all match, as the node evaluates them. Path prefixes, methods, hosts and CIDR ranges are separated by commas or spaces; regexes (path, user agent, referer) are separated by spaces only, because a comma is valid inside a regex. Every value is checked with the node's own rules (at most 16 values per matcher, 256 characters each, the regex subset in the firewall guide). Besides the path, method, user agent, CIDR and host matchers there are a header matcher (a name compared by equality or by regex, optionally negated), a scheme matcher (HTTP or HTTPS) and a referer regex. A header value can be marked secret: it is hidden while you type, sent to the node, and never shown in the rule list, which prints `(hidden)` instead, or kept in the form after saving. A rule can be limited to one site by its id and given a label that appears in logs. The list shows each rule's effect (the action, `Redirect 301`, `Headers`, `CORS`), the redirect target or header and CORS summary, and the label. The presets come from the node and now include Redirect to www, Redirect to the bare domain and Force HTTPS; a preset is added node-wide, so for a redirect that should affect one site use Add rule with a site id instead.
+Each matcher takes several values: values of one matcher are alternatives (any one may match) and different matchers must all match, as the node evaluates them. Path prefixes, methods, hosts and CIDR ranges are separated by commas or spaces; regexes (path, user agent, referer) are separated by spaces only, because a comma is valid inside a regex. Every value is checked with the node's own rules (at most 16 values per matcher, 256 characters each, the regex subset in the firewall guide). Besides the path, method, user agent, CIDR and host matchers there are a header matcher (a name compared by equality or by regex, optionally negated), a scheme matcher (HTTP or HTTPS) and a referer regex. A header value can be marked secret: it is hidden while you type, sent to the node, and never shown in the rule list, which prints `(hidden)` instead, or kept in the form after saving. A rule can be limited to one site by its id and given a label that appears in logs. The list shows each rule's effect (the action, `Redirect 301`, `Headers`, `CORS`), the redirect target or header and CORS summary, and the label. The presets come from the node and include Redirect to www, Redirect to the bare domain and Force HTTPS. A preset has no site, so for a redirect that should affect one site use Add rule with a site id instead.
+
+### Rules across nodes
+
+- The page reads rules from every node in the switcher scope. A node that cannot be read is named in a notice and left out.
+- Identical rules (same id and same content, ignoring on or off) become one row with a chip per holder. A rule with the same id but different content on another node is a separate row with a `differs` pill.
+- Hits over 24 hours are summed over the nodes that hold the row.
+- The switch is on only when every holder has the rule on. A rule held by one node changes that node. A rule held by several opens the node picker, limited to its holders.
+- Add rule, Save rule, Delete rule and Apply on a preset open the node picker. Saving a rule keeps each node's own on or off state.
+- Matchers wrap onto as many lines as they need. One wider than its column ends in an ellipsis and shows in full on hover.
+- The "N rules" pill on a preset lists, on hover, every rule the preset adds with its action and patterns.
 
 ## Adding a node
 
@@ -143,6 +221,7 @@ The URL must be a bare origin such as `https://edge.example.com:7443`, with no p
 | What | Where |
 |---|---|
 | Node list (name, URL, CA) | `~/Library/Application Support/Cite/desktop.json` on macOS. Elsewhere `$XDG_CONFIG_HOME/cite/desktop.json`, or `~/.config/cite/desktop.json` when that variable is unset or not absolute. Mode 0600. |
+| Database transfers | `transfers.json` in the same directory. Mode 0600. Names, counts and phases only. |
 | API tokens | The operating system keychain, under the service `dev.seggys116.cite`, with the node name as the account. |
 
 The config file never contains a token, and the app refuses a config file with unknown fields. When a node is added the token goes to the keychain first, and the keychain entry is removed again if the config cannot be saved.

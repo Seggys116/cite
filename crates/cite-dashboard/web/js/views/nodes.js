@@ -14,6 +14,9 @@ export function openAddNode(onDone) {
   const url = h('input', { class: 'input mono', type: 'url', placeholder: 'https://edge.example.com:8443', autocomplete: 'off', spellcheck: 'false' });
   const token = h('input', { class: 'input mono', type: 'password', placeholder: 'Connector API token', autocomplete: 'off' });
   const ca = h('textarea', { class: 'textarea mono', rows: '6', placeholder: '-----BEGIN CERTIFICATE-----', spellcheck: 'false', 'aria-label': 'Connector CA certificate' });
+  name.title = 'A short label shown in the node switcher.';
+  token.title = 'Stored by the dashboard server and never shown again.';
+  ca.title = 'The connector ca.pem, needed when the node uses its own certificate authority.';
   const err = h('p', { class: 'form-error', role: 'alert', hidden: true });
   const save = button('Add node', { kind: 'primary', iconName: 'plus' });
   let drawer = null;
@@ -44,12 +47,11 @@ export function openAddNode(onDone) {
 
   drawer = openDrawer({
     title: 'Add node',
-    subtitle: 'Register a connector the dashboard can manage.',
     content: h('div', { class: 'form' },
-      field('Name', name, 'A short label shown in the node switcher.'),
-      field('Connector URL', url, 'Base address of the node connector, without /api/v1.'),
-      field('API token', token, 'Stored by the dashboard server and never shown again.'),
-      field('CA certificate', ca, 'Optional. The connector ca.pem, needed when the node uses its own certificate authority.'),
+      field('Name', name),
+      field('Connector URL', url, 'Without /api/v1.'),
+      field('API token', token),
+      field('CA certificate (optional)', ca),
       err),
     footer: [button('Cancel', { onClick: () => drawer.close() }), save],
   });
@@ -70,7 +72,7 @@ function render(nodes, reload) {
           iconButton('trash', 'Remove node ' + n.name, async () => {
             const ok = await confirmDialog({
               title: 'Remove node',
-              message: `Remove ${n.name} from the dashboard? The node keeps running and serving traffic; only this console forgets it.`,
+              message: `Remove ${n.name} from this console? The node keeps running.`,
               confirmLabel: 'Remove node',
               danger: true,
             });
@@ -90,7 +92,6 @@ function render(nodes, reload) {
     empty: emptyState({
       iconName: 'server',
       title: 'No nodes yet',
-      text: 'A node is a server running the Cite connector. Add one with its URL and an API token.',
       action: button('Add node', { kind: 'primary', iconName: 'plus', onClick: () => openAddNode(reload) }),
     }),
   });
@@ -102,7 +103,7 @@ export function nodesView(ctx) {
   const body = h('div', {});
   let reload = null;
   const add = button('Add node', { kind: 'primary', iconName: 'plus', onClick: () => openAddNode(() => reload()) });
-  ctx.root.append(pageHeader({ title: 'Nodes', subtitle: 'Connectors this console manages', actions: add }), body);
+  ctx.root.append(pageHeader({ title: 'Nodes', actions: add }), body);
   reload = loadInto(body, async () => {
     await loadNodes();
     return state.nodes;

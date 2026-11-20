@@ -4,7 +4,7 @@ use crate::app::{Console, new_input};
 use crate::model::{PATHS_HINT, PATHS_LIMITS, clean_list, paths_match, paths_problem};
 use crate::theme::{Tone, c};
 use crate::ui::input::TextInput;
-use crate::ui::widgets::{BtnKind, btn, id, pill, seg_item, seg_row, text_dim};
+use crate::ui::widgets::{BtnKind, btn, id, pill, seg_item, seg_row, text_dim, tip};
 
 pub const MAX_PATH_ROWS: usize = 32;
 
@@ -148,7 +148,10 @@ pub fn path_editor(
                 .children(verdict),
         );
     }
-    col.child(text_dim(PATHS_HINT).text_size(px(12.)))
-        .child(text_dim(PATHS_LIMITS).text_size(px(11.)))
-        .into_any_element()
+    col.child(tip(
+        text_dim("Path matching rules on hover.").text_size(px(12.)),
+        id(key, "rules-tip"),
+        format!("{PATHS_HINT}\n{PATHS_LIMITS}"),
+    ))
+    .into_any_element()
 }

@@ -1,0 +1,14 @@
+/* node scope bar and small helpers for the single-node screens: tokens from app.css only */
+
+.node-scope { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s2); margin-bottom: var(--s4); }
+.node-scope-label { font-size: 12px; color: var(--text-faint); }
+.node-scope .segmented { flex-wrap: wrap; max-width: 100%; border-radius: var(--r-well); }
+.node-scope .seg[disabled] { color: var(--text-faint); cursor: not-allowed; }
+.node-scope .seg[disabled]:hover { color: var(--text-faint); }
+.node-scope-off { margin-left: var(--s2); font-size: 11px; color: var(--bad); }
+
+/* one webhook in the alerts form */
+.alert-hook { padding: var(--s3); border: 1px solid var(--border); border-radius: var(--r-well); }
+
+/* numbered and bulleted lists in the certificate tools */
+.list-indent { padding-left: 20px; }

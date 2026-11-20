@@ -2,6 +2,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use crate::envval;
+use crate::policy::Policy;
 
 const MAX_GITHUB_URL_LEN: usize = 200;
 pub const FORGES: [&str; 3] = ["github", "gitlab", "gitea"];
@@ -31,6 +32,21 @@ pub struct Config {
     pub egress_bridge: String,
     /// The node-wide CITE_EGRESS_* entries every egress proxy must carry, in the order the connector writes them.
     pub egress_env: Vec<String>,
+    /// The named volume data jobs read and write through a per-site subpath (CITE_PROXY_BACKUP_VOLUME, default cite-backups).
+    pub backup_volume: String,
+    /// Whether the data roles (Postgres, jobs, their volumes and networks) are served at all (CITE_PROXY_DATA, default true).
+    pub data_enabled: bool,
+}
+
+pub const DEFAULT_BACKUP_VOLUME: &str = "cite-backups";
+
+fn backup_volume_ok(name: &str) -> bool {
+    let b = name.as_bytes();
+    (1..=63).contains(&b.len())
+        && (b[0].is_ascii_lowercase() || b[0].is_ascii_digit())
+        && b.iter().all(|c| {
+            c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, b'_' | b'.' | b'-')
+        })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -351,7 +367,20 @@ impl Config {
                 egress_env.push(format!("{env_key}={value}"));
             }
         }
-        Ok(Config {
+        let backup_volume = text("CITE_PROXY_BACKUP_VOLUME", DEFAULT_BACKUP_VOLUME);
+        if !backup_volume_ok(&backup_volume) {
+            return Err(format!(
+                "CITE_PROXY_BACKUP_VOLUME {backup_volume:?} is not a plain volume name"
+            ));
+        }
+        let data_enabled = match optional("CITE_PROXY_DATA").as_deref() {
+            None | Some("true") => true,
+            Some("false") => false,
+            Some(v) => return Err(format!("CITE_PROXY_DATA {v:?} must be true or false")),
+        };
+        let cfg = Config {
+            backup_volume,
+            data_enabled,
             egress_mode,
             egress_bridge,
             egress_env,
@@ -366,7 +395,15 @@ impl Config {
             edge_network,
             max_conns,
             github_api_url,
-        })
+        };
+        // The backup volume is created by compose, never by the connector, so it must stay outside every name the proxy serves.
+        if Policy::new(&cfg).names_cite_object(&cfg.backup_volume) {
+            return Err(format!(
+                "CITE_PROXY_BACKUP_VOLUME {:?} collides with a cite object name",
+                cfg.backup_volume
+            ));
+        }
+        Ok(cfg)
     }
 }
 
@@ -672,5 +709,44 @@ mod tests {
         assert_eq!(parse_cpus("4"), Ok(4_000_000_000));
         assert_eq!(parse_cpus("0.25"), Ok(250_000_000));
         assert_eq!(parse_cpus("1.000000001"), Ok(1_000_000_001));
+    }
+
+    #[test]
+    fn data_settings_default_to_on_with_the_compose_backup_volume() {
+        let c = cfg(&[]).unwrap();
+        assert!(c.data_enabled);
+        assert_eq!(c.backup_volume, "cite-backups");
+        let off = cfg(&[("CITE_PROXY_DATA", " false ")]).unwrap();
+        assert!(!off.data_enabled);
+        assert!(cfg(&[("CITE_PROXY_DATA", "true")]).unwrap().data_enabled);
+        let named = cfg(&[("CITE_PROXY_BACKUP_VOLUME", "node.backups_1")]).unwrap();
+        assert_eq!(named.backup_volume, "node.backups_1");
+    }
+
+    #[test]
+    fn data_settings_refuse_hostile_values() {
+        for pairs in [
+            [("CITE_PROXY_DATA", "yes")],
+            [("CITE_PROXY_DATA", "TRUE")],
+            [("CITE_PROXY_DATA", "1")],
+            [("CITE_PROXY_BACKUP_VOLUME", "/host/backups")],
+            [("CITE_PROXY_BACKUP_VOLUME", "../x")],
+            [("CITE_PROXY_BACKUP_VOLUME", "Upper")],
+            [("CITE_PROXY_BACKUP_VOLUME", "-lead")],
+            [("CITE_PROXY_BACKUP_VOLUME", "a b")],
+            [("CITE_PROXY_BACKUP_VOLUME", "a:rw")],
+            // Names the proxy itself serves: a stack, site or data volume, or the shared instance's.
+            [("CITE_PROXY_BACKUP_VOLUME", "cite-shop-blue-data")],
+            [("CITE_PROXY_BACKUP_VOLUME", "cite-vol-shop_data")],
+            [("CITE_PROXY_BACKUP_VOLUME", "cite-shop-db-data")],
+            [("CITE_PROXY_BACKUP_VOLUME", "cite-pg-shared-data")],
+            [("CITE_PROXY_BACKUP_VOLUME", "cite-pg-shared-conf")],
+            [("CITE_PROXY_BACKUP_VOLUME", "cite-shop-dbnet")],
+        ] {
+            assert!(cfg(&pairs).is_err(), "{pairs:?}");
+        }
+        let long = "a".repeat(64);
+        assert!(cfg(&[("CITE_PROXY_BACKUP_VOLUME", &long)]).is_err());
+        assert!(cfg(&[("CITE_PROXY_BACKUP_VOLUME", &long[..63])]).is_ok());
     }
 }

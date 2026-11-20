@@ -5,14 +5,15 @@ use std::sync::Arc;
 
 use cite_core::atomic::{read_limited, write_atomic};
 use rcgen::{
-    BasicConstraints, Certificate, CertificateParams, DistinguishedName, DnType,
-    ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose,
+    BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
+    Issuer, KeyPair, KeyUsagePurpose,
 };
 use sha2::{Digest, Sha256};
 use time::{Duration, OffsetDateTime};
 use tokio_rustls::TlsAcceptor;
 
 use crate::config::ConnectorConfig;
+use crate::seal::{self, Keyring, OpenMode};
 use crate::{ConnectorError, Result};
 
 const CA_VALID_DAYS: i64 = 3650;
@@ -87,8 +88,7 @@ fn ca_params() -> CertificateParams {
 }
 
 fn issue_leaf(
-    ca: &Certificate,
-    ca_key: &KeyPair,
+    issuer: &Issuer<'_, &KeyPair>,
     sans: &[String],
     node_name: &str,
 ) -> Result<(String, String)> {
@@ -106,7 +106,7 @@ fn issue_leaf(
     params.not_after = params.not_before + Duration::days(LEAF_VALID_DAYS);
     let key = KeyPair::generate().map_err(|e| tls_err("key generation failed", e))?;
     let cert = params
-        .signed_by(&key, ca, ca_key)
+        .signed_by(&key, issuer)
         .map_err(|e| tls_err("certificate signing failed", e))?;
     Ok((cert.pem(), key.serialize_pem()))
 }
@@ -116,7 +116,8 @@ pub fn generate(sans: &[String], node_name: &str) -> Result<TlsMaterial> {
     let ca = ca_params()
         .self_signed(&ca_key)
         .map_err(|e| tls_err("CA generation failed", e))?;
-    let (server_pem, server_key_pem) = issue_leaf(&ca, &ca_key, sans, node_name)?;
+    let issuer = Issuer::new(ca_params(), &ca_key);
+    let (server_pem, server_key_pem) = issue_leaf(&issuer, sans, node_name)?;
     Ok(TlsMaterial {
         ca_pem: ca.pem(),
         ca_key_pem: ca_key.serialize_pem(),
@@ -130,32 +131,60 @@ fn write_pem(path: &Path, pem: &str, mode: u32) -> Result<()> {
         .map_err(|e| tls_err(&format!("cannot write {}", path.display()), e))
 }
 
-fn write_leaf(paths: &TlsPaths, server_pem: &str, server_key_pem: &str) -> Result<()> {
-    write_pem(&paths.server_key, server_key_pem, 0o600)?;
+// Private keys are sealed under the node key when there is one; certificates are public and stay PEM.
+fn write_key(path: &Path, pem: &str, keyring: Option<&Keyring>) -> Result<()> {
+    seal::write_path(keyring, path, pem.as_bytes(), 0o600)
+}
+
+fn write_leaf(
+    paths: &TlsPaths,
+    server_pem: &str,
+    server_key_pem: &str,
+    keyring: Option<&Keyring>,
+) -> Result<()> {
+    write_key(&paths.server_key, server_key_pem, keyring)?;
     write_pem(&paths.server_pem, server_pem, 0o644)
 }
 
-pub fn write_material(paths: &TlsPaths, m: &TlsMaterial) -> Result<()> {
-    write_pem(&paths.ca_key, &m.ca_key_pem, 0o600)?;
+pub fn write_material(paths: &TlsPaths, m: &TlsMaterial, keyring: Option<&Keyring>) -> Result<()> {
+    write_key(&paths.ca_key, &m.ca_key_pem, keyring)?;
     write_pem(&paths.ca_pem, &m.ca_pem, 0o644)?;
-    write_leaf(paths, &m.server_pem, &m.server_key_pem)
+    write_leaf(paths, &m.server_pem, &m.server_key_pem, keyring)
+}
+
+// Files that exist from an earlier release hold their key as plain PEM; they move under the node key here, once, keeping a `.pre-seal` copy.
+pub fn migrate_keys(tls_dir: &Path, keyring: &Keyring) -> Result<Vec<String>> {
+    let mut sealed = Vec::new();
+    for file in ["ca.key", "server.key"] {
+        let path = tls_dir.join(file);
+        if let Some(read) = seal::read_path(Some(keyring), &path, MAX_PEM_BYTES)?
+            && seal::migrate_path(keyring, &path, &read)?
+        {
+            sealed.push(format!("tls/{file}"));
+        }
+    }
+    Ok(sealed)
 }
 
 // The stored CA certificate is left untouched; the rebuilt issuer only supplies the subject and key.
-pub fn renew_leaf(paths: &TlsPaths, sans: &[String], node_name: &str) -> Result<()> {
-    let key_pem = read_limited(&paths.ca_key, MAX_PEM_BYTES).map_err(|_| {
+pub fn renew_leaf(
+    paths: &TlsPaths,
+    sans: &[String],
+    node_name: &str,
+    keyring: Option<&Keyring>,
+) -> Result<()> {
+    let key_pem = seal::read_path(keyring, &paths.ca_key, MAX_PEM_BYTES)?.ok_or_else(|| {
         ConnectorError::Internal(format!(
             "{} is missing; run init without --renew-tls to create a new CA",
             paths.ca_key.display()
         ))
     })?;
-    let key_pem = String::from_utf8(key_pem).map_err(|e| tls_err("ca.key is not text", e))?;
-    let ca_key = KeyPair::from_pem(&key_pem).map_err(|e| tls_err("ca.key is invalid", e))?;
-    let issuer = ca_params()
-        .self_signed(&ca_key)
-        .map_err(|e| tls_err("CA rebuild failed", e))?;
-    let (server_pem, server_key_pem) = issue_leaf(&issuer, &ca_key, sans, node_name)?;
-    write_leaf(paths, &server_pem, &server_key_pem)
+    let key_pem =
+        std::str::from_utf8(&key_pem.plaintext).map_err(|e| tls_err("ca.key is not text", e))?;
+    let ca_key = KeyPair::from_pem(key_pem).map_err(|e| tls_err("ca.key is invalid", e))?;
+    let issuer = Issuer::new(ca_params(), &ca_key);
+    let (server_pem, server_key_pem) = issue_leaf(&issuer, sans, node_name)?;
+    write_leaf(paths, &server_pem, &server_key_pem, keyring)
 }
 
 fn first_cert_der(pem: &[u8]) -> Result<Vec<u8>> {
@@ -192,39 +221,58 @@ fn outcome(paths: &TlsPaths, generated: bool) -> Result<TlsOutcome> {
     })
 }
 
+// Creating TLS material is part of init, which also creates the node key if the node has none.
 pub fn ensure(cfg: &ConnectorConfig) -> Result<TlsOutcome> {
     let paths = TlsPaths::new(&cfg.tls_dir);
+    let keyring = Keyring::load(cfg, OpenMode::Migrating)?;
     let have_leaf = paths.server_pem.is_file() && paths.server_key.is_file();
     let can_reissue = paths.ca_pem.is_file() && paths.ca_key.is_file();
     let generated = if have_leaf {
         false
     } else if can_reissue {
-        renew_leaf(&paths, &cfg.tls_sans, &cfg.node_name)?;
+        renew_leaf(&paths, &cfg.tls_sans, &cfg.node_name, keyring.as_ref())?;
         true
     } else {
-        write_material(&paths, &generate(&cfg.tls_sans, &cfg.node_name)?)?;
+        write_material(
+            &paths,
+            &generate(&cfg.tls_sans, &cfg.node_name)?,
+            keyring.as_ref(),
+        )?;
         true
     };
     outcome(&paths, generated)
 }
 
+// Runs from the command line, possibly while the server is up: it uses the key if there is one and never creates it.
 pub fn renew(cfg: &ConnectorConfig) -> Result<TlsOutcome> {
     let paths = TlsPaths::new(&cfg.tls_dir);
-    renew_leaf(&paths, &cfg.tls_sans, &cfg.node_name)?;
+    let keyring = Keyring::load(cfg, OpenMode::ReadOnly)?;
+    renew_leaf(&paths, &cfg.tls_sans, &cfg.node_name, keyring.as_ref())?;
     outcome(&paths, true)
 }
 
+// The node key is found the way the other loaders find it: from the environment, then the data directory next to `dir`.
 pub fn load_acceptor(dir: &Path) -> Result<TlsAcceptor> {
+    let data_dir = dir
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let keyring = Keyring::discover(data_dir, OpenMode::ReadOnly)?;
+    load_acceptor_with(dir, keyring.as_ref())
+}
+
+pub fn load_acceptor_with(dir: &Path, keyring: Option<&Keyring>) -> Result<TlsAcceptor> {
     install_provider();
     let paths = TlsPaths::new(dir);
-    let missing = |_| {
+    let missing = || {
         ConnectorError::Internal(format!(
             "TLS certificate or key not found in {}; run `cite-connector init`",
             dir.display()
         ))
     };
-    let cert_pem = read_limited(&paths.server_pem, MAX_PEM_BYTES).map_err(missing)?;
-    let key_pem = read_limited(&paths.server_key, MAX_PEM_BYTES).map_err(missing)?;
+    let cert_pem = read_limited(&paths.server_pem, MAX_PEM_BYTES).map_err(|_| missing())?;
+    let key = seal::read_path(keyring, &paths.server_key, MAX_PEM_BYTES)?.ok_or_else(missing)?;
+    let key_pem = key.plaintext;
     let certs = CertificateDer::pem_slice_iter(&cert_pem)
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|e| tls_err("server.pem is invalid", e))?;
@@ -342,8 +390,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let m = generate(&sans(), "n1").expect("generate");
         let paths = TlsPaths::new(dir.path());
-        write_material(&paths, &m).expect("write");
-        let acceptor = load_acceptor(dir.path()).expect("acceptor");
+        write_material(&paths, &m, None).expect("write");
+        let acceptor = load_acceptor_with(dir.path(), None).expect("acceptor");
         assert!(handshake(acceptor.clone(), &m.ca_pem, "localhost").await);
         assert!(handshake(acceptor.clone(), &m.ca_pem, "connector.example.com").await);
         assert!(!handshake(acceptor, &m.ca_pem, "evil.example").await);
@@ -353,9 +401,9 @@ mod tests {
     async fn an_unrelated_ca_is_not_trusted() {
         let dir = tempfile::tempdir().expect("tempdir");
         let m = generate(&sans(), "n1").expect("generate");
-        write_material(&TlsPaths::new(dir.path()), &m).expect("write");
+        write_material(&TlsPaths::new(dir.path()), &m, None).expect("write");
         let other = generate(&sans(), "n2").expect("other");
-        let acceptor = load_acceptor(dir.path()).expect("acceptor");
+        let acceptor = load_acceptor_with(dir.path(), None).expect("acceptor");
         assert!(!handshake(acceptor, &other.ca_pem, "localhost").await);
     }
 
@@ -364,22 +412,23 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let m = generate(&sans(), "n1").expect("generate");
         let paths = TlsPaths::new(dir.path());
-        write_material(&paths, &m).expect("write");
-        renew_leaf(&paths, &sans(), "n1").expect("renew");
+        write_material(&paths, &m, None).expect("write");
+        renew_leaf(&paths, &sans(), "n1", None).expect("renew");
         let renewed = std::fs::read_to_string(&paths.server_pem).expect("read");
         assert_ne!(renewed, m.server_pem);
         assert_eq!(
             std::fs::read_to_string(&paths.ca_pem).expect("ca"),
             m.ca_pem
         );
-        let acceptor = load_acceptor(dir.path()).expect("acceptor");
+        let acceptor = load_acceptor_with(dir.path(), None).expect("acceptor");
         assert!(handshake(acceptor, &m.ca_pem, "localhost").await);
     }
 
     #[test]
     fn renew_without_ca_key_explains_itself() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let err = renew_leaf(&TlsPaths::new(dir.path()), &sans(), "n1").expect_err("must fail");
+        let err =
+            renew_leaf(&TlsPaths::new(dir.path()), &sans(), "n1", None).expect_err("must fail");
         assert!(err.to_string().contains("ca.key"));
     }
 
@@ -405,7 +454,133 @@ mod tests {
     #[test]
     fn missing_material_points_at_init() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let err = load_acceptor(dir.path()).err().expect("must fail");
+        let err = load_acceptor_with(dir.path(), None)
+            .err()
+            .expect("must fail");
         assert!(err.to_string().contains("init"));
+    }
+
+    fn sealed_kid(path: &Path) -> Option<[u8; 8]> {
+        seal::envelope_kid(&std::fs::read(path).expect("read"))
+    }
+
+    fn tls_cfg() -> (tempfile::TempDir, ConnectorConfig) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = test_config(dir.path());
+        std::fs::create_dir_all(&cfg.tls_dir).expect("mkdir");
+        (dir, cfg)
+    }
+
+    #[tokio::test]
+    async fn init_seals_the_private_keys_and_the_server_still_loads_and_renews_them() {
+        let (_dir, cfg) = tls_cfg();
+        let first = ensure(&cfg).expect("ensure");
+        let paths = TlsPaths::new(&cfg.tls_dir);
+        let ring = Keyring::load(&cfg, OpenMode::ReadOnly)
+            .expect("load")
+            .expect("init created the key");
+        for key in [&paths.ca_key, &paths.server_key] {
+            assert_eq!(sealed_kid(key), Some(ring.kid()), "{}", key.display());
+            let text = std::fs::read_to_string(key).expect("read");
+            assert!(!text.contains("PRIVATE KEY"), "{}", key.display());
+        }
+        for cert in [&paths.ca_pem, &paths.server_pem] {
+            let text = std::fs::read_to_string(cert).expect("read");
+            assert!(text.starts_with("-----BEGIN CERTIFICATE-----"));
+        }
+        let ca_pem = std::fs::read_to_string(&paths.ca_pem).expect("ca");
+        let acceptor = load_acceptor(&cfg.tls_dir).expect("the server finds the key by itself");
+        assert!(handshake(acceptor, &ca_pem, "localhost").await);
+
+        let renewed = renew(&cfg).expect("renew with the sealed ca key");
+        assert_eq!(renewed.fingerprint, first.fingerprint);
+        assert_eq!(
+            sealed_kid(&paths.server_key),
+            Some(ring.kid()),
+            "renewal seals the new key"
+        );
+        let acceptor = load_acceptor(&cfg.tls_dir).expect("acceptor after renewal");
+        assert!(handshake(acceptor, &ca_pem, "localhost").await);
+    }
+
+    #[test]
+    fn a_sealed_key_is_refused_without_a_keyring_and_never_read_as_pem() {
+        let (_dir, cfg) = tls_cfg();
+        ensure(&cfg).expect("ensure");
+        let err = load_acceptor_with(&cfg.tls_dir, None)
+            .err()
+            .expect("sealed")
+            .to_string();
+        assert!(err.contains("no secrets key"), "{err}");
+        let renew_err = renew_leaf(&TlsPaths::new(&cfg.tls_dir), &sans(), "n1", None)
+            .expect_err("sealed ca key");
+        assert!(
+            renew_err.to_string().contains("no secrets key"),
+            "{renew_err}"
+        );
+    }
+
+    #[test]
+    fn the_two_sealed_keys_cannot_be_swapped() {
+        let (_dir, cfg) = tls_cfg();
+        ensure(&cfg).expect("ensure");
+        let paths = TlsPaths::new(&cfg.tls_dir);
+        let server_key = std::fs::read(&paths.server_key).expect("read");
+        std::fs::write(&paths.ca_key, server_key).expect("swap");
+        let err = renew(&cfg).err().expect("must refuse").to_string();
+        assert!(err.contains("decrypted"), "{err}");
+    }
+
+    #[test]
+    fn plaintext_keys_from_an_earlier_release_are_sealed_once_with_a_pre_seal_copy() {
+        let (_dir, cfg) = tls_cfg();
+        let paths = TlsPaths::new(&cfg.tls_dir);
+        let material = generate(&sans(), "n1").expect("generate");
+        write_material(&paths, &material, None).expect("write plain");
+        let ring = Keyring::load(&cfg, OpenMode::Migrating)
+            .expect("load")
+            .expect("key created");
+
+        let sealed = migrate_keys(&cfg.tls_dir, &ring).expect("migrate");
+        assert_eq!(sealed, ["tls/ca.key", "tls/server.key"]);
+        for (file, plain) in [
+            ("ca.key", &material.ca_key_pem),
+            ("server.key", &material.server_key_pem),
+        ] {
+            let path = cfg.tls_dir.join(file);
+            assert_eq!(sealed_kid(&path), Some(ring.kid()));
+            let copy = cfg.tls_dir.join(format!("{file}.pre-seal"));
+            assert_eq!(std::fs::read_to_string(&copy).expect("copy"), *plain);
+            let mode = std::fs::metadata(&copy).expect("meta").permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        assert!(load_acceptor_with(&cfg.tls_dir, Some(&ring)).is_ok());
+
+        assert!(migrate_keys(&cfg.tls_dir, &ring).expect("again").is_empty());
+        for file in ["ca.key.pre-seal", "server.key.pre-seal"] {
+            assert!(
+                !cfg.tls_dir.join(file).exists(),
+                "{file} goes at the next start"
+            );
+        }
+        let read_only = Keyring::from_keys(
+            crate::seal::NodeKey::from_bytes(&[3; 32]),
+            crate::seal::KeySource::Env,
+            Vec::new(),
+            OpenMode::ReadOnly,
+        );
+        let other = tempfile::tempdir().expect("tempdir");
+        let plain_paths = TlsPaths::new(other.path());
+        write_material(&plain_paths, &material, None).expect("write plain");
+        assert!(
+            migrate_keys(other.path(), &read_only)
+                .expect("noop")
+                .is_empty()
+        );
+        assert_eq!(
+            sealed_kid(&plain_paths.ca_key),
+            None,
+            "a read-only keyring does not rewrite"
+        );
     }
 }

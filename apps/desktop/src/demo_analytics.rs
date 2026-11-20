@@ -309,15 +309,36 @@ fn facet_list(total: u64, shares: &[(String, f64)]) -> Vec<FacetValue> {
     out
 }
 
-fn weights(n: usize) -> Vec<f64> {
-    let raw: Vec<f64> = (0..n).map(|i| 1.0 / (i as f64 + 2.0)).collect();
-    let sum: f64 = raw.iter().sum();
-    raw.into_iter().map(|w| w / sum).collect()
+// Relative traffic one demo site takes on one node: the first node leans on the storefront, the
+// second on the API, and a site in maintenance takes none.
+pub fn site_share(node: i64, id: &str, maintenance: bool) -> f64 {
+    if maintenance {
+        return 0.0;
+    }
+    match (node, id) {
+        (0, "shop") => 6.0,
+        (0, "api") => 3.0,
+        (0, "docs") => 1.0,
+        (_, "api") => 8.0,
+        (_, "shop") => 2.0,
+        (_, "docs") => 0.5,
+        _ => 1.0,
+    }
 }
 
-// Sites and hosts get falling shares of the traffic; methods, status classes and bot classes use fixed ones.
-pub fn facets_for(total: u64, sites: &[(String, Vec<String>)]) -> Facets {
-    let w = weights(sites.len());
+// Rescales relative shares so they add up to one; all zeros stay zeros.
+fn normalised(shares: &[f64]) -> Vec<f64> {
+    let sum: f64 = shares.iter().sum();
+    if sum <= 0.0 {
+        return vec![0.0; shares.len()];
+    }
+    shares.iter().map(|s| s / sum).collect()
+}
+
+// Sites and hosts split the traffic by the relative share given for every site, in the order of
+// `sites`; methods, status classes and bot classes use fixed shares.
+pub fn facets_with(total: u64, sites: &[(String, Vec<String>)], shares: &[f64]) -> Facets {
+    let w = normalised(shares);
     let site: Vec<(String, f64)> = sites
         .iter()
         .zip(&w)
@@ -572,14 +593,45 @@ mod tests {
             ),
             ("blog".to_string(), vec!["blog.example.com".to_string()]),
         ];
-        let f = facets_for(10_000, &sites);
+        let f = facets_with(10_000, &sites, &[3.0, 1.0]);
         assert_eq!(f.site[0].key, "shop");
         assert!(f.site[0].count > f.site[1].count);
         assert_eq!(f.host.len(), 3);
         assert_eq!(f.method[0].key, "GET");
         assert_eq!(f.status_class.len(), 4);
         assert_eq!(f.bot_class[0].key, "human");
-        assert!(facets_for(100, &[]).site.is_empty());
+        assert!(facets_with(100, &[], &[]).site.is_empty());
+    }
+
+    #[test]
+    fn facets_follow_the_shares_given_and_a_site_with_none_is_left_out() {
+        let sites = vec![
+            ("shop".to_string(), vec!["shop.example.com".to_string()]),
+            ("api".to_string(), vec!["api.example.com".to_string()]),
+            ("docs".to_string(), vec!["docs.example.com".to_string()]),
+        ];
+        let shares = [
+            site_share(1, "shop", false),
+            site_share(1, "api", false),
+            site_share(1, "docs", true),
+        ];
+        let f = facets_with(10_000, &sites, &shares);
+        assert_eq!(f.site[0].key, "api");
+        assert!(f.site.iter().all(|v| v.key != "docs"));
+        assert!(f.host.iter().all(|v| v.key != "docs.example.com"));
+        assert_eq!(f.site.iter().map(|v| v.count).sum::<u64>(), 10_000);
+        assert!(
+            facets_with(10_000, &sites, &[0.0, 0.0, 0.0])
+                .site
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn the_api_is_busiest_on_the_second_node_and_the_storefront_on_the_first() {
+        assert!(site_share(0, "shop", false) > site_share(0, "api", false));
+        assert!(site_share(1, "api", false) > site_share(1, "shop", false));
+        assert_eq!(site_share(1, "docs", true), 0.0);
     }
 
     #[test]

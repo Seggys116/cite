@@ -17,8 +17,10 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
+use zeroize::Zeroizing;
 
 use crate::config::ConnectorConfig;
+use crate::seal::{self, Keyring, OpenMode};
 use crate::{ConnectorError, Result};
 
 const SESSION_IDLE_SECS: u64 = 1800;
@@ -32,7 +34,8 @@ const AUDIT_DETAIL_MAX: usize = 1024;
 const SECRET_NAME_MAX: usize = 128;
 // Above the 24 KiB an environment map may take, so a full build or runtime env always fits.
 const SECRET_VALUE_MAX: usize = 32 * 1024;
-const MAX_SECRETS: usize = 512;
+// A site with data services keeps up to about 80 secrets of its own, so this allows a large fleet of them.
+const MAX_SECRETS: usize = 4096;
 // Room for a token and two full env maps per site across a large fleet; put_secret refuses a write past it.
 const SECRETS_FILE_MAX_BYTES: u64 = 16 * 1024 * 1024;
 const TOKEN_CHECK_CONCURRENCY: usize = 2;
@@ -100,6 +103,8 @@ struct Paths {
 
 pub struct Store {
     paths: Paths,
+    // None only for a command-line open on a node that has no key yet: files are then read and written as plaintext.
+    keyring: Option<Arc<Keyring>>,
     session_ttl_secs: u64,
     config: ArcSwap<EdgeConfig>,
     write_lock: Mutex<()>,
@@ -188,11 +193,20 @@ fn fixed_name(name: &str) -> Result<FileName> {
     FileName::new(name).map_err(|e| internal("invalid store file name", e))
 }
 
-async fn write_file(dir: Arc<TrustedDir>, name: FileName, bytes: Vec<u8>, mode: u32) -> Result<()> {
-    tokio::task::spawn_blocking(move || write_atomic_in(&dir, &name, &bytes, mode))
-        .await
-        .map_err(|e| internal("write task", e))?
-        .map_err(|e| internal("write failed", e))
+// The bytes are sealed under the keyring when one is given; edge.json and tokens.json pass None and stay readable.
+async fn write_file(
+    dir: Arc<TrustedDir>,
+    name: FileName,
+    bytes: Zeroizing<Vec<u8>>,
+    mode: u32,
+    keyring: Option<Arc<Keyring>>,
+) -> Result<()> {
+    tokio::task::spawn_blocking(move || {
+        seal::write_file(keyring.as_deref(), &dir, &name, &bytes, mode)
+    })
+    .await
+    .map_err(|e| internal("write task", e))?
+    .map_err(|e| internal("write failed", e))
 }
 
 fn read_optional(dir: &TrustedDir, name: &FileName, max: u64) -> Result<Option<Vec<u8>>> {
@@ -216,11 +230,37 @@ fn load_json<T: serde::de::DeserializeOwned>(
     }
 }
 
-fn disk_generation(dir: &TrustedDir, name: &FileName) -> u64 {
-    load_json::<GenerationOnly>(dir, name, MAX_SMALL_FILE_BYTES)
+struct Loaded<T> {
+    value: T,
+    read: seal::ReadFile,
+}
+
+// For the files that may be sealed. Parse errors give a position only: serde would otherwise quote a secret.
+fn load_sealed<T: serde::de::DeserializeOwned>(
+    keyring: Option<&Keyring>,
+    dir: &TrustedDir,
+    name: &FileName,
+    max_plain: u64,
+) -> Result<Option<Loaded<T>>> {
+    let Some(read) = seal::read_file(keyring, dir, name, max_plain)? else {
+        return Ok(None);
+    };
+    match serde_json::from_slice(&read.plaintext) {
+        Ok(value) => Ok(Some(Loaded { value, read })),
+        Err(e) => Err(ConnectorError::Internal(format!(
+            "{name} is invalid at line {} column {}",
+            e.line(),
+            e.column()
+        ))),
+    }
+}
+
+// The generation of a file that may be sealed; unreadable or absent counts as zero.
+fn disk_generation(dir: &TrustedDir, name: &FileName, keyring: Option<&Keyring>) -> u64 {
+    load_sealed::<GenerationOnly>(keyring, dir, name, MAX_SMALL_FILE_BYTES)
         .ok()
         .flatten()
-        .map_or(0, |g| g.generation)
+        .map_or(0, |loaded| loaded.value.generation)
 }
 
 // Held across a generation check and the rename after it, in server and CLI alike, so a reset is never overwritten by older state.
@@ -234,24 +274,20 @@ async fn guarded_write(
     lock: FileName,
     target: FileName,
     seen: u64,
-    bytes: Vec<u8>,
+    bytes: Zeroizing<Vec<u8>>,
+    keyring: Option<Arc<Keyring>>,
 ) -> Result<bool> {
     tokio::task::spawn_blocking(move || -> Result<bool> {
         let _held = lock_auth(&dir, &lock).map_err(|e| internal("auth lock failed", e))?;
-        if disk_generation(&dir, &target) > seen {
+        if disk_generation(&dir, &target, keyring.as_deref()) > seen {
             return Ok(false);
         }
-        write_atomic_in(&dir, &target, &bytes, 0o600).map_err(|e| internal("write failed", e))?;
+        seal::write_file(keyring.as_deref(), &dir, &target, &bytes, 0o600)
+            .map_err(|e| internal("write failed", e))?;
         Ok(true)
     })
     .await
     .map_err(|e| internal("write task", e))?
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum OpenMode {
-    Migrating,
-    ReadOnly,
 }
 
 const MIGRATION_BACKUP: &str = "edge.json.pre-migration";
@@ -390,24 +426,39 @@ impl Store {
 
     async fn open_with(cfg: &ConnectorConfig, mode: OpenMode) -> Result<Arc<Store>> {
         let cfg = cfg.clone();
-        let (store, migrated) =
+        let (store, migrated, sealed) =
             tokio::task::spawn_blocking(move || Self::open_blocking(&cfg, mode))
                 .await
                 .map_err(|e| internal("open task", e))??;
         if let Some(summary) = migrated {
             store.audit("system", "config.migrated", &summary).await;
         }
+        if !sealed.is_empty() {
+            // file names only, never contents
+            store
+                .audit("system", "secrets.sealed", &sealed.join(","))
+                .await;
+        }
         Ok(Arc::new(store))
     }
 
-    // The second value says what start-up changed in edge.json, for the audit log once the store exists.
-    fn open_blocking(cfg: &ConnectorConfig, mode: OpenMode) -> Result<(Store, Option<String>)> {
+    // The second value says what start-up changed in edge.json and the third which files were moved under the node key, both for the audit log once the store exists.
+    fn open_blocking(
+        cfg: &ConnectorConfig,
+        mode: OpenMode,
+    ) -> Result<(Store, Option<String>, Vec<String>)> {
         // The data directory is traversable but not listable so HAProxy can reach its subdirectory.
         make_dir(&cfg.data_dir, 0o711)?;
         for dir in [&cfg.haproxy_dir, &cfg.maps_dir, &cfg.pages_dir] {
             make_dir(dir, 0o755)?;
         }
         make_dir(&cfg.tls_dir, 0o700)?;
+
+        // Before anything is read, so a lost key stops the start with a precise message instead of a parse error.
+        let keyring = Keyring::load(cfg, mode)?.map(Arc::new);
+        if let Some(keyring) = &keyring {
+            seal::verify_kids(keyring, &cfg.data_dir)?;
+        }
 
         let dir = TrustedDir::open(&cfg.data_dir)
             .map_err(|e| internal(&format!("cannot open {}", cfg.data_dir.display()), e))?;
@@ -475,17 +526,36 @@ impl Store {
                 (c, None)
             }
         };
-        let creds = load_json::<Stamped<Credentials>>(
+        let kr = keyring.as_deref();
+        let creds = load_sealed::<Stamped<Credentials>>(
+            kr,
             &paths.dir,
             &paths.credentials,
             MAX_SMALL_FILE_BYTES,
         )?;
-        let secrets = load_json::<HashMap<String, String>>(
+        let secrets = load_sealed::<HashMap<String, String>>(
+            kr,
             &paths.dir,
             &paths.secrets,
             SECRETS_FILE_MAX_BYTES,
-        )?
-        .unwrap_or_default();
+        )?;
+        // Files that opened as legacy plaintext, or under an older key, move to the primary key now.
+        let mut sealed = Vec::new();
+        if let (Some(keyring), true) = (kr, mode == OpenMode::Migrating) {
+            if let Some(loaded) = &creds
+                && seal::migrate_file(keyring, &paths.dir, &paths.credentials, &loaded.read)?
+            {
+                sealed.push("credentials.json".to_string());
+            }
+            if let Some(loaded) = &secrets
+                && seal::migrate_file(keyring, &paths.dir, &paths.secrets, &loaded.read)?
+            {
+                sealed.push("secrets.json".to_string());
+            }
+            sealed.extend(crate::tls::migrate_keys(&cfg.tls_dir, keyring)?);
+        }
+        let creds = creds.map(|loaded| loaded.value);
+        let secrets = secrets.map(|loaded| loaded.value).unwrap_or_default();
         let tokens =
             load_json::<Stamped<ApiTokens>>(&paths.dir, &paths.tokens, MAX_SMALL_FILE_BYTES)?;
         let disk = AuthDisk {
@@ -500,6 +570,7 @@ impl Store {
             session_ttl_secs: cfg.session_ttl_secs,
             sessions: StdMutex::new(SessionStore::new(cfg.session_ttl_secs, SESSION_IDLE_SECS)),
             paths,
+            keyring,
             config: ArcSwap::from_pointee(config),
             write_lock: Mutex::new(()),
             creds: ArcSwapOption::from(creds.map(|c| Arc::new(c.value))),
@@ -516,7 +587,22 @@ impl Store {
             #[cfg(test)]
             fail_config_write_in: std::sync::atomic::AtomicI64::new(-1),
         };
-        Ok((store, migrated))
+        Ok((store, migrated, sealed))
+    }
+
+    // None only for a command-line open on a node that has no key yet.
+    pub fn keyring(&self) -> Option<Arc<Keyring>> {
+        self.keyring.clone()
+    }
+
+    // For callers that cannot work without a key, such as backups; the server always has one.
+    pub fn require_keyring(&self) -> Result<Arc<Keyring>> {
+        self.keyring.clone().ok_or_else(|| {
+            ConnectorError::Unavailable(
+                "no secrets key is available on this node; start the connector once to create it"
+                    .into(),
+            )
+        })
     }
 
     #[cfg(test)]
@@ -567,8 +653,9 @@ impl Store {
         write_file(
             self.paths.dir.clone(),
             self.paths.edge.clone(),
-            bytes,
+            Zeroizing::new(bytes),
             0o600,
+            None,
         )
         .await?;
         self.config.store(Arc::new(next));
@@ -639,7 +726,7 @@ impl Store {
         }
         // Changed in place and put back on failure; readers wait on the same lock, so none sees the attempt.
         let previous = map.insert(name.to_string(), value.to_string());
-        let written = match serde_json::to_vec(&*map) {
+        let written = match serde_json::to_vec(&*map).map(Zeroizing::new) {
             Ok(bytes) if bytes.len() as u64 > SECRETS_FILE_MAX_BYTES => {
                 Err(ConnectorError::BadRequest(format!(
                     "the secrets file would exceed {} MiB; remove secrets or env values that are no longer used",
@@ -652,6 +739,7 @@ impl Store {
                     self.paths.secrets.clone(),
                     bytes,
                     0o600,
+                    self.keyring.clone(),
                 )
                 .await
             }
@@ -675,13 +763,14 @@ impl Store {
         let Some(old) = map.remove(name) else {
             return;
         };
-        let written = match serde_json::to_vec(&*map) {
+        let written = match serde_json::to_vec(&*map).map(Zeroizing::new) {
             Ok(bytes) => {
                 write_file(
                     self.paths.dir.clone(),
                     self.paths.secrets.clone(),
                     bytes,
                     0o600,
+                    self.keyring.clone(),
                 )
                 .await
             }
@@ -712,12 +801,13 @@ impl Store {
             return;
         }
         disk.creds_key = Some(key);
-        match load_json::<Stamped<Credentials>>(
+        match load_sealed::<Stamped<Credentials>>(
+            self.keyring.as_deref(),
             &self.paths.dir,
             &self.paths.credentials,
             MAX_SMALL_FILE_BYTES,
         ) {
-            Ok(Some(next)) if next.generation > disk.creds_gen => {
+            Ok(Some(Loaded { value: next, .. })) if next.generation > disk.creds_gen => {
                 disk.creds_gen = next.generation;
                 self.creds.store(Some(Arc::new(next.value)));
                 self.clear_sessions();
@@ -767,14 +857,16 @@ impl Store {
             generation: self.creds_generation(),
             value: c,
         };
-        let bytes = serde_json::to_vec_pretty(&stamped)?;
+        let bytes = Zeroizing::new(serde_json::to_vec_pretty(&stamped)?);
         let dir = self.paths.dir.clone();
         let lock_name = self.paths.auth_lock.clone();
         let target = self.paths.credentials.clone();
+        let keyring = self.keyring.clone();
         let this = Arc::clone(self);
         // The write and the in-memory update run as one owned task, so a dropped request cannot leave the file ahead of memory.
         tokio::spawn(async move {
-            let written = guarded_write(dir, lock_name, target, stamped.generation, bytes).await?;
+            let written =
+                guarded_write(dir, lock_name, target, stamped.generation, bytes, keyring).await?;
             // A reset adopted while the write was finishing is newer than this copy, so memory must keep it.
             let stored = {
                 let mut disk = lock(&this.disk);
@@ -809,12 +901,13 @@ impl Store {
             self.paths.credentials.clone(),
         );
         let fresh = c.clone();
+        let keyring = self.keyring.clone();
         let generation = tokio::task::spawn_blocking(move || -> Result<u64> {
             let (dir, lock_name, tokens_name, creds_name) = paths;
             let _held = lock_auth(&dir, &lock_name).map_err(|e| internal("auth lock failed", e))?;
             let generation = floor
-                .max(disk_generation(&dir, &creds_name))
-                .max(disk_generation(&dir, &tokens_name))
+                .max(disk_generation(&dir, &creds_name, keyring.as_deref()))
+                .max(disk_generation(&dir, &tokens_name, None))
                 .saturating_add(1);
             let empty = Stamped {
                 generation,
@@ -831,13 +924,9 @@ impl Store {
                 0o600,
             )
             .map_err(|e| internal("write failed", e))?;
-            write_atomic_in(
-                &dir,
-                &creds_name,
-                &serde_json::to_vec_pretty(&creds)?,
-                0o600,
-            )
-            .map_err(|e| internal("write failed", e))?;
+            let creds_bytes = Zeroizing::new(serde_json::to_vec_pretty(&creds)?);
+            seal::write_file(keyring.as_deref(), &dir, &creds_name, &creds_bytes, 0o600)
+                .map_err(|e| internal("write failed", e))?;
             Ok(generation)
         })
         .await
@@ -951,11 +1040,12 @@ impl Store {
             generation: seen,
             value: &next,
         };
-        let bytes = serde_json::to_vec_pretty(&stamped)?;
+        let bytes = Zeroizing::new(serde_json::to_vec_pretty(&stamped)?);
         let dir = self.paths.dir.clone();
         let lock_name = self.paths.auth_lock.clone();
         let target = self.paths.tokens.clone();
-        let written = guarded_write(dir, lock_name, target, seen, bytes).await?;
+        // tokens.json holds hashes only and stays plaintext, so no keyring is passed
+        let written = guarded_write(dir, lock_name, target, seen, bytes, None).await?;
         lock(&self.disk).tokens_key = None;
         if !written {
             self.refresh_tokens(tokens);
@@ -1598,7 +1688,8 @@ mod tests {
         let (dir, store) = open_temp().await;
         drop(store);
         let value = "a".repeat(SECRET_VALUE_MAX);
-        let seed: HashMap<String, String> = (0..MAX_SECRETS - 1)
+        // 511 values of the largest size fill the 16 MiB file almost exactly
+        let seed: HashMap<String, String> = (0..511)
             .map(|i| (format!("s{i:03}"), value.clone()))
             .collect();
         let path = dir.path().join("secrets.json");
@@ -1875,7 +1966,10 @@ mod tests {
         assert!(running.list_api_tokens().await.is_empty());
         let disk = fs::read_to_string(dir.path().join("tokens.json")).expect("tokens");
         assert!(!disk.contains("backdoor"), "{disk}");
-        assert_eq!(disk_generation(&root(dir.path()), &nm("tokens.json")), 5);
+        assert_eq!(
+            disk_generation(&root(dir.path()), &nm("tokens.json"), None),
+            5
+        );
         let (_, fresh) = running.create_api_token("later").await.expect("token");
         assert!(running.verify_api_token(&fresh).await.is_some());
     }
@@ -1952,7 +2046,11 @@ mod tests {
         let adopted = running.credentials().expect("credentials");
         assert_eq!(adopted.totp_secret, "MFRGGZDFMZTWQ2LK");
         assert_eq!(
-            disk_generation(&root(dir.path()), &nm("credentials.json")),
+            disk_generation(
+                &root(dir.path()),
+                &nm("credentials.json"),
+                running.keyring().as_deref()
+            ),
             5
         );
     }
@@ -2049,5 +2147,282 @@ mod tests {
             })
             .await;
         assert!(result.is_err());
+    }
+
+    fn write_plain_credentials(dir: &Path) {
+        let stamped = Stamped {
+            generation: 1,
+            value: creds(),
+        };
+        let path = dir.join("credentials.json");
+        fs::write(&path, serde_json::to_vec_pretty(&stamped).expect("json")).expect("write");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("mode");
+    }
+
+    fn sealed_kid(dir: &Path, file: &str) -> Option<[u8; 8]> {
+        seal::envelope_kid(&fs::read(dir.join(file)).expect("read"))
+    }
+
+    fn secrets_sealed_entries(entries: &[AuditEntry]) -> Vec<&AuditEntry> {
+        entries
+            .iter()
+            .filter(|e| e.action == "secrets.sealed")
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn secrets_and_credentials_are_sealed_on_disk_and_read_back_after_a_reopen() {
+        let (dir, store) = open_temp().await;
+        store
+            .put_secret("gh-blog", "ghp_sealed_value")
+            .await
+            .expect("put");
+        store.set_credentials(creds()).await.expect("set");
+        let kid = store.keyring().expect("a key").kid();
+        let (_, _plain) = store.create_api_token("ci").await.expect("token");
+        for file in ["secrets.json", "credentials.json"] {
+            let raw = fs::read_to_string(dir.path().join(file)).expect("read");
+            assert!(
+                !raw.contains("ghp_sealed_value") && !raw.contains(SECRET),
+                "{file}"
+            );
+            assert_eq!(sealed_kid(dir.path(), file), Some(kid), "{file}");
+            let mode = fs::metadata(dir.path().join(file))
+                .expect("meta")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "{file}");
+        }
+        assert!(
+            sealed_kid(dir.path(), "tokens.json").is_none(),
+            "tokens.json holds hashes only and stays readable"
+        );
+        let reopened = Store::open(&test_config(dir.path())).await.expect("reopen");
+        assert_eq!(
+            reopened.get_secret("gh-blog").await.as_deref(),
+            Some("ghp_sealed_value")
+        );
+        assert_eq!(reopened.credentials().expect("creds").totp_secret, SECRET);
+        assert!(secrets_sealed_entries(&reopened.audit_tail(50).await).is_empty());
+    }
+
+    #[tokio::test]
+    async fn legacy_plaintext_files_are_sealed_at_the_first_start_and_the_copies_go_at_the_next() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = test_config(dir.path());
+        let secrets: &[u8] = br#"{"gh-blog":"ghp_plaintext_value"}"#;
+        fs::write(dir.path().join("secrets.json"), secrets).expect("seed");
+        write_plain_credentials(dir.path());
+        let creds_before = fs::read(dir.path().join("credentials.json")).expect("read");
+
+        let store = Store::open(&cfg).await.expect("first start");
+        assert_eq!(
+            store.get_secret("gh-blog").await.as_deref(),
+            Some("ghp_plaintext_value")
+        );
+        assert_eq!(store.credentials().expect("creds").username, "admin");
+        let kid = store.keyring().expect("a key").kid();
+        for file in ["secrets.json", "credentials.json"] {
+            let raw = fs::read(dir.path().join(file)).expect("read");
+            assert_eq!(seal::envelope_kid(&raw), Some(kid), "{file}");
+            assert!(!String::from_utf8_lossy(&raw).contains("ghp_plaintext_value"));
+        }
+        assert_eq!(
+            fs::read(dir.path().join("secrets.json.pre-seal")).expect("copy"),
+            secrets
+        );
+        assert_eq!(
+            fs::read(dir.path().join("credentials.json.pre-seal")).expect("copy"),
+            creds_before
+        );
+        let mode = fs::metadata(dir.path().join("secrets.json.pre-seal"))
+            .expect("meta")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+        let audit = store.audit_tail(50).await;
+        let entries = secrets_sealed_entries(&audit);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].detail, "credentials.json,secrets.json");
+        drop(store);
+
+        let again = Store::open(&cfg).await.expect("second start");
+        assert!(!dir.path().join("secrets.json.pre-seal").exists());
+        assert!(!dir.path().join("credentials.json.pre-seal").exists());
+        assert_eq!(
+            again.get_secret("gh-blog").await.as_deref(),
+            Some("ghp_plaintext_value")
+        );
+        assert_eq!(secrets_sealed_entries(&again.audit_tail(50).await).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_command_line_open_reads_plaintext_without_a_key_and_never_writes_or_creates_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = test_config(dir.path());
+        fs::write(dir.path().join("secrets.json"), br#"{"a":"b"}"#).expect("seed");
+        write_plain_credentials(dir.path());
+        let before = (
+            fs::read(dir.path().join("secrets.json")).expect("read"),
+            fs::read(dir.path().join("credentials.json")).expect("read"),
+        );
+        let store = Store::open_read_only(&cfg).await.expect("open");
+        assert!(store.keyring().is_none());
+        assert_eq!(store.get_secret("a").await.as_deref(), Some("b"));
+        assert!(store.credentials().is_some());
+        assert_eq!(
+            fs::read(dir.path().join("secrets.json")).expect("read"),
+            before.0
+        );
+        assert_eq!(
+            fs::read(dir.path().join("credentials.json")).expect("read"),
+            before.1
+        );
+        assert!(!dir.path().join("secrets.key").exists());
+        assert!(!dir.path().join("secrets.json.pre-seal").exists());
+        assert!(store.require_keyring().is_err());
+    }
+
+    #[tokio::test]
+    async fn the_command_line_open_with_a_key_reads_sealed_state_and_writes_sealed_resets() {
+        let (dir, running) = open_temp().await;
+        running.put_secret("a", "b").await.expect("put");
+        let kid = running.keyring().expect("a key").kid();
+        let cli = Store::open_read_only(&test_config(dir.path()))
+            .await
+            .expect("cli");
+        assert_eq!(cli.keyring().expect("key found").kid(), kid);
+        assert_eq!(cli.get_secret("a").await.as_deref(), Some("b"));
+        let before = fs::read(dir.path().join("secrets.json")).expect("read");
+        cli.reset_credentials(creds()).await.expect("reset");
+        assert_eq!(
+            fs::read(dir.path().join("secrets.json")).expect("read"),
+            before
+        );
+        assert_eq!(sealed_kid(dir.path(), "credentials.json"), Some(kid));
+        assert_eq!(
+            running.credentials().expect("adopted").totp_secret,
+            SECRET,
+            "the running server reads what the command line sealed"
+        );
+    }
+
+    #[tokio::test]
+    async fn sealed_files_without_the_key_stop_the_start_and_no_key_is_made() {
+        let (dir, store) = open_temp().await;
+        store.put_secret("a", "b").await.expect("put");
+        let kid = store.keyring().expect("a key").kid_hex();
+        drop(store);
+        fs::remove_file(dir.path().join("secrets.key")).expect("lose the key");
+        let err = Store::open(&test_config(dir.path()))
+            .await
+            .err()
+            .expect("must refuse")
+            .to_string();
+        assert!(err.contains(&kid) && err.contains("did not start"), "{err}");
+        assert!(
+            !dir.path().join("secrets.key").exists(),
+            "a key is never regenerated"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sealed_file_under_an_unknown_key_stops_the_start_naming_both_keys() {
+        let (dir, store) = open_temp().await;
+        store.put_secret("a", "b").await.expect("put");
+        let kid = store.keyring().expect("a key").kid_hex();
+        drop(store);
+        let other = crate::seal::NodeKey::from_bytes(&[9; 32]);
+        let mut cfg = test_config(dir.path());
+        cfg.secrets_key = Some(
+            crate::config::KeyInput::new(&other.text(), crate::config::KeyInputSource::Env)
+                .expect("key"),
+        );
+        let err = Store::open(&cfg)
+            .await
+            .err()
+            .expect("must refuse")
+            .to_string();
+        assert!(
+            err.contains(&kid) && err.contains(&other.kid_hex()),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn after_a_key_rotation_the_next_start_reseals_under_the_new_key() {
+        let (dir, store) = open_temp().await;
+        store.put_secret("gh", "tok").await.expect("put");
+        store.set_credentials(creds()).await.expect("set");
+        let old_kid = store.keyring().expect("a key").kid();
+        drop(store);
+        let cfg = test_config(dir.path());
+        let (old_hex, new_hex) = seal::rotate_managed(&cfg).expect("rotate");
+
+        let store = Store::open(&cfg).await.expect("start after rotation");
+        let ring = store.keyring().expect("a key");
+        assert_eq!(ring.kid_hex(), new_hex);
+        assert_eq!(ring.older_kids(), [old_hex]);
+        for file in ["secrets.json", "credentials.json"] {
+            assert_eq!(sealed_kid(dir.path(), file), Some(ring.kid()), "{file}");
+            assert_eq!(
+                sealed_kid(dir.path(), &format!("{file}.pre-seal")),
+                Some(old_kid),
+                "{file} keeps one copy under the old key"
+            );
+        }
+        assert_eq!(store.get_secret("gh").await.as_deref(), Some("tok"));
+        assert_eq!(store.credentials().expect("creds").totp_secret, SECRET);
+        drop(store);
+        let third = Store::open(&cfg).await.expect("next start");
+        assert!(!dir.path().join("secrets.json.pre-seal").exists());
+        assert_eq!(third.get_secret("gh").await.as_deref(), Some("tok"));
+    }
+
+    #[tokio::test]
+    async fn a_sealed_file_cannot_stand_in_for_another() {
+        let (dir, store) = open_temp().await;
+        store.put_secret("a", "b").await.expect("put");
+        store.set_credentials(creds()).await.expect("set");
+        drop(store);
+        let sealed_secrets = fs::read(dir.path().join("secrets.json")).expect("read");
+        fs::write(dir.path().join("credentials.json"), sealed_secrets).expect("swap");
+        let err = Store::open(&test_config(dir.path()))
+            .await
+            .err()
+            .expect("must refuse")
+            .to_string();
+        assert!(
+            err.contains("credentials.json") && err.contains("decrypted"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_secrets_file_can_hold_the_cap_of_a_site_with_data_services() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = test_config(dir.path());
+        let seed: HashMap<String, String> = (0..MAX_SECRETS - 1)
+            .map(|i| (format!("s{i:04}"), "v".into()))
+            .collect();
+        fs::write(
+            dir.path().join("secrets.json"),
+            serde_json::to_vec(&seed).expect("json"),
+        )
+        .expect("seed");
+        let store = Store::open(&cfg).await.expect("opens");
+        store
+            .put_secret("one-more", "v")
+            .await
+            .expect("the last slot");
+        let err = store.put_secret("past-the-cap", "v").await.unwrap_err();
+        assert!(err.to_string().contains("too many secrets"), "{err}");
+        store
+            .put_secret("s0000", "changed")
+            .await
+            .expect("an existing name is not a new slot");
+        assert_eq!(store.get_secret("s0000").await.as_deref(), Some("changed"));
     }
 }

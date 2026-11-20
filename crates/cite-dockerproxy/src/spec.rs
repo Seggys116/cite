@@ -2,7 +2,7 @@ use serde_json::{Map, Value, json};
 
 use crate::config::{EgressMode, MIN_STACK_MEMORY, MIN_STACK_NANO_CPUS};
 use crate::envval;
-use crate::policy::{Policy, Stack};
+use crate::policy::{DataNetwork, DataVolume, Policy, Stack};
 
 // Upper bounds for the resource limits a create body may ask for.
 const MIB: i64 = 1 << 20;
@@ -159,6 +159,20 @@ fn executor_outbound(
     }
 }
 
+// The manager and executor may add their own site's dbnet, never another site's, and only while data services are on.
+fn stack_dbnet(policy: &Policy, role: Role, c: &Stack, body: &Value) -> Result<bool, String> {
+    if !matches!(role, Role::Manager | Role::Executor) {
+        return Ok(false);
+    }
+    let asks = body["NetworkingConfig"]["EndpointsConfig"]
+        .as_object()
+        .is_some_and(|e| e.contains_key(&format!("cite-{}-dbnet", c.id)));
+    if asks {
+        policy.data_gate()?;
+    }
+    Ok(asks)
+}
+
 /// The address every filtered executor's proxy variables point at.
 fn egress_proxy_url(c: &Stack) -> String {
     format!("http://cite-{}-{}-egress-proxy:3128", c.id, c.slot)
@@ -224,6 +238,8 @@ enum EnvRule {
     Branch,
     Poll,
     Node,
+    // The runtime the manager image can serve: rust for the rust manager, node, bun or static for the shared one.
+    Runtime,
     Token,
     GithubApi,
     RelPath,
@@ -245,11 +261,15 @@ enum EnvRule {
     NodeEgress(&'static str),
     // A site's allow or deny list of CIDRs and host names.
     EgressRules,
+    // TCP forwards of the site's external databases; only while data services are on.
+    EgressForwards,
+    // Exact host names of the site's own attachments; only while data services are on.
+    EgressHosts,
 }
 
 const OUTBOUND_MODES: &[&str] = &["public", "allowlist"];
 
-const EGRESS_ENV: [(&str, EnvRule); 8] = [
+const EGRESS_ENV: [(&str, EnvRule); 10] = [
     (
         "CITE_EGRESS_ALLOW_CIDRS",
         EnvRule::NodeEgress("CITE_EGRESS_ALLOW_CIDRS"),
@@ -270,15 +290,18 @@ const EGRESS_ENV: [(&str, EnvRule); 8] = [
     ("CITE_EGRESS_BLOCK_MAIL", EnvRule::Bool),
     ("CITE_EGRESS_ALLOW", EnvRule::EgressRules),
     ("CITE_EGRESS_DENY", EnvRule::EgressRules),
+    ("CITE_EGRESS_FORWARDS", EnvRule::EgressForwards),
+    ("CITE_EGRESS_AUTO_ALLOW", EnvRule::EgressHosts),
 ];
 
 const PACKAGE_MANAGERS: &[&str] = &["npm", "pnpm", "yarn", "bun"];
 const RENDERINGS: &[&str] = &["static", "ssr"];
 
-const MANAGER_ENV: [(&str, EnvRule); 29] = [
+const MANAGER_ENV: [(&str, EnvRule); 30] = [
     ("CITE_REPO", EnvRule::Repo),
     ("CITE_BRANCH", EnvRule::Branch),
     ("CITE_POLL_INTERVAL", EnvRule::Poll),
+    ("CITE_RUNTIME", EnvRule::Runtime),
     ("CITE_NODE", EnvRule::Node),
     ("CITE_GITHUB_TOKEN", EnvRule::Token),
     ("CITE_GITHUB_API_URL", EnvRule::GithubApi),
@@ -340,7 +363,7 @@ fn labels(id: &str, slot: &str, role: &str) -> Value {
     })
 }
 
-fn log_config() -> Value {
+pub(crate) fn log_config() -> Value {
     json!({ "Type": "json-file", "Config": { "max-size": "10m", "max-file": "3" } })
 }
 
@@ -354,7 +377,7 @@ fn healthcheck(test: &[&str], start_period_ns: u64) -> Value {
     })
 }
 
-fn mount(source: &str, target: &str, subpath: Option<&str>, read_only: bool) -> Value {
+pub(crate) fn mount(source: &str, target: &str, subpath: Option<&str>, read_only: bool) -> Value {
     let mut m =
         json!({ "Type": "volume", "Source": source, "Target": target, "ReadOnly": read_only });
     if let Some(sub) = subpath {
@@ -376,6 +399,7 @@ fn expected(
     site: &[(String, String)],
     outbound: Outbound,
     egress_bridge: &str,
+    dbnet: bool,
 ) -> Value {
     let base = format!("cite-{}-{}", c.id, c.slot);
     let (data, work, cache) = (
@@ -413,7 +437,11 @@ fn expected(
             ]);
             host["NanoCpus"] = json!(limits.nano_cpus);
             host["RestartPolicy"] = json!({ "Name": "unless-stopped" });
-            body["NetworkingConfig"] = json!({ "EndpointsConfig": { network: {} } });
+            let mut endpoints = json!({ network: {} });
+            if dbnet {
+                endpoints[format!("cite-{}-dbnet", c.id)] = json!({});
+            }
+            body["NetworkingConfig"] = json!({ "EndpointsConfig": endpoints });
         }
         Role::Executor => {
             body["User"] = json!("65532:65532");
@@ -436,6 +464,9 @@ fn expected(
                 Outbound::Open => endpoints[format!("{base}-egress")] = json!({}),
                 Outbound::Filtered => endpoints[format!("{base}-xnet")] = json!({}),
                 Outbound::None => {}
+            }
+            if dbnet {
+                endpoints[format!("cite-{}-dbnet", c.id)] = json!({});
             }
             body["NetworkingConfig"] = json!({ "EndpointsConfig": endpoints });
         }
@@ -470,7 +501,7 @@ fn expected(
 }
 
 // Reports only the path of the first mismatch, never a value, so tokens do not reach the log.
-fn first_difference(path: &str, want: &Value, got: &Value) -> Option<String> {
+pub(crate) fn first_difference(path: &str, want: &Value, got: &Value) -> Option<String> {
     match (want, got) {
         (Value::Object(w), Value::Object(g)) => {
             if let Some(k) = g.keys().find(|k| !w.contains_key(*k)) {
@@ -487,12 +518,17 @@ fn first_difference(path: &str, want: &Value, got: &Value) -> Option<String> {
     }
 }
 
-fn object<'a>(v: &'a Value, what: &str) -> Result<&'a Map<String, Value>, String> {
+pub(crate) fn object<'a>(v: &'a Value, what: &str) -> Result<&'a Map<String, Value>, String> {
     v.as_object()
         .ok_or_else(|| format!("{what} is not an object"))
 }
 
-fn within(host: &Map<String, Value>, key: &str, min: i64, max: i64) -> Result<i64, String> {
+pub(crate) fn within(
+    host: &Map<String, Value>,
+    key: &str,
+    min: i64,
+    max: i64,
+) -> Result<i64, String> {
     match host.get(key).and_then(Value::as_i64) {
         Some(n) if (min..=max).contains(&n) => Ok(n),
         _ => Err(format!("HostConfig.{key} is missing or out of range")),
@@ -529,7 +565,17 @@ fn is_slug_part(s: &str, max: usize, extra: &[char]) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || extra.contains(&c))
 }
 
-fn env_value_ok(policy: &Policy, c: &Stack, rule: &EnvRule, value: &str) -> bool {
+// A manager body does not name its executor image, so the runtime is tied to what the manager image can serve.
+fn runtime_ok(image: &str, value: &str) -> bool {
+    let name = image.rsplit_once(':').map_or(image, |(n, _)| n);
+    if name.ends_with("/cite-manager-rust") {
+        value == "rust"
+    } else {
+        matches!(value, "node" | "bun" | "static")
+    }
+}
+
+fn env_value_ok(policy: &Policy, c: &Stack, image: &str, rule: &EnvRule, value: &str) -> bool {
     match rule {
         EnvRule::Fixed(want) => value == *want,
         EnvRule::Repo => match value.split_once('/') {
@@ -548,6 +594,7 @@ fn env_value_ok(policy: &Policy, c: &Stack, rule: &EnvRule, value: &str) -> bool
         }
         EnvRule::Poll => is_slug_part(value, 16, &[]),
         EnvRule::Node => value == "22" || value == "24",
+        EnvRule::Runtime => runtime_ok(image, value),
         EnvRule::Token => {
             !value.is_empty()
                 && value.len() <= MAX_TOKEN_LEN
@@ -569,6 +616,8 @@ fn env_value_ok(policy: &Policy, c: &Stack, rule: &EnvRule, value: &str) -> bool
         EnvRule::EgressProxyUrl => value == egress_proxy_url(c),
         EnvRule::NodeEgress(key) => policy.egress_env.contains(&format!("{key}={value}")),
         EnvRule::EgressRules => envval::egress_rules(value),
+        EnvRule::EgressForwards => policy.data_enabled && envval::egress_forwards(value),
+        EnvRule::EgressHosts => policy.data_enabled && envval::egress_hosts(value),
     }
 }
 
@@ -592,13 +641,23 @@ fn check_egress_env(policy: &Policy, env: &Value) -> Result<(), String> {
             return Err(format!("Env key {key:?} is missing"));
         }
     }
-    if entries.contains(&"CITE_EGRESS_MODE=allowlist") && !has("CITE_EGRESS_ALLOW") {
+    // The site's own attachment hosts (CITE_EGRESS_AUTO_ALLOW) also satisfy an allowlist.
+    if entries.contains(&"CITE_EGRESS_MODE=allowlist")
+        && !has("CITE_EGRESS_ALLOW")
+        && !has("CITE_EGRESS_AUTO_ALLOW")
+    {
         return Err("allowlist mode needs CITE_EGRESS_ALLOW".to_string());
     }
     Ok(())
 }
 
-fn check_env(policy: &Policy, c: &Stack, role: Role, env: Option<&Value>) -> Result<Value, String> {
+fn check_env(
+    policy: &Policy,
+    c: &Stack,
+    role: Role,
+    image: &str,
+    env: Option<&Value>,
+) -> Result<Value, String> {
     let rules: &[(&str, EnvRule)] = match role {
         Role::Init => {
             return match env {
@@ -625,7 +684,7 @@ fn check_env(policy: &Policy, c: &Stack, role: Role, env: Option<&Value>) -> Res
         if seen.contains(&key) {
             return Err(format!("Env key {key:?} is repeated"));
         }
-        if !env_value_ok(policy, c, rule, value) {
+        if !env_value_ok(policy, c, image, rule, value) {
             return Err(format!("Env value for {key:?} is not allowed"));
         }
         seen.push(key);
@@ -651,6 +710,9 @@ fn check_network_mode(policy: &Policy, role: Role, c: &Stack, mode: &str) -> Res
 
 // Exact structural equality with the rebuilt body is what rejects every key the orchestrator never sends.
 pub fn validate_container(policy: &Policy, name: &str, body: &Value) -> Result<(), String> {
+    if let Some(data) = policy.data_container(name) {
+        return crate::spec_data::validate_data_container(policy, &data, body);
+    }
     let stack = policy.container(name)?;
     let role = match stack.kind.as_str() {
         "manager" => Role::Manager,
@@ -677,7 +739,7 @@ pub fn validate_container(policy: &Policy, name: &str, body: &Value) -> Result<(
     if !image_ok {
         return Err("Image is not allowed for this container".to_string());
     }
-    let env = check_env(policy, &stack, role, obj.get("Env"))?;
+    let env = check_env(policy, &stack, role, image, obj.get("Env"))?;
     if role == Role::EgressProxy {
         check_egress_env(policy, &env)?;
     }
@@ -694,6 +756,7 @@ pub fn validate_container(policy: &Policy, name: &str, body: &Value) -> Result<(
     check_network_mode(policy, role, &stack, mode)?;
     let site = site_mounts(policy, role, &stack, host)?;
     let outbound = executor_outbound(policy, role, &stack, body)?;
+    let dbnet = stack_dbnet(policy, role, &stack, body)?;
     if role == Role::Executor {
         check_executor_proxy_env(&env, outbound)?;
     }
@@ -708,6 +771,7 @@ pub fn validate_container(policy: &Policy, name: &str, body: &Value) -> Result<(
         &site,
         outbound,
         &policy.egress_bridge,
+        dbnet,
     );
     match first_difference("body", &want, body) {
         Some(reason) => Err(reason),
@@ -736,6 +800,24 @@ pub fn validate_volume(policy: &Policy, body: &Value) -> Result<(), String> {
     let obj = object(body, "body")?;
     exact_keys(obj, &["Name", "Labels"])?;
     let name = obj["Name"].as_str().ok_or("Name is not a string")?;
+    if let Some(data) = policy.data_volume(name) {
+        policy.data_gate()?;
+        let want = match data {
+            DataVolume::Site(id) => {
+                json!({ "cite.managed": "true", "cite.site": id, "cite.volume": "db-data" })
+            }
+            DataVolume::SharedData => {
+                json!({ "cite.managed": "true", "cite.volume": "pg-shared-data" })
+            }
+            DataVolume::SharedConf => {
+                json!({ "cite.managed": "true", "cite.volume": "pg-shared-conf" })
+            }
+        };
+        return match first_difference("Labels", &want, &obj["Labels"]) {
+            Some(reason) => Err(reason),
+            None => Ok(()),
+        };
+    }
     if let Ok((id, volume)) = policy.site_volume(name) {
         let want = json!({ "cite.managed": "true", "cite.site": id, "cite.volume": volume });
         return match first_difference("Labels", &want, &obj["Labels"]) {
@@ -785,6 +867,25 @@ pub fn validate_network(policy: &Policy, body: &Value) -> Result<(), String> {
             None => Ok(()),
         };
     }
+    // Data networks never have a gateway, and their labels name the site (or the admin role) instead of a slot.
+    if let Some(data) = policy.data_network(name) {
+        policy.data_gate()?;
+        if !internal {
+            return Err("Internal does not fit the network kind".to_string());
+        }
+        let want = match data {
+            DataNetwork::Site(id) => {
+                json!({ "cite.managed": "true", "cite.site": id, "cite.role": "dbnet" })
+            }
+            DataNetwork::SharedAdmin => {
+                json!({ "cite.managed": "true", "cite.role": "pg-shared-admin" })
+            }
+        };
+        return match first_difference("Labels", &want, &obj["Labels"]) {
+            Some(reason) => Err(reason),
+            None => Ok(()),
+        };
+    }
     let stack = policy.network(name)?;
     // The manager's egress network keeps its gateway; the executor's net and xnet never have one.
     if internal != (stack.kind != "egress") {
@@ -794,8 +895,20 @@ pub fn validate_network(policy: &Policy, body: &Value) -> Result<(), String> {
 }
 
 pub fn validate_attach(policy: &Policy, network: &str, body: &Value) -> Result<(), String> {
-    policy.network(network)?;
     let obj = object(body, "body")?;
+    // A site's dbnet takes the shared instance and nothing else.
+    if let Some(data) = policy.data_network(network) {
+        policy.data_gate()?;
+        exact_keys(obj, &["Container"])?;
+        return match (data, obj["Container"].as_str()) {
+            (DataNetwork::Site(_), Some(crate::spec_data::SHARED_DB)) => Ok(()),
+            _ => Err(
+                "only the shared database instance may be attached to a database network"
+                    .to_string(),
+            ),
+        };
+    }
+    policy.network(network)?;
     exact_keys(obj, &["Container"])?;
     match obj["Container"].as_str() {
         Some(c) if c == policy.haproxy => Ok(()),

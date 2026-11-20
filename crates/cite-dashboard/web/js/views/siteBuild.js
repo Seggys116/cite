@@ -9,11 +9,13 @@ import {
 import { siteBody } from '../sitelib.js';
 import { makeDirty } from '../dirtylib.js';
 import {
+  ENV_NAMES_NOTE, ENV_VALUE_HINT, ENV_VALUE_LABEL, WRITE_ONLY_HINT,
   addProblem, buildPatch, emptyPending, pendingCount, pendingSummary,
 } from '../envlib.js';
 import {
   canUseNodeToken, nodeTokenNote, tokenHealth, tokenInputProblem, tokenSourceText,
 } from '../tokenlib.js';
+import { envTargetOf, linkedFromText, linksForTarget } from '../datalib.js';
 import { sourceFields } from './sourceFields.js';
 import { askRebuild, deployWithToasts } from './deployFlow.js';
 
@@ -60,7 +62,7 @@ export function buildSettingsCard({ node, site, info, onSaved, onStatusChange })
     const changed = sourceDiff(site.source, next);
     try {
       await withBusy(save, () => nodeApi(node).put(`/sites/${encodeURIComponent(site.id)}`, siteBody(site, { source: next })));
-      toast('Build settings saved', 'success');
+      toast(`Build settings saved on ${node}`, 'success');
     } catch (ex) {
       err.textContent = formatError(ex);
       err.hidden = false;
@@ -69,7 +71,7 @@ export function buildSettingsCard({ node, site, info, onSaved, onStatusChange })
     dirty.reset();
     update();
     // Asked every time: a change to how the site is built does nothing until a build runs
-    if (needsRebuild(changed) && await askRebuild(changedLabels(changed))) {
+    if (needsRebuild(changed) && await askRebuild(changedLabels(changed), node)) {
       await deployWithToasts({ node, siteId: site.id, info }, { onAfter: () => onSaved(true) });
       return;
     }
@@ -78,7 +80,7 @@ export function buildSettingsCard({ node, site, info, onSaved, onStatusChange })
 
   const el = card({
     title: 'Build settings',
-    subtitle: 'Where the code comes from and how it is built. Leave a field on Auto to use what the manager detects.',
+    subtitle: `Saved on ${node} only. A field left on Auto uses what the manager detects.`,
     actions: badge,
     body: h('div', { class: 'form' }, fields.el, err, h('div', { class: 'form-actions' }, reset, save)),
   });
@@ -86,11 +88,13 @@ export function buildSettingsCard({ node, site, info, onSaved, onStatusChange })
 }
 
 // Names are listed from the node; a value can only be typed in, never read back. Typed values live in one Map until saved, then are dropped.
-export function envCard({ node, siteId, which, title, subtitle, note }) {
+// With showLinks, variables set by a data link are listed beneath as read-only rows; they are changed on the Data tab.
+export function envCard({ node, siteId, which, title, subtitle, note, showLinks = false }) {
   const base = `/sites/${encodeURIComponent(siteId)}/${which}`;
   const body = h('div', {});
   const list = h('div', {});
   let names = [];
+  let linked = new Map();
   let pending = emptyPending();
   let revealed = new Set();
   const wipe = () => {
@@ -104,12 +108,14 @@ export function envCard({ node, siteId, which, title, subtitle, note }) {
   const discard = button('Discard', { onClick: () => { wipe(); draw(); } });
 
   const nameInput = h('input', { class: 'input mono', type: 'text', placeholder: 'NAME', spellcheck: 'false', autocomplete: 'off', autocapitalize: 'characters', 'aria-label': 'New variable name' });
-  const valueInput = h('input', { class: 'input mono', type: 'password', placeholder: 'Value', 'aria-label': 'New variable value', ...noAutofill });
+  const valueInput = h('input', { class: 'input mono', type: 'password', placeholder: ENV_VALUE_LABEL, 'aria-label': 'New variable value', ...noAutofill });
   const addErr = h('span', { class: 'error-text', role: 'status', 'aria-live': 'polite', hidden: true });
   const add = button('Add', { size: 'sm', iconName: 'plus' });
   add.addEventListener('click', () => {
     const name = nameInput.value.trim();
-    const bad = addProblem(name, valueInput.value, names, [...pending.set.keys()]);
+    const bad = linked.has(name)
+      ? `${name} is ${linkedFromText(linked.get(name))}. Change it on the Data tab.`
+      : addProblem(name, valueInput.value, names, [...pending.set.keys()]);
     addErr.textContent = bad || '';
     addErr.hidden = !bad;
     if (bad) return;
@@ -130,7 +136,7 @@ export function envCard({ node, siteId, which, title, subtitle, note }) {
   function rowFor(name) {
     const removing = pending.unset.has(name);
     const replacing = pending.set.has(name);
-    const value = h('input', { class: 'input mono', type: 'password', placeholder: 'New value', 'aria-label': `New value for ${name}`, ...noAutofill });
+    const value = h('input', { class: 'input mono', type: 'password', placeholder: ENV_VALUE_LABEL, 'aria-label': `New value for ${name}`, ...noAutofill });
     value.hidden = !revealed.has(name);
     value.addEventListener('input', () => {
       if (value.value) pending.set.set(name, value.value);
@@ -165,13 +171,18 @@ export function envCard({ node, siteId, which, title, subtitle, note }) {
 
   function draw() {
     const added = [...pending.set.keys()].filter((n) => !names.includes(n));
+    const linkedRows = [...linked.values()].sort((a, b) => a.var.localeCompare(b.var));
     list.replaceChildren(
       names.length || added.length
         ? h('div', { class: 'stack-sm' }, names.map(rowFor), added.map((name) => h('div', { class: 'env-row' },
           h('code', { class: 'mono env-name' }, name), pill('New', 'info'), h('span', { class: 'muted' }, 'value hidden'),
           button('Undo', { size: 'sm', onClick: () => { pending.set.delete(name); draw(); } }))))
-        : h('p', { class: 'muted' }, 'No variables are set.'),
-      h('div', { class: 'env-add' }, nameInput, valueInput, add), addErr);
+        : h('p', { class: 'muted' }, linkedRows.length ? 'No variables are set by hand.' : 'No variables are set.'),
+      linkedRows.length ? h('div', { class: 'stack-sm env-linked-list', role: 'group', 'aria-label': 'Variables set by data links' }, linkedRows.map((l) => h('div', { class: 'env-row env-linked' },
+        h('code', { class: 'mono env-name' }, l.var), pill('Linked', 'info'),
+        h('span', { class: 'muted wrap-any' }, `${linkedFromText(l)}. Read only here; change it on the Data tab.`)))) : null,
+      h('div', { class: 'env-add' }, nameInput, valueInput, add), addErr,
+      h('p', { class: 'hint' }, ENV_VALUE_HINT));
     refreshState();
   }
 
@@ -188,7 +199,7 @@ export function envCard({ node, siteId, which, title, subtitle, note }) {
     try {
       const res = await withBusy(save, () => nodeApi(node).patch(base, built.patch));
       names = Array.isArray(res && res.names) ? res.names : names;
-      toast('Variables saved. They apply on the next build.', 'success');
+      toast(`Variables saved on ${node}. They apply on the next build.`, 'success');
       // The values are dropped as soon as the node has them
       built.patch.set = {};
       wipe();
@@ -199,12 +210,18 @@ export function envCard({ node, siteId, which, title, subtitle, note }) {
     }
   });
 
-  const el = card({ title, subtitle, body: h('div', { class: 'stack-sm' }, note ? h('p', { class: 'muted' }, note) : null, body, err, h('div', { class: 'form-actions' }, summary, discard, save)) });
+  const el = card({ title, subtitle: `${subtitle} ${ENV_NAMES_NOTE}`, body: h('div', { class: 'stack-sm' }, note ? h('p', { class: 'muted' }, note) : null, body, err, h('div', { class: 'form-actions' }, summary, discard, save)) });
 
   function load() {
     loadInto(body, async () => {
       const res = await nodeApi(node).get(base);
-      names = Array.isArray(res && res.names) ? res.names : [];
+      linked = new Map();
+      if (showLinks) {
+        // A node that cannot answer the links route simply has none to show
+        const links = await nodeApi(node).get(`/sites/${encodeURIComponent(siteId)}/data/links`).catch(() => []);
+        linked = linksForTarget(links, envTargetOf(which));
+      }
+      names = (Array.isArray(res && res.names) ? res.names : []).filter((n) => !linked.has(n));
       return names;
     }, () => {
       draw();
@@ -241,7 +258,7 @@ export function tokenCard({ node, siteId, onChanged }) {
       h('p', {}, tokenSourceText(status)),
       health.text ? h('p', { class: health.kind === 'bad' ? 'error-text' : 'muted' }, health.text) : null,
       h('div', { class: 'field' }, h('span', { class: 'field-label' }, status && status.site_token_set ? 'Change the site token' : 'Set a token for this site'), input,
-        h('span', { class: 'hint' }, 'Fine-grained and read-only for the one repository. The node tests it with the git host before storing it, and never shows it again.')),
+        h('span', { class: 'hint' }, `${WRITE_ONLY_HINT}. Use a fine-grained, read-only token for this one repository.`)),
       err,
       h('div', { class: 'form-actions' }, canUseNodeToken(status) ? useNode : null, set),
       noteText ? h('p', { class: 'muted' }, noteText) : null);
@@ -259,7 +276,7 @@ export function tokenCard({ node, siteId, onChanged }) {
     input.value = '';
     try {
       status = await withBusy(set, () => nodeApi(node).put(base, { token }));
-      toast('Token saved', 'success');
+      toast(`Token saved on ${node}`, 'success');
       if (onChanged) onChanged();
       draw();
     } catch (ex) {
@@ -273,7 +290,7 @@ export function tokenCard({ node, siteId, onChanged }) {
     if (!ok) return;
     try {
       await withBusy(useNode, () => nodeApi(node).del(base));
-      toast('The site now uses the node token', 'success');
+      toast(`The site now uses the node token on ${node}`, 'success');
       if (onChanged) onChanged();
       reload();
     } catch (ex) {

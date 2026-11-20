@@ -823,6 +823,7 @@ fn site(id: &str) -> Site {
         volumes: Vec::new(),
         outbound: true,
         outbound_rules: Default::default(),
+        data: Default::default(),
     }
 }
 
@@ -1988,6 +1989,1106 @@ async fn replicate_mode_reports_a_failing_node_without_stopping_the_rest() {
     assert!(outcomes[1].ok);
     assert_eq!(good.sites.lock().expect("lock").len(), 1);
     assert!(bad.sites.lock().expect("lock").is_empty());
+}
+
+// ---- site data routes: a recording mock that answers every data route with a canned body ----
+
+use cite_client::{CLIENT_HEADER, CLIENT_VERSION, LinksOutcome};
+use cite_edge::datamodel::{BackupPolicy, LinkSource, LinkTarget, PgLevel, PgMode, SecretEncoding};
+use cite_edge::datawire::{
+    BackupCreateReq, BackupPatchReq, BackupRecord, ConvertReq, DatabaseCreateReq, DeleteFrom,
+    EnvLinkReq, ExternalPutReq, Freeze, JobState, LinkTargetSel, LinksReq, PgEnableReq, Preset,
+    PresetRequest, PushReq, RestoreReq, S3PutReq, SecretCreateReq, SharedReq, TargetReq,
+    UserCreateReq, UserPatchReq,
+};
+use sha2::{Digest, Sha256};
+
+const D_BID: &str = "01JC9ZQ7M3X8V4N2B6T5R0WHYA";
+const D_BAD_SHA: &str = "01JC9ZQ7M3X8V4N2B6T5R0WHYB";
+const D_JOB: &str = "01JC9ZQ7M3X8V4N2B6T5R0WHYC";
+const D_NO_SHA: &str = "01JC9ZQ7M3X8V4N2B6T5R0WHYD";
+const D_DUMP: &[u8] = b"-- dump bytes: hello backup --";
+
+#[derive(Clone, Debug)]
+struct DataCall {
+    method: String,
+    path: String,
+    query: Option<String>,
+    client: Option<String>,
+    auth: Option<String>,
+    range: Option<String>,
+    body: Value,
+}
+
+#[derive(Default)]
+struct DataFake {
+    calls: Mutex<Vec<DataCall>>,
+}
+
+fn dump_sha() -> String {
+    Sha256::digest(D_DUMP)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+fn data_download(bid: &str, range: Option<&str>) -> Response {
+    let sha = match bid {
+        D_BAD_SHA => Some("0".repeat(64)),
+        D_NO_SHA => None,
+        _ => Some(dump_sha()),
+    };
+    let mut b = Response::builder()
+        .header(header::CONTENT_TYPE, "text/html")
+        .header(
+            header::CONTENT_DISPOSITION,
+            "attachment; filename=\"evil.exe\"",
+        );
+    if let Some(sha) = sha {
+        b = b.header("x-backup-sha256", sha);
+    }
+    if range.is_some() {
+        return b
+            .status(206)
+            .header(header::CONTENT_RANGE, format!("bytes 0-3/{}", D_DUMP.len()))
+            .body(Body::from(D_DUMP[..4].to_vec()))
+            .expect("response");
+    }
+    b.body(Body::from(D_DUMP.to_vec())).expect("response")
+}
+
+fn data_canned(method: &str, path: &str, body: &Value) -> (u16, Value) {
+    let key = path
+        .replace(D_BID, "{b}")
+        .replace(D_JOB, "{j}")
+        .replace("session-1", "{s}");
+    let job = json!({ "job_id": "job1" });
+    let record = json!({
+        "id": D_BID, "database": "pg:app", "version": 3, "created_at": "2026-11-20T00:00:00Z"
+    });
+    if key == "/sites/shop" {
+        return (204, Value::Null);
+    }
+    let Some(rest) = key.strip_prefix("/sites/shop/data") else {
+        return match (method, key.as_str()) {
+            ("GET", "/data") => (200, json!({ "enabled": true, "backup_volume_ok": true })),
+            ("GET", "/data/jobs/{j}") => (
+                200,
+                json!({ "id": D_JOB, "kind": "backup", "state": "ok", "step": "done" }),
+            ),
+            ("GET", "/data/jobs/missing") => (404, json!({ "error": "unknown job" })),
+            ("GET", "/data/targets") => (200, json!([{ "id": "t1", "name": "offsite" }])),
+            ("POST", "/data/targets") => (201, json!({ "id": "t1", "name": "offsite" })),
+            ("PUT", "/data/targets/t1") => (200, json!({ "id": "t1", "name": "offsite" })),
+            ("DELETE", "/data/targets/t1") => (204, Value::Null),
+            ("POST", "/data/targets/t1/test") => (200, json!({ "ok": true })),
+            ("GET", "/data/shared") => (200, json!({ "enabled": true, "major": 18 })),
+            ("PUT" | "DELETE", "/data/shared")
+            | ("POST", "/data/shared/restart" | "/data/shared/backups") => (202, job),
+            ("GET", "/data/shared/backups") => (200, json!([{ "id": D_BID, "status": "ok" }])),
+            ("DELETE", "/data/shared/backups/{b}") => (204, Value::Null),
+            ("GET", "/data/orphans") => (200, json!([{ "site": "old-shop", "backups": 2 }])),
+            ("DELETE", "/data/orphans/old-shop") => (204, Value::Null),
+            _ => (404, json!({ "error": "no such route" })),
+        };
+    };
+    let clash = body.to_string();
+    let links =
+        json!([{ "var": "DATABASE_URL", "target": "runtime", "source": { "kind": "site_url" } }]);
+    match (method, rest) {
+        ("GET", "") => (200, json!({ "redeploy_needed": true })),
+        ("PUT" | "DELETE", "/postgres") => (202, job),
+        ("PUT", "/postgres/policy") => (200, json!({ "major": 18 })),
+        ("POST", "/postgres/convert") => (202, json!({ "session": "session-1" })),
+        ("POST", "/postgres/convert/{s}/cutover" | "/postgres/convert/{s}/abort") => (
+            200,
+            json!({
+                "id": "session-1", "kind": "convert", "site": "shop", "database": "pg:app",
+                "state": "awaiting_cutover", "created_at": "t", "updated_at": "t"
+            }),
+        ),
+        ("DELETE", "/postgres/retired")
+        | ("POST", "/postgres/databases")
+        | ("DELETE", "/postgres/databases/app")
+        | ("POST", "/postgres/databases/app/users")
+        | ("PATCH" | "DELETE", "/postgres/databases/app/users/rw") => (202, job),
+        ("POST", "/postgres/databases/app/users/rw/rotate") => {
+            (202, json!({ "job_id": "job1", "redeploy_needed": true }))
+        }
+        ("PUT", "/external/billing-db") => (
+            200,
+            json!({ "name": "billing-db", "host": "db.example.com", "port": 5432 }),
+        ),
+        ("PUT", "/s3/media") => (200, json!({ "name": "media", "has_keys": true })),
+        ("DELETE", "/external/billing-db" | "/s3/media" | "/secrets/auth-secret") => {
+            (204, Value::Null)
+        }
+        ("POST", "/secrets") => (
+            201,
+            json!({ "name": "auth-secret", "bytes": 32, "encoding": "hex" }),
+        ),
+        ("POST", "/secrets/auth-secret/rotate") => (
+            200,
+            json!({ "name": "auth-secret", "redeploy_needed": true }),
+        ),
+        ("POST", "/links") if clash.contains("CLASH_VAR") => (
+            409,
+            json!({
+                "error": "conflict",
+                "conflicts": [{ "var": "CLASH_VAR", "target": "runtime", "set_by": "manual" }]
+            }),
+        ),
+        ("POST", "/links") if clash.contains("OTHER_VAR") => {
+            (409, json!({ "error": "a variable is in the way" }))
+        }
+        ("GET" | "POST", "/links") => (200, links),
+        ("DELETE", "/links/runtime/DATABASE_URL") => (204, Value::Null),
+        ("POST", "/links/preset") if clash.contains("clashdb") => (
+            409,
+            json!({
+                "error": "conflict",
+                "conflicts": [{ "var": "DATABASE_URL", "target": "runtime", "set_by": "link" }]
+            }),
+        ),
+        ("POST", "/links/preset") if clash.contains("plaindb") => {
+            (409, json!({ "error": "a preset is already applied" }))
+        }
+        ("POST", "/links/preset") => (
+            200,
+            json!({ "links": [], "created_users": ["app/app"], "created_secrets": [] }),
+        ),
+        ("GET", "/backups") => (200, json!([record])),
+        ("POST", "/backups") => (202, json!({ "job_id": "job1", "backup_id": D_BID })),
+        ("GET" | "PATCH", "/backups/{b}") => (200, record),
+        ("DELETE", "/backups/{b}") => (204, Value::Null),
+        ("POST", "/backups/{b}/restore") => (
+            202,
+            json!({ "job_id": "job1", "pre_restore_backup_id": D_BAD_SHA }),
+        ),
+        ("POST", "/backups/{b}/push") => (202, job),
+        ("GET", "/prune-preview") => (200, json!([{ "database": "pg:app" }])),
+        ("POST", "/prune") => (200, json!({ "deleted": 2 })),
+        _ => (404, json!({ "error": "no such route" })),
+    }
+}
+
+async fn data_fallback(
+    State(state): State<Arc<DataFake>>,
+    method: axum::http::Method,
+    uri: axum::http::Uri,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let text = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    };
+    let path = uri
+        .path()
+        .strip_prefix("/api/v1")
+        .unwrap_or(uri.path())
+        .to_string();
+    let parsed = if body.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&body).unwrap_or(Value::Null)
+    };
+    let call = DataCall {
+        method: method.to_string(),
+        path: path.clone(),
+        query: uri.query().map(str::to_string),
+        client: text(CLIENT_HEADER),
+        auth: text("authorization"),
+        range: text("range"),
+        body: parsed.clone(),
+    };
+    let range = call.range.clone();
+    state.calls.lock().expect("lock").push(call);
+    if let Some(bid) = path
+        .strip_suffix("/download")
+        .and_then(|p| p.rsplit('/').next())
+    {
+        return data_download(bid, range.as_deref());
+    }
+    let (code, value) = data_canned(method.as_str(), &path, &parsed);
+    if code == 204 {
+        return StatusCode::NO_CONTENT.into_response();
+    }
+    (StatusCode::from_u16(code).expect("status"), Json(value)).into_response()
+}
+
+async fn data_spawn() -> (String, Arc<DataFake>) {
+    let state = Arc::new(DataFake::default());
+    let app = Router::new()
+        .fallback(data_fallback)
+        .with_state(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (format!("http://{addr}"), state)
+}
+
+fn data_calls(node: &DataFake) -> Vec<DataCall> {
+    node.calls.lock().expect("lock").clone()
+}
+
+fn want(
+    method: &'static str,
+    path: String,
+    query: &'static str,
+    body: Value,
+) -> (String, String, String, Value) {
+    (method.to_string(), path, query.to_string(), body)
+}
+
+fn backup_record(id: &str, sha: &str) -> BackupRecord {
+    serde_json::from_value(json!({
+        "id": id, "database": "pg:app", "version": 3,
+        "created_at": "2026-11-20T00:00:00Z", "sha256": sha
+    }))
+    .expect("record")
+}
+
+#[tokio::test]
+async fn data_routes_hit_their_exact_methods_paths_and_bodies() {
+    let (url, node) = data_spawn().await;
+    let c = client("n1", &url, "cite_good");
+    let b = D_BID;
+    let s = "/sites/shop/data";
+    let target = TargetReq {
+        name: "offsite".into(),
+        endpoint: "https://s3.example.com".into(),
+        bucket: "backups".into(),
+        region: "eu-west-1".into(),
+        path_style: false,
+        prefix: None,
+        encrypt: None,
+        access_key_id: Some("AKTESTID".into()),
+        secret_access_key: Some("sk-test-value".into()),
+    };
+    let target_json = json!({
+        "name": "offsite", "endpoint": "https://s3.example.com", "bucket": "backups",
+        "region": "eu-west-1", "path_style": false, "prefix": null, "encrypt": null,
+        "access_key_id": "AKTESTID", "secret_access_key": "sk-test-value"
+    });
+    let pg_enable = json!({
+        "mode": "shared", "major": 17, "memory_mb": null, "max_connections": null, "preset": null
+    });
+    let policy = BackupPolicy::default();
+
+    // node level
+    assert!(c.data_node().await.expect("node").enabled);
+    assert_eq!(c.data_job(D_JOB).await.expect("job").state, JobState::Ok);
+    assert_eq!(c.data_targets().await.expect("targets")[0].id, "t1");
+    assert_eq!(
+        c.data_target_create(&target).await.expect("create").id,
+        "t1"
+    );
+    c.data_target_update("t1", &target).await.expect("update");
+    c.data_target_delete("t1").await.expect("delete");
+    assert!(c.data_target_test("t1").await.expect("test").ok);
+    assert_eq!(c.data_shared().await.expect("shared").major, 18);
+    let shared = SharedReq {
+        major: Some(18),
+        memory_mb: 512,
+        cpus: 1.0,
+        max_connections: 100,
+    };
+    assert_eq!(
+        c.data_shared_put(&shared).await.expect("put").job_id,
+        "job1"
+    );
+    c.data_shared_restart().await.expect("restart");
+    c.data_shared_delete(true, false).await.expect("delete");
+    assert_eq!(c.data_shared_backups().await.expect("list")[0].id, D_BID);
+    c.data_shared_backup().await.expect("backup");
+    c.data_shared_backup_delete(b).await.expect("backup delete");
+    assert_eq!(c.data_orphans().await.expect("orphans")[0].site, "old-shop");
+    c.data_orphan_purge("old-shop").await.expect("purge");
+
+    // site level: overview and postgres
+    assert!(
+        c.site_data("shop")
+            .await
+            .expect("site data")
+            .redeploy_needed
+    );
+    c.delete_site_purging_data("shop")
+        .await
+        .expect("delete site");
+    let enable = PgEnableReq {
+        mode: PgMode::Shared,
+        major: Some(17),
+        memory_mb: None,
+        max_connections: None,
+        preset: None,
+    };
+    c.site_pg_enable("shop", &enable).await.expect("enable");
+    c.site_pg_disable("shop", true).await.expect("disable");
+    assert_eq!(
+        c.site_pg_policy("shop", &policy)
+            .await
+            .expect("policy")
+            .major,
+        18
+    );
+    let convert = ConvertReq {
+        to: PgMode::Dedicated,
+        freeze: Freeze::Maintenance,
+    };
+    assert_eq!(
+        c.site_pg_convert("shop", &convert)
+            .await
+            .expect("convert")
+            .session,
+        "session-1"
+    );
+    c.site_pg_convert_cutover("shop", "session-1")
+        .await
+        .expect("cutover");
+    c.site_pg_convert_abort("shop", "session-1")
+        .await
+        .expect("abort");
+    c.site_pg_retired_delete("shop").await.expect("retired");
+
+    // databases and users
+    c.site_db_create("shop", &DatabaseCreateReq { name: "app".into() })
+        .await
+        .expect("db create");
+    c.site_db_delete("shop", "app", true)
+        .await
+        .expect("db delete");
+    let user = UserCreateReq {
+        name: "rw".into(),
+        level: PgLevel::Readwrite,
+        connection_limit: Some(5),
+        statement_timeout_ms: None,
+        idle_in_transaction_timeout_ms: None,
+    };
+    c.site_db_user_create("shop", "app", &user)
+        .await
+        .expect("user create");
+    let patch = UserPatchReq {
+        disabled: Some(true),
+        ..UserPatchReq::default()
+    };
+    c.site_db_user_update("shop", "app", "rw", &patch)
+        .await
+        .expect("user update");
+    let rotated = c
+        .site_db_user_rotate("shop", "app", "rw")
+        .await
+        .expect("rotate");
+    assert!(rotated.redeploy_needed);
+    c.site_db_user_delete("shop", "app", "rw")
+        .await
+        .expect("user delete");
+
+    // external, s3, secrets
+    let url_req = ExternalPutReq {
+        url: "postgres://user:pw@db.example.com/app".into(),
+    };
+    assert_eq!(
+        c.site_external_put("shop", "billing-db", &url_req)
+            .await
+            .expect("external")
+            .port,
+        5432
+    );
+    c.site_external_delete("shop", "billing-db")
+        .await
+        .expect("external delete");
+    let s3 = S3PutReq {
+        endpoint: "https://s3.example.com".into(),
+        bucket: "media".into(),
+        region: "eu-west-1".into(),
+        path_style: true,
+        access_key_id: Some("AKTESTID".into()),
+        secret_access_key: Some("sk-test-value".into()),
+    };
+    assert!(
+        c.site_s3_put("shop", "media", &s3)
+            .await
+            .expect("s3")
+            .has_keys
+    );
+    c.site_s3_delete("shop", "media").await.expect("s3 delete");
+    let secret = SecretCreateReq {
+        name: "auth-secret".into(),
+        bytes: Some(32),
+        encoding: Some(SecretEncoding::Hex),
+    };
+    assert_eq!(
+        c.site_secret_create("shop", &secret)
+            .await
+            .expect("secret")
+            .bytes,
+        32
+    );
+    assert!(
+        c.site_secret_rotate("shop", "auth-secret")
+            .await
+            .expect("rotate")
+            .redeploy_needed
+    );
+    c.site_secret_delete("shop", "auth-secret")
+        .await
+        .expect("secret delete");
+
+    // links
+    assert_eq!(
+        c.site_links("shop").await.expect("links")[0].var,
+        "DATABASE_URL"
+    );
+    let links = LinksReq {
+        links: vec![EnvLinkReq {
+            var: "DATABASE_URL".into(),
+            target: LinkTargetSel::Both,
+            source: LinkSource::SiteUrl,
+        }],
+        override_manual: false,
+    };
+    match c.site_links_add("shop", &links).await.expect("add") {
+        LinksOutcome::Applied(list) => assert_eq!(list.len(), 1),
+        other => panic!("{other:?}"),
+    }
+    c.site_link_delete("shop", LinkTarget::Runtime, "DATABASE_URL")
+        .await
+        .expect("link delete");
+    let preset = PresetRequest {
+        preset: Preset::Prisma,
+        database: "app".into(),
+        runtime_user: "app".into(),
+        migrate_user: "migrate".into(),
+        auth_database: None,
+        override_manual: false,
+    };
+    match c.site_links_preset("shop", &preset).await.expect("preset") {
+        LinksOutcome::Applied(applied) => assert_eq!(applied.created_users, ["app/app"]),
+        other => panic!("{other:?}"),
+    }
+
+    // backups
+    assert_eq!(
+        c.site_backups("shop", Some("pg:app")).await.expect("list")[0].version,
+        3
+    );
+    assert_eq!(c.site_backup("shop", b).await.expect("one").id, D_BID);
+    let create = BackupCreateReq {
+        database: "pg:app".into(),
+        label: Some("before upgrade".into()),
+        push_s3: false,
+    };
+    assert_eq!(
+        c.site_backup_create("shop", &create)
+            .await
+            .expect("create")
+            .backup_id,
+        D_BID
+    );
+    let pin = BackupPatchReq {
+        label: Some(None),
+        pinned: Some(true),
+    };
+    c.site_backup_patch("shop", b, &pin).await.expect("patch");
+    c.site_backup_delete("shop", b, DeleteFrom::S3)
+        .await
+        .expect("delete");
+    let restore = RestoreReq {
+        confirm: "shop".into(),
+        database: None,
+    };
+    let started = c
+        .site_backup_restore("shop", b, &restore)
+        .await
+        .expect("restore");
+    assert_eq!(started.job_id, "job1");
+    let push = PushReq {
+        target: Some("t1".into()),
+    };
+    c.site_backup_push("shop", b, &push).await.expect("push");
+    assert_eq!(
+        c.site_prune_preview("shop").await.expect("preview")[0].database,
+        "pg:app"
+    );
+    assert_eq!(c.site_prune("shop").await.expect("prune").deleted, 2);
+
+    let calls = data_calls(&node);
+    assert!(
+        calls
+            .iter()
+            .all(|c| c.auth.as_deref() == Some("Bearer cite_good")),
+        "every call is authenticated"
+    );
+    let seen: Vec<(String, String, String, Value)> = calls
+        .into_iter()
+        .map(|c| {
+            (
+                c.method,
+                c.path,
+                c.query.as_deref().map(percent_decode).unwrap_or_default(),
+                c.body,
+            )
+        })
+        .collect();
+    let expected = vec![
+        want("GET", "/data".into(), "", Value::Null),
+        want("GET", format!("/data/jobs/{D_JOB}"), "", Value::Null),
+        want("GET", "/data/targets".into(), "", Value::Null),
+        want("POST", "/data/targets".into(), "", target_json.clone()),
+        want("PUT", "/data/targets/t1".into(), "", target_json),
+        want("DELETE", "/data/targets/t1".into(), "", Value::Null),
+        want("POST", "/data/targets/t1/test".into(), "", json!({})),
+        want("GET", "/data/shared".into(), "", Value::Null),
+        want(
+            "PUT",
+            "/data/shared".into(),
+            "",
+            json!({ "major": 18, "memory_mb": 512, "cpus": 1.0, "max_connections": 100 }),
+        ),
+        want("POST", "/data/shared/restart".into(), "", json!({})),
+        want(
+            "DELETE",
+            "/data/shared".into(),
+            "force=true&purge=false",
+            Value::Null,
+        ),
+        want("GET", "/data/shared/backups".into(), "", Value::Null),
+        want("POST", "/data/shared/backups".into(), "", json!({})),
+        want(
+            "DELETE",
+            format!("/data/shared/backups/{b}"),
+            "",
+            Value::Null,
+        ),
+        want("GET", "/data/orphans".into(), "", Value::Null),
+        want("DELETE", "/data/orphans/old-shop".into(), "", Value::Null),
+        want("GET", s.into(), "", Value::Null),
+        want(
+            "DELETE",
+            "/sites/shop".into(),
+            "purge_data=true",
+            Value::Null,
+        ),
+        want("PUT", format!("{s}/postgres"), "", pg_enable),
+        want("DELETE", format!("{s}/postgres"), "purge=true", Value::Null),
+        want(
+            "PUT",
+            format!("{s}/postgres/policy"),
+            "",
+            serde_json::to_value(&policy).expect("policy json"),
+        ),
+        want(
+            "POST",
+            format!("{s}/postgres/convert"),
+            "",
+            json!({ "to": "dedicated", "freeze": "maintenance" }),
+        ),
+        want(
+            "POST",
+            format!("{s}/postgres/convert/session-1/cutover"),
+            "",
+            json!({}),
+        ),
+        want(
+            "POST",
+            format!("{s}/postgres/convert/session-1/abort"),
+            "",
+            json!({}),
+        ),
+        want("DELETE", format!("{s}/postgres/retired"), "", Value::Null),
+        want(
+            "POST",
+            format!("{s}/postgres/databases"),
+            "",
+            json!({ "name": "app" }),
+        ),
+        want(
+            "DELETE",
+            format!("{s}/postgres/databases/app"),
+            "purge=true",
+            Value::Null,
+        ),
+        want(
+            "POST",
+            format!("{s}/postgres/databases/app/users"),
+            "",
+            json!({
+                "name": "rw", "level": "readwrite", "connection_limit": 5,
+                "statement_timeout_ms": null, "idle_in_transaction_timeout_ms": null
+            }),
+        ),
+        want(
+            "PATCH",
+            format!("{s}/postgres/databases/app/users/rw"),
+            "",
+            json!({ "disabled": true }),
+        ),
+        want(
+            "POST",
+            format!("{s}/postgres/databases/app/users/rw/rotate"),
+            "",
+            json!({}),
+        ),
+        want(
+            "DELETE",
+            format!("{s}/postgres/databases/app/users/rw"),
+            "",
+            Value::Null,
+        ),
+        want(
+            "PUT",
+            format!("{s}/external/billing-db"),
+            "",
+            json!({ "url": "postgres://user:pw@db.example.com/app" }),
+        ),
+        want(
+            "DELETE",
+            format!("{s}/external/billing-db"),
+            "",
+            Value::Null,
+        ),
+        want(
+            "PUT",
+            format!("{s}/s3/media"),
+            "",
+            json!({
+                "endpoint": "https://s3.example.com", "bucket": "media", "region": "eu-west-1",
+                "path_style": true, "access_key_id": "AKTESTID", "secret_access_key": "sk-test-value"
+            }),
+        ),
+        want("DELETE", format!("{s}/s3/media"), "", Value::Null),
+        want(
+            "POST",
+            format!("{s}/secrets"),
+            "",
+            json!({ "name": "auth-secret", "bytes": 32, "encoding": "hex" }),
+        ),
+        want(
+            "POST",
+            format!("{s}/secrets/auth-secret/rotate"),
+            "",
+            json!({}),
+        ),
+        want(
+            "DELETE",
+            format!("{s}/secrets/auth-secret"),
+            "",
+            Value::Null,
+        ),
+        want("GET", format!("{s}/links"), "", Value::Null),
+        want(
+            "POST",
+            format!("{s}/links"),
+            "",
+            json!({
+                "links": [{ "var": "DATABASE_URL", "target": "both", "source": { "kind": "site_url" } }],
+                "override": false
+            }),
+        ),
+        want(
+            "DELETE",
+            format!("{s}/links/runtime/DATABASE_URL"),
+            "",
+            Value::Null,
+        ),
+        want(
+            "POST",
+            format!("{s}/links/preset"),
+            "",
+            json!({
+                "preset": "prisma", "database": "app", "runtime_user": "app",
+                "migrate_user": "migrate", "auth_database": null, "override_manual": false
+            }),
+        ),
+        want(
+            "GET",
+            format!("{s}/backups"),
+            "database=pg:app",
+            Value::Null,
+        ),
+        want("GET", format!("{s}/backups/{b}"), "", Value::Null),
+        want(
+            "POST",
+            format!("{s}/backups"),
+            "",
+            json!({ "database": "pg:app", "label": "before upgrade", "push_s3": false }),
+        ),
+        want(
+            "PATCH",
+            format!("{s}/backups/{b}"),
+            "",
+            json!({ "label": null, "pinned": true }),
+        ),
+        want("DELETE", format!("{s}/backups/{b}"), "from=s3", Value::Null),
+        want(
+            "POST",
+            format!("{s}/backups/{b}/restore"),
+            "",
+            json!({ "confirm": "shop", "database": null }),
+        ),
+        want(
+            "POST",
+            format!("{s}/backups/{b}/push"),
+            "",
+            json!({ "target": "t1" }),
+        ),
+        want("GET", format!("{s}/prune-preview"), "", Value::Null),
+        want("POST", format!("{s}/prune"), "", json!({})),
+    ];
+    assert_eq!(seen.len(), expected.len(), "{seen:#?}");
+    for (got, want) in seen.iter().zip(&expected) {
+        assert_eq!(got, want);
+    }
+}
+
+#[tokio::test]
+async fn every_request_to_a_connector_carries_the_client_version() {
+    let (url, node) = data_spawn().await;
+    let c = client("n1", &url, "cite_good");
+    c.data_node().await.expect("node");
+    c.forward(
+        reqwest::Method::GET,
+        "data",
+        None,
+        Vec::new(),
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("forward");
+    c.site_backup_stream("shop", D_BID, None)
+        .await
+        .expect("stream");
+    let calls = data_calls(&node);
+    assert_eq!(calls.len(), 3);
+    assert_eq!(CLIENT_VERSION, env!("CARGO_PKG_VERSION"));
+    assert!(!CLIENT_VERSION.is_empty());
+    for call in calls {
+        assert_eq!(
+            call.client.as_deref(),
+            Some(CLIENT_VERSION),
+            "{}",
+            call.path
+        );
+    }
+}
+
+#[tokio::test]
+async fn data_calls_validate_before_any_request() {
+    macro_rules! refused {
+        ($call:expr) => {
+            assert!(
+                matches!($call.await, Err(ClientError::Config(_))),
+                stringify!($call)
+            )
+        };
+    }
+    let (url, node) = data_spawn().await;
+    let c = client("n1", &url, "cite_good");
+    let enable_old = PgEnableReq {
+        mode: PgMode::Dedicated,
+        major: Some(16),
+        ..PgEnableReq::default()
+    };
+    let enable_preset = PgEnableReq {
+        mode: PgMode::Dedicated,
+        preset: Some("prisma".into()),
+        ..PgEnableReq::default()
+    };
+    let url_req = ExternalPutReq {
+        url: "postgres://user:pw@db.example.com/app".into(),
+    };
+    let long_label = BackupCreateReq {
+        database: "pg:app".into(),
+        label: Some("x".repeat(101)),
+        push_s3: false,
+    };
+    let bad_database = BackupCreateReq {
+        database: "app".into(),
+        label: None,
+        push_s3: false,
+    };
+    let wrong_confirm = RestoreReq {
+        confirm: "other".into(),
+        database: None,
+    };
+    let bad_link = LinksReq {
+        links: vec![EnvLinkReq {
+            var: "database_url".into(),
+            target: LinkTargetSel::Runtime,
+            source: LinkSource::SiteUrl,
+        }],
+        override_manual: false,
+    };
+    let no_links = LinksReq {
+        links: vec![],
+        override_manual: false,
+    };
+    let bad_preset = PresetRequest {
+        preset: Preset::Generic,
+        database: "App".into(),
+        runtime_user: "app".into(),
+        migrate_user: "migrate".into(),
+        auth_database: None,
+        override_manual: false,
+    };
+    let old_shared = SharedReq {
+        major: Some(16),
+        memory_mb: 512,
+        cpus: 1.0,
+        max_connections: 100,
+    };
+    let empty_label_patch = BackupPatchReq::default();
+    let long_label_patch = BackupPatchReq {
+        label: Some(Some("x".repeat(101))),
+        pinned: None,
+    };
+    refused!(c.site_data("../x"));
+    refused!(c.site_data("Bad_Id"));
+    refused!(c.site_backup("shop", "not-a-ulid"));
+    refused!(c.site_backup("shop", "01jc9zq7m3x8v4n2b6t5r0whya"));
+    refused!(c.site_backups("shop", Some("app")));
+    refused!(c.site_db_delete("shop", "App", false));
+    refused!(c.site_db_user_rotate("shop", "app", "a-b"));
+    refused!(c.site_external_put("shop", "Billing", &url_req));
+    refused!(c.site_s3_delete("shop", "a_b"));
+    refused!(c.site_secret_rotate("shop", "1x"));
+    refused!(c.site_link_delete("shop", LinkTarget::Runtime, "database_url"));
+    refused!(c.data_job("a/b"));
+    refused!(c.data_target_delete("a.b"));
+    refused!(c.data_orphan_purge("Bad_Id"));
+    refused!(c.data_shared_backup_delete("short"));
+    refused!(c.data_shared_put(&old_shared));
+    refused!(c.site_pg_enable("shop", &enable_old));
+    refused!(c.site_pg_enable("shop", &enable_preset));
+    refused!(c.site_pg_convert_cutover("shop", "a b"));
+    refused!(c.site_db_user_update("shop", "app", "rw", &UserPatchReq::default()));
+    refused!(c.site_backup_patch("shop", D_BID, &empty_label_patch));
+    refused!(c.site_backup_patch("shop", D_BID, &long_label_patch));
+    refused!(c.site_backup_create("shop", &long_label));
+    refused!(c.site_backup_create("shop", &bad_database));
+    refused!(c.site_backup_restore("shop", D_BID, &wrong_confirm));
+    refused!(c.site_links_add("shop", &no_links));
+    refused!(c.site_links_add("shop", &bad_link));
+    refused!(c.site_links_preset("shop", &bad_preset));
+    assert!(
+        data_calls(&node).is_empty(),
+        "invalid input never reaches the node"
+    );
+}
+
+#[tokio::test]
+async fn link_conflicts_are_returned_and_other_refusals_stay_errors() {
+    let (url, _node) = data_spawn().await;
+    let c = client("n1", &url, "cite_good");
+    let req = |var: &str| LinksReq {
+        links: vec![EnvLinkReq {
+            var: var.into(),
+            target: LinkTargetSel::Runtime,
+            source: LinkSource::SiteUrl,
+        }],
+        override_manual: false,
+    };
+    match c
+        .site_links_add("shop", &req("CLASH_VAR"))
+        .await
+        .expect("outcome")
+    {
+        LinksOutcome::Conflicts(conflicts) => {
+            assert_eq!(conflicts.len(), 1);
+            assert_eq!(conflicts[0].var, "CLASH_VAR");
+            assert_eq!(conflicts[0].target, LinkTarget::Runtime);
+        }
+        other => panic!("{other:?}"),
+    }
+    let err = c
+        .site_links_add("shop", &req("OTHER_VAR"))
+        .await
+        .expect_err("plain 409");
+    assert_eq!(err.status_code(), Some(409));
+    assert!(err.to_string().contains("in the way"), "{err}");
+}
+
+#[tokio::test]
+async fn preset_conflicts_are_returned_like_link_conflicts_and_other_refusals_stay_errors() {
+    let (url, _node) = data_spawn().await;
+    let c = client("n1", &url, "cite_good");
+    let preset = |database: &str| PresetRequest {
+        preset: Preset::Prisma,
+        database: database.into(),
+        runtime_user: "app".into(),
+        migrate_user: "migrate".into(),
+        auth_database: None,
+        override_manual: false,
+    };
+    match c
+        .site_links_preset("shop", &preset("clashdb"))
+        .await
+        .expect("outcome")
+    {
+        LinksOutcome::Conflicts(conflicts) => {
+            assert_eq!(conflicts.len(), 1);
+            assert_eq!(conflicts[0].var, "DATABASE_URL");
+            assert_eq!(conflicts[0].target, LinkTarget::Runtime);
+        }
+        other => panic!("{other:?}"),
+    }
+    let err = c
+        .site_links_preset("shop", &preset("plaindb"))
+        .await
+        .expect_err("a 409 without a list stays an error");
+    assert_eq!(err.status_code(), Some(409));
+    assert!(err.to_string().contains("already applied"), "{err}");
+}
+
+#[tokio::test]
+async fn data_errors_carry_the_node_status_and_message() {
+    let (url, _node) = data_spawn().await;
+    let c = client("n1", &url, "cite_good");
+    let err = c.data_job("missing").await.expect_err("unknown job");
+    assert_eq!(err.status_code(), Some(404));
+    assert!(err.to_string().contains("unknown job"), "{err}");
+}
+
+#[tokio::test]
+async fn a_backup_download_is_verified_and_named_from_the_record() {
+    let (url, node) = data_spawn().await;
+    let c = client("n1", &url, "cite_good");
+    let dir = tempfile::tempdir().expect("dir");
+    let dest = dir.path().join("dump.bin");
+    let report = c
+        .site_backup_download_to("shop", &backup_record(D_BID, &dump_sha()), &dest, 1 << 20)
+        .await
+        .expect("download");
+    assert_eq!(std::fs::read(&dest).expect("file"), D_DUMP);
+    assert_eq!(report.bytes, D_DUMP.len() as u64);
+    assert_eq!(report.suggested_name.as_deref(), Some("shop-app-v3.dump"));
+    assert_eq!(std::fs::read_dir(dir.path()).expect("ls").count(), 1);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&dest).expect("meta").permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    // A record without a checksum is checked against the node's header alone.
+    let again = dir.path().join("again.bin");
+    c.site_backup_download_to("shop", &backup_record(D_BID, ""), &again, 1 << 20)
+        .await
+        .expect("header only");
+    assert_eq!(std::fs::read(&again).expect("file"), D_DUMP);
+
+    let shared = dir.path().join("shared.tar");
+    let report = c
+        .data_shared_backup_download_to(D_BID, &shared, 1 << 20)
+        .await
+        .expect("shared");
+    assert_eq!(
+        report.suggested_name.as_deref(),
+        Some(format!("cite-pg-shared-{D_BID}.tar").as_str())
+    );
+    assert_eq!(std::fs::read(&shared).expect("file"), D_DUMP);
+
+    let calls = data_calls(&node);
+    assert!(calls.iter().all(|call| call.range.is_none()));
+    assert_eq!(calls.len(), 3);
+}
+
+#[tokio::test]
+async fn a_download_that_fails_verification_leaves_no_file_and_keeps_the_old_one() {
+    let (url, _node) = data_spawn().await;
+    let c = client("n1", &url, "cite_good");
+    let dir = tempfile::tempdir().expect("dir");
+    let dest = dir.path().join("dump.bin");
+    std::fs::write(&dest, "old").expect("seed");
+    let listing = || std::fs::read_dir(dir.path()).expect("ls").count();
+
+    // The node's checksum header does not match the bytes it sent.
+    let err = c
+        .site_backup_download_to("shop", &backup_record(D_BAD_SHA, ""), &dest, 1 << 20)
+        .await
+        .expect_err("mismatch");
+    assert!(
+        matches!(&err, ClientError::Decode(m) if m.contains("sha256")),
+        "{err:?}"
+    );
+    assert_eq!(listing(), 1);
+    assert_eq!(std::fs::read_to_string(&dest).expect("file"), "old");
+
+    // No checksum header at all.
+    let err = c
+        .site_backup_download_to("shop", &backup_record(D_NO_SHA, ""), &dest, 1 << 20)
+        .await
+        .expect_err("no header");
+    assert!(matches!(err, ClientError::Decode(_)), "{err:?}");
+    assert_eq!(listing(), 1);
+
+    // The backup record's own checksum disagrees with the node's header.
+    let err = c
+        .site_backup_download_to(
+            "shop",
+            &backup_record(D_BID, &"1".repeat(64)),
+            &dest,
+            1 << 20,
+        )
+        .await
+        .expect_err("catalog mismatch");
+    assert!(matches!(err, ClientError::Decode(_)), "{err:?}");
+    assert_eq!(listing(), 1);
+
+    // Over the size cap.
+    let err = c
+        .site_backup_download_to("shop", &backup_record(D_BID, &dump_sha()), &dest, 5)
+        .await
+        .expect_err("too large");
+    assert!(matches!(err, ClientError::Decode(_)), "{err:?}");
+    assert_eq!(listing(), 1);
+    assert_eq!(std::fs::read_to_string(&dest).expect("file"), "old");
+
+    // The same checks apply to the whole-instance download.
+    let tar = dir.path().join("shared.tar");
+    c.data_shared_backup_download_to(D_BAD_SHA, &tar, 1 << 20)
+        .await
+        .expect_err("shared mismatch");
+    assert!(!tar.exists());
+    assert_eq!(listing(), 1);
+}
+
+#[tokio::test]
+async fn a_ranged_backup_stream_passes_the_range_and_exposes_the_checksum() {
+    use futures_util::StreamExt;
+    let (url, node) = data_spawn().await;
+    let c = client("n1", &url, "cite_good");
+    let stream = c
+        .site_backup_stream("shop", D_BID, Some("bytes=0-3"))
+        .await
+        .expect("stream");
+    assert_eq!(stream.status(), 206);
+    let want_range = format!("bytes 0-3/{}", D_DUMP.len());
+    assert_eq!(stream.content_range(), Some(want_range.as_str()));
+    assert_eq!(stream.sha256(), Some(dump_sha().as_str()));
+    assert_eq!(stream.content_length(), Some(4));
+    let mut body = Vec::new();
+    let mut chunks = Box::pin(stream.into_body_stream());
+    while let Some(chunk) = chunks.next().await {
+        body.extend_from_slice(&chunk.expect("chunk"));
+    }
+    assert_eq!(body, &D_DUMP[..4]);
+    assert_eq!(data_calls(&node)[0].range.as_deref(), Some("bytes=0-3"));
+
+    // Without a range the node answers 200 and no Content-Range.
+    let whole = c
+        .site_backup_stream("shop", D_BID, None)
+        .await
+        .expect("whole");
+    assert_eq!(whole.status(), 200);
+    assert_eq!(whole.content_range(), None);
 }
 
 #[test]

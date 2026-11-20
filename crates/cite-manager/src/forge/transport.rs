@@ -47,14 +47,12 @@ impl Transport {
         let base_str = api_url.trim_end_matches('/').to_string();
         let base = Url::parse(&base_str)
             .map_err(|err| ManagerError::new(format!("forge api url: {err}")))?;
-        let api = Client::builder()
-            .use_rustls_tls()
+        let api = cite_tls::client_builder()
             .redirect(Policy::none())
             .timeout(Duration::from_secs(120))
             .connect_timeout(Duration::from_secs(30))
             .build()?;
-        let download = Client::builder()
-            .use_rustls_tls()
+        let download = cite_tls::client_builder()
             .redirect(Policy::none())
             .connect_timeout(Duration::from_secs(30))
             .read_timeout(IDLE_TIMEOUT)

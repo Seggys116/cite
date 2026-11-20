@@ -170,6 +170,64 @@ jobs:
           cache-from: type=gha,scope=${{ matrix.image }}
           cache-to: type=gha,mode=max,scope=${{ matrix.image }}
 
+  postgres-image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        major: ["17", "18"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: hadolint/hadolint-action@06be81baf89a55ffd0e24b8f04a4185738dd3387 # v3.5.0
+        with:
+          dockerfile: images/postgres/Dockerfile
+      - name: Lint the job script
+        run: |
+          sh -n images/postgres/cite-pg-job
+          shellcheck --shell=sh images/postgres/cite-pg-job
+      - name: Resolve the pinned base image
+        id: base
+        env:
+          PG_MAJOR: ${{ matrix.major }}
+        run: |
+          image="$(awk -v major="$PG_MAJOR" '
+            function done_block() { if (inpg && m == major && img != "" && dg != "") { print img "@" dg; found = 1; exit } }
+            /^\[/ { done_block(); inpg = ($0 == "[[postgres]]"); m = ""; img = ""; dg = ""; next }
+            inpg && $1 == "major" { m = $3 }
+            inpg && $1 == "image" { gsub(/"/, "", $3); img = $3 }
+            inpg && $1 == "digest" { gsub(/"/, "", $3); dg = $3 }
+            END { if (!found) done_block() }
+          ' images/images.toml)"
+          digest="${image##*@}"
+          if [[ -z "$image" || ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::images/images.toml has no pinned digest for postgres ${PG_MAJOR}" >&2
+            exit 1
+          fi
+          echo "image=${image}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: images/postgres/Dockerfile
+          load: true
+          build-args: PG_IMAGE=${{ steps.base.outputs.image }}
+          tags: cite-postgres:ci-pg${{ matrix.major }}
+          cache-from: type=gha,scope=postgres-pg${{ matrix.major }}
+          cache-to: type=gha,mode=max,scope=postgres-pg${{ matrix.major }}
+      - name: The image runs as the postgres user and carries a valid job script
+        run: |
+          image="cite-postgres:ci-pg${{ matrix.major }}"
+          [ "$(docker run --rm --entrypoint id "$image" -u)" = 70 ] || { echo "::error::the image must run as uid 70"; exit 1; }
+          docker run --rm --entrypoint sh "$image" -n /usr/local/bin/cite-pg-job
+          docker run --rm --entrypoint sh "$image" -c 'psql --version && pg_dump --version && pg_restore --version'
+          docker run --rm --user 10001:10001 -e CITE_JOB_ID=00000000000000000000000000 --entrypoint cite-pg-job "$image" backup \
+            && { echo "::error::the job script must refuse a missing environment"; exit 1; } || true
+
   e2e:
     runs-on: ubuntu-latest
     timeout-minutes: 40

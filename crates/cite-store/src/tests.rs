@@ -2895,7 +2895,7 @@ fn a_size_cap_smaller_than_the_minute_tables_still_trims_only_the_oldest_rows() 
     s.prune(NOW).expect("settle");
     let before = s.stats().expect("stats");
     assert_eq!(before.rows, total as u64);
-    let minute_bytes: u64 = s
+    let minute_bytes: i64 = s
         .inner
         .read(|c| {
             Ok(c.query_row(
@@ -2905,6 +2905,7 @@ fn a_size_cap_smaller_than_the_minute_tables_still_trims_only_the_oldest_rows() 
             )?)
         })
         .expect("dbstat");
+    let minute_bytes = u64::try_from(minute_bytes).expect("non-negative size");
     let live = s.inner.live_bytes().expect("live");
     assert!(minute_bytes > 0);
     s.set_max_bytes(Some(live - minute_bytes - (live - minute_bytes) / 4));

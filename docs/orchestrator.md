@@ -50,6 +50,7 @@ The manager environment is a closed list of at most 32 entries, each key at most
 | `CITE_REPO` | `owner/name`, each part letters, digits, `.`, `_`, `-`, at most 100 characters. |
 | `CITE_BRANCH` | Letters, digits, `.`, `_`, `-`, `/`, at most 100 characters, no leading `-`, no `..`. |
 | `CITE_POLL_INTERVAL` | Letters and digits, at most 16 characters. |
+| `CITE_RUNTIME` | `node`, `bun` or `static` on the shared `cite-manager` image, `rust` on `cite-manager-rust`. The proxy cannot see the executor image from a manager body, so it ties the value to the manager image. |
 | `CITE_NODE` | `22` or `24`. |
 | `CITE_GITHUB_TOKEN` | 1 to 512 printable ASCII characters without spaces. |
 | `CITE_GITHUB_API_URL` | Exactly the proxy's `CITE_PROXY_GITHUB_API_URL`. |
@@ -67,7 +68,7 @@ The manager environment is a closed list of at most 32 entries, each key at most
 
 The executor environment is likewise closed: its fixed values, `CITE_NODE`, and `CITE_RUNTIME_ENV_JSON`, which follows the same rules as `CITE_BUILD_ENV_JSON` and also refuses `PORT`, `NODE_ENV`, `HOST`, `HOSTNAME` and `NITRO_HOST`, the names the executor sets itself. A filtered executor (see [Outbound network access](#outbound-network-access)) must also carry `HTTP_PROXY`, `HTTPS_PROXY`, `http_proxy` and `https_proxy`, each exactly `http://cite-<id>-<slot>-egress-proxy:3128` for its own stack, `NO_PROXY=localhost,127.0.0.1` and `NODE_USE_ENV_PROXY=1`; any other executor must carry none of them. `NODE_USE_ENV_PROXY` is refused in the owner's variables like the proxy names.
 
-The egress proxy environment holds only `CITE_EGRESS_*` keys: the node lists (`CITE_EGRESS_ALLOW_CIDRS`, `CITE_EGRESS_DENY_CIDRS`, `CITE_EGRESS_DENY_HOSTS`, `CITE_EGRESS_ALLOW_PORTS`) must each be present exactly when the proxy's own `CITE_STACK_EGRESS_*` setting is non-empty, with exactly that value, so a create body cannot widen or drop them; `CITE_EGRESS_MODE` (`public` or `allowlist`) and `CITE_EGRESS_BLOCK_MAIL` (`true` or `false`) are required; `CITE_EGRESS_ALLOW` and `CITE_EGRESS_DENY` are optional comma lists of at most 64 distinct IPs, CIDRs or lowercase host names (a leading `.` adds subdomains), and allowlist mode needs `CITE_EGRESS_ALLOW`. The rest of the body is fixed: image `cite-egress:<x.y.z>`, user 65532, read-only root, all capabilities dropped, no mounts, 64 MiB, 0.25 CPU, 128 pids, no health check, network mode `cite-<id>-<slot>-xnet` and exactly two endpoints, that xnet and the egress bridge, with no aliases. The proxy refuses an egress proxy create unless its mode is `filtered`.
+The egress proxy environment holds only `CITE_EGRESS_*` keys: the node lists (`CITE_EGRESS_ALLOW_CIDRS`, `CITE_EGRESS_DENY_CIDRS`, `CITE_EGRESS_DENY_HOSTS`, `CITE_EGRESS_ALLOW_PORTS`) must each be present exactly when the proxy's own `CITE_STACK_EGRESS_*` setting is non-empty, with exactly that value, so a create body cannot widen or drop them; `CITE_EGRESS_MODE` (`public` or `allowlist`) and `CITE_EGRESS_BLOCK_MAIL` (`true` or `false`) are required; `CITE_EGRESS_ALLOW` and `CITE_EGRESS_DENY` are optional comma lists of at most 64 distinct IPs, CIDRs or lowercase host names (a leading `.` adds subdomains), and allowlist mode needs `CITE_EGRESS_ALLOW`. The rest of the body is fixed: image `cite-egress:<x.y.z>`, user 65532, read-only root, all capabilities dropped, no mounts, 64 MiB, 0.25 CPU, 128 pids, no health check, network mode `cite-<id>-<slot>-xnet` and exactly two endpoints, that xnet and the egress bridge, with no aliases. The proxy refuses an egress proxy create unless its mode is `filtered`. Two more optional keys exist for [site data services](data.md#external-postgres): `CITE_EGRESS_FORWARDS`, 1 to 8 entries `<listen>=<host>:<port>` with listen ports 15432 to 15439, and `CITE_EGRESS_AUTO_ALLOW`, 1 to 16 lowercase host names.
 
 Anything else is refused, including `CITE_BUILD_UID`, `CITE_BUILD_GID`, `CITE_DEV_SAME_USER`, `CITE_BUILD_ENV_FILE`, the `CITE_MAX_*` limits, `CITE_BUILD_TIMEOUT`, any other directory key and per-site API URLs. With every key at its longest value and a 24 KiB build environment escaped twice, a create body still fits the 64 KiB body cap.
 
@@ -95,6 +96,8 @@ Proxy settings, all on the `dockerproxy` service:
 | `CITE_NODE_PUBLIC_IPS` | empty | Filtered mode: the node's own public IPs, added to the deny list of every egress proxy so sites cannot reach host services through the public address. Set it on every internet-facing node; set it on both the connector and the Docker proxy (the orchestrator overlay passes it to both). |
 | `CITE_STACK_EGRESS_DENY_HOSTS` | empty | Filtered mode: host names no site may reach, each also covering its subdomains. A site allow entry never overrides it. |
 | `CITE_STACK_EGRESS_ALLOW_PORTS` | empty (every port) | Filtered mode: comma list of ports or ranges (`80,443,8000-8100`) a site may connect to. Mail ports 25, 465 and 587 stay refused for sites whose `block_mail` is on (the default) even when listed. |
+| `CITE_PROXY_DATA` | `true` | `true` or `false`. `false` refuses every data container, volume and network (see [Site data services](#site-data-services)). The overlay sets it from `CITE_DATA` in `.env`. |
+| `CITE_PROXY_BACKUP_VOLUME` | `cite-backups` | The named volume data jobs mount a subpath of. A plain volume name that matches no Cite container, volume or network pattern. Keep it equal to the connector's `CITE_DATA_BACKUP_VOLUME`. |
 
 Persistent site volumes add these rules (see [Persistent volumes](#persistent-volumes)). `POST /volumes/create` also accepts a `cite-vol-<id>_<name>` volume whose labels are exactly `cite.managed=true`, `cite.site=<id>` and `cite.volume=<name>`; no driver or options. `GET` and `DELETE /volumes/<name>` accept those names, and `DELETE` still requires the `cite.managed` label on the existing volume. `GET /volumes` is allowed only with a `filters` label list that contains `cite.managed=true`. An executor create body may carry, after its three fixed mounts, at most 8 extra entries of `Type` `volume` whose `Source` is `cite-vol-<its own site>_<name>`, `ReadOnly` false, with no `VolumeOptions`, bind, tmpfs or driver settings; each `Target` follows the mount path rule below and no two may repeat or nest. An init create body may carry the same volumes at exactly `/vols/<name>`, and its script must be the fixed layout script followed by the fixed ownership step for exactly those names.
 
@@ -156,6 +159,57 @@ Volumes are created before the new slot starts. The executor runs as uid 65532 o
 
 Changing the list takes effect on the next deploy; until then the site status shows the settings as not current. Removing a volume from the list stops mounting it but keeps its data. Delete the data with `DELETE /api/v1/sites/{id}/volumes/{name}`; it is refused with 409 while the volume is still declared and the site has a running container, or while a running slot still mounts it. Remove it from the list, redeploy, then delete. Deleting a site keeps its volumes unless the request carries `?purge_volumes=true`; volumes left over from an earlier list are reported by `GET /api/v1/sites/{id}/volumes` with `declared: false`. Sizes come from Docker's usage data when the engine reports it, and are `null` otherwise (the proxy does not open `/system/df`).
 
+## Site data services
+
+A site can have a managed Postgres, in two modes, and one-shot job containers that maintain it. What they are for, and how a site uses them, is in [Site data services](data.md). This section is the topology and the names the orchestrator creates.
+
+```text
+                  cite_edge (internal) ----- HAProxy
+                        |
+     cite-<id>-blue-net                          cite-<id>-green-net
+            |                                            |
+     cite-<id>-blue-executor ---+          +--- cite-<id>-green-executor
+            |                   |          |
+            | (filtered only)   +-- cite-<id>-dbnet (internal) --+-- cite-<id>-<slot>-manager
+     cite-<id>-blue-xnet        |        |                       |   (only with build links to Postgres)
+            |                   |   cite-<id>-db          cite-<id>-dbjob (one-shot)
+     cite-<id>-blue-egress-proxy
+       (CONNECT :3128, TCP forwards :15432 to :15439)
+            |
+     cite-egress bridge --> internet: external Postgres, S3, APIs
+
+Shared mode, tenants X and Y:
+     cite-X-dbnet ---+                              +--- cite-Y-dbnet
+                     |                              |
+                  cite-pg-shared   (pg_hba.conf: each tenant's logins reach only their database, only from their own subnet)
+                     |
+            cite-pg-shared-admin (internal) -- cite-pg-shared-job, and the cite-<id>-dbjob of sites in shared mode
+```
+
+| Object | Name | Notes |
+|---|---|---|
+| Dedicated Postgres | `cite-<id>-db` | One container for all of the site's databases; blue and green share it. Restarts unless stopped. |
+| Dedicated data volume | `cite-<id>-db-data` | Kept when Postgres is turned off or the site is deleted, unless purged. |
+| Site database network | `cite-<id>-dbnet` | Internal. Joined by the site's executors, the site's manager (only with a build link to Postgres), the database and, in shared mode, `cite-pg-shared`. |
+| Site job | `cite-<id>-dbjob` | One-shot, one at a time per site. |
+| Shared Postgres | `cite-pg-shared` | Joins only `cite-pg-shared-admin` and the `dbnet` of each tenant. |
+| Shared volumes | `cite-pg-shared-data`, `cite-pg-shared-conf` | The second holds the generated `pg_hba.conf`; the server mounts it read-only. |
+| Shared admin network | `cite-pg-shared-admin` | Internal. The shared server and the jobs that administer it. |
+| Shared job | `cite-pg-shared-job` | One-shot, instance-wide operations. |
+| Backup volume | `cite-backups` | Created by the compose overlay (named by `CITE_PROXY_BACKUP_VOLUME`), never by the proxy. The connector mounts it at `/backups`; a job mounts only `staging/<id>` of it. |
+| Image | `cite-postgres:<version>-pg17`, `-pg18` | From `CITE_REGISTRY`, like the other Cite images. |
+
+None of these carries a `cite.slot` label, so none is mistaken for a stack. No data container publishes a port, and HAProxy never joins a `dbnet`. The executor and manager specifications do not depend on the mode: they only gain an optional endpoint on `cite-<id>-dbnet`, and in shared mode the connector attaches `cite-pg-shared` to that network. The manager keeps its `-egress` network as its `NetworkMode`.
+
+The data roles are validated like the stack roles, with an exact body per role:
+
+- **Postgres servers** (`cite-<id>-db`, `cite-pg-shared`): user `70:70`, read-only root, all capabilities dropped, `no-new-privileges`, an init process, tmpfs for `/tmp` and the socket directory, 256 MiB of shared memory, 512 pids, restart policy `unless-stopped`, one internal network, and a single named volume at the data directory (the shared server also mounts the config volume read-only). The command line is fixed except `max_connections` (10 to 1000), and so is the environment of six keys, of which only the 43-character generated superuser password varies. Memory and CPU use the same bounds as the stack roles (`CITE_STACK_MAX_MEM`, `CITE_STACK_MAX_CPUS`).
+- **Jobs** (`cite-<id>-dbjob`, `cite-pg-shared-job`): user `10001:10001`, the entrypoint `cite-pg-job` with one operation (`backup`, `restore`, `counts`, `freeze`, `unfreeze`, `provision`, `deprovision`, `joblogin`, `regrant`, `user`, `hba`, `sizes` or `globals`), 512 MiB, one CPU, 64 pids, no restart. The only mount is the `cite-backups` volume at `/backup`, through a subpath (`staging/<id>`, or `staging/_shared`), read-only for `restore`; `hba` also mounts the shared config volume. The environment is a closed list per operation with checked values. A job of a site must carry that site's own role tag, and only `backup` may run on a site's `-xnet` or `-egress` network (to dump an external database). The `hba` entries must each be a database tag with a CIDR of at least `/8` (IPv4) or `/48` (IPv6), at most 256 and 24 KiB.
+- **Networks and volumes**: `cite-<id>-dbnet` and `cite-pg-shared-admin` are created `Internal` with the data labels and no other option; data volumes carry no driver options.
+- **Attach**: `POST /networks/{name}/connect` and `disconnect` also accept a `-dbnet` network when the body is exactly `{"Container":"cite-pg-shared"}`. The proxy cannot know which site a shared tenant is, so it allows that container onto any site's `dbnet`; which tenant may reach which network is the connector's decision, enforced in the database by `pg_hba.conf`.
+
+`CITE_PROXY_DATA=false` makes the proxy refuse all of these names with `data services are off on this node (CITE_PROXY_DATA=false)`. The proxy tests feed what the connector emits for every mode and operation through the validator and check that mutations (an extra environment key, a host mount, another site's volume or network, a wrong subpath or user, added capabilities, published ports, an extra endpoint) are refused.
+
 ## Source settings
 
 The `source` object on a site:
@@ -187,7 +241,7 @@ There are two ways to give a site its GitHub token.
 
 **1. On the connector, once for the node (recommended).** Set `CITE_GITHUB_TOKEN` in `.env` (as in the single-site stack). The orchestrator overlay passes it to the connector, which reads it at start and uses it for every site built from GitHub that has no token of its own. Use a fine-grained token with Contents:read, or a classic PAT with repo scope. `CITE_GITHUB_TOKEN_FILE` is the alternative for secret mounts: mount the file into the connector and set the variable to its path; the environment variable wins when both are set. Both follow the same rules as a per-site token (printable ASCII, up to 512 bytes), and an invalid value stops the connector at start with an error that never prints it. `GET /api/v1/node` reports `github.token_configured` and `github.source` (`env`, `file` or `none`), never the value.
 
-**2. Per site.** Send a `github_token` string beside the site object in the `POST /api/v1/sites` body. It overrides the node token for that site. The connector stores it in `secrets.json` (mode 0600, up to 512 secrets, 32 KiB each) under a name it chooses from the site id, and records only that name in the site.
+**2. Per site.** Send a `github_token` string beside the site object in the `POST /api/v1/sites` body. It overrides the node token for that site. The connector stores it in `secrets.json` (mode 0600, sealed under the node key, up to 4096 secrets, 32 KiB each) under a name it chooses from the site id, and records only that name in the site.
 
 A site created with a `source` and neither token is refused with 400 ("No GitHub token: set CITE_GITHUB_TOKEN on the connector (or pass github_token for this site)"); the manager needs the token even for a public repository.
 

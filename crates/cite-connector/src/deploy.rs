@@ -1,19 +1,20 @@
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use cite_edge::model::{
-    DeployAction, Deployment, EdgeConfig, Maintenance, Site, Slot, Target, Upstream,
+    DeployAction, Deployment, EdgeConfig, Maintenance, Site, SiteData, Slot, Target, Upstream,
 };
 use cite_edge::validate::{
-    normalise_outbound_rules, validate_outbound_breadth, validate_site_strict,
+    normalise_outbound_rules, validate_outbound_breadth, validate_site_data, validate_site_strict,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 use tokio::time::sleep;
 
+use crate::data::DataService;
 use crate::error::{ConnectorError, Result};
 use crate::haproxy::Haproxy;
 use crate::orchestrator::{Orchestrator, SlotInspect, StackOpts};
@@ -61,6 +62,15 @@ pub struct Deployer {
     config_lock: Mutex<()>,
     pub(crate) timing: Timing,
     pub(crate) site_ops: SiteOps,
+    // Set once after construction; weak, so the service and the deployer never keep each other alive.
+    data: OnceLock<Weak<DataService>>,
+}
+
+/// What a delete leaves behind that the caller may want to report.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SiteDeleted {
+    /// S3 backup copies kept because they live outside the node; only counted for `purge_data`.
+    pub s3_objects_left: u64,
 }
 
 /// Answer of a deploy that was not waited for; poll the site status for its outcome.
@@ -329,7 +339,17 @@ impl Deployer {
                 stuck_window: STUCK_WINDOW,
             },
             site_ops: SiteOps::default(),
+            data: OnceLock::new(),
         }
+    }
+
+    /// Connects the data service that supplies link credentials, redactions and delete cleanup; set once.
+    pub fn set_data_service(&self, service: &Arc<DataService>) {
+        let _ = self.data.set(Arc::downgrade(service));
+    }
+
+    pub(crate) fn data_service(&self) -> Option<Arc<DataService>> {
+        self.data.get().and_then(Weak::upgrade)
     }
 
     pub fn with_timing(
@@ -563,10 +583,13 @@ impl Deployer {
         let orch = self.orchestrator()?;
         self.prepare_repo_volumes(orch, site, slot).await?;
         let token = self.token_for(site).await;
+        let (data, db_password) = self.data_inputs(site).await?;
         let opts = StackOpts {
             deploy_id: Some(deploy_id.to_string()),
             build_env: self.env_opt(&site.id, EnvKind::Build).await?,
             runtime_env: self.env_opt(&site.id, EnvKind::Runtime).await?,
+            data,
+            db_password,
         };
         orch.ensure_stack_with(site, slot, git_ref, &token, &opts)
             .await
@@ -688,6 +711,8 @@ impl Deployer {
         github_token: Option<String>,
     ) -> Result<Site> {
         site.history.clear();
+        // A new site starts without data; databases, storage and links come from the data routes only.
+        site.data = SiteData::default();
         normalise_outbound_rules(&mut site.outbound_rules);
         validate_site_strict(&site)?;
         self.check_outbound_breadth(&site)?;
@@ -812,6 +837,11 @@ impl Deployer {
         site.blue = existing.blue.clone();
         site.green = existing.green.clone();
         site.maintenance = existing.maintenance.clone();
+        // Data moves only through its own routes. Whatever the body carries is replaced, so a client that
+        // never saw the field (it is omitted for older clients) cannot drop databases or links by saving.
+        site.data = existing.data.clone();
+        // The merged site must still hold together: a source change or outbound off cannot strand the data.
+        validate_site_data(&site)?;
         if let Some(source) = site.source.as_mut() {
             source.secret = existing.source.as_ref().and_then(|s| s.secret.clone());
             source.doppler = existing.source.as_ref().and_then(|s| s.doppler.clone());
@@ -860,24 +890,56 @@ impl Deployer {
         self.delete_site_with(actor, id, false).await
     }
 
-    /// Persistent site volumes survive a delete unless `purge_volumes` is set.
+    /// Persistent site volumes survive a delete unless `purge_volumes` is set; the site's data is kept.
     pub async fn delete_site_with(
         self: &Arc<Self>,
         actor: &str,
         id: &str,
         purge_volumes: bool,
     ) -> Result<()> {
-        let (this, actor, id) = (Arc::clone(self), actor.to_string(), id.to_string());
-        detach(async move { this.delete_site_inner(&actor, &id, purge_volumes).await }).await
+        self.delete_site_full(actor, id, purge_volumes, false)
+            .await
+            .map(|_| ())
     }
 
-    async fn delete_site_inner(&self, actor: &str, id: &str, purge_volumes: bool) -> Result<()> {
+    /// Like `delete_site_with`, and `purge_data` also destroys the site's databases, data secrets and
+    /// local backups. Without it a dedicated database container goes but its volume, secrets and backups
+    /// stay, and the logins of a shared tenant are disabled and kept.
+    pub async fn delete_site_full(
+        self: &Arc<Self>,
+        actor: &str,
+        id: &str,
+        purge_volumes: bool,
+        purge_data: bool,
+    ) -> Result<SiteDeleted> {
+        let (this, actor, id) = (Arc::clone(self), actor.to_string(), id.to_string());
+        detach(async move {
+            this.delete_site_inner(&actor, &id, purge_volumes, purge_data)
+                .await
+        })
+        .await
+    }
+
+    async fn delete_site_inner(
+        &self,
+        actor: &str,
+        id: &str,
+        purge_volumes: bool,
+        purge_data: bool,
+    ) -> Result<SiteDeleted> {
         // A Doppler sync in flight finishes first, so it cannot write a snapshot after the secrets below are gone.
         let doppler_gate = self.doppler_gate(id);
         let _doppler_held = doppler_gate.lock().await;
         let lock = self.site_lock(id);
         let guard = lock.lock().await;
         let site = self.get_site(id)?;
+        // Checked before anything is removed: a purge that cannot reach the data secrets must not half-run.
+        if purge_data && !site.data.is_empty() && self.data_service().is_none() {
+            return Err(ConnectorError::Unavailable(
+                "the site has data services, but they are not available on this node, so its data cannot be purged"
+                    .into(),
+            ));
+        }
         let sid = id.to_string();
         self.mutate_apply(actor, "site.delete", move |cfg| {
             let scoped: Vec<&str> = cfg
@@ -926,7 +988,42 @@ impl Deployer {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .remove(id);
-        Ok(())
+        // After the site lock is released: the data service takes its own per-site lock and calls back into
+        // the deployer elsewhere, so holding this one here could deadlock against it.
+        Ok(self.remove_site_data(&site, purge_data).await)
+    }
+
+    // The site is already out of the config and its stacks are gone, so the database network has no members
+    // left but the database itself. A purge goes through the data service (it drops tenant databases and
+    // logins on the shared instance and deletes credentials and backups); the dedicated container and network
+    // are then removed here, with the volume only when purging. Failures are logged like the other cleanup
+    // steps: the delete itself has happened and is not undone, and an orphan purge can finish the job.
+    async fn remove_site_data(&self, site: &Site, purge_data: bool) -> SiteDeleted {
+        let mut deleted = SiteDeleted::default();
+        if site.data.is_empty() {
+            return deleted;
+        }
+        let id = site.id.as_str();
+        if purge_data && let Some(service) = self.data_service() {
+            match service.purge_site(site).await {
+                Ok(left) => deleted.s3_objects_left = u64::from(left),
+                Err(err) => {
+                    tracing::warn!("data of deleted site {id} could not be purged: {err}");
+                }
+            }
+        }
+        if !purge_data && let Some(service) = self.data_service() {
+            // Kept data must not stay reachable: shared tenants lose their logins and hba entries.
+            if let Err(err) = service.detach_site(site).await {
+                tracing::warn!("tenant of deleted site {id} could not be detached: {err}");
+            }
+        }
+        if let Some(orch) = &self.orchestrator
+            && let Err(err) = orch.remove_site_database(id, purge_data).await
+        {
+            tracing::warn!("database of deleted site {id} could not be removed: {err}");
+        }
+        deleted
     }
 
     pub async fn deploy(
@@ -1533,6 +1630,8 @@ mod tests {
                 executor_present: false,
                 executor_outbound: false,
                 executor_filtered: false,
+                executor_dbnet: false,
+                manager_dbnet: false,
                 egress_proxy: None,
             };
             if self.orch.slot_ref(site_id, slot).await?.is_none() {
@@ -1702,6 +1801,7 @@ mod tests {
             volumes: Vec::new(),
             outbound: true,
             outbound_rules: Default::default(),
+            data: Default::default(),
         }
     }
 
@@ -2906,6 +3006,8 @@ mod tests {
             executor_present: false,
             executor_outbound: false,
             executor_filtered: false,
+            executor_dbnet: false,
+            manager_dbnet: false,
             egress_proxy: None,
         }
     }
@@ -3422,5 +3524,235 @@ mod tests {
                 "{secret} is not redacted"
             );
         }
+    }
+
+    // ---- site data services ----
+
+    const DB_PASSWORD: &str = "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789_-abcde";
+
+    fn shop_data() -> SiteData {
+        serde_json::from_value(json!({
+            "postgres": {
+                "mode": "dedicated",
+                "major": 18,
+                "databases": [{ "name": "app", "users": [
+                    { "name": "app", "level": "readwrite" },
+                    { "name": "migrate", "level": "owner" },
+                ] }],
+            },
+            "links": [
+                { "var": "DATABASE_URL", "target": "runtime",
+                  "source": { "kind": "postgres", "database": "app", "user": "app", "field": "url" } },
+                { "var": "MIGRATION_DATABASE_URL", "target": "build",
+                  "source": { "kind": "postgres", "database": "app", "user": "migrate", "field": "url" } },
+            ],
+        }))
+        .unwrap()
+    }
+
+    // Writes the data straight into the stored site, as the data routes do.
+    async fn with_data(e: &Env) -> Site {
+        let data = shop_data();
+        e.store
+            .update("t", "seed", move |cfg| {
+                site_mut(cfg, "shop")?.data = data;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        current(e, "shop")
+    }
+
+    #[tokio::test]
+    async fn a_site_write_from_a_client_that_never_saw_data_keeps_it() {
+        let (e, _orch, _docker, _sim) = docker_env(Duration::from_millis(50), None, None).await;
+        built(&e, "ghp_testtoken").await;
+        let stored = with_data(&e).await;
+        // An older client reads the site without `data` and writes it back without it.
+        let mut edit = stored.clone();
+        edit.data = SiteData::default();
+        edit.history.clear();
+        edit.name = "Renamed".into();
+        if let Some(source) = edit.source.as_mut() {
+            source.secret = None;
+        }
+        let saved = e.deployer.update_site("t", edit).await.unwrap();
+        assert_eq!(saved.name, "Renamed");
+        assert_eq!(saved.data, stored.data, "the write must not drop the data");
+        assert_eq!(current(&e, "shop").data, stored.data);
+    }
+
+    #[tokio::test]
+    async fn a_site_write_cannot_change_the_data_either() {
+        let (e, _orch, _docker, _sim) = docker_env(Duration::from_millis(50), None, None).await;
+        built(&e, "ghp_testtoken").await;
+        let stored = with_data(&e).await;
+        let mut edit = stored.clone();
+        edit.history.clear();
+        edit.name = "Renamed".into();
+        edit.data.links.clear();
+        edit.data.postgres = None;
+        if let Some(source) = edit.source.as_mut() {
+            source.secret = None;
+        }
+        let saved = e.deployer.update_site("t", edit).await.unwrap();
+        assert_eq!(saved.name, "Renamed");
+        assert_eq!(
+            saved.data, stored.data,
+            "data moves only through its own routes"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_site_write_that_would_strand_the_data_is_refused_and_changes_nothing() {
+        let (e, _orch, _docker, _sim) = docker_env(Duration::from_millis(50), None, None).await;
+        built(&e, "ghp_testtoken").await;
+        let stored = with_data(&e).await;
+        let mut edit = stored.clone();
+        edit.history.clear();
+        if let Some(source) = edit.source.as_mut() {
+            source.secret = None;
+            // A static site has no server process to use a database.
+            source.runtime = Some("static".into());
+        }
+        let err = e.deployer.update_site("t", edit).await.unwrap_err();
+        assert!(matches!(err, ConnectorError::BadRequest(_)), "{err}");
+        let after = current(&e, "shop");
+        assert_eq!(after.data, stored.data);
+        assert_eq!(
+            after.source.as_ref().and_then(|s| s.runtime.clone()),
+            stored.source.as_ref().and_then(|s| s.runtime.clone())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_new_site_never_starts_with_data() {
+        let (e, _orch, _docker, _sim) = docker_env(Duration::from_millis(50), None, None).await;
+        let mut site = orchestrated_site("shop");
+        site.data = shop_data();
+        let created = e
+            .deployer
+            .create_site("t", site, Some("ghp_testtoken".into()))
+            .await
+            .unwrap();
+        assert!(created.data.is_empty());
+        assert!(current(&e, "shop").data.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_linked_variable_cannot_be_set_by_hand_but_other_names_and_targets_can() {
+        let (e, _orch, _docker, _sim) = docker_env(Duration::from_millis(50), None, None).await;
+        built(&e, "ghp_testtoken").await;
+        with_data(&e).await;
+        let runtime = e
+            .deployer
+            .patch_runtime_env("t", "shop", patch("DATABASE_URL", "manual"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                &runtime,
+                ConnectorError::BadRequest(m)
+                    if m == "DATABASE_URL is linked from postgres app/app (runtime); remove the link first"
+            ),
+            "{runtime:?}"
+        );
+        let build = e
+            .deployer
+            .patch_build_env("t", "shop", patch("MIGRATION_DATABASE_URL", "manual"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                &build,
+                ConnectorError::BadRequest(m)
+                    if m.contains("MIGRATION_DATABASE_URL is linked from postgres app/migrate (build)")
+            ),
+            "{build:?}"
+        );
+        // The same name is free on the other target, and unrelated names are untouched.
+        e.deployer
+            .patch_runtime_env("t", "shop", patch("MIGRATION_DATABASE_URL", "manual"))
+            .await
+            .unwrap();
+        e.deployer
+            .patch_runtime_env("t", "shop", patch("OTHER", "1"))
+            .await
+            .unwrap();
+        let names = e.deployer.runtime_env_names("shop").await.unwrap().names;
+        assert_eq!(names, vec!["MIGRATION_DATABASE_URL", "OTHER"]);
+        // Removing a name is never refused: the manual map cannot hold a linked one anyway.
+        let unset = BuildEnvPatch {
+            set: Default::default(),
+            unset: vec!["DATABASE_URL".into()],
+        };
+        e.deployer
+            .patch_runtime_env("t", "shop", unset)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_site_with_data_cannot_start_without_the_data_service() {
+        let (e, _orch, _docker, _sim) = docker_env(Duration::from_millis(50), None, None).await;
+        built(&e, "ghp_testtoken").await;
+        let plain = current(&e, "shop");
+        let (data, password) = e.deployer.data_inputs(&plain).await.unwrap();
+        assert!(data.is_none() && password.is_none());
+        let site = with_data(&e).await;
+        let err = e.deployer.data_inputs(&site).await.unwrap_err();
+        assert!(matches!(err, ConnectorError::Unavailable(_)), "{err}");
+        assert!(err.to_string().contains("not available on this node"));
+        assert!(e.deployer.kept_opts(&site, Slot::Blue).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn deleting_a_site_keeps_a_dedicated_database_volume_and_a_purge_needs_the_service() {
+        use crate::orchestrator::tests::{has_container, has_network, has_volume};
+        let (e, orch, docker, _sim) = docker_env(Duration::from_millis(50), None, None).await;
+        built(&e, "ghp_testtoken").await;
+        let site = with_data(&e).await;
+        orch.ensure_site_database(&site, DB_PASSWORD).await.unwrap();
+        assert!(has_container(&docker, "cite-shop-db"));
+
+        // This node has no data service, so a purge cannot reach the credentials: nothing is touched.
+        let err = e
+            .deployer
+            .delete_site_full("t", "shop", false, true)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ConnectorError::Unavailable(_)), "{err}");
+        assert_eq!(e.store.config().sites.len(), 1);
+        assert!(has_container(&docker, "cite-shop-db"));
+
+        let deleted = e
+            .deployer
+            .delete_site_full("t", "shop", false, false)
+            .await
+            .unwrap();
+        assert_eq!(deleted.s3_objects_left, 0);
+        assert!(e.store.config().sites.is_empty());
+        assert!(!has_container(&docker, "cite-shop-db"));
+        assert!(!has_network(&docker, "cite-shop-dbnet"));
+        assert!(
+            has_volume(&docker, "cite-shop-db-data"),
+            "the data survives a delete without purge_data"
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_a_site_without_data_does_not_touch_the_database_objects() {
+        let (e, _orch, docker, _sim) = docker_env(Duration::from_millis(50), None, None).await;
+        built(&e, "ghp_testtoken").await;
+        let before = crate::orchestrator::tests::count(&docker, "GET /containers/cite-shop-db/");
+        e.deployer.delete_site("t", "shop").await.unwrap();
+        assert_eq!(
+            crate::orchestrator::tests::count(&docker, "GET /containers/cite-shop-db/"),
+            before
+        );
+        assert_eq!(
+            crate::orchestrator::tests::count(&docker, "POST /networks/cite-shop-dbnet"),
+            0
+        );
     }
 }

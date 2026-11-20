@@ -12,6 +12,7 @@ pub mod security;
 pub mod server;
 pub mod settings;
 pub mod state;
+pub mod transfers;
 
 pub use api::router;
 pub use error::{ApiError, Error, Result};

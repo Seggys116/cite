@@ -1,4 +1,4 @@
-ARG RUST_IMAGE=docker.io/library/rust:1.98-bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
+ARG RUST_IMAGE=docker.io/library/rust:1.100-bookworm@sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea
 ARG HAPROXY_IMAGE=docker.io/library/haproxy:3.2-bookworm
 
 FROM ${RUST_IMAGE} AS build
@@ -32,6 +32,8 @@ ENV RUST_LOG=info
 
 USER 0
 WORKDIR /conf
+# A fresh cite-backups volume copies this ownership on first mount; backups and staged dumps are private to the connector.
+RUN mkdir -p /backups && chown 10001:10001 /backups && chmod 0700 /backups
 USER 10001:10001
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \

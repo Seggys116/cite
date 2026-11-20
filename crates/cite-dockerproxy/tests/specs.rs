@@ -43,6 +43,7 @@ fn site(id: &str, runtime: &str, node_major: Option<u8>) -> Site {
         volumes: Vec::new(),
         outbound: true,
         outbound_rules: Default::default(),
+        data: Default::default(),
     }
 }
 
@@ -869,6 +870,7 @@ fn maximal_manager_env(build_env_json: &str) -> Vec<String> {
         ),
         ("CITE_BRANCH", "c".repeat(100)),
         ("CITE_POLL_INTERVAL", "9".repeat(16)),
+        ("CITE_RUNTIME", "static".to_string()),
         ("CITE_NODE", "24".to_string()),
         ("CITE_GITHUB_TOKEN", quotes(512)),
         ("CITE_GITHUB_API_URL", max_github_url()),
@@ -925,7 +927,7 @@ fn create_with_env(env: &[String]) -> (usize, Result<(), String>) {
 fn the_largest_legal_create_body_fits_the_body_cap() {
     assert_eq!(max_github_url().len(), 200);
     let env = maximal_manager_env(&build_env_json_of(24 * 1024));
-    assert_eq!(env.len(), 29);
+    assert_eq!(env.len(), 30);
     let (size, result) = create_with_env(&env);
     result.unwrap();
     assert!(size < MAX_BODY, "{size} bytes");
@@ -936,6 +938,46 @@ fn the_largest_legal_create_body_fits_the_body_cap() {
 fn one_byte_more_than_the_largest_legal_build_environment_is_refused() {
     let (_, result) = create_with_env(&maximal_manager_env(&build_env_json_of(24 * 1024 + 1)));
     assert!(result.is_err());
+}
+
+// The manager's runtime must be one its image can serve: the rust manager only rust, the shared node manager
+// node, bun or static. Anything else, or a repeat, is refused.
+fn manager_runtime(runtime: &str, value: &str) -> Result<(), String> {
+    let s = specs("shop", runtime, Slot::Blue, true);
+    let mut body = s.manager.clone();
+    let env = body["Env"].as_array_mut().unwrap();
+    env.retain(|e| !e.as_str().unwrap().starts_with("CITE_RUNTIME="));
+    env.push(json!(format!("CITE_RUNTIME={value}")));
+    accepts(&s.manager_name, &body)
+}
+
+#[test]
+fn a_bun_site_manager_carries_its_runtime_and_the_proxy_checks_it() {
+    let s = specs("shop", "bun", Slot::Blue, true);
+    assert!(
+        s.manager["Env"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("CITE_RUNTIME=bun"))
+    );
+    accepts(&s.manager_name, &s.manager).unwrap();
+    for runtime in ["node", "bun", "static", "rust"] {
+        manager_runtime(runtime, runtime).unwrap();
+    }
+    for shared in ["node", "bun", "static"] {
+        denied(manager_runtime(shared, "rust"));
+    }
+    denied(manager_runtime("rust", "node"));
+    denied(manager_runtime("rust", "bun"));
+    for bad in ["deno", "", "Bun", "bun ", "node;x", "nodejs"] {
+        denied(manager_runtime("bun", bad));
+    }
+    denied(manager(|b| {
+        b["Env"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!("CITE_RUNTIME=node"))
+    }));
 }
 
 #[test]

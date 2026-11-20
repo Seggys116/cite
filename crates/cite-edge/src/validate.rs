@@ -9,8 +9,10 @@ use thiserror::Error;
 use crate::cloudflare::{check_width, parse_range};
 use crate::effects::{Piece, Target, parse_template};
 use crate::model::{
-    Cors, EdgeConfig, EdgeSettings, FirewallRule, HeaderMatch, HeaderOp, HeaderOpKind,
-    HeaderTarget, HealthCheck, MaintenancePage, Matchers, Redirect, Site,
+    BACKUP_EVERY_HOURS, BackupPolicy, BackupRetention, Cors, EdgeConfig, EdgeSettings, EnvLink,
+    FirewallRule, HeaderMatch, HeaderOp, HeaderOpKind, HeaderTarget, HealthCheck, LinkSource,
+    LinkTarget, MaintenancePage, ManagedPostgres, Matchers, PgField, RESERVED_PG_DATABASES,
+    Redirect, Site, is_pg_ident, is_resource_name,
 };
 use crate::pattern::{Subject, check_budget, check_regex, work as pattern_work};
 use crate::presets::ZONE_HEADER;
@@ -332,7 +334,484 @@ pub fn validate_site_strict(site: &Site) -> Result<(), ValidationError> {
         validate_source(src).map_err(|e| ValidationError(format!("site {} {}", site.id, e.0)))?;
     }
     validate_volumes(site)?;
-    validate_outbound_rules(site)
+    validate_outbound_rules(site)?;
+    validate_site_data(site)
+}
+
+/// Postgres majors the node images exist for; keep in step with `images/images.toml` and the Docker proxy.
+pub const PG_MAJORS: [u8; 2] = [17, 18];
+
+pub const MAX_PG_DATABASES: usize = 4;
+pub const MAX_PG_USERS_PER_DATABASE: usize = 8;
+pub const MAX_EXTERNAL_POSTGRES: usize = 4;
+pub const MAX_S3_ATTACHMENTS: usize = 4;
+pub const MAX_GENERATED_SECRETS: usize = 8;
+pub const MAX_ENV_LINKS: usize = 64;
+pub const MIN_PG_MEMORY_MB: u32 = 256;
+/// Upper bound of a dedicated instance's memory in the model; the Docker proxy applies the node's own cap on top.
+pub const MAX_PG_MEMORY_MB: u32 = 65_536;
+pub const MAX_PG_TIMEOUT_MS: u32 = 3_600_000;
+const SSL_MODES: [&str; 6] = [
+    "disable",
+    "allow",
+    "prefer",
+    "require",
+    "verify-ca",
+    "verify-full",
+];
+
+/// The parts of an S3 endpoint the attachment rules look at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct S3Endpoint {
+    pub https: bool,
+    /// Lowercase host name or IP literal without brackets.
+    pub host: String,
+    pub port: Option<u16>,
+}
+
+/// Parses `http(s)://host[:port]` with nothing after the authority and applies the alert-URL host rules (no private or loopback literals).
+pub fn parse_s3_endpoint(endpoint: &str) -> Result<S3Endpoint, String> {
+    if endpoint.len() > 255 || !endpoint.bytes().all(|b| b.is_ascii_graphic()) {
+        return Err("must be at most 255 printable ASCII characters".into());
+    }
+    let (https, rest) = if let Some(rest) = endpoint.strip_prefix("https://") {
+        (true, rest)
+    } else if let Some(rest) = endpoint.strip_prefix("http://") {
+        (false, rest)
+    } else {
+        return Err("must start with http:// or https://".into());
+    };
+    if rest.contains(['/', '?', '#', '@', '\\']) {
+        return Err("must be scheme://host[:port] with nothing after the host and port".into());
+    }
+    let (host, port_text) = if let Some(inner) = rest.strip_prefix('[') {
+        let (host, tail) = inner.split_once(']').ok_or("the host is malformed")?;
+        match tail {
+            "" => (host, None),
+            _ => (
+                host,
+                Some(tail.strip_prefix(':').ok_or("the host is malformed")?),
+            ),
+        }
+    } else {
+        match rest.rsplit_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (rest, None),
+        }
+    };
+    let port = match port_text {
+        None => None,
+        Some(p) if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) => Some(
+            p.parse::<u16>()
+                .ok()
+                .filter(|p| *p != 0)
+                .ok_or("the port must be 1..=65535")?,
+        ),
+        Some(_) => return Err("the port must be 1..=65535".into()),
+    };
+    if host != host.to_ascii_lowercase() {
+        return Err("the host must be lowercase".into());
+    }
+    crate::alerts::check_host(host)?;
+    Ok(S3Endpoint {
+        https,
+        host: host.to_string(),
+        port,
+    })
+}
+
+fn is_bucket_name(s: &str) -> bool {
+    let b = s.as_bytes();
+    (3..=63).contains(&b.len())
+        && b.iter()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, b'.' | b'-'))
+        && b[0].is_ascii_alphanumeric()
+        && b[b.len() - 1].is_ascii_alphanumeric()
+}
+
+fn is_region_name(s: &str) -> bool {
+    (1..=32).contains(&s.len())
+        && s.bytes()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
+}
+
+/// An id the connector gives a node-level backup target.
+fn is_target_id(s: &str) -> bool {
+    (1..=64).contains(&s.len())
+        && s.bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+}
+
+fn valid_external_host(host: &str) -> bool {
+    (!host.starts_with('.') && is_egress_host(host))
+        || (!host.contains('/') && is_egress_cidr(host))
+}
+
+fn check_retention(what: &str, r: &BackupRetention) -> Result<(), ValidationError> {
+    check_range(
+        &format!("{what} keep_all_hours"),
+        r.keep_all_hours.into(),
+        0,
+        720,
+    )?;
+    check_range(&format!("{what} daily_days"), r.daily_days.into(), 0, 366)?;
+    check_range(
+        &format!("{what} weekly_weeks"),
+        r.weekly_weeks.into(),
+        0,
+        260,
+    )?;
+    check_range(
+        &format!("{what} monthly_months"),
+        r.monthly_months.into(),
+        0,
+        120,
+    )?;
+    check_range(
+        &format!("{what} pre_restore_days"),
+        r.pre_restore_days.into(),
+        0,
+        366,
+    )
+}
+
+/// The backup policy rules, shared with the policy route.
+pub fn validate_backup_policy(what: &str, policy: &BackupPolicy) -> Result<(), ValidationError> {
+    if let Some(s) = &policy.schedule {
+        if !BACKUP_EVERY_HOURS.contains(&s.every_hours) {
+            return invalid(format!(
+                "{what}: every_hours {} must be one of {BACKUP_EVERY_HOURS:?}",
+                s.every_hours
+            ));
+        }
+        check_range(&format!("{what} schedule minute"), s.minute.into(), 0, 59)?;
+    }
+    check_retention(&format!("{what} local retention"), &policy.local)?;
+    if let Some(copy) = &policy.s3 {
+        if !is_target_id(&copy.target) {
+            return invalid(format!(
+                "{what}: s3 target {:?} must be 1 to 64 letters, digits, '-' or '_'",
+                copy.target
+            ));
+        }
+        check_retention(&format!("{what} s3 retention"), &copy.retention)?;
+    }
+    Ok(())
+}
+
+fn validate_managed_postgres(what: &str, pg: &ManagedPostgres) -> Result<(), ValidationError> {
+    let what = format!("{what} postgres");
+    if !PG_MAJORS.contains(&pg.major) {
+        return invalid(format!(
+            "{what}: major {} must be one of {PG_MAJORS:?}",
+            pg.major
+        ));
+    }
+    if pg.tls {
+        return invalid(format!("{what}: tls is not supported in this release"));
+    }
+    check_range(
+        &format!("{what} memory_mb"),
+        pg.memory_mb.into(),
+        MIN_PG_MEMORY_MB.into(),
+        MAX_PG_MEMORY_MB.into(),
+    )?;
+    check_range(
+        &format!("{what} max_connections"),
+        pg.max_connections.into(),
+        10,
+        1000,
+    )?;
+    if pg.databases.is_empty() || pg.databases.len() > MAX_PG_DATABASES {
+        return invalid(format!("{what}: needs 1 to {MAX_PG_DATABASES} databases"));
+    }
+    for (i, db) in pg.databases.iter().enumerate() {
+        if !is_pg_ident(&db.name) || RESERVED_PG_DATABASES.contains(&db.name.as_str()) {
+            return invalid(format!(
+                "{what}: database name {:?} must match ^[a-z][a-z0-9]{{0,15}}$ and not be postgres, template0 or template1",
+                db.name
+            ));
+        }
+        if pg.databases[..i].iter().any(|o| o.name == db.name) {
+            return invalid(format!("{what}: database {:?} is listed twice", db.name));
+        }
+        let dbwhat = format!("{what} database {}", db.name);
+        if db.users.is_empty() || db.users.len() > MAX_PG_USERS_PER_DATABASE {
+            return invalid(format!(
+                "{dbwhat}: needs 1 to {MAX_PG_USERS_PER_DATABASE} users"
+            ));
+        }
+        for (j, u) in db.users.iter().enumerate() {
+            if !is_pg_ident(&u.name) {
+                return invalid(format!(
+                    "{dbwhat}: user name {:?} must match ^[a-z][a-z0-9]{{0,15}}$",
+                    u.name
+                ));
+            }
+            if db.users[..j].iter().any(|o| o.name == u.name) {
+                return invalid(format!("{dbwhat}: user {:?} is listed twice", u.name));
+            }
+            let uwhat = format!("{dbwhat} user {}", u.name);
+            check_range(
+                &format!("{uwhat} connection_limit"),
+                u.connection_limit.into(),
+                1,
+                500,
+            )?;
+            if let Some(ms) = u.statement_timeout_ms {
+                check_range(
+                    &format!("{uwhat} statement_timeout_ms"),
+                    ms.into(),
+                    0,
+                    MAX_PG_TIMEOUT_MS.into(),
+                )?;
+            }
+            if let Some(ms) = u.idle_in_transaction_timeout_ms {
+                check_range(
+                    &format!("{uwhat} idle_in_transaction_timeout_ms"),
+                    ms.into(),
+                    1_000,
+                    MAX_PG_TIMEOUT_MS.into(),
+                )?;
+            }
+        }
+    }
+    if let Some(r) = &pg.retired {
+        if !PG_MAJORS.contains(&r.major) {
+            return invalid(format!(
+                "{what}: retired major {} must be one of {PG_MAJORS:?}",
+                r.major
+            ));
+        }
+        if r.since.is_empty()
+            || r.since.len() > 40
+            || !r.since.bytes().all(|b| b.is_ascii_graphic())
+        {
+            return invalid(format!("{what}: retired since must be a timestamp"));
+        }
+    }
+    validate_backup_policy(&what, &pg.backup)
+}
+
+fn link_var_ok(var: &str, target: LinkTarget) -> Result<(), ValidationError> {
+    let mut patch = crate::status::BuildEnvPatch::default();
+    patch.set.insert(var.to_string(), String::new());
+    match target {
+        LinkTarget::Runtime => patch.validate_runtime(),
+        LinkTarget::Build => patch.validate(),
+    }
+}
+
+/// Checks everything the site's data section can get wrong without touching a secret: limits, names, ranges, the links' sources and env rules.
+pub fn validate_site_data(site: &Site) -> Result<(), ValidationError> {
+    let data = &site.data;
+    if data.is_empty() {
+        return Ok(());
+    }
+    let what = format!("site {} data", site.id);
+    if !site.source.as_ref().is_some_and(runs_server) {
+        return invalid(format!(
+            "{what}: only sites built from a repository with a server runtime can have data services; a static site has no process to use them"
+        ));
+    }
+    if (!data.external_postgres.is_empty() || !data.s3.is_empty()) && !site.outbound {
+        return invalid(format!(
+            "{what}: external Postgres and S3 attachments need outbound access, which is switched off for this site"
+        ));
+    }
+    for (name, len, max) in [
+        (
+            "external_postgres",
+            data.external_postgres.len(),
+            MAX_EXTERNAL_POSTGRES,
+        ),
+        ("s3", data.s3.len(), MAX_S3_ATTACHMENTS),
+        ("secrets", data.secrets.len(), MAX_GENERATED_SECRETS),
+        ("links", data.links.len(), MAX_ENV_LINKS),
+    ] {
+        if len > max {
+            return invalid(format!("{what}: at most {max} {name}"));
+        }
+    }
+    if let Some(pg) = &data.postgres {
+        validate_managed_postgres(&what, pg)?;
+    }
+    for (i, e) in data.external_postgres.iter().enumerate() {
+        if !is_resource_name(&e.name) {
+            return invalid(format!(
+                "{what}: external postgres name {:?} must match ^[a-z][a-z0-9-]{{0,30}}$",
+                e.name
+            ));
+        }
+        if data.external_postgres[..i].iter().any(|o| o.name == e.name) {
+            return invalid(format!(
+                "{what}: external postgres {:?} is listed twice",
+                e.name
+            ));
+        }
+        if !valid_external_host(&e.host) {
+            return invalid(format!(
+                "{what}: external postgres {} host {:?} must be a lowercase host name or an IP address",
+                e.name, e.host
+            ));
+        }
+        if e.port == 0 {
+            return invalid(format!(
+                "{what}: external postgres {} port must be 1..=65535",
+                e.name
+            ));
+        }
+        if e.database.is_empty()
+            || e.database.len() > 128
+            || e.database.chars().any(char::is_control)
+        {
+            return invalid(format!(
+                "{what}: external postgres {} needs a database name",
+                e.name
+            ));
+        }
+        if let Some(mode) = &e.sslmode
+            && !SSL_MODES.contains(&mode.as_str())
+        {
+            return invalid(format!(
+                "{what}: external postgres {} sslmode {mode:?} must be one of {SSL_MODES:?}",
+                e.name
+            ));
+        }
+    }
+    for (i, s) in data.s3.iter().enumerate() {
+        if !is_resource_name(&s.name) {
+            return invalid(format!(
+                "{what}: s3 name {:?} must match ^[a-z][a-z0-9-]{{0,30}}$",
+                s.name
+            ));
+        }
+        if data.s3[..i].iter().any(|o| o.name == s.name) {
+            return invalid(format!(
+                "{what}: s3 attachment {:?} is listed twice",
+                s.name
+            ));
+        }
+        match parse_s3_endpoint(&s.endpoint) {
+            Err(why) => return invalid(format!("{what}: s3 {} endpoint: {why}", s.name)),
+            // Private addresses are refused, so plain http would carry the keys over the internet.
+            Ok(ep) if !ep.https => {
+                return invalid(format!("{what}: s3 {} endpoint must use https", s.name));
+            }
+            Ok(_) => {}
+        }
+        if !is_bucket_name(&s.bucket) {
+            return invalid(format!(
+                "{what}: s3 {} bucket {:?} must be 3 to 63 of a-z, 0-9, '.' and '-', starting and ending with a letter or digit",
+                s.name, s.bucket
+            ));
+        }
+        if !is_region_name(&s.region) {
+            return invalid(format!(
+                "{what}: s3 {} region {:?} must be 1 to 32 of a-z, 0-9 and '-'",
+                s.name, s.region
+            ));
+        }
+    }
+    for (i, g) in data.secrets.iter().enumerate() {
+        if !is_resource_name(&g.name) {
+            return invalid(format!(
+                "{what}: secret name {:?} must match ^[a-z][a-z0-9-]{{0,30}}$",
+                g.name
+            ));
+        }
+        if data.secrets[..i].iter().any(|o| o.name == g.name) {
+            return invalid(format!("{what}: secret {:?} is listed twice", g.name));
+        }
+        check_range(
+            &format!("{what} secret {} bytes", g.name),
+            g.bytes.into(),
+            32,
+            128,
+        )?;
+        if g.rotated_at.len() > 40 || !g.rotated_at.bytes().all(|b| b.is_ascii_graphic()) {
+            return invalid(format!(
+                "{what}: secret {} rotated_at must be a timestamp",
+                g.name
+            ));
+        }
+    }
+    for (i, link) in data.links.iter().enumerate() {
+        link_var_ok(&link.var, link.target).map_err(|e| {
+            ValidationError(format!(
+                "{what}: link {} ({}): {}",
+                link.var,
+                link.target.as_str(),
+                e.0
+            ))
+        })?;
+        if data.links[..i]
+            .iter()
+            .any(|o| o.var == link.var && o.target == link.target)
+        {
+            return invalid(format!(
+                "{what}: {} is linked twice for the {} target",
+                link.var,
+                link.target.as_str()
+            ));
+        }
+        validate_link_source(&what, site, link)?;
+    }
+    Ok(())
+}
+
+fn validate_link_source(what: &str, site: &Site, link: &EnvLink) -> Result<(), ValidationError> {
+    let data = &site.data;
+    let var = &link.var;
+    match &link.source {
+        LinkSource::Postgres {
+            database,
+            user,
+            field,
+        } => {
+            let Some(pg) = &data.postgres else {
+                return invalid(format!(
+                    "{what}: link {var} reads managed Postgres, which is not enabled"
+                ));
+            };
+            let Some(db) = pg.databases.iter().find(|d| &d.name == database) else {
+                return invalid(format!(
+                    "{what}: link {var} names unknown database {database:?}"
+                ));
+            };
+            if !db.users.iter().any(|u| &u.name == user) {
+                return invalid(format!(
+                    "{what}: link {var} names unknown user {user:?} of database {database}"
+                ));
+            }
+            if *field == PgField::TlsServername {
+                return invalid(format!(
+                    "{what}: link {var}: tls_servername exists only for external Postgres"
+                ));
+            }
+        }
+        LinkSource::External { name, .. } => {
+            if !data.external_postgres.iter().any(|e| &e.name == name) {
+                return invalid(format!(
+                    "{what}: link {var} names unknown external postgres {name:?}"
+                ));
+            }
+        }
+        LinkSource::S3 { name, .. } => {
+            if !data.s3.iter().any(|s| &s.name == name) {
+                return invalid(format!(
+                    "{what}: link {var} names unknown s3 attachment {name:?}"
+                ));
+            }
+        }
+        LinkSource::Secret { name } => {
+            if !data.secrets.iter().any(|s| &s.name == name) {
+                return invalid(format!("{what}: link {var} names unknown secret {name:?}"));
+            }
+        }
+        LinkSource::SiteUrl => {}
+    }
+    Ok(())
 }
 
 pub const MAX_VOLUMES: usize = 8;
@@ -1601,6 +2080,7 @@ pub(crate) mod fixtures {
             volumes: Vec::new(),
             outbound: true,
             outbound_rules: Default::default(),
+            data: Default::default(),
         }
     }
 

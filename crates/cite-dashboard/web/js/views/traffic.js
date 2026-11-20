@@ -1,13 +1,16 @@
 import { h, icon, clear } from '../dom.js';
 import { nodeApi, qs } from '../api.js';
-import { currentNode, storage, state } from '../state.js';
+import { storage, state } from '../state.js';
 import { timeSeriesChart, donut, hbars, histogram } from '../charts.js';
 import {
   pageHeader, button, loadInto, card, pill, dataTable, emptyState, errorState, segmented, kvList, openDrawer,
   toast, withBusy, formatError, newId, escapeRegex, fmtNum, fmtInt, fmtBytes, fmtMs, fmtPct, fmtDate, fmtTime,
   skeletonCards, skeletonBlock, toMs,
 } from '../ui.js';
-import { noNodes, nodeNotice } from './common.js';
+import { noNodes } from './common.js';
+import {
+  chooseNodeNotice, nodeScopeBar, rememberScope, scopeFor,
+} from './nodeScope.js';
 import { perBucketSizes } from '../sizes.js';
 import {
   botsPanel, botsSkeleton, topExplorer, storageCard, openExportDialog, botDetail, captureRows, botCells,
@@ -69,7 +72,7 @@ function renderAnalytics({ summary: sm, series }) {
       statTile('Bandwidth out', fmtBytes(sm.bytes_out), fmtBytes(sm.bytes_in) + ' received'),
       statTile('Errors', fmtNum(errors), sm.requests ? fmtPct(errors / sm.requests, 2) + ' of requests' : 'no traffic'),
       statTile('Blocked', fmtNum(sm.blocked), 'stopped by the firewall')),
-    card({ title: 'Requests over time', subtitle: 'Hover the chart for exact values', body: timeSeriesChart(series.points || [], { series: SERIES }) }),
+    card({ title: 'Requests over time', body: timeSeriesChart(series.points || [], { series: SERIES }) }),
     h('div', { class: 'grid-cards' },
       card({
         title: 'Status classes',
@@ -78,7 +81,7 @@ function renderAnalytics({ summary: sm, series }) {
           h('ul', { class: 'legend-list' }, donutSegs.map((x) => h('li', {}, h('i', { class: 'swatch ' + x.cls }), h('span', {}, x.label), h('b', { class: 'mono' }, fmtNum(x.value)))))),
       }),
       card({ title: 'Methods', body: hbars(methodItems) }),
-      card({ title: 'Latency', subtitle: 'Total time per request', body: hbars(latency, { format: fmtMs }) }),
+      card({ title: 'Latency', body: hbars(latency, { format: fmtMs }) }),
       card({ title: 'Response sizes', body: sizeBuckets.length ? histogram(sizeBuckets) : h('p', { class: 'muted' }, 'No data in this window.') }),
       card({ title: 'Content types', body: hbars(typeItems) })),
     h('div', { class: 'grid-cards wide' },
@@ -94,7 +97,7 @@ function openEventSheet(node, ev) {
   const block = async (btn, rule, label) => {
     try {
       await withBusy(btn, () => nodeApi(node).post('/firewall/rules', rule));
-      toast(`${label} blocked. See Firewall for the new rule.`, 'success');
+      toast(`${label} blocked on ${node}`, 'success');
       sheet.close();
     } catch (ex) {
       toast(formatError(ex), 'error');
@@ -143,7 +146,7 @@ function liveLog(node, getSite) {
   const blockedIn = h('input', { type: 'checkbox', 'aria-label': 'Blocked only' });
   const tableHost = h('div', {});
   const stamp = h('span', { class: 'muted' }, 'waiting for data');
-  const live = h('span', { class: 'live-badge' }, h('i', { class: 'dot dot-ok pulse' }), 'Live');
+  const live = h('span', { class: 'live-badge', title: 'Newest first, refreshed every 3 seconds' }, h('i', { class: 'dot dot-ok pulse' }), 'Live');
   let paused = false;
   let inflight = false;
   let signature = '';
@@ -183,7 +186,7 @@ function liveLog(node, getSite) {
           rows: events,
           onRowClick: (e) => openEventSheet(node, e),
           rowLabel: (e) => `Open request ${e.method} ${e.path}`,
-          empty: emptyState({ iconName: 'activity', title: 'No matching requests', text: 'Requests appear here as they arrive. Loosen the filters if you expect more.' }),
+          empty: emptyState({ iconName: 'activity', title: 'No matching requests' }),
         }));
       }
     } catch (ex) {
@@ -222,7 +225,6 @@ function liveLog(node, getSite) {
 
   const el = card({
     title: 'Live requests',
-    subtitle: 'Newest first, refreshed every 3 seconds',
     actions: [live, stamp, pauseBtn],
     body: h('div', { class: 'stack' },
       h('div', { class: 'filters' }, statusIn, methodIn, pathIn, ipIn, h('label', { class: 'check-row' }, blockedIn, h('span', {}, 'Blocked only'))),
@@ -233,10 +235,9 @@ function liveLog(node, getSite) {
 
 export function trafficView(ctx) {
   ctx.setCrumbs([{ label: 'Traffic' }]);
-  const node = currentNode();
+  let node = scopeFor('traffic', state);
   const body = h('div', { class: 'stack' });
-  const analytics = h('div', {});
-  const sitePick = h('select', { class: 'select', 'aria-label': 'Filter by site' }, h('option', { value: '' }, 'All sites'));
+  const sitePick = h('select', { class: 'select', 'aria-label': 'Filter by site' });
   let win = storage.get('window', '24h');
   if (!WINDOWS.includes(win)) win = '24h';
   let reload = null;
@@ -256,38 +257,68 @@ export function trafficView(ctx) {
     sitePick,
     button('', { iconName: 'refresh', title: 'Refresh', onClick: () => { reloadPanels(); storageBox.refresh(); if (log) log.refresh(); } }),
     button('Export', { iconName: 'download', title: 'Export analytics', onClick: () => openExportDialog({ node, win, sites: siteChoices(), site: sitePick.value }) }));
-  const head = pageHeader({ title: 'Traffic', subtitle: node ? 'Analytics from ' + node : 'Requests, errors and blocked traffic', actions: node ? controls : null });
-  ctx.root.append(...[head, nodeNotice(node), body].filter(Boolean));
-  if (!node || !state.nodes.length) {
-    body.appendChild(noNodes());
-    return undefined;
+  const head = pageHeader({ title: 'Traffic', actions: controls });
+  let cleanup = null;
+
+  // Builds every panel for the chosen node; a node change tears the old set down first.
+  // Without a chosen node nothing is requested or polled, because this screen also writes (export, block, backups).
+  function mount() {
+    if (cleanup) cleanup();
+    cleanup = null;
+    body.replaceChildren();
+    const target = node;
+    controls.hidden = !target;
+    if (!target) {
+      body.appendChild(state.nodes.length ? chooseNodeNotice() : noNodes());
+      return;
+    }
+    const n = nodeApi(target);
+    sitePick.replaceChildren(h('option', { value: '' }, 'All sites'));
+    n.get('/sites').then((sites) => {
+      if (target !== node) return;
+      for (const site of sites) sitePick.appendChild(h('option', { value: site.id }, site.name));
+    }, () => {});
+    const siteId = () => sitePick.value;
+
+    const analytics = h('div', {});
+    body.append(analytics);
+    reload = loadInto(analytics, async () => {
+      const q = { window: win, site: siteId() };
+      const [summary, series] = await Promise.all([n.get('/analytics/summary' + qs(q)), n.get('/analytics/timeseries' + qs(q))]);
+      return { summary, series };
+    }, renderAnalytics, { skeleton: () => h('div', { class: 'stack' }, skeletonCards(4), skeletonBlock(300)) });
+
+    const botsHost = h('div', {});
+    body.append(botsHost);
+    reloadBots = loadInto(botsHost, () => n.get('/analytics/bots' + qs({ window: win, site: siteId() })), botsPanel, { skeleton: botsSkeleton });
+    topEx = topExplorer(target, () => ({ window: win, site: siteId() }));
+    storageBox = storageCard(target);
+    body.append(topEx.el, storageBox.el);
+
+    log = liveLog(target, siteId);
+    body.append(log.el);
+    const current = log;
+    cleanup = () => current.stop();
   }
 
-  const n = nodeApi(node);
-  n.get('/sites').then((sites) => {
-    for (const site of sites) sitePick.appendChild(h('option', { value: site.id }, site.name));
-  }, () => {});
-  const siteId = () => sitePick.value;
-
-  body.append(analytics);
-  reload = loadInto(analytics, async () => {
-    const q = { window: win, site: siteId() };
-    const [summary, series] = await Promise.all([n.get('/analytics/summary' + qs(q)), n.get('/analytics/timeseries' + qs(q))]);
-    return { summary, series };
-  }, renderAnalytics, { skeleton: () => h('div', { class: 'stack' }, skeletonCards(4), skeletonBlock(300)) });
-
-  const botsHost = h('div', {});
-  body.append(botsHost);
-  reloadBots = loadInto(botsHost, () => n.get('/analytics/bots' + qs({ window: win, site: siteId() })), botsPanel, { skeleton: botsSkeleton });
-  topEx = topExplorer(node, () => ({ window: win, site: siteId() }));
-  storageBox = storageCard(node);
-  body.append(topEx.el, storageBox.el);
-
-  log = liveLog(node, siteId);
-  body.append(log.el);
   sitePick.addEventListener('change', () => {
     reloadPanels();
     log.refresh();
   });
-  return () => log.stop();
+  const scope = state.nodes.length
+    ? nodeScopeBar({
+      nodes: state.nodes,
+      selected: node,
+      onChange: (name) => {
+        node = name;
+        rememberScope('traffic', state, name);
+        mount();
+      },
+    })
+    : null;
+  ctx.root.append(...[head, scope, body].filter(Boolean));
+  mount();
+  return () => {
+    if (cleanup) cleanup();
+  };
 }

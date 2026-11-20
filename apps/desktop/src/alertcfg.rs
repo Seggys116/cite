@@ -22,6 +22,7 @@ pub fn event_label(event: AlertEvent) -> &'static str {
         AlertEvent::DeploySucceeded => "A deploy succeeds",
         AlertEvent::CertExpiring => "A certificate is about to expire",
         AlertEvent::NodeError => "The node reports an error",
+        AlertEvent::BackupFailed => "A database backup or its S3 copy fails",
     }
 }
 
@@ -966,6 +967,30 @@ mod tests {
         assert_eq!(e, [AlertEvent::SiteUnhealthy]);
         assert_eq!(events_text(&[]), "Every event");
         assert_eq!(events_text(&e), "A site becomes unhealthy");
+    }
+
+    #[test]
+    fn a_failed_backup_is_an_alert_event_the_settings_list() {
+        // The alert panel lists every event of AlertEvent::ALL with its label, so a labelled BackupFailed shows in it.
+        assert!(AlertEvent::ALL.contains(&AlertEvent::BackupFailed));
+        for event in AlertEvent::ALL {
+            assert!(!event_label(event).is_empty(), "{event:?}");
+        }
+        assert_eq!(
+            event_label(AlertEvent::BackupFailed),
+            "A database backup or its S3 copy fails"
+        );
+        assert_eq!(
+            event_from_wire("backup_failed"),
+            Some(AlertEvent::BackupFailed)
+        );
+        let mut chosen = Vec::new();
+        toggle_event(&mut chosen, AlertEvent::BackupFailed);
+        assert_eq!(wire_events(&chosen), ["backup_failed"]);
+        assert_eq!(
+            events_text(&chosen),
+            "A database backup or its S3 copy fails"
+        );
     }
 
     #[test]

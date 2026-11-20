@@ -12,7 +12,7 @@ Compose-level settings live in `.env` (copy `.env.example`). `.env` is gitignore
 | `CITE_GITHUB_TOKEN` | — | **required**, PAT with `contents:read`; passed to the manager only |
 | `CITE_BRANCH` | `main` | |
 | `CITE_POLL_INTERVAL` | `5m` | `1m`…`1d`, or `off` |
-| `CITE_VERSION` | `0.4.1` | Image tag shared by manager + executor |
+| `CITE_VERSION` | `0.5.0` | Image tag shared by manager + executor |
 | `CITE_NODE` | `22` | `22` or `24` — selects image pair |
 | `CITE_PORT` | `8080` | Host published port (container always `:8080`) |
 | `CITE_BIND` | `0.0.0.0` | Host bind address |
@@ -95,6 +95,45 @@ Both files are optional (`required: false`). The manager and executor pass every
 
 Builds run with a cleared environment plus these variables, so `CITE_GITHUB_TOKEN` never reaches build code. The executor is never given the PAT. Do not put the PAT in `build.env` or `runtime.env`.
 
+## Site data services (node mode)
+
+These settings belong to the node stack, not to the single-site compose file. The feature is described in [Site data services](data.md). The orchestrator overlay sets the connector and Docker proxy values; `.env` supplies the rest.
+
+**Compose / `.env`**
+
+| Var | Default | Notes |
+|---|---|---|
+| `CITE_DATA` | `true` | `false` makes the Docker proxy refuse every data container, volume and network (`CITE_PROXY_DATA`). |
+| `CITE_DATA_S3_ALLOW_PRIVATE` | `false` | Passed to the connector. `true` lets backup targets use RFC 1918, IPv6 ULA (fc00::/7) and CGNAT (100.64.0.0/10) addresses, and plain http to those addresses only. Loopback, link-local (including 169.254.169.254) and other reserved addresses stay refused. |
+| `CITE_DATA_JOB_TIMEOUT` | `21600` | Passed to the connector. Seconds a single database job may run. |
+| `CITE_SECRETS_KEY_FILE` | empty | Passed to the connector by `docker-compose.node.yml` and the overlay. Path of a node key file you mount into the connector; empty uses the managed `/conf/secrets.key`. |
+
+**Connector**
+
+| Var | Default | Notes |
+|---|---|---|
+| `CITE_DATA_BACKUP_DIR` | unset | Absolute directory of the backup volume inside the connector (`/backups` in the overlay). Data services run only when it is set and the orchestrator is on. No `..` or control characters. |
+| `CITE_DATA_BACKUP_VOLUME` | `cite-backups` | Name of the Docker volume behind that directory, so jobs can mount a subpath of it. Lowercase letters, digits, `_`, `.` and `-`, at most 63 characters. Must equal the proxy's `CITE_PROXY_BACKUP_VOLUME`. |
+| `CITE_DATA_S3_ALLOW_PRIVATE` | `false` | `true`, `false` or the other boolean spellings. Allows RFC 1918, ULA and CGNAT addresses (and http to them) for backup targets; loopback, link-local, unspecified, multicast and reserved addresses stay refused. It does not change site S3 attachments. |
+| `CITE_DATA_JOB_TIMEOUT` | `21600` | 60 to 86400 seconds a database job (dump, restore, count) may run. |
+| `CITE_SECRETS_KEY` | unset | The node key, `cite-key-v1:` and 43 base64url characters. Wins over `CITE_SECRETS_KEY_FILE`. A malformed value stops the connector at start without printing it. |
+| `CITE_SECRETS_KEY_FILE` | unset | Path of a file holding the key (at most 1024 bytes). A mode wider than 0600 logs a warning. With neither variable the connector uses `/conf/secrets.key` and creates it on first start. |
+| `CITE_SECRETS_KEY_PREVIOUS`, `CITE_SECRETS_KEY_PREVIOUS_FILE` | unset | The key before a rotation, so files and backups sealed under it can be read and re-sealed. Remove it once the connector logs that it is no longer needed. |
+
+**Docker proxy**
+
+| Var | Default | Notes |
+|---|---|---|
+| `CITE_PROXY_DATA` | `true` | `true` or `false` (nothing else). `false` refuses all data names. |
+| `CITE_PROXY_BACKUP_VOLUME` | `cite-backups` | Plain volume name that matches no Cite container, volume or network pattern. |
+
+**Egress proxy** (`cite-egress`, set by the connector in the proxy's create body; you do not set these by hand)
+
+| Var | Notes |
+|---|---|
+| `CITE_EGRESS_FORWARDS` | `<listen>=<host>:<port>,...`: 1 to 8 TCP forwards. Listen ports 15432 to 15439, each once; a destination is a lowercase host name, a dotted IPv4 address or a bracketed IPv6 address, and appears once. Each connection is checked like an HTTP `CONNECT`. A forward closes after 30 minutes without traffic. |
+| `CITE_EGRESS_AUTO_ALLOW` | Up to 16 plain lowercase host names. They satisfy `CITE_EGRESS_MODE=allowlist` and never open a private address. |
+
 ## Executor image
 
 `docker-compose.yml` runs `cite-executor-node`. For Bun or static-only sites, add a `docker-compose.override.yml` next to it (Compose loads it automatically):
@@ -102,7 +141,7 @@ Builds run with a cleared environment plus these variables, so `CITE_GITHUB_TOKE
 ```yaml
 services:
   executor:
-    image: ghcr.io/seggys116/cite-executor-static:${CITE_VERSION:-0.4.1}
+    image: ghcr.io/seggys116/cite-executor-static:${CITE_VERSION:-0.5.0}
 ```
 
 Use `cite-executor-bun` for Bun sites. Both images set `CITE_RUNTIME` themselves.

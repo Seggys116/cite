@@ -506,6 +506,7 @@ fn site(id: &str) -> Site {
         volumes: Vec::new(),
         outbound: true,
         outbound_rules: Default::default(),
+        data: Default::default(),
     }
 }
 
@@ -1395,6 +1396,101 @@ async fn analytics_facets_and_compare_relay_the_whole_query_and_refuse_writes() 
     }
     let anonymous = get_path(&h.app, "/api/v1/nodes/edge-1/analytics/facets", &[]).await;
     assert_eq!(anonymous.status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn transfer_routes_need_a_session_validate_plans_and_refuse_overlaps() {
+    let fake = new_fake(NODE_TOKEN);
+    let url = spawn_fake(fake).await;
+    let h = harness_with_nodes(&[
+        ("edge-1", url.as_str(), NODE_TOKEN),
+        ("edge-2", url.as_str(), NODE_TOKEN),
+    ]);
+    let anon = get_path(&h.app, "/api/v1/transfers", &[]).await;
+    assert_eq!(anon.status, StatusCode::UNAUTHORIZED);
+    let s = login(&h).await;
+    let list = get_path(&h.app, "/api/v1/transfers", &s.headers()).await;
+    assert_eq!(list.status, StatusCode::OK, "{}", list.text());
+    assert_eq!(list.json(), json!([]));
+
+    let plan = |source: &str, target: &str, site: &str| json!({ "source_node": source, "target_node": target, "site": site, "database": "app" });
+    let create = |body: Value| {
+        let (app, headers) = (h.app.clone(), s.headers());
+        async move { send_json(&app, Method::POST, "/api/v1/transfers", &headers, body).await }
+    };
+    // Bad plans are refused before anything is stored.
+    for body in [
+        plan("edge-1", "edge-1", "shop"),
+        plan("edge-1", "edge-2", "Bad Site"),
+        json!({ "source_node": "edge-1", "target_node": "edge-2", "site": "shop", "database": "ext:billing" }),
+        json!({ "source_node": "edge-1", "target_node": "edge-2", "site": "shop", "database": "app", "extra": 1 }),
+    ] {
+        let reply = create(body.clone()).await;
+        assert_eq!(
+            reply.status,
+            StatusCode::BAD_REQUEST,
+            "{body}: {}",
+            reply.text()
+        );
+    }
+    let reply = create(plan("edge-1", "nowhere", "shop")).await;
+    assert_eq!(reply.status, StatusCode::NOT_FOUND, "{}", reply.text());
+    let none = get_path(&h.app, "/api/v1/transfers", &s.headers()).await;
+    assert_eq!(
+        none.json(),
+        json!([]),
+        "a refused plan leaves nothing behind"
+    );
+
+    // A good plan is accepted and visible; a second one for the same database and node is a conflict.
+    let first = create(plan("edge-1", "edge-2", "shop")).await;
+    assert_eq!(first.status, StatusCode::ACCEPTED, "{}", first.text());
+    let view = first.json();
+    let id = view["id"].as_str().expect("id").to_string();
+    assert_eq!(view["plan"]["database"], "pg:app");
+    assert!(view.get("running").is_some() && view.get("awaiting_operator").is_some());
+    let again = create(plan("edge-1", "edge-2", "shop")).await;
+    assert_eq!(again.status, StatusCode::CONFLICT, "{}", again.text());
+    let shared_target = create(plan("edge-2", "edge-1", "shop")).await;
+    assert_eq!(
+        shared_target.status,
+        StatusCode::ACCEPTED,
+        "another direction uses other nodes first: {}",
+        shared_target.text()
+    );
+    let overlap_target = create(plan("edge-1", "edge-2", "shop")).await;
+    assert_eq!(overlap_target.status, StatusCode::CONFLICT);
+
+    let one = get_path(&h.app, &format!("/api/v1/transfers/{id}"), &s.headers()).await;
+    assert_eq!(one.status, StatusCode::OK);
+    assert_eq!(one.json()["id"], id.as_str());
+    let all = get_path(&h.app, "/api/v1/transfers", &s.headers()).await;
+    assert!(!all.json().as_array().unwrap().is_empty());
+
+    // Unknown ids are 404 on every route.
+    let missing = get_path(&h.app, "/api/v1/transfers/nope", &s.headers()).await;
+    assert_eq!(missing.status, StatusCode::NOT_FOUND);
+    for action in ["resume", "cancel", "cutover", "rollback"] {
+        let reply = send_json(
+            &h.app,
+            Method::POST,
+            &format!("/api/v1/transfers/nope/{action}"),
+            &s.headers(),
+            json!({}),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::NOT_FOUND, "{action}");
+    }
+    // Writes need the csrf token like every other route.
+    let no_csrf = send_json(
+        &h.app,
+        Method::POST,
+        "/api/v1/transfers",
+        &[("cookie", s.cookie.as_str())],
+        plan("edge-1", "edge-2", "blog"),
+    )
+    .await;
+    assert_eq!(no_csrf.status, StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]

@@ -4,7 +4,6 @@ use std::time::Instant;
 use cite_edge::auth::{Credentials, hash_password};
 use cite_edge::model::LogEvent;
 use cite_edge::totp;
-use reqwest::Client;
 use serde_json::{Value, json};
 
 use super::*;
@@ -57,7 +56,7 @@ async fn perf_api_500_sites() {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
     let task = tokio::spawn(serve(listener, state, None));
-    let http = Client::new();
+    let http = cite_tls::client_builder().build().expect("client");
     let url = |path: &str| format!("http://{addr}/api/v1{path}");
     let code = totp::code_at(SECRET, now_unix()).expect("code");
     let login: Value = http

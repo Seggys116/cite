@@ -14,12 +14,13 @@ use crate::certs::{
     is_custom_source, parse_port, parse_range_list, ranges_summary, ranges_text, sans_text,
     short_fingerprint, uncovered_note, uploaded_text, validity_text, zone_lock_help,
 };
-use crate::scope::{Sequence, foreign_notice};
+use crate::scope::Sequence;
 use crate::theme::{BORDER, DIM, MONO, ROW_RADIUS, Tone, c};
 use crate::ui::input::TextInput;
+use crate::ui::nodescope::{failed_on, no_node_text, on_node};
 use crate::ui::widgets::{
     BtnKind, Col, btn, btn_off, card, checkbox, clip, field, id, mono, notice, pill, seg_item,
-    seg_row, skeleton, strong, table, text_dim,
+    seg_row, skeleton, strong, table, text_dim, tip,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -101,10 +102,10 @@ impl State {
 }
 
 // Shown when a node answers the certificate routes with 404, 405 or 501.
-fn needs_update(title: &str, subtitle: &str, text: &str) -> AnyElement {
+fn needs_update(title: &str, text: &str) -> AnyElement {
     card(
         Some(title),
-        Some(subtitle),
+        None,
         div()
             .flex()
             .items_center()
@@ -123,9 +124,14 @@ fn op_error(err: &ClientError) -> String {
     }
 }
 
+// The shared delete wording, with the node the files are removed from named instead of "the node".
+fn delete_confirm(node: &str, name: &str, covers: &[String]) -> String {
+    delete_message(name, covers).replacen("from the node?", &format!("from {node}?"), 1)
+}
+
 impl Console {
     pub fn load_certs(&mut self, cx: &mut Context<Self>) {
-        let Some(h) = self.active_handle() else {
+        let Some(h) = self.settings_handle() else {
             self.certs.list = Load::Idle;
             self.certs.ranges = Load::Idle;
             return;
@@ -198,6 +204,7 @@ impl Console {
     fn run_cert_op<T, F>(
         &mut self,
         cx: &mut Context<Self>,
+        node: &str,
         card: Card,
         busy: CertBusy,
         fut: F,
@@ -210,22 +217,31 @@ impl Console {
             return;
         }
         let noun = busy.noun();
+        let name = node.to_string();
         self.certs.busy = busy;
         self.certs.note = None;
         self.certs.ranges_note = None;
-        self.fetch_origin(cx, fut, move |this, res, here, origin, cx| {
-            // Only one operation runs at a time, so the lock is released wherever the user is now.
-            this.certs.busy = CertBusy::Idle;
-            match (res, here) {
-                (Ok(v), true) => done(this, v, cx),
-                (Err(e), true) => this.cert_note(card, op_error(&e), Tone::Bad),
-                (Ok(_), false) => this.say(foreign_notice(&noun, origin, "done"), Tone::Ok),
-                (Err(e), false) => {
-                    this.say(foreign_notice(&noun, origin, &op_error(&e)), Tone::Bad)
+        self.fetch_on(
+            cx,
+            node,
+            Self::settings_node,
+            fut,
+            move |this, res, here, cx| {
+                // Only one operation runs at a time, so the lock is released wherever the user is now.
+                this.certs.busy = CertBusy::Idle;
+                match (res, here) {
+                    (Ok(v), true) => done(this, v, cx),
+                    (Err(e), true) => {
+                        this.cert_note(card, failed_on(&noun, &name, &op_error(&e)), Tone::Bad)
+                    }
+                    (Ok(_), false) => {
+                        this.say(on_node(&format!("{noun} finished"), &name), Tone::Ok)
+                    }
+                    (Err(e), false) => this.say(failed_on(&noun, &name, &op_error(&e)), Tone::Bad),
                 }
-            }
-            cx.notify();
-        });
+                cx.notify();
+            },
+        );
     }
 
     // The key is dropped from every input when the panel closes, whether or not the upload worked.
@@ -255,7 +271,7 @@ impl Console {
         self.certs.files = false;
         self.certs.note = None;
         self.certs.panel = Some(Panel::Upload {
-            node: self.active_name().unwrap_or_default(),
+            node: self.settings_node().unwrap_or_default(),
         });
     }
 
@@ -269,7 +285,7 @@ impl Console {
         let name = item.name.clone();
         self.certs.name.update(cx, |i, cx| i.set_text(&name, cx));
         self.certs.panel = Some(Panel::Replace {
-            node: self.active_name().unwrap_or_default(),
+            node: self.settings_node().unwrap_or_default(),
             id: item.id.clone(),
             name,
         });
@@ -293,10 +309,11 @@ impl Console {
         if !self.certs.busy.is_idle() {
             return;
         }
-        let (Some(panel), Some(h)) = (self.certs.panel.clone(), self.active_handle()) else {
+        let (Some(panel), Some(h)) = (self.certs.panel.clone(), self.settings_handle()) else {
             return;
         };
-        if let Err(msg) = ensure_same_node(panel.node(), self.active_name().as_deref()) {
+        let node = h.name().to_string();
+        if let Err(msg) = ensure_same_node(panel.node(), Some(&node)) {
             self.close_panel(cx);
             self.cert_note(Card::Certs, msg, Tone::Bad);
             return;
@@ -321,10 +338,11 @@ impl Console {
                 None => h.certificate_upload(&req).await,
             }
         };
-        self.run_cert_op(cx, Card::Certs, busy, fut, move |this, out, cx| {
+        let named = node.clone();
+        self.run_cert_op(cx, &node, Card::Certs, busy, fut, move |this, out, cx| {
             this.clear_inputs(ClearOn::Success, cx);
             this.certs.panel = None;
-            let done = uploaded_text(&out.cert.name, replaced);
+            let done = on_node(&uploaded_text(&out.cert.name, replaced), &named);
             match out.warning {
                 Some(warning) => {
                     this.cert_note(Card::Certs, format!("{done} {warning}"), Tone::Warn)
@@ -339,28 +357,31 @@ impl Console {
         if item.read_only() {
             return;
         }
-        let asked_on = self.active_name().unwrap_or_default();
+        let Some(node) = self.settings_node() else {
+            return;
+        };
         self.ask(Confirm {
             title: "Delete certificate".into(),
-            message: delete_message(&item.name, &item.covers),
+            message: delete_confirm(&node, &item.name, &item.covers),
             label: "Delete".into(),
             danger: true,
             action: Box::new(move |this, cx| {
-                let Some(h) = this.active_handle() else {
+                // The confirmation named this node, so the write goes to it whatever is shown now.
+                let Some(h) = this.handle_named(&node) else {
+                    this.cert_note(Card::Certs, no_node_text(Some(&node)), Tone::Bad);
                     return;
                 };
-                if let Err(msg) = ensure_same_node(&asked_on, this.active_name().as_deref()) {
-                    this.cert_note(Card::Certs, msg, Tone::Bad);
-                    return;
-                }
                 let (cert_id, label) = (item.id.clone(), item.name.clone());
+                let named = node.clone();
                 this.run_cert_op(
                     cx,
+                    &node,
                     Card::Certs,
                     CertBusy::Delete(item.name.clone()),
                     async move { h.certificate_delete(&cert_id).await },
                     move |this, _, cx| {
-                        this.cert_note(Card::Certs, format!("Deleted {label}."), Tone::Ok);
+                        let text = on_node(&format!("Deleted {label}."), &named);
+                        this.cert_note(Card::Certs, text, Tone::Ok);
                         this.load_certs(cx);
                     },
                 );
@@ -377,17 +398,17 @@ impl Console {
         done_text: &str,
         change: impl FnOnce(&mut EdgeSettings),
     ) {
-        let (Some(h), Some(data)) = (self.active_handle(), self.settings.data.ready()) else {
+        let (Some(h), Some(data)) = (self.settings_handle(), self.settings.data.ready()) else {
             return;
         };
-        let active = self.active_name();
+        let node = h.name().to_string();
         let mut owners = vec![self.settings.data_node.as_str()];
         if card == Card::Ranges {
             owners.push(self.certs.ranges_node.as_str());
         }
         if let Some(msg) = owners
             .into_iter()
-            .find_map(|owner| ensure_same_node(owner, active.as_deref()).err())
+            .find_map(|owner| ensure_same_node(owner, Some(&node)).err())
         {
             self.cert_note(card, msg, Tone::Bad);
             return;
@@ -398,9 +419,10 @@ impl Console {
             self.cert_note(card, e.to_string(), Tone::Bad);
             return;
         }
-        let text = done_text.to_string();
+        let text = on_node(done_text, &node);
         self.run_cert_op(
             cx,
+            &node,
             card,
             busy,
             async move { h.put_settings(&next).await },
@@ -462,7 +484,6 @@ impl Console {
         if s.unsupported {
             return needs_update(
                 "Certificates",
-                "TLS certificates the node serves over HTTPS",
                 "This node predates certificate management. Update it to use it.",
             );
         }
@@ -500,7 +521,7 @@ impl Console {
         );
         if !list.dir_ready {
             body = body.child(notice(
-                "The node cannot store certificates yet because its certificate directory is not ready. Uploads are off until it is.",
+                "The node's certificate directory is not ready, so uploads are off.",
                 Tone::Warn,
             ));
         }
@@ -522,11 +543,7 @@ impl Console {
             body = body.child(notice(text, *tone));
         }
         body = body.child(self.cert_table(list, cx));
-        let subtitle = format!(
-            "TLS certificates {} serves over HTTPS",
-            self.active_name().unwrap_or_default()
-        );
-        card(Some("Certificates"), Some(subtitle.as_str()), body).into_any_element()
+        card(Some("Certificates"), None, body).into_any_element()
     }
 
     // Without an HTTPS port the node stores certificates but serves nothing over TLS.
@@ -551,7 +568,7 @@ impl Console {
             .flex_col()
             .gap(px(10.))
             .child(notice(
-                "HTTPS is off: the node has no HTTPS port, so certificates are stored but not served. Set a port to turn it on.",
+                "HTTPS is off: the node has no HTTPS port, so certificates are stored but not served.",
                 Tone::Warn,
             ))
             .child(
@@ -713,24 +730,24 @@ impl Console {
             inputs = inputs
                 .child(field(
                     "Certificate file",
-                    Some("Full path to a PEM file with the certificate and its chain. Regular files; the certificate and key together up to 100 KiB."),
+                    Some("Full path to a PEM file with the chain; certificate and key together up to 100 KiB."),
                     s.cert_path.clone(),
                 ))
                 .child(field(
                     "Private key file",
-                    Some("Full path to the unencrypted PEM key. It is read once and sent to the node."),
+                    Some("Full path to the unencrypted PEM key."),
                     s.key_path.clone(),
                 ));
         } else {
             inputs = inputs
                 .child(field(
                     "Certificate chain",
-                    Some("PEM text: the certificate first, then any intermediates."),
+                    Some("PEM text, the certificate first."),
                     s.cert_text.clone(),
                 ))
                 .child(field(
                     "Private key",
-                    Some("Unencrypted PEM text. It is hidden here, sent once and cleared afterwards."),
+                    Some("Unencrypted PEM, sent once and cleared afterwards."),
                     s.key_text.clone(),
                 ));
         }
@@ -779,7 +796,6 @@ impl Console {
         if s.ranges_unsupported {
             return needs_update(
                 "Cloudflare ranges",
-                "Addresses trusted as Cloudflare",
                 "This node predates the Cloudflare options. Update it to use them.",
             );
         }
@@ -819,7 +835,7 @@ impl Console {
             .child(text_dim(ranges_summary(listing)).text_size(px(12.)))
             .child(field(
                 "Trusted ranges",
-                Some("One CIDR range per line. Saving a list replaces the built-in one for this node."),
+                Some("One CIDR range per line. Saving replaces the built-in list."),
                 s.ranges_input.clone(),
             ))
             .child(div().flex().gap(px(8.)).child(save).child(builtin));
@@ -831,12 +847,7 @@ impl Console {
         if let Some((text, tone)) = &s.ranges_note {
             body = body.child(notice(text, *tone));
         }
-        card(
-            Some("Cloudflare ranges"),
-            Some("Sites set to only accept traffic from Cloudflare allow just these addresses"),
-            body,
-        )
-        .into_any_element()
+        card(Some("Cloudflare ranges"), None, body).into_any_element()
     }
 }
 
@@ -855,40 +866,55 @@ pub fn access_body(controls: AccessControls, draft: AccessDraft) -> Div {
     } else {
         FULL_HELP
     };
+    // The long explanations sit in tooltips; only what prevents a mistake stays on the page.
+    let zone_row = tip(
+        div()
+            .flex()
+            .items_center()
+            .gap(px(10.))
+            .child(controls.zone_box)
+            .child(div().flex().flex_col().child(ZONE_LABEL))
+            .when(!draft.cloudflare_only, |d| d.opacity(0.5)),
+        id("access-tip", "zone"),
+        zone_lock_help(draft.cloudflare_only, draft.zone_lock),
+    );
     let mut body = div()
         .flex()
         .flex_col()
         .gap(px(12.))
-        .child(
+        .child(tip(
             div()
                 .flex()
                 .items_center()
                 .gap(px(10.))
                 .child(controls.cloudflare_box)
                 .child(div().flex().flex_col().child(PROXY_LABEL)),
-        )
-        .child(text_dim(PROXY_HELP).text_size(px(12.)))
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .gap(px(10.))
-                .child(controls.zone_box)
-                .child(div().flex().flex_col().child(ZONE_LABEL))
-                .when(!draft.cloudflare_only, |d| d.opacity(0.5)),
-        )
-        .child(text_dim(zone_lock_help(draft.cloudflare_only, draft.zone_lock)).text_size(px(12.)))
+            id("access-tip", "proxy"),
+            PROXY_HELP,
+        ))
+        .child(zone_row);
+    if !draft.cloudflare_only {
+        body = body.child(text_dim(zone_lock_help(false, draft.zone_lock)).text_size(px(12.)));
+    }
+    body = body
         .child(field(
             "HTTPS",
-            Some(help),
-            div().flex().child(controls.ssl_mode),
+            None,
+            tip(
+                div().flex().child(controls.ssl_mode),
+                id("access-tip", "https"),
+                help,
+            ),
         ))
         .child(field(
             "Bots",
             Some(bots_help(draft.bots)),
-            div().flex().child(controls.bots),
-        ))
-        .child(text_dim(BOTS_NOTE).text_size(px(11.)));
+            tip(
+                div().flex().child(controls.bots),
+                id("access-tip", "bots"),
+                BOTS_NOTE,
+            ),
+        ));
     if let Some(warning) = bots_warning(draft.bots) {
         body = body.child(notice(warning, Tone::Warn));
     }
@@ -969,5 +995,20 @@ pub fn zone_box(key: gpui::ElementId, draft: AccessDraft) -> gpui::Stateful<Div>
         boxed
     } else {
         boxed.cursor_default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_delete_confirmation_names_the_node() {
+        let text = delete_confirm("edge-fra", "shop", &[]);
+        assert!(text.contains("Delete shop from edge-fra?"), "{text}");
+        assert!(!text.contains("from the node"), "{text}");
+        let covered = delete_confirm("edge-nyc", "shop", &["shop.example.com".to_string()]);
+        assert!(covered.contains("from edge-nyc?"), "{covered}");
+        assert!(covered.contains("shop.example.com"), "{covered}");
     }
 }

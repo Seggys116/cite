@@ -3,12 +3,12 @@ use std::fmt;
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
 
-use cite_core::atomic::write_atomic_in;
 use cite_core::confined::{FileName, TrustedDir};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
+use crate::seal::{self, Keyring, OpenMode};
 use crate::store::now_rfc3339;
 use crate::{ConnectorError, Result};
 
@@ -130,6 +130,8 @@ impl fmt::Debug for Rotated {
 // Per-site secrets for Cloudflare zone locks; they are injected into the rendered config only and never enter edge.json.
 pub struct ZoneStore {
     dir: PathBuf,
+    // The node key, when the node has one: the secrets file is then sealed with it. HAProxy never reads this file; it gets the secrets in the rendered config.
+    keyring: Option<Keyring>,
     // Set when the file existed but could not be read: nothing is generated or written over it, and renders fail closed.
     broken: bool,
     secrets: Mutex<BTreeMap<String, Entry>>,
@@ -148,13 +150,16 @@ impl fmt::Debug for ZoneStore {
 
 impl ZoneStore {
     pub fn open(dir: PathBuf) -> Result<Self> {
+        // Sealed data without its key is an error here, which the caller turns into a store that fails closed.
+        let keyring = Keyring::discover(&dir, OpenMode::Migrating)?;
         let secrets = match TrustedDir::open(&dir) {
-            Ok(root) => read_file(&root)?,
+            Ok(root) => read_file(&root, keyring.as_ref())?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
             Err(e) => return Err(internal("cannot open the data directory", e)),
         };
         Ok(Self {
             dir,
+            keyring,
             broken: false,
             secrets: Mutex::new(secrets),
             #[cfg(test)]
@@ -165,6 +170,7 @@ impl ZoneStore {
     pub fn unreadable(dir: PathBuf) -> Self {
         Self {
             dir,
+            keyring: None,
             broken: true,
             secrets: Mutex::new(BTreeMap::new()),
             #[cfg(test)]
@@ -243,7 +249,7 @@ impl ZoneStore {
         let root = TrustedDir::open(&self.dir)
             .map_err(|e| internal("cannot open the data directory", e))?;
         let name = FileName::new(FILE).map_err(|e| internal("zone secret file name", e))?;
-        write_atomic_in(&root, &name, &bytes, 0o600)
+        seal::write_file(self.keyring.as_ref(), &root, &name, &bytes, 0o600)
             .map_err(|e| internal("cannot write the zone secrets", e))
     }
 
@@ -336,18 +342,20 @@ impl ZoneStore {
     }
 }
 
-fn read_file(root: &TrustedDir) -> Result<BTreeMap<String, Entry>> {
+fn read_file(root: &TrustedDir, keyring: Option<&Keyring>) -> Result<BTreeMap<String, Entry>> {
     let name = FileName::new(FILE).map_err(|e| internal("zone secret file name", e))?;
-    let bytes = match root.read_limited(&name, MAX_FILE_BYTES) {
-        Ok(b) => Zeroizing::new(b),
-        Err(cite_core::Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(BTreeMap::new());
-        }
-        Err(e) => return Err(internal("cannot read zone-secrets.json", e)),
+    let Some(read) = seal::read_file(keyring, root, &name, MAX_FILE_BYTES)? else {
+        return Ok(BTreeMap::new());
     };
     // serde errors can quote input, so the text of this one is not passed on
-    let records: BTreeMap<String, RecordIn> = serde_json::from_slice(&bytes)
+    let records: BTreeMap<String, RecordIn> = serde_json::from_slice(&read.plaintext)
         .map_err(|_| ConnectorError::Internal("zone-secrets.json is not valid".into()))?;
+    // A plaintext file from an earlier release, or one under a previous key, moves to the current key; locks work either way.
+    if let Some(keyring) = keyring
+        && let Err(e) = seal::migrate_file(keyring, root, &name, &read)
+    {
+        tracing::error!(error = %e, "zone-secrets.json could not be sealed and was left as it is");
+    }
     Ok(records
         .into_iter()
         .map(|(site, r)| {
@@ -552,5 +560,128 @@ mod tests {
             std::fs::read_to_string(dir.path().join(FILE)).unwrap(),
             "not json"
         );
+    }
+
+    fn node_key(dir: &std::path::Path) -> crate::seal::NodeKey {
+        let key = crate::seal::NodeKey::generate().unwrap();
+        let path = dir.join("secrets.key");
+        std::fs::write(&path, key.text().as_bytes()).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        key
+    }
+
+    const LEGACY: &str =
+        r#"{"a":{"secret":"legacy-secret-value","created_at":"2025-01-01T00:00:00Z"}}"#;
+
+    #[test]
+    fn with_a_node_key_the_file_is_sealed_and_survives_a_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = node_key(dir.path());
+        let store = ZoneStore::open(dir.path().to_path_buf()).unwrap();
+        let rotated = store.rotate("a").unwrap();
+        let raw = std::fs::read(dir.path().join(FILE)).unwrap();
+        assert_eq!(seal::envelope_kid(&raw), Some(key.kid()));
+        assert!(!String::from_utf8_lossy(&raw).contains(rotated.secret.as_str()));
+        let mode = std::fs::metadata(dir.path().join(FILE))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+        sync(&store, &["a", "b"]);
+        let reopened = ZoneStore::open(dir.path().to_path_buf()).unwrap();
+        assert!(holds(reopened.secret_for("a"), rotated.secret.as_str()));
+        assert!(reopened.secret_for("b").is_some());
+    }
+
+    #[test]
+    fn without_a_node_key_the_file_stays_plaintext_and_no_key_is_made() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ZoneStore::open(dir.path().to_path_buf()).unwrap();
+        let rotated = store.rotate("a").unwrap();
+        let text = std::fs::read_to_string(dir.path().join(FILE)).unwrap();
+        assert!(text.contains(rotated.secret.as_str()));
+        assert!(!dir.path().join("secrets.key").exists());
+    }
+
+    #[test]
+    fn a_plaintext_file_is_sealed_once_keeping_a_pre_seal_copy_until_the_next_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = node_key(dir.path());
+        std::fs::write(dir.path().join(FILE), LEGACY).unwrap();
+
+        let store = ZoneStore::open(dir.path().to_path_buf()).unwrap();
+        assert!(holds(store.secret_for("a"), "legacy-secret-value"));
+        let raw = std::fs::read(dir.path().join(FILE)).unwrap();
+        assert_eq!(seal::envelope_kid(&raw), Some(key.kid()));
+        let copy = dir.path().join("zone-secrets.json.pre-seal");
+        assert_eq!(std::fs::read_to_string(&copy).unwrap(), LEGACY);
+
+        let again = ZoneStore::open(dir.path().to_path_buf()).unwrap();
+        assert!(holds(again.secret_for("a"), "legacy-secret-value"));
+        assert!(!copy.exists(), "the next open removes the copy");
+    }
+
+    #[test]
+    fn a_file_under_a_previous_key_is_resealed_with_the_current_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = crate::seal::NodeKey::generate().unwrap();
+        let old_ring = Keyring::from_keys(
+            old.clone(),
+            crate::seal::KeySource::Env,
+            Vec::new(),
+            OpenMode::Migrating,
+        );
+        std::fs::write(
+            dir.path().join(FILE),
+            old_ring.seal(FILE, LEGACY.as_bytes()).unwrap(),
+        )
+        .unwrap();
+        let current = node_key(dir.path());
+        std::fs::write(
+            dir.path().join("secrets.key.previous"),
+            old.text().as_bytes(),
+        )
+        .unwrap();
+
+        let store = ZoneStore::open(dir.path().to_path_buf()).unwrap();
+        assert!(holds(store.secret_for("a"), "legacy-secret-value"));
+        let raw = std::fs::read(dir.path().join(FILE)).unwrap();
+        assert_eq!(seal::envelope_kid(&raw), Some(current.kid()));
+    }
+
+    #[test]
+    fn a_sealed_file_without_its_key_fails_to_open_and_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let stranger = Keyring::from_keys(
+            crate::seal::NodeKey::generate().unwrap(),
+            crate::seal::KeySource::Env,
+            Vec::new(),
+            OpenMode::Migrating,
+        );
+        let sealed = stranger.seal(FILE, LEGACY.as_bytes()).unwrap();
+        std::fs::write(dir.path().join(FILE), &sealed).unwrap();
+        assert!(ZoneStore::open(dir.path().to_path_buf()).is_err());
+        assert_eq!(std::fs::read(dir.path().join(FILE)).unwrap(), sealed);
+        assert!(!dir.path().join("secrets.key").exists());
+    }
+
+    #[test]
+    fn the_secrets_file_cannot_be_swapped_for_another_sealed_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = node_key(dir.path());
+        let ring = Keyring::from_keys(
+            key,
+            crate::seal::KeySource::Env,
+            Vec::new(),
+            OpenMode::Migrating,
+        );
+        std::fs::write(
+            dir.path().join(FILE),
+            ring.seal("alerts.json", LEGACY.as_bytes()).unwrap(),
+        )
+        .unwrap();
+        let err = ZoneStore::open(dir.path().to_path_buf()).err().unwrap();
+        assert!(err.to_string().contains("decrypted"), "{err}");
     }
 }

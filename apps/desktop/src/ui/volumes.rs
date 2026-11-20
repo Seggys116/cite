@@ -13,6 +13,7 @@ use crate::ui::detail::outbound::OutboundState;
 use crate::ui::input::TextInput;
 use crate::ui::widgets::{
     BtnKind, Col, btn, btn_off, card, empty_state, field, id, mono, notice, pill, table, text_dim,
+    tip,
 };
 
 // The node wrappers live here because the volume routes are used by this tab only.
@@ -98,6 +99,79 @@ pub fn undeclared<'a>(existing: &'a [VolumeInfo], declared: &[Volume]) -> Vec<&'
         .iter()
         .filter(|e| !declared.iter().any(|d| d.name == e.name))
         .collect()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VolumeKind {
+    // In the list the page edits; `saved` is false until the node has the entry.
+    Declared { saved: bool },
+    // The node keeps data for it but the list does not name it; `removal_pending` while the saved list still does.
+    Kept { removal_pending: bool },
+}
+
+// One line of the volume list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VolumeRow {
+    pub name: String,
+    pub mount_path: String,
+    pub size_bytes: Option<u64>,
+    pub created_at: Option<String>,
+    pub kind: VolumeKind,
+    // None while the node has no data for it yet.
+    pub mounted: Option<bool>,
+}
+
+// Declared volumes in the order of the list, then the data the node keeps for volumes the list no longer names.
+pub fn volume_rows(
+    declared: &[Volume],
+    saved: &[Volume],
+    existing: &[VolumeInfo],
+) -> Vec<VolumeRow> {
+    let mut rows: Vec<VolumeRow> = declared
+        .iter()
+        .map(|v| {
+            let info = existing.iter().find(|i| i.name == v.name);
+            VolumeRow {
+                name: v.name.clone(),
+                mount_path: v.mount_path.clone(),
+                size_bytes: info.and_then(|i| i.size_bytes),
+                created_at: info.and_then(|i| i.created_at.clone()),
+                kind: VolumeKind::Declared {
+                    saved: saved.contains(v),
+                },
+                mounted: info.map(|i| i.mounted),
+            }
+        })
+        .collect();
+    rows.extend(
+        undeclared(existing, declared)
+            .into_iter()
+            .map(|i| VolumeRow {
+                name: i.name.clone(),
+                mount_path: i.mount_path.clone(),
+                size_bytes: i.size_bytes,
+                created_at: i.created_at.clone(),
+                kind: VolumeKind::Kept {
+                    removal_pending: saved.iter().any(|s| s.name == i.name),
+                },
+                mounted: Some(i.mounted),
+            }),
+    );
+    rows
+}
+
+// The pills of a row: whether the site lists the volume, and whether a container has it mounted.
+pub fn volume_pills(row: &VolumeRow) -> Vec<(&'static str, Tone)> {
+    let mount = match row.mounted {
+        Some(true) => ("mounted", Tone::Ok),
+        Some(false) => ("not mounted", Tone::Muted),
+        None => ("no data yet", Tone::Muted),
+    };
+    match row.kind {
+        VolumeKind::Declared { saved: false } => vec![("unsaved", Tone::Warn)],
+        VolumeKind::Declared { saved: true } => vec![("declared", Tone::Info), mount],
+        VolumeKind::Kept { .. } => vec![("not declared", Tone::Warn), mount],
+    }
 }
 
 // The edited list while there is one, otherwise what the node has saved.
@@ -211,13 +285,14 @@ impl Console {
             return;
         };
         let shown = name.clone();
+        let node = self.detail.node.clone();
         let fut = async move { h.vol_delete(&site, &name).await };
         self.ops_action(cx, "Volume data", fut, move |_| {
-            format!("The data of volume {shown} was deleted")
+            format!("The data of volume {shown} was deleted on {node}")
         });
     }
 
-    // The declared volumes with their live state, the add row, and the data kept for volumes no longer declared.
+    // One list of every volume: the declared ones with their live state, then the data kept for volumes no longer declared, and the add row.
     pub(crate) fn volumes_tab(
         &self,
         data: &Data,
@@ -232,51 +307,82 @@ impl Console {
         };
         let busy = self.detail.busy || self.ops.busy;
         let now = now_ms();
+        let node = self.detail.node.clone();
         let mut rows: Vec<Vec<AnyElement>> = Vec::new();
-        for vol in &declared {
-            let info = existing.iter().find(|i| i.name == vol.name);
-            let saved = data
-                .site
-                .volumes
-                .iter()
-                .any(|s| s.name == vol.name && s.mount_path == vol.mount_path);
-            let state = match (saved, info) {
-                (false, _) => pill("unsaved", Tone::Warn),
-                (true, Some(i)) if i.mounted => pill("mounted", Tone::Ok),
-                (true, Some(_)) => pill("not mounted", Tone::Muted),
-                (true, None) => pill("new", Tone::Info),
-            };
-            let name = vol.name.clone();
-            let remove = if busy {
-                btn_off("Remove").into_any_element()
-            } else {
-                btn(id("vol-remove", &vol.name), "Remove", BtnKind::Plain)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.volume_remove(&name, cx);
-                        cx.notify();
-                    }))
+        for row in volume_rows(&declared, &data.site.volumes, existing) {
+            let kept = matches!(row.kind, VolumeKind::Kept { .. });
+            let mut pills = div().flex().flex_wrap().gap(px(4.));
+            for (i, (text, tone)) in volume_pills(&row).into_iter().enumerate() {
+                let badge = pill(text, tone);
+                pills = pills.child(if kept && i == 0 {
+                    tip(
+                        badge,
+                        id("vol-kept-tip", &row.name),
+                        "The site no longer lists it. Its data stays on the node until you delete it.",
+                    )
                     .into_any_element()
+                } else {
+                    badge.into_any_element()
+                });
+            }
+            let name = row.name.clone();
+            let action = match row.kind {
+                _ if busy => btn_off(if kept { "Delete" } else { "Remove" }).into_any_element(),
+                VolumeKind::Declared { .. } => {
+                    btn(id("vol-remove", &row.name), "Remove", BtnKind::Plain)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.volume_remove(&name, cx);
+                            cx.notify();
+                        }))
+                        .into_any_element()
+                }
+                VolumeKind::Kept {
+                    removal_pending: true,
+                } => text_dim("Kept after you save")
+                    .text_size(px(11.))
+                    .into_any_element(),
+                VolumeKind::Kept {
+                    removal_pending: false,
+                } => {
+                    let node = node.clone();
+                    btn(id("vol-delete", &row.name), "Delete", BtnKind::Danger)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let victim = name.clone();
+                            this.ask(Confirm {
+                                title: format!("Delete volume data on {node}"),
+                                message: format!(
+                                    "Permanently delete everything stored in {victim} on {node}? This cannot be undone."
+                                ),
+                                label: "Delete data".into(),
+                                danger: true,
+                                action: Box::new(move |this, cx| this.volume_delete(victim, cx)),
+                            });
+                            cx.notify();
+                        }))
+                        .into_any_element()
+                }
+            };
+            let path = if row.mount_path.is_empty() {
+                "-".to_string()
+            } else {
+                row.mount_path.clone()
             };
             rows.push(vec![
-                mono(vol.name.clone()).into_any_element(),
-                mono(vol.mount_path.clone()).into_any_element(),
-                text_dim(size_text(info.and_then(|i| i.size_bytes))).into_any_element(),
-                state.into_any_element(),
-                text_dim(created_text(
-                    info.and_then(|i| i.created_at.as_deref()),
-                    now,
-                ))
-                .into_any_element(),
-                remove,
+                mono(row.name.clone()).into_any_element(),
+                mono(path).into_any_element(),
+                text_dim(size_text(row.size_bytes)).into_any_element(),
+                pills.into_any_element(),
+                text_dim(created_text(row.created_at.as_deref(), now)).into_any_element(),
+                action,
             ]);
         }
         let cols = [
-            Col::fixed("Name", 150.),
+            Col::fixed("Name", 140.),
             Col::flex("Mount path"),
-            Col::fixed("Size", 90.),
-            Col::fixed("State", 110.),
-            Col::fixed("Created", 110.),
-            Col::fixed("", 90.),
+            Col::fixed("Size", 80.),
+            Col::fixed("State", 190.),
+            Col::fixed("Created", 100.),
+            Col::fixed("", 110.),
         ];
         let mut list = div().flex().flex_col().gap(px(14.));
         if let Some(Err(e)) = &v.existing {
@@ -327,71 +433,15 @@ impl Console {
                     .text_color(crate::theme::c(Tone::Bad.color())),
             );
         }
-        list = list.child(
-            text_dim("Data in a volume survives redeploys and rollbacks. Both slots mount the same volumes, so the idle slot sees what the live one wrote. Changes apply on the next deploy.")
-                .text_size(px(11.)),
-        );
-        let mut out = vec![
+        vec![
             card(
                 Some("Persistent volumes"),
-                Some("Folders whose files are kept outside the build"),
+                Some("Data in a volume survives redeploys and rollbacks."),
                 list,
             )
             .into_any_element(),
-        ];
-        let kept = undeclared(existing, &declared);
-        if !kept.is_empty() {
-            let mut kept_rows: Vec<Vec<AnyElement>> = Vec::new();
-            for info in kept {
-                let pending = data.site.volumes.iter().any(|s| s.name == info.name);
-                let name = info.name.clone();
-                let action = if pending {
-                    text_dim("Kept after you save")
-                        .text_size(px(11.))
-                        .into_any_element()
-                } else if busy {
-                    btn_off("Delete data").into_any_element()
-                } else {
-                    btn(id("vol-delete", &info.name), "Delete data", BtnKind::Danger)
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            let victim = name.clone();
-                            this.ask(Confirm {
-                                title: "Delete volume data".into(),
-                                message: format!(
-                                    "Permanently delete everything stored in {victim}? This cannot be undone."
-                                ),
-                                label: "Delete data".into(),
-                                danger: true,
-                                action: Box::new(move |this, cx| this.volume_delete(victim, cx)),
-                            });
-                            cx.notify();
-                        }))
-                        .into_any_element()
-                };
-                kept_rows.push(vec![
-                    mono(info.name.clone()).into_any_element(),
-                    text_dim(size_text(info.size_bytes)).into_any_element(),
-                    text_dim(created_text(info.created_at.as_deref(), now)).into_any_element(),
-                    action,
-                ]);
-            }
-            let kept_cols = [
-                Col::flex("Name"),
-                Col::fixed("Size", 90.),
-                Col::fixed("Created", 110.),
-                Col::fixed("", 140.),
-            ];
-            out.push(
-                card(
-                    Some("Data kept without a volume"),
-                    Some("Removing a volume from the list keeps its data on the node until you delete it here."),
-                    table(&kept_cols, kept_rows, None),
-                )
-                .into_any_element(),
-            );
-        }
-        out.push(bar);
-        out
+            bar,
+        ]
     }
 }
 
@@ -614,6 +664,97 @@ mod tests {
         ))));
         assert!(!source_serves(Some(&source(None, Some("static")))));
         assert!(!source_serves(None));
+    }
+
+    fn stored(name: &str, path: &str, size: Option<u64>, mounted: bool) -> VolumeInfo {
+        VolumeInfo {
+            name: name.into(),
+            mount_path: path.into(),
+            size_bytes: size,
+            mounted,
+            created_at: None,
+            declared: true,
+        }
+    }
+
+    #[test]
+    fn the_list_has_one_row_per_volume_declared_ones_first() {
+        let saved = vec![vol("data", "/data"), vol("cache", "/cache")];
+        // "cache" was dropped from the edited list; "old" is data the node keeps from an earlier list.
+        let declared = vec![vol("data", "/data"), vol("uploads", "/uploads")];
+        let existing = vec![
+            stored("old", "", Some(10), false),
+            stored("data", "/data", Some(2048), true),
+            stored("cache", "/cache", Some(5), true),
+        ];
+        let rows = volume_rows(&declared, &saved, &existing);
+        let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, vec!["data", "uploads", "old", "cache"]);
+        assert_eq!(rows[0].kind, VolumeKind::Declared { saved: true });
+        assert_eq!(rows[0].size_bytes, Some(2048));
+        assert_eq!(rows[0].mounted, Some(true));
+        // Not saved yet, so the node knows nothing about it.
+        assert_eq!(rows[1].kind, VolumeKind::Declared { saved: false });
+        assert_eq!(rows[1].mounted, None);
+        assert_eq!(
+            rows[2].kind,
+            VolumeKind::Kept {
+                removal_pending: false
+            }
+        );
+        // Dropped from the edited list but still in the saved one: the data is kept after the save.
+        assert_eq!(
+            rows[3].kind,
+            VolumeKind::Kept {
+                removal_pending: true
+            }
+        );
+        assert_eq!(rows[3].mount_path, "/cache");
+    }
+
+    #[test]
+    fn a_changed_mount_path_counts_as_unsaved() {
+        let saved = vec![vol("data", "/data")];
+        let rows = volume_rows(&[vol("data", "/srv/data")], &saved, &[]);
+        assert_eq!(rows[0].kind, VolumeKind::Declared { saved: false });
+    }
+
+    #[test]
+    fn pills_say_whether_the_site_lists_the_volume_and_whether_it_is_mounted() {
+        let row = |kind, mounted| VolumeRow {
+            name: "data".into(),
+            mount_path: "/data".into(),
+            size_bytes: None,
+            created_at: None,
+            kind,
+            mounted,
+        };
+        let declared = VolumeKind::Declared { saved: true };
+        assert_eq!(
+            volume_pills(&row(declared, Some(true))),
+            vec![("declared", Tone::Info), ("mounted", Tone::Ok)]
+        );
+        assert_eq!(
+            volume_pills(&row(declared, Some(false))),
+            vec![("declared", Tone::Info), ("not mounted", Tone::Muted)]
+        );
+        assert_eq!(
+            volume_pills(&row(declared, None)),
+            vec![("declared", Tone::Info), ("no data yet", Tone::Muted)]
+        );
+        assert_eq!(
+            volume_pills(&row(VolumeKind::Declared { saved: false }, None)),
+            vec![("unsaved", Tone::Warn)]
+        );
+        assert_eq!(
+            volume_pills(&row(
+                VolumeKind::Kept {
+                    removal_pending: false
+                },
+                Some(false)
+            )),
+            vec![("not declared", Tone::Warn), ("not mounted", Tone::Muted)]
+        );
     }
 
     #[test]

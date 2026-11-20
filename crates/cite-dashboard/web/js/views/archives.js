@@ -5,7 +5,7 @@ import {
   formatError, fmtBytes, fmtInt,
 } from '../ui.js';
 import {
-  MAX_RETENTION_DAYS, SUPPORT_NOTE, DELETE_WARNING, archivePath, buildCutRequest, canRunCut, cutKey, describeCut, describePreview,
+  MAX_RETENTION_DAYS, SUPPORT_NOTE, archivePath, buildCutRequest, canRunCut, cutKey, describeCut, describePreview,
   entryView, isUnsupported, sortEntries,
 } from '../archivelib.js';
 
@@ -37,11 +37,13 @@ export function openCutDialog({ node, onDone }) {
   const daysIn = h('input', { class: 'input mono', type: 'number', min: '1', max: String(MAX_RETENTION_DAYS), inputmode: 'numeric', 'aria-label': 'Cut data older than this many days' });
   daysIn.value = form.days;
   const dateIn = h('input', { class: 'input', type: 'date', max: today(), 'aria-label': 'Cut data before this date' });
-  const daysField = field('Older than (days)', daysIn, `Whole days from 1 to ${MAX_RETENTION_DAYS}.`);
-  const dateField = field('Before this date', dateIn, 'Data from earlier days is cut; the day itself stays.');
+  daysIn.title = `Whole days from 1 to ${MAX_RETENTION_DAYS}.`;
+  dateIn.title = 'Data from earlier days is cut; the day itself stays.';
+  const daysField = field('Older than (days)', daysIn);
+  const dateField = field('Before this date', dateIn);
   const archiveIn = h('input', { type: 'checkbox', checked: true });
   const ackIn = h('input', { type: 'checkbox' });
-  const warn = h('p', { class: 'notice warn', role: 'note', hidden: true }, DELETE_WARNING);
+  const warn = h('p', { class: 'notice warn', role: 'note', hidden: true }, 'Archiving is off: the rows are deleted for good.');
   const ackRow = checkRow(ackIn, 'I understand this deletes data permanently');
   const errorBox = h('div', { class: 'form-error', role: 'alert', hidden: true });
   const result = h('p', { class: 'muted', role: 'status', 'aria-live': 'polite' });
@@ -120,7 +122,7 @@ export function openCutDialog({ node, onDone }) {
     if (!built.request.archive) {
       const ok = await confirmDialog({
         title: 'Delete data permanently',
-        message: 'This cut writes no archive. The rows are removed from the node and cannot be recovered.',
+        message: `This cut writes no archive. The rows are removed from ${node} and cannot be recovered.`,
         confirmLabel: 'Delete permanently',
         danger: true,
       });
@@ -129,7 +131,7 @@ export function openCutDialog({ node, onDone }) {
     result.textContent = 'Cutting...';
     try {
       const report = await withBusy(cutBtn, () => n.post('/analytics/cut', built.request));
-      toast(describeCut(report), 'success');
+      toast(`${node}: ${describeCut(report)}`, 'success');
       modal.close();
       if (onDone) onDone(describeCut(report));
     } catch (ex) {
@@ -139,14 +141,14 @@ export function openCutDialog({ node, onDone }) {
     }
   });
 
+  const archiveRow = checkRow(archiveIn, 'Archive the rows before deleting them');
+  archiveRow.title = 'Archived rows are written to files on the node and verified before anything is deleted.';
   const content = h('div', { class: 'form' },
-    h('p', { class: 'muted' }, 'Move old rows out of the live database. Preview first to see how many rows are affected.'),
     field('Cutoff', modeSeg, null, { group: true }),
     daysField, dateField,
-    checkRow(archiveIn, 'Archive the rows before deleting them'),
-    h('p', { class: 'hint' }, 'Archived rows are written to files on the node and verified before anything is deleted.'),
+    archiveRow,
     warn, ackRow, errorBox, result);
-  const modal = openModal({ title: 'Cut old data', content, actions: [cancel, preview, cutBtn] });
+  const modal = openModal({ title: `Cut old data on ${node}`, content, actions: [cancel, preview, cutBtn] });
   sync();
   return modal;
 }
@@ -187,21 +189,21 @@ export function archivesPanel(node, { onDataChanged } = {}) {
     } else {
       startNavigation('/api/v1' + path);
     }
-    status.textContent = `Download of ${view.name} started. Your browser saves it to its downloads folder.`;
+    status.textContent = `Download of ${view.name} started.`;
   };
 
   const restore = async (view) => {
     const ok = await confirmDialog({
       title: `Restore ${view.kind.toLowerCase()}`,
-      message: `Import ${view.name} into the live analytics data? The file stays on the node.`,
+      message: `Import ${view.name} into the live analytics data on ${node}? The file stays on the node.`,
       confirmLabel: 'Restore',
     });
     if (!ok) return;
-    status.textContent = `Restoring ${view.name}...`;
+    status.textContent = `Restoring ${view.name} on ${node}...`;
     try {
       const res = await n.post('/analytics/restore', { name: view.name });
-      status.textContent = `Restored ${fmtInt(res && res.rows)} rows from ${view.name}.`;
-      toast('Restore finished', 'success');
+      status.textContent = `Restored ${fmtInt(res && res.rows)} rows from ${view.name} on ${node}.`;
+      toast(`Restore finished on ${node}`, 'success');
       changed();
     } catch (ex) {
       status.textContent = '';
@@ -212,14 +214,15 @@ export function archivesPanel(node, { onDataChanged } = {}) {
   const remove = async (view, again) => {
     const ok = await confirmDialog({
       title: `Delete ${view.kind.toLowerCase()}`,
-      message: `Delete ${view.name} from the node? Download it first if you want to keep a copy. This cannot be undone.`,
+      message: `Delete ${view.name} from ${node}? This cannot be undone.`,
       confirmLabel: 'Delete',
       danger: true,
     });
     if (!ok) return;
     try {
       await n.del('/analytics/archives/' + encodeURIComponent(view.name));
-      status.textContent = `Deleted ${view.name}.`;
+      status.textContent = `Deleted ${view.name} from ${node}.`;
+      toast(`Deleted ${view.name} from ${node}`, 'success');
       again();
     } catch (ex) {
       toast(failureText(ex), 'error');
@@ -241,8 +244,8 @@ export function archivesPanel(node, { onDataChanged } = {}) {
     if (list === null) return h('p', { class: 'notice', role: 'note' }, SUPPORT_NOTE);
     const items = sortEntries(list.items);
     const intro = items.length
-      ? `${fmtInt(items.length)} ${items.length === 1 ? 'file' : 'files'} using ${fmtBytes(list.dir_bytes)} on the node.`
-      : 'No archives or backups yet. Back up now, or cut old data with archiving on, to create one.';
+      ? `${fmtInt(items.length)} ${items.length === 1 ? 'file' : 'files'} using ${fmtBytes(list.dir_bytes)}.`
+      : 'No archives or backups yet.';
     return h('div', { class: 'stack-sm' },
       h('div', { class: 'section-row' }, h('h2', { class: 'section-title' }, 'Archives and backups')),
       h('p', { class: 'muted' }, intro),
@@ -268,12 +271,12 @@ export function archivesPanel(node, { onDataChanged } = {}) {
   }, { skeleton: () => skeletonBlock(80) });
 
   backupBtn.addEventListener('click', async () => {
-    status.textContent = 'Creating a backup...';
+    status.textContent = `Creating a backup on ${node}...`;
     try {
       const made = await withBusy(backupBtn, () => n.post('/analytics/backup', {}));
       const view = entryView(made);
-      status.textContent = `Backup ${view.name} created (${view.size}).`;
-      toast('Backup created', 'success');
+      status.textContent = `Backup ${view.name} created on ${node} (${view.size}).`;
+      toast(`Backup created on ${node}`, 'success');
       run();
     } catch (ex) {
       status.textContent = '';

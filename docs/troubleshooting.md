@@ -89,6 +89,65 @@ Engine must support volume subpaths. Confirm with `docker compose config`, Engin
 
 Put build-time variables in `build.env` and runtime variables in `runtime.env` next to `docker-compose.yml`, then `docker compose up -d`. Variables prefixed `CITE_` and host variables (`PATH`, `HOME`, ...) are not forwarded. See [config.md](config.md).
 
+## Node: the connector will not start with `sealed secrets found`
+
+The connector seals its secret files under a node key and refuses to start when it cannot open them. `docker compose -f docker-compose.node.yml logs connector` shows one of:
+
+- `sealed secrets found (<file>, key <id>) but no key: restore /conf/secrets.key or set CITE_SECRETS_KEY_FILE`: the managed key is gone and none is configured. Put the exported key back as `/conf/secrets.key` (mode 0600), or mount it and set `CITE_SECRETS_KEY_FILE`. The connector never makes a new key over sealed data.
+- `<file> is sealed under key <id>, but this node has key <id>`: the key in use is not the one that sealed the file, for example after a restore of an older `cite_conf` or a changed `CITE_SECRETS_KEY_FILE`. Supply the key with the first id. After a rotation, put the old key in `CITE_SECRETS_KEY_PREVIOUS_FILE` and restart.
+- `CITE_SECRETS_KEY: the secrets key must look like cite-key-v1:<43 characters of base64url>` (or the same for `CITE_SECRETS_KEY_FILE`): the value is not a key. The error never prints the value.
+
+`docker compose -f docker-compose.node.yml run --rm --no-deps connector secrets status` shows which key the node has, where it comes from, and the state of each file (absent, plaintext, sealed under which key, unreadable). `<name>.pre-seal` files are the plaintext copies made when a file was first sealed; see [Upgrading](node.md#secrets-are-sealed-site-data-services-release). If you lost the key and have an older volume backup, restore that backup and its key together.
+
+## Node: data routes answer 404, or the Data tab is missing
+
+- `data services are not enabled on this node`: the connector has no Docker access or no `CITE_DATA_BACKUP_DIR`. Start the node with the orchestrator overlay.
+- The `data-*` capabilities are listed only while the data service is running, so a node whose data service failed to start shows no Data tab and no Databases view. The connector log says why (`data services are off`).
+- A static site has no Data tab and cannot enable Postgres; the site needs a repository build with a server runtime.
+- A console that predates data services shows no Data tab and, through an older connector, sees sites without a `data` field. Update the dashboard or desktop app; see [Upgrading](node.md#data-services-and-older-clients).
+- Docker proxy refusals that name `data services are off on this node (CITE_PROXY_DATA=false)`: set `CITE_DATA=true` in `.env` and recreate the proxy.
+
+## Node: a deploy says `the database of <id> is not ready`
+
+The deploy checks the site's Postgres before it changes any container and stops, with the running slot untouched, when the database does not become healthy within 120 seconds. The reason follows the message. Look at the database container's logs (`cite-<id>-db`, or `cite-pg-shared` for shared mode) and its health in the site's Data tab. The Databases page has a Restart action for the shared instance.
+
+## Node: a database job failed
+
+Jobs report as `the <op> job failed (exit <n>): <last lines>`; the lines are redacted. Exit 2 means the job refused its input, 3 means the shared server rejected the generated `pg_hba.conf` (the previous file was restored). A job also fails after `CITE_DATA_JOB_TIMEOUT` seconds. `GET /api/v1/data/jobs/{job}` gives the state, step and error of a job started by a data route; the connector keeps the last 200. `two data jobs are already running; try again shortly` (429) means the node's two job slots are busy. `not enough space` (507) is an import that needs twice the dump plus 1 GiB on the backup volume.
+
+## Node: a site cannot connect to its database
+
+- The connection string comes from an env link, and links apply at the next deploy. A new, rotated or converted credential reaches a running container only after a deploy (`redeploy_needed`).
+- `no pg_hba.conf entry` or `rejected` from the shared instance: the instance allows a tenant only from its own `dbnet` subnet. The connector writes each tenant's subnet into `pg_hba.conf` at startup, whenever a `dbnet`, the admin network or the shared container is recreated, and when the instance or a shared tenant changes. A disabled user cannot log in, and neither can any user of a database that is frozen or being restored: those logins are `NOLOGIN` and carry the role comment `cite:locked` until the freeze or restore ends. Do not edit these comments.
+- A user that was rotated keeps working on its old login until the next deploy replaced the containers (or 7 days); then the old login is retired. A container that still carries the old password after that has not been redeployed.
+- Check the user's level. A read-only user cannot write and a read and write user cannot change the schema.
+
+## Node: backup, restore and S3 problems
+
+- `the active slot is not running; start the site first`: a backup of an external database runs through the site's own network and needs a running executor.
+- A restore fails with `the dump creates an extension that only a superuser can create`: restores run without superuser rights, so only trusted extensions (for example `pgcrypto`, `citext`, `hstore`) can be restored.- A backup of an external database fails when the URL points at a pooler that rejects the `options` startup parameter (pgbouncer in some modes): the backup job pins `search_path` that way. Attach the database directly for backups.
+- `the backup comes from Postgres <n>, newer than this database`: a restore or import refuses a dump from a newer major than its target.
+- A backup stays `running` after a connector restart: the connector marks it `failed` at start with the note `interrupted by a connector restart`. Start a new one.
+- A failed scheduled backup raises the `backup_failed` alert and is not retried until the next slot.
+- `the backup does not match its recorded checksum`, or `the backup is damaged: chunk <n> failed authentication`: the file was altered or truncated, or it is being opened under another backup id. A backup sealed under a key this node does not hold reports the key ids, as for the secret files above.
+- `POST /api/v1/data/targets/{id}/test` returns `{ok:false,error}` where `error` is one of `auth_failed`, `bucket_missing`, `unreachable`, `tls_error`, `refused_address`, `http_<status>` or `request_failed`; the server's own message is only in the connector's debug log. `refused_address` means the endpoint is a loopback, link-local or other reserved address, a private address while `CITE_DATA_S3_ALLOW_PRIVATE` is not `true`, or plain http to anything but an RFC 1918, ULA or CGNAT address.
+- A backup whose S3 object could not be deleted stays listed with a `delete_error` on its S3 copy, and the scheduler retries.
+
+## Node: an external database is unreachable
+
+- `outbound access is switched off ...` or `this site has outbound access switched off`: switch the site's `outbound` flag on, and check `CITE_STACK_EGRESS_MODE` is not `off`.
+- `the node's CITE_STACK_EGRESS_ALLOW_PORTS does not include <port>`: add the port.
+- The egress proxy's log shows `verdict=denied` with a reason. A private or internal address needs an explicit rule: the host name or range in the site's `outbound_rules.allow`, or a range in the node's `CITE_STACK_EGRESS_ALLOW_CIDRS`. `CITE_EGRESS_AUTO_ALLOW` never opens one. In allowlist mode an IP-address host needs its own `allow` entry.
+- `sslmode=verify-full` fails on a filtered node because the client verifies the proxy's name. Use `require` or `verify-ca`, or link the `tls_servername` field into a driver option that sets the server name.
+- A forward port moves when attachments are added or renamed, because ports follow the sorted names. Redeploy so the new URLs and the proxy's forwards agree.
+
+## Node: env link problems
+
+- A link request answers 409 with a list of conflicts: those variables are already set by hand or linked to another source. Resend with `override: true` to replace the manual ones, or remove the link first.
+- `PATCH` of a build or runtime variable answers 400 `<var> is linked from ...; remove the link first`.
+- A linked variable that is also in Doppler is shadowed by the link; `GET /sites/{id}/data` lists it under `shadowed`.
+- `... would be <n> characters; the limit is 4096` or an environment over 128 variables or 24 KiB: the merged environment must fit the same limits as any site.
+
 ## Reset local data
 
 ```bash

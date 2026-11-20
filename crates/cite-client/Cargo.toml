@@ -18,10 +18,12 @@ serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 reqwest.workspace = true
+cite-tls.workspace = true
 ulid.workspace = true
 futures-util.workspace = true
 bytes.workspace = true
 zeroize.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 axum.workspace = true

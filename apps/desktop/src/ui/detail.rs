@@ -5,24 +5,30 @@ use cite_edge::model::{Deployment, MaintenancePage, Site, SiteKind, Slot, TlsMod
 use gpui::{AnyElement, ClipboardItem, Context, Div, Entity, div, prelude::*, px};
 use serde_json::Value;
 
-use crate::app::{Confirm, Console, Load, View, new_input};
+use crate::api::{NodeHandle, join_all};
+use crate::app::{Confirm, Console, Load, TargetPicker, View, new_input};
 use crate::certs::zone_newly_enabled;
 use crate::demo::now_ms;
 use crate::diagnose::{
-    started_deployment,
-    Banner, NOTE_PREVIEW, banner, deploy_outcome, failure_text, save_outcome, shown_output,
-    slot_lines, split_note,
+    Banner, NOTE_PREVIEW, banner, deploy_outcome, failure_text, shown_output, slot_lines,
+    split_note, started_deployment,
 };
 use crate::model::{
     SiteChange, draft_from_site, edit_site, fmt_targets, parse_rfc3339_ms, parse_targets, rel_time,
     site_change, source_deploy_request,
 };
-use crate::scope::{error_survives, foreign_notice};
+use crate::pages_union::{NodePages, Page, PagesUnion, UnionPage, nodes_needing_page, union_pages};
+use crate::scope::{Sequence, error_survives, foreign_notice};
 use crate::siteops::{
     CAP_BUILD_ENV, CAP_LOGS, CAP_RUNTIME_ENV, CAP_VOLUMES, has_cap, is_busy_phase,
 };
-use crate::theme::{BORDER, CARD_RADIUS, DIM, ROW_RADIUS, SURFACE, Tone, c, tint};
+use crate::targets::{NodeInfo, NodeResult, result_message};
+use crate::theme::{
+    BORDER, CARD_RADIUS, DIM, PILL_RADIUS, ROW_RADIUS, SURFACE, TEXT, Tone, c, chip_fill,
+    chip_stroke, tint,
+};
 use crate::ui::certs::{access_body, access_controls};
+use crate::ui::dataview;
 use crate::ui::input::TextInput;
 use crate::ui::overview::{action_pill, slot_pill};
 use crate::ui::paths::PathRow;
@@ -30,7 +36,7 @@ use crate::ui::siteform::{Home, SiteFields, basics, domains, health_fields, sour
 use crate::ui::sites::health_tone;
 use crate::ui::widgets::{
     BtnKind, Col, btn, btn_off, card, code_block, dot, empty_state, field, form_grid, id, mono,
-    notice, page_header, pill, seg_item, seg_row, skeleton, strong, table, text_dim, toggle,
+    notice, page_header, pill, seg_item, seg_row, skeleton, strong, table, text_dim, tip, toggle,
 };
 use crate::wizard::{FieldProblems, field_problems};
 use crate::zone::{
@@ -39,6 +45,8 @@ use crate::zone::{
 };
 
 // The site page's own parts live beside this file; they are declared here so the page stays one module tree.
+#[path = "data.rs"]
+pub(crate) mod data;
 #[path = "doppler.rs"]
 pub(crate) mod doppler;
 #[path = "env.rs"]
@@ -54,17 +62,39 @@ pub(crate) mod volumes;
 
 use self::tabs::{SiteTab, TabMemory, TabOffer, shown_tab, visible_tabs};
 
-// A new zone secret (or why none came) and the outcome of a redeploy, when one was asked for.
-type SaveDone = (
-    Option<Result<ZoneReveal, String>>,
-    Option<Result<Deployment, String>>,
-);
-
 pub struct Data {
     pub site: Site,
     pub live: Option<Value>,
     pub pages: Vec<MaintenancePage>,
     pub zone: Option<ZoneStatus>,
+}
+
+// What another node says about the site on screen and the maintenance pages it holds.
+pub struct Peer {
+    pub node: String,
+    // None when the node does not hold the site or could not be read; it then never counts as a holder.
+    pub site: Option<Site>,
+    // None when the node's pages could not be read.
+    pub pages: Option<Vec<MaintenancePage>>,
+}
+
+// The other nodes' view of the site on screen, read beside the page so a slow node never holds it back.
+pub struct Cross {
+    // The node and site id the peers were read for.
+    pub key: (String, String),
+    pub peers: Vec<Peer>,
+    // False until the other nodes have answered.
+    pub ready: bool,
+}
+
+impl Cross {
+    fn pending(node: &str, site: &str) -> Self {
+        Self {
+            key: (node.to_string(), site.to_string()),
+            peers: Vec::new(),
+            ready: false,
+        }
+    }
 }
 
 pub struct State {
@@ -78,8 +108,12 @@ pub struct State {
     pub error: Option<String>,
     // The slot whose build log explains the error on screen, when it came from a deploy.
     pub error_slot: Option<Slot>,
-    pub maint_enabled: bool,
-    pub maint_page: Option<String>,
+    pub cross: Cross,
+    pub cross_seq: Sequence,
+    // The page the owner picked for maintenance: None until picked, then Some(None) for the built-in page.
+    pub maint_pick: Option<Option<String>>,
+    // Nodes with a maintenance change in flight, whose switches are inert until it settles.
+    pub maint_busy: Vec<String>,
     // The edit form, built from the same fields as the create wizard.
     pub edit: SiteFields,
     // The site the form was last filled from, to tell a reload apart from unsaved edits.
@@ -118,8 +152,10 @@ impl State {
             busy_what: "",
             error: None,
             error_slot: None,
-            maint_enabled: false,
-            maint_page: None,
+            cross: Cross::pending("", ""),
+            cross_seq: Sequence::default(),
+            maint_pick: None,
+            maint_busy: Vec::new(),
             edit: SiteFields::new(cx),
             edit_base: None,
             edit_for: (String::new(), String::new()),
@@ -141,6 +177,345 @@ pub fn open_url(hosts: &[String]) -> Option<String> {
 
 fn keeps_page(same_place: bool, shown_site: Option<&str>, next_site: &str) -> bool {
     same_place && shown_site == Some(next_site)
+}
+
+// Online nodes other than the one the page belongs to; an offline node is never asked.
+fn peer_names(nodes: &[NodeInfo], current: &str) -> Vec<String> {
+    nodes
+        .iter()
+        .filter(|n| n.online && n.name != current)
+        .map(|n| n.name.clone())
+        .collect()
+}
+
+// One node's entry, from what its site and page lists returned (None where a list could not be read).
+fn peer_from(
+    node: &str,
+    site_id: &str,
+    sites: Option<Vec<Site>>,
+    pages: Option<Vec<MaintenancePage>>,
+) -> Peer {
+    Peer {
+        node: node.to_string(),
+        site: sites.and_then(|list| list.into_iter().find(|s| s.id == site_id)),
+        pages,
+    }
+}
+
+// The nodes that hold the site, in the order of `order` and then any other. The node the page was opened from always counts.
+fn holder_nodes(current: &str, peers: &[Peer], order: &[String]) -> Vec<String> {
+    let held =
+        |name: &str| name == current || peers.iter().any(|p| p.node == name && p.site.is_some());
+    let mut out: Vec<String> = order.iter().filter(|n| held(n.as_str())).cloned().collect();
+    if !out.iter().any(|n| n == current) {
+        out.push(current.to_string());
+    }
+    for p in peers.iter().filter(|p| p.site.is_some()) {
+        if !out.contains(&p.node) {
+            out.push(p.node.clone());
+        }
+    }
+    out
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Relation {
+    Same,
+    Different,
+}
+
+// Ids default to a slug of the name, so two unrelated sites can share one. Two copies are the same site when their host sets
+// overlap or they build from the same repository (both compared without regard to case); otherwise a shared edit would overwrite an unrelated site.
+fn site_relation(current: &Site, other: &Site) -> Relation {
+    let mine: Vec<String> = current.hosts.iter().map(|h| h.to_lowercase()).collect();
+    if other.hosts.iter().any(|h| mine.contains(&h.to_lowercase())) {
+        return Relation::Same;
+    }
+    match (&current.source, &other.source) {
+        (Some(a), Some(b)) if !a.repo.is_empty() && a.repo.eq_ignore_ascii_case(&b.repo) => {
+            Relation::Same
+        }
+        _ => Relation::Different,
+    }
+}
+
+// The holders other than this node whose copy has this id but is a different site, with that copy's hosts.
+fn different_holders(
+    current_site: &Site,
+    current: &str,
+    peers: &[Peer],
+    holders: &[String],
+) -> Vec<(String, Vec<String>)> {
+    peers
+        .iter()
+        .filter(|p| p.node != current && holders.contains(&p.node))
+        .filter_map(|p| {
+            let theirs = p.site.as_ref()?;
+            (site_relation(current_site, theirs) == Relation::Different)
+                .then(|| (p.node.clone(), theirs.hosts.clone()))
+        })
+        .collect()
+}
+
+// "edge-iad has a site with this id but different hosts (api.example.org)."
+fn different_note(node: &str, hosts: &[String]) -> String {
+    let shown = if hosts.is_empty() {
+        "none".to_string()
+    } else {
+        hosts.join(", ")
+    };
+    format!("{node} has a site with this id but different hosts ({shown}).")
+}
+
+// The body to save on a node other than the one on screen: that node's own stored site with only the shared fields replaced.
+// Its upstream targets, active slot, source, volumes and stored GitHub token stay as it has them.
+fn shared_body(stored: &Site, edited: &Site) -> Site {
+    let mut body = stored.clone();
+    body.name = edited.name.clone();
+    body.kind = edited.kind;
+    body.hosts = edited.hosts.clone();
+    body.path_prefixes = edited.path_prefixes.clone();
+    body.path_regexes = edited.path_regexes.clone();
+    body.health = edited.health.clone();
+    body.access = edited.access.clone();
+    body
+}
+
+// One line for a save that went to one or more nodes, with the redeploy on this node when one was asked for.
+// It is an error as soon as any node or the redeploy failed, so the page shows it where it stays.
+fn save_message(
+    results: &[NodeResult],
+    deploy: Option<&Result<Deployment, String>>,
+) -> Result<String, String> {
+    let mut text = result_message("Saved", results);
+    let mut failed = results.iter().any(|r| r.outcome.is_err());
+    let tail = match deploy {
+        Some(Ok(d)) => match deploy_outcome(d) {
+            Ok(t) => Some(t),
+            Err(t) => {
+                failed = true;
+                Some(t)
+            }
+        },
+        Some(Err(e)) => {
+            failed = true;
+            Some(format!("The redeploy failed: {e}"))
+        }
+        None => None,
+    };
+    if let Some(t) = tail {
+        text = if text.is_empty() {
+            t
+        } else {
+            format!("{text}. {t}")
+        };
+    }
+    if failed { Err(text) } else { Ok(text) }
+}
+
+// A node's answer named first, so a toast about this node never reads as being about another.
+fn named(node: &str, message: &str) -> String {
+    format!("{node}: {message}")
+}
+
+fn to_union_page(p: &MaintenancePage) -> Page {
+    Page {
+        id: p.id.clone(),
+        name: p.name.clone(),
+        html: p.html.clone(),
+        status: p.status,
+    }
+}
+
+fn page_from_union(p: &UnionPage) -> MaintenancePage {
+    MaintenancePage {
+        id: p.id.clone(),
+        name: p.name.clone(),
+        html: p.html.clone(),
+        status: p.status,
+    }
+}
+
+// Every node's pages as one library; the node on screen is listed first, so its copy wins a tie.
+fn union_for(current: &str, own: &[MaintenancePage], peers: &[Peer]) -> PagesUnion {
+    let mut per_node = vec![NodePages {
+        node: current.to_string(),
+        pages: Some(own.iter().map(to_union_page).collect()),
+    }];
+    per_node.extend(peers.iter().map(|p| {
+        NodePages {
+            node: p.node.clone(),
+            pages: p
+                .pages
+                .as_ref()
+                .map(|list| list.iter().map(to_union_page).collect()),
+        }
+    }));
+    union_pages(&per_node)
+}
+
+// One node's maintenance state as its switch shows it.
+struct MaintRow {
+    node: String,
+    enabled: bool,
+    page_id: Option<String>,
+}
+
+fn maint_rows(holders: &[String], current: &str, site: &Site, peers: &[Peer]) -> Vec<MaintRow> {
+    holders
+        .iter()
+        .map(|node| {
+            let state = if node == current {
+                Some(&site.maintenance)
+            } else {
+                peers
+                    .iter()
+                    .find(|p| p.node == *node)
+                    .and_then(|p| p.site.as_ref())
+                    .map(|s| &s.maintenance)
+            };
+            MaintRow {
+                node: node.clone(),
+                enabled: state.is_some_and(|m| m.enabled),
+                page_id: state.and_then(|m| m.page_id.clone()),
+            }
+        })
+        .collect()
+}
+
+// The page the chooser shows: the owner's pick, else the first page a node already serves; never one no node holds.
+fn effective_page(
+    pick: &Option<Option<String>>,
+    rows: &[MaintRow],
+    union: &PagesUnion,
+) -> Option<String> {
+    let wanted = match pick {
+        Some(choice) => choice.clone(),
+        None => rows.iter().find_map(|r| r.page_id.clone()),
+    };
+    wanted.filter(|id| union.pages.iter().any(|p| p.id == *id))
+}
+
+// Turning on uses the chosen page; turning off keeps the page the node already serves.
+fn maint_page_for(enabled: bool, chosen: Option<&str>, node_page: Option<&str>) -> Option<String> {
+    let page = if enabled {
+        chosen
+    } else {
+        node_page.or(chosen)
+    };
+    page.map(str::to_string)
+}
+
+// "Maintenance enabled on edge-fra, edge-nyc. Failed on edge-ams: reason"
+fn maint_message(enabled: bool, results: &[NodeResult]) -> String {
+    let state = if enabled { "enabled" } else { "disabled" };
+    result_message(&format!("Maintenance {state}"), results)
+}
+
+// One node's part of a save: the body it takes and what follows the write.
+struct SaveJob {
+    handle: NodeHandle,
+    // Set only for the node on screen, whose stored copy is already loaded; any other node is read first.
+    stored: Option<Site>,
+    edited: Site,
+    redeploy: Option<(DeployRequest, Slot)>,
+}
+
+struct NodeSave {
+    node: String,
+    here: bool,
+    saved: Result<(), String>,
+    reveal: Option<Result<ZoneReveal, String>>,
+    deploy: Option<Result<Deployment, String>>,
+}
+
+// The node on screen takes the whole edited site; another node takes only the shared fields on top of its own copy.
+// Turning the zone lock on rotates in a secret right after the write, because the node only shows it when asked.
+async fn save_on_node(job: SaveJob) -> NodeSave {
+    let SaveJob {
+        handle: h,
+        stored,
+        edited,
+        redeploy,
+    } = job;
+    let node = h.name().to_string();
+    let here = stored.is_some();
+    let failed = |node: String, e: String| NodeSave {
+        node,
+        here,
+        saved: Err(e),
+        reveal: None,
+        deploy: None,
+    };
+    let stored = match stored {
+        Some(s) => s,
+        None => match h.get_site(&edited.id).await {
+            Ok(d) => d.site,
+            Err(e) => return failed(node, e.to_string()),
+        },
+    };
+    let body = if here {
+        edited
+    } else {
+        shared_body(&stored, &edited)
+    };
+    if let Err(e) = h.update_site(&body.id, &body).await {
+        return failed(node, e.to_string());
+    }
+    let reveal = if zone_newly_enabled(&stored.access, &body.access) {
+        Some(
+            h.rotate_zone_secret(&body.id)
+                .await
+                .map_err(|e| e.to_string()),
+        )
+    } else {
+        None
+    };
+    let deploy = match redeploy {
+        Some((req, idle)) => {
+            let started = if body.source.is_some() {
+                h.deploy_async(&body.id, None, req.note.as_deref())
+                    .await
+                    .map(|id| started_deployment(id, idle))
+            } else {
+                h.deploy(&body.id, &req).await
+            };
+            Some(started.map_err(|e| e.to_string()))
+        }
+        None => None,
+    };
+    NodeSave {
+        node,
+        here,
+        saved: Ok(()),
+        reveal,
+        deploy,
+    }
+}
+
+// One node's part of a maintenance change; a node that lacks the chosen page gets it first, because it refuses a page it does not hold.
+struct MaintJob {
+    handle: NodeHandle,
+    site: String,
+    enabled: bool,
+    page: Option<String>,
+    create: Option<MaintenancePage>,
+}
+
+async fn run_maintenance(job: MaintJob) -> NodeResult {
+    let node = job.handle.name().to_string();
+    let outcome = async {
+        if let Some(page) = &job.create {
+            job.handle.create_page(page).await?;
+        }
+        job.handle
+            .maintenance(&job.site, job.enabled, job.page.as_deref())
+            .await?;
+        Ok::<(), ClientError>(())
+    }
+    .await
+    .map_err(|e| e.to_string());
+    NodeResult { node, outcome }
 }
 
 // The form as typed, checked, and compared with the stored site.
@@ -172,6 +547,7 @@ impl Console {
             self.detail.data = Load::Failed(format!("Node {node} is not connected."));
             return;
         };
+        self.load_peers(&node, &site_id, cx);
         let (ops_node, ops_site) = (node.clone(), site_id.clone());
         // The three reads do not depend on each other, so they run together.
         let fut = async move {
@@ -190,14 +566,73 @@ impl Console {
         };
         self.fetch_scoped(cx, fut, move |this, res, cx| {
             if let Ok(data) = &res {
-                this.detail.maint_enabled = data.site.maintenance.enabled;
-                this.detail.maint_page = data.site.maintenance.page_id.clone();
                 this.refill_edit(&data.site, cx);
-                this.load_ops(ops_node, ops_site, data.site.source.is_some(), cx);
+                this.load_ops(
+                    ops_node.clone(),
+                    ops_site.clone(),
+                    data.site.source.is_some(),
+                    cx,
+                );
+                // The Environment tab shows linked variables read-only, so the data is read with the site, not with its tab.
+                if volumes::source_serves(data.site.source.as_ref()) {
+                    this.load_site_data(ops_node, ops_site, cx);
+                }
             }
             this.detail.data = Load::from_result(res);
             cx.notify();
         });
+    }
+
+    // Reads the site list and page list of every other online node, all at once and apart from the page's own load.
+    // A reload keeps the last answer on screen until the new one arrives; another site starts from this node alone.
+    fn load_peers(&mut self, node: &str, site_id: &str, cx: &mut Context<Self>) {
+        let key = (node.to_string(), site_id.to_string());
+        if self.detail.cross.key != key {
+            self.detail.cross = Cross::pending(node, site_id);
+            self.detail.maint_pick = None;
+        }
+        let seq = self.detail.cross_seq.issue();
+        let jobs: Vec<NodeHandle> = peer_names(&self.node_infos(), node)
+            .iter()
+            .filter_map(|n| self.handle_named(n))
+            .collect();
+        if jobs.is_empty() {
+            self.detail.cross.peers.clear();
+            self.detail.cross.ready = true;
+            return;
+        }
+        let site = site_id.to_string();
+        let fut = async move {
+            let all = join_all(
+                jobs.into_iter()
+                    .map(|h| {
+                        let site = site.clone();
+                        async move {
+                            let (sites, pages) = tokio::join!(h.list_sites(), h.list_pages());
+                            peer_from(h.name(), &site, sites.ok(), pages.ok())
+                        }
+                    })
+                    .collect(),
+            )
+            .await;
+            Ok::<_, ClientError>(all.into_iter().flatten().collect::<Vec<Peer>>())
+        };
+        self.fetch(cx, fut, move |this, res, cx| {
+            if this.detail.cross.key != key || !this.detail.cross_seq.accept(seq) {
+                return;
+            }
+            if let Ok(peers) = res {
+                this.detail.cross.peers = peers;
+                this.detail.cross.ready = true;
+            }
+            cx.notify();
+        });
+    }
+
+    // The nodes that hold the site on screen: this one, and every other online node whose site list has its id.
+    fn holders(&self) -> Vec<String> {
+        let order: Vec<String> = self.node_infos().into_iter().map(|n| n.name).collect();
+        holder_nodes(&self.detail.node, &self.detail.cross.peers, &order)
     }
 
     fn fail(&mut self, msg: String, slot: Option<Slot>) {
@@ -214,11 +649,14 @@ impl Console {
         let source = data.site.source.is_some();
         // Until the node has said what it offers, a remembered tab stays open instead of jumping to Overview.
         if !self.ops.loaded {
+            let remembered = self.detail.tabs.get(&self.detail.node, &data.site.id);
             return TabOffer {
                 source,
                 env: true,
                 logs: true,
                 volumes: volumes::volumes_apply(&data.site),
+                // Only a remembered Data tab is kept open: a node without data services must not flash one.
+                data: remembered == Some(SiteTab::Data) && volumes::volumes_apply(&data.site),
             };
         }
         let caps = &self.ops.extras.caps;
@@ -229,6 +667,7 @@ impl Console {
                 || self.ops.doppler.offered,
             logs: has_cap(caps, CAP_LOGS),
             volumes: has_cap(caps, CAP_VOLUMES) && volumes::volumes_apply(&data.site),
+            data: dataview::data_tab_offered(caps) && volumes::volumes_apply(&data.site),
         }
     }
 
@@ -255,6 +694,11 @@ impl Console {
         self.remember_tab(tab);
         if tab == SiteTab::Logs {
             self.open_logs(cx);
+        }
+        // Opening the tab reads the data again, so it is current when it is shown.
+        if tab == SiteTab::Data {
+            let (node, site) = (self.detail.node.clone(), self.detail.site_id.clone());
+            self.load_site_data(node, site, cx);
         }
     }
 
@@ -311,9 +755,10 @@ impl Console {
             return;
         };
         let target = site.active.other();
+        let node = self.detail.node.clone();
         let fut = async move { h.switch(&site.id, target).await };
         self.site_action(cx, "Switch", fut, None, move |_| {
-            Ok(format!("{} is now active", target.as_str()))
+            Ok(format!("{} is now active on {node}", target.as_str()))
         });
     }
 
@@ -321,8 +766,11 @@ impl Console {
         let Some((h, site)) = self.site_handle() else {
             return;
         };
+        let node = self.detail.node.clone();
         let fut = async move { h.rollback(&site.id).await };
-        self.site_action(cx, "Rollback", fut, None, |_| Ok("Rolled back".into()));
+        self.site_action(cx, "Rollback", fut, None, move |_| {
+            Ok(format!("Rolled back on {node}"))
+        });
     }
 
     // Deploy waits on health checks, so the busy notice stays up until the node answers.
@@ -351,6 +799,7 @@ impl Console {
         let idle = site.active.other();
         let logs_slot = site.source.is_some().then_some(idle);
         let from_source = site.source.is_some();
+        let node = self.detail.node.clone();
         let fut = async move {
             if from_source {
                 let note = req.note.clone();
@@ -360,7 +809,11 @@ impl Console {
                 h.deploy(&site.id, &req).await
             }
         };
-        self.site_action(cx, "Deploy", fut, logs_slot, deploy_outcome);
+        self.site_action(cx, "Deploy", fut, logs_slot, move |d| {
+            deploy_outcome(d)
+                .map(|m| named(&node, &m))
+                .map_err(|m| named(&node, &m))
+        });
     }
 
     // The form follows the node: it is refilled after every load unless the owner has unsaved edits in it.
@@ -392,11 +845,10 @@ impl Console {
         self.clear_error();
     }
 
-    // Saves the whole form through the normal site update; with redeploy it then starts a deploy so a source change takes effect.
-    // Turning the zone lock on rotates in a secret right after the save, because the node only shows it when asked.
+    // Checks the form, then saves it: straight to this node when it holds the site alone, otherwise after asking which of the holders to update.
     // The stored GitHub token is never sent: the node keeps it.
     fn do_save(&mut self, redeploy: bool, cx: &mut Context<Self>) {
-        let Some((h, existing)) = self.site_handle() else {
+        let Some((_, existing)) = self.site_handle() else {
             return;
         };
         let draft = self.detail.edit.draft(cx);
@@ -407,7 +859,55 @@ impl Console {
                 return;
             }
         };
-        let rotate = zone_newly_enabled(&existing.access, &edited.access);
+        let node = self.detail.node.clone();
+        let holders = self.holders();
+        if holders.len() < 2 {
+            self.save_to(redeploy, existing, edited, vec![node], cx);
+            return;
+        }
+        let nodes: Vec<NodeInfo> = self
+            .node_infos()
+            .into_iter()
+            .filter(|n| holders.contains(&n.name))
+            .collect();
+        // Only this node is ticked; a node holding an unrelated site with this id stays unticked and is called out.
+        let mut message = format!(
+            "{} is on {} nodes. Pick where to save these changes.",
+            existing.name,
+            holders.len()
+        );
+        for (other, hosts) in
+            different_holders(&existing, &node, &self.detail.cross.peers, &holders)
+        {
+            message.push_str(&format!(
+                " {} Check before saving there.",
+                different_note(&other, &hosts)
+            ));
+        }
+        self.ask_targets(TargetPicker {
+            title: "Save changes".into(),
+            message,
+            verb: "Save".into(),
+            nodes,
+            selected: vec![node],
+            danger: false,
+            action: Box::new(move |this, cx, targets| {
+                this.save_to(redeploy, existing, edited, targets, cx)
+            }),
+        });
+    }
+
+    // Writes the form to the chosen nodes at once. This node takes the whole edited site, another node only the shared fields on top of its own copy.
+    // With redeploy, this node then starts a deploy so a source change takes effect; the redeploy never runs elsewhere.
+    fn save_to(
+        &mut self,
+        redeploy: bool,
+        existing: Site,
+        edited: Site,
+        targets: Vec<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let here_node = self.detail.node.clone();
         // A saved source change is not in the running build, so the owner is asked about a rebuild afterwards.
         let ask_rebuild = !redeploy
             && existing.source.is_some()
@@ -416,64 +916,86 @@ impl Console {
             Some(self.detail.note.read(cx).text().trim().to_string()).filter(|n| !n.is_empty()),
         );
         let idle = existing.active.other();
+        let jobs: Vec<SaveJob> = targets
+            .iter()
+            .filter_map(|name| {
+                let on_screen = *name == here_node;
+                Some(SaveJob {
+                    handle: self.handle_named(name)?,
+                    stored: on_screen.then(|| existing.clone()),
+                    edited: edited.clone(),
+                    redeploy: (redeploy && on_screen).then(|| (req.clone(), idle)),
+                })
+            })
+            .collect();
+        if jobs.is_empty() {
+            self.fail("None of the chosen nodes is connected.".into(), None);
+            return;
+        }
         self.detail.busy = true;
-        self.detail.busy_what = if redeploy { "Saving, then starting a build" } else { "Saving the site" };
+        self.detail.busy_what = if redeploy {
+            "Saving, then starting a build"
+        } else {
+            "Saving the site"
+        };
         self.clear_error();
         let fut = async move {
-            h.update_site(&edited.id, &edited).await?;
-            let reveal = if rotate {
-                Some(
-                    h.rotate_zone_secret(&edited.id)
-                        .await
-                        .map_err(|e| e.to_string()),
-                )
-            } else {
-                None
-            };
-            let deploy = if redeploy {
-                let started = if edited.source.is_some() {
-                    h.deploy_async(&edited.id, None, req.note.as_deref())
-                        .await
-                        .map(|id| started_deployment(id, idle))
-                } else {
-                    h.deploy(&edited.id, &req).await
-                };
-                Some(started.map_err(|e| e.to_string()))
-            } else {
-                None
-            };
-            Ok((reveal, deploy))
+            let all = join_all(jobs.into_iter().map(save_on_node).collect()).await;
+            Ok::<_, ClientError>(all.into_iter().flatten().collect::<Vec<NodeSave>>())
         };
         self.fetch_origin(
             cx,
             fut,
-            move |this, res: Result<SaveDone, ClientError>, here, origin, cx| {
+            move |this, res: Result<Vec<NodeSave>, ClientError>, here, origin, cx| {
                 const WHAT: &str = "Save site";
-                let saved = res.is_ok();
-                let deploy_slot = match &res {
-                    Ok((_, Some(Ok(d)))) => Some(d.slot),
-                    Ok((_, Some(Err(_)))) => Some(idle),
-                    _ => None,
+                let saves = match res {
+                    Ok(saves) => saves,
+                    Err(e) => {
+                        this.detail.busy = false;
+                        if here {
+                            this.fail(e.to_string(), None);
+                            this.reload_detail(cx);
+                        } else {
+                            this.say(foreign_notice(WHAT, origin, &e.to_string()), Tone::Bad);
+                        }
+                        cx.notify();
+                        return;
+                    }
                 };
-                let (reveal, outcome) = match res {
-                    Ok((reveal, deploy)) => (reveal, save_outcome(deploy.as_ref())),
-                    Err(e) => (None, Err(e.to_string())),
+                let results: Vec<NodeResult> = saves
+                    .iter()
+                    .map(|s| NodeResult {
+                        node: s.node.clone(),
+                        outcome: s.saved.clone(),
+                    })
+                    .collect();
+                let screen = saves.iter().find(|s| s.here);
+                let saved_here = screen.is_some_and(|s| s.saved.is_ok());
+                let deploy = screen.and_then(|s| s.deploy.clone());
+                let deploy_slot = match &deploy {
+                    Some(Ok(d)) => Some(d.slot),
+                    Some(Err(_)) => Some(idle),
+                    None => None,
                 };
-                if here && saved {
+                let outcome = save_message(&results, deploy.as_ref());
+                if here && saved_here {
                     this.ops.volumes.clear_edits();
+                    if ask_rebuild {
+                        this.ops.rebuild_prompt = true;
+                    }
                 }
-                if here && saved && ask_rebuild {
-                    this.ops.rebuild_prompt = true;
+                // A secret for another place is kept under its own node and site and shown only there.
+                let mut warns = Vec::new();
+                for save in saves {
+                    match save.reveal {
+                        Some(Ok(r)) => this.keep_reveal(r),
+                        Some(Err(e)) => warns.push(named(&save.node, &rotation_failed(&e))),
+                        None => {}
+                    }
                 }
-                let mut warn = None;
-                match reveal {
-                    Some(Ok(r)) => this.keep_reveal(r),
-                    Some(Err(e)) => warn = Some(rotation_failed(&e)),
-                    None => {}
-                }
+                let warn = (!warns.is_empty()).then(|| warns.join(" "));
                 this.detail.busy = false;
                 if !here {
-                    // A secret for another place is kept under its own node and site and shown only there.
                     let (mut text, tone) = match outcome {
                         Ok(t) => (t, Tone::Ok),
                         Err(t) => (t, Tone::Bad),
@@ -485,7 +1007,6 @@ impl Console {
                     cx.notify();
                     return;
                 }
-                this.detail.busy = false;
                 match (outcome, warn) {
                     (Ok(t), None) => this.say(t, Tone::Ok),
                     (Ok(t), Some(w)) => this.fail(format!("{t} {w}"), None),
@@ -618,10 +1139,12 @@ impl Console {
                     .text_color(c(Tone::Bad.color())),
             );
         }
-        let explain = if data.site.source.is_some() {
-            "Routing, health check and access apply at once. Repository, build settings and resources take effect on the next deploy; Save and redeploy builds the branch again. The stored GitHub token is kept."
+        let explain = if self.holders().len() > 1 {
+            "Saving asks which nodes to update. Build settings and volumes apply to this node only."
+        } else if data.site.source.is_some() {
+            "Repository and build changes take effect on the next deploy."
         } else {
-            "Saved settings apply to routing at once. To change the targets, deploy new ones on the Overview tab."
+            "To change the targets, deploy on the Overview tab."
         };
         bar.child(text_dim(explain).text_size(px(11.)))
             .into_any_element()
@@ -671,8 +1194,9 @@ impl Console {
                 this.detail.busy = false;
                 match res {
                     Ok(reveal) => {
+                        let node = reveal.node.clone();
                         this.keep_reveal(reveal);
-                        this.say("Zone secret rotated", Tone::Ok);
+                        this.say(format!("Zone secret rotated on {node}"), Tone::Ok);
                     }
                     Err(e) => this.fail(e.to_string(), None),
                 }
@@ -682,27 +1206,137 @@ impl Console {
         );
     }
 
-    fn do_maintenance(&mut self, cx: &mut Context<Self>) {
-        let Some((h, site)) = self.site_handle() else {
+    // Turns maintenance on or off on the given nodes at once; every node is written on its own, and the page is created first where it is missing.
+    fn set_maintenance(&mut self, nodes: Vec<String>, enabled: bool, cx: &mut Context<Self>) {
+        let Some(data) = self.detail.data.ready() else {
             return;
         };
-        let (enabled, page) = (self.detail.maint_enabled, self.detail.maint_page.clone());
-        let fut = async move { h.maintenance(&site.id, enabled, page.as_deref()).await };
-        self.site_action(cx, "Maintenance change", fut, None, move |_| {
-            Ok(if enabled {
-                "Maintenance mode enabled".into()
-            } else {
-                "Maintenance mode disabled".into()
+        let (site_id, site_name) = (data.site.id.clone(), data.site.name.clone());
+        let current = self.detail.node.clone();
+        let peers = &self.detail.cross.peers;
+        let rows = maint_rows(&self.holders(), &current, &data.site, peers);
+        let union = union_for(&current, &data.pages, peers);
+        let chosen = effective_page(&self.detail.maint_pick, &rows, &union);
+        let jobs: Vec<MaintJob> = nodes
+            .iter()
+            .filter_map(|name| {
+                let node_page = rows
+                    .iter()
+                    .find(|r| r.node == *name)
+                    .and_then(|r| r.page_id.as_deref());
+                let page = maint_page_for(enabled, chosen.as_deref(), node_page);
+                let create = page
+                    .as_deref()
+                    .filter(|_| enabled)
+                    .filter(|p| {
+                        !nodes_needing_page(&union, p, std::slice::from_ref(name)).is_empty()
+                    })
+                    .and_then(|p| union.pages.iter().find(|u| u.id == p))
+                    .map(page_from_union);
+                Some(MaintJob {
+                    handle: self.handle_named(name)?,
+                    site: site_id.clone(),
+                    enabled,
+                    page,
+                    create,
+                })
             })
+            .collect();
+        if jobs.is_empty() {
+            return;
+        }
+        let busy: Vec<String> = jobs.iter().map(|j| j.handle.name().to_string()).collect();
+        self.detail.maint_busy.extend(busy.iter().cloned());
+        let fut = async move {
+            let all = join_all(jobs.into_iter().map(run_maintenance).collect()).await;
+            Ok::<_, ClientError>(all.into_iter().flatten().collect::<Vec<NodeResult>>())
+        };
+        self.fetch_origin(cx, fut, move |this, res, here, _origin, cx| {
+            this.detail.maint_busy.retain(|n| !busy.contains(n));
+            let results = res.unwrap_or_else(|e| {
+                busy.iter()
+                    .map(|node| NodeResult {
+                        node: node.clone(),
+                        outcome: Err(e.to_string()),
+                    })
+                    .collect()
+            });
+            let text = maint_message(enabled, &results);
+            let tone = if results.iter().all(|r| r.outcome.is_ok()) {
+                Tone::Ok
+            } else {
+                Tone::Bad
+            };
+            if here {
+                this.say(text, tone);
+                this.reload_detail(cx);
+            } else {
+                this.say(named(&site_name, &text), tone);
+            }
+            cx.notify();
         });
     }
 
-    // Deleting leaves the page, so it navigates instead of reloading.
+    // Asks before changing every node that is not already in the wanted state.
+    fn ask_everywhere(&mut self, enabled: bool) {
+        let Some(data) = self.detail.data.ready() else {
+            return;
+        };
+        let holders = self.holders();
+        let peers = &self.detail.cross.peers;
+        let rows = maint_rows(&holders, &self.detail.node, &data.site, peers);
+        // A holder with an unrelated site of this id is skipped: it has its own switch.
+        let different = different_holders(&data.site, &self.detail.node, peers, &holders);
+        let names: Vec<String> = rows
+            .iter()
+            .filter(|r| r.enabled != enabled && !different.iter().any(|(n, _)| *n == r.node))
+            .map(|r| r.node.clone())
+            .collect();
+        if names.is_empty() {
+            return;
+        }
+        let skipped: Vec<&str> = different.iter().map(|(n, _)| n.as_str()).collect();
+        let (title, mut message) = if enabled {
+            (
+                "Turn on everywhere",
+                format!(
+                    "Puts {} into maintenance on {}.",
+                    data.site.name,
+                    names.join(", ")
+                ),
+            )
+        } else {
+            (
+                "Turn off everywhere",
+                format!(
+                    "Takes {} out of maintenance on {}.",
+                    data.site.name,
+                    names.join(", ")
+                ),
+            )
+        };
+        if !skipped.is_empty() {
+            message.push_str(&format!(
+                " Skips {}, which has a site with this id but different hosts; use its own switch.",
+                skipped.join(", ")
+            ));
+        }
+        self.ask(Confirm {
+            title: title.into(),
+            message,
+            label: title.into(),
+            danger: enabled,
+            action: Box::new(move |this, cx| this.set_maintenance(names, enabled, cx)),
+        });
+    }
+
+    // Deleting leaves the page, so it navigates instead of reloading. It removes the site from this node only.
     fn do_delete(&mut self, cx: &mut Context<Self>) {
         let Some((h, site)) = self.site_handle() else {
             return;
         };
         let name = site.name.clone();
+        let node = self.detail.node.clone();
         self.detail.busy = true;
         self.detail.busy_what = "Deleting the site";
         self.fetch_origin(
@@ -712,7 +1346,7 @@ impl Console {
                 this.detail.busy = false;
                 if !here {
                     let (text, tone) = match res {
-                        Ok(()) => (format!("Site {name} deleted"), Tone::Ok),
+                        Ok(()) => (format!("Site {name} deleted from {node}"), Tone::Ok),
                         Err(e) => (e.to_string(), Tone::Bad),
                     };
                     this.say(foreign_notice("Delete", origin, &text), tone);
@@ -722,7 +1356,7 @@ impl Console {
                 this.detail.busy = false;
                 match res {
                     Ok(()) => {
-                        this.say(format!("Site {name} deleted"), Tone::Ok);
+                        this.say(format!("Site {name} deleted from {node}"), Tone::Ok);
                         this.navigate(View::Sites, cx);
                     }
                     Err(e) => this.fail(e.to_string(), None),
@@ -883,6 +1517,29 @@ impl Console {
                 .status
                 .as_ref()
                 .is_some_and(|s| is_busy_phase(&s.phase));
+        let holders = self.holders();
+        let place = if holders.len() > 1 {
+            let mut chips = div()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap(px(6.))
+                .child(mono(site.id.clone()).text_size(px(11.)).text_color(c(DIM)))
+                .child(text_dim("on").text_size(px(11.)));
+            let different =
+                different_holders(site, &self.detail.node, &self.detail.cross.peers, &holders);
+            for name in &holders {
+                let differs = different.iter().any(|(n, _)| n == name);
+                chips = chips.child(self.holder_chip(name, &site.id, differs, cx));
+            }
+            chips
+        } else {
+            div().flex().child(
+                mono(format!("{} on {}", site.id, self.detail.node))
+                    .text_size(px(11.))
+                    .text_color(c(DIM)),
+            )
+        };
         let mut actions = div().flex().items_center().gap(px(8.)).child(back);
         if let Some(url) = open_url(&site.hosts) {
             actions = actions.child(
@@ -903,10 +1560,11 @@ impl Console {
                     .ready()
                     .map(|d| d.site.name.clone())
                     .unwrap_or_default();
+                let node = this.detail.node.clone();
                 this.ask(Confirm {
-                    title: "Switch active slot".into(),
+                    title: format!("Switch active slot on {node}"),
                     message: format!(
-                        "Send all traffic for {name} to the {} slot now?",
+                        "Send all traffic for {name} on {node} to the {} slot now?",
                         idle.as_str()
                     ),
                     label: "Switch".into(),
@@ -949,15 +1607,72 @@ impl Console {
                             .items_center()
                             .gap(px(12.))
                             .child(health)
-                            .child(
-                                mono(format!("{} on {}", site.id, self.detail.node))
-                                    .text_size(px(11.))
-                                    .text_color(c(DIM)),
-                            ),
+                            .child(place),
                     ),
             )
             .child(actions)
             .into_any_element()
+    }
+
+    // A node that holds this site: this one is marked, another opens its own page for the same site.
+    // `differs` marks a node whose site only shares the id, in a warn tone, so it is not mistaken for another copy of this site.
+    fn holder_chip(
+        &self,
+        name: &str,
+        site_id: &str,
+        differs: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        if name == self.detail.node {
+            return tip(
+                pill(name, Tone::Info),
+                id("holder-tip", name),
+                "This page shows this node",
+            )
+            .into_any_element();
+        }
+        let (node, site) = (name.to_string(), site_id.to_string());
+        let chip = div()
+            .id(id("holder", name))
+            .flex()
+            .items_center()
+            .px(px(10.))
+            .py(px(2.))
+            .rounded(px(PILL_RADIUS))
+            .border_1()
+            .border_color(if differs {
+                tint(Tone::Warn.color(), 0.5)
+            } else {
+                chip_stroke()
+            })
+            .bg(if differs {
+                tint(Tone::Warn.color(), 0.12)
+            } else {
+                chip_fill()
+            })
+            .text_color(c(if differs { Tone::Warn.color() } else { DIM }))
+            .text_size(px(11.))
+            .cursor_pointer()
+            .hover(|s| s.text_color(c(TEXT)))
+            .child(name.to_string())
+            .on_click(cx.listener(move |this, _, _, cx| {
+                // The other node's page opens on the tab being read here.
+                let tab = this.site_tab();
+                this.detail.tabs.set(&node, &site, tab);
+                this.navigate(
+                    View::SiteDetail {
+                        node: node.clone(),
+                        id: site.clone(),
+                    },
+                    cx,
+                );
+            }));
+        let hint = if differs {
+            format!("Open on {name}: a different site with the same id")
+        } else {
+            format!("Open on {name}")
+        };
+        tip(chip, id("holder-tip", name), hint).into_any_element()
     }
 
     // The error of the last action, compact: the node's words, a way to its build log, and the form stays below.
@@ -1061,7 +1776,7 @@ impl Console {
                     body.push(
                         card(
                             Some("Source"),
-                            Some("Where the node builds this site from. Changes take effect on the next deploy."),
+                            Some("Takes effect on the next deploy."),
                             source_fields(&self.detail.edit, HOME, &form.problems, cx),
                         )
                         .into_any_element(),
@@ -1079,6 +1794,7 @@ impl Console {
                 body.push(self.save_bar(data, &form, cx));
             }
             SiteTab::Environment => body.extend(self.env_tab(data, cx)),
+            SiteTab::Data => body.extend(self.data_tab(data, cx)),
             SiteTab::Volumes => {
                 let bar = self.save_bar(data, &form, cx);
                 body.extend(self.volumes_tab(data, bar, cx));
@@ -1194,7 +1910,7 @@ impl Console {
             )
             .child(div().flex_1())
             .child(if active {
-                pill("LIVE", Tone::Ok)
+                pill("Live", Tone::Ok)
             } else {
                 pill("idle", Tone::Muted)
             });
@@ -1240,23 +1956,20 @@ impl Console {
             return card(
                 Some("Redeploy from GitHub"),
                 Some(&format!(
-                    "The node fetches {} of {} again, builds it in the idle {} slot, health checks it, then flips traffic over.",
-                    branch,
+                    "Builds {branch} of {} into the idle {} slot on {} only, then flips traffic.",
                     src.repo,
-                    idle.as_str()
+                    idle.as_str(),
+                    self.detail.node
                 )),
                 div()
                     .flex()
                     .items_end()
                     .gap(px(12.))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .flex_1()
-                            .min_w_0()
-                            .child(field("Note", None, self.detail.note.clone())),
-                    )
+                    .child(div().flex().flex_col().flex_1().min_w_0().child(field(
+                        "Note",
+                        None,
+                        self.detail.note.clone(),
+                    )))
                     .child(deploy),
             )
             .into_any_element();
@@ -1268,7 +1981,14 @@ impl Console {
             .child(form_grid(vec![
                 field(
                     "Targets for the new version",
-                    Some(&format!("host:port with an optional weight, separated by commas. Idle slot now holds: {}", if current.is_empty() { "nothing".into() } else { current })),
+                    Some(&format!(
+                        "host:port with an optional weight, separated by commas. Idle slot: {}",
+                        if current.is_empty() {
+                            "empty".into()
+                        } else {
+                            current
+                        }
+                    )),
                     self.detail.targets.clone(),
                 )
                 .into_any_element(),
@@ -1278,8 +1998,9 @@ impl Console {
         card(
             Some("Deploy new version"),
             Some(&format!(
-                "Targets are written to the idle {} slot, health checked, then traffic flips over.",
-                idle.as_str()
+                "Writes the targets to the idle {} slot on {} only, then flips traffic.",
+                idle.as_str(),
+                self.detail.node
             )),
             body,
         )
@@ -1360,8 +2081,9 @@ impl Console {
                 BtnKind::Plain,
             )
             .on_click(cx.listener(|this, _, _, cx| {
+                let node = this.detail.node.clone();
                 this.ask(Confirm {
-                    title: "Rotate zone secret".into(),
+                    title: format!("Rotate zone secret on {node}"),
                     message: ROTATE_WARNING.into(),
                     label: "Rotate".into(),
                     danger: true,
@@ -1377,7 +2099,7 @@ impl Console {
         body = body.children(self.bot_trust_block(data));
         card(
             Some("Access"),
-            Some("Saved with the Save bar below. Older nodes reject these fields: if saving fails, update the node."),
+            Some("Older nodes reject these fields; update the node if saving fails."),
             body,
         )
         .into_any_element()
@@ -1512,77 +2234,130 @@ impl Console {
         panels
     }
 
-    // The toggle and page choice are staged locally and only sent by Apply.
+    // One switch per node that holds the site. Each switch writes only its own node, so one node can be taken down while another serves.
     fn maintenance_card(&self, data: &Data, cx: &mut Context<Self>) -> AnyElement {
-        let enabled = self.detail.maint_enabled;
+        let node = &self.detail.node;
+        let peers = &self.detail.cross.peers;
+        let holders = self.holders();
+        let rows = maint_rows(&holders, node, &data.site, peers);
+        let union = union_for(node, &data.pages, peers);
+        let chosen = effective_page(&self.detail.maint_pick, &rows, &union);
         let mut options = vec![
-            seg_item(
-                id("mpage", "default"),
-                "Built-in default",
-                self.detail.maint_page.is_none(),
-            )
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.detail.maint_page = None;
-                cx.notify();
-            }))
-            .into_any_element(),
+            seg_item(id("mpage", "default"), "Built-in default", chosen.is_none())
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.detail.maint_pick = Some(None);
+                    cx.notify();
+                }))
+                .into_any_element(),
         ];
-        for p in &data.pages {
+        for p in &union.pages {
             let pid = p.id.clone();
             options.push(
                 seg_item(
                     id("mpage", &p.id),
                     &format!("{} ({})", p.name, p.status),
-                    self.detail.maint_page.as_deref() == Some(&p.id),
+                    chosen.as_deref() == Some(p.id.as_str()),
                 )
                 .on_click(cx.listener(move |this, _, _, cx| {
-                    this.detail.maint_page = Some(pid.clone());
+                    this.detail.maint_pick = Some(Some(pid.clone()));
                     cx.notify();
                 }))
                 .into_any_element(),
             );
         }
-        let switch =
-            toggle(id("detail", "maint"), enabled).on_click(cx.listener(|this, _, _, cx| {
-                this.detail.maint_enabled = !this.detail.maint_enabled;
-                cx.notify();
-            }));
-        let apply = btn(id("detail", "apply-maint"), "Apply", BtnKind::Primary).on_click(
-            cx.listener(|this, _, _, cx| {
-                this.do_maintenance(cx);
-                cx.notify();
-            }),
-        );
-        let current = if data.site.maintenance.enabled {
-            "Currently enabled"
-        } else {
-            "Currently disabled"
-        };
-        let body = div()
-            .flex()
-            .flex_col()
-            .gap(px(12.))
-            .child(
+        let different = different_holders(&data.site, node, peers, &holders);
+        let is_different = |name: &str| different.iter().any(|(n, _)| n == name);
+        let mut list = div().flex().flex_col().gap(px(10.));
+        for row in &rows {
+            let (label, tone) = if row.enabled {
+                ("Maintenance", Tone::Warn)
+            } else {
+                ("Live", Tone::Ok)
+            };
+            let name = row.node.clone();
+            let next = !row.enabled;
+            let switch = toggle(id("maint", &row.node), row.enabled);
+            let switch = if self.detail.maint_busy.contains(&row.node) {
+                switch.opacity(0.5)
+            } else {
+                switch.on_click(cx.listener(move |this, _, _, cx| {
+                    this.set_maintenance(vec![name.clone()], next, cx);
+                    cx.notify();
+                }))
+            };
+            list = list.child(
                 div()
                     .flex()
                     .items_center()
                     .gap(px(12.))
-                    .child(switch)
+                    .child(tip(
+                        switch,
+                        id("maint-tip", &row.node),
+                        format!(
+                            "Turn maintenance {} on {}",
+                            if row.enabled { "off" } else { "on" },
+                            row.node
+                        ),
+                    ))
                     .child(
                         div()
                             .flex()
-                            .flex_col()
-                            .child(strong("Serve the maintenance page"))
-                            .child(text_dim(current).text_size(px(12.))),
+                            .w(px(96.))
+                            .flex_none()
+                            .text_size(px(12.))
+                            .text_color(c(tone.color()))
+                            .child(label),
+                    )
+                    .child(mono(row.node.clone()))
+                    .children(is_different(&row.node).then(|| {
+                        tip(
+                            pill("Different site", Tone::Warn),
+                            id("maint-diff-tip", &row.node),
+                            "It has a site with this id but different hosts. Its own switch still works.",
+                        )
+                    })),
+            );
+        }
+        let mut body = div().flex().flex_col().gap(px(12.));
+        if !self.detail.cross.ready {
+            body = body.child(text_dim("Checking the other nodes...").text_size(px(12.)));
+        }
+        body = body
+            .child(list)
+            .child(field("Page", None, div().flex().child(seg_row(options))));
+        // The everywhere buttons cover only holders that are the same site.
+        let covered: Vec<&MaintRow> = rows.iter().filter(|r| !is_different(&r.node)).collect();
+        if covered.len() > 1 {
+            let on = covered.iter().filter(|r| r.enabled).count();
+            let mut every = div().flex().gap(px(8.));
+            if on < covered.len() {
+                every = every.child(
+                    btn(id("maint", "all-on"), "Turn on everywhere", BtnKind::Plain).on_click(
+                        cx.listener(|this, _, _, cx| {
+                            this.ask_everywhere(true);
+                            cx.notify();
+                        }),
                     ),
-            )
-            .child(field("Page", None, div().flex().child(seg_row(options))))
-            .child(div().flex().child(apply));
+                );
+            }
+            if on > 0 {
+                every = every.child(
+                    btn(
+                        id("maint", "all-off"),
+                        "Turn off everywhere",
+                        BtnKind::Plain,
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.ask_everywhere(false);
+                        cx.notify();
+                    })),
+                );
+            }
+            body = body.child(every);
+        }
         card(
-            Some("Maintenance mode"),
-            Some(
-                "Visitors see the chosen page with its status code while upstreams stay untouched.",
-            ),
+            Some("Maintenance"),
+            Some("Each switch changes only its own node."),
             body,
         )
         .into_any_element()
@@ -1628,10 +2403,11 @@ impl Console {
                 .ready()
                 .map(|d| d.site.active.other().as_str())
                 .unwrap_or("previous");
+            let node = this.detail.node.clone();
             this.ask(Confirm {
-                title: "Roll back".into(),
+                title: format!("Roll back on {node}"),
                 message: format!(
-                    "Return traffic to the previous version? The {other} slot becomes active again."
+                    "Return traffic on {node} to the previous version? The {other} slot becomes active again."
                 ),
                 label: "Roll back".into(),
                 danger: true,
@@ -1670,10 +2446,11 @@ impl Console {
         let name = site.name.clone();
         let del = btn(id("detail", "delete"), "Delete site", BtnKind::Danger)
             .on_click(cx.listener(move |this, _, _, cx| {
+            let node = this.detail.node.clone();
             this.ask(Confirm {
-                title: "Delete site".into(),
+                title: format!("Delete site from {node}"),
                 message: format!(
-                    "This removes {name} and stops routing its hosts. Deployment history is lost."
+                    "This removes {name} from {node} only and stops routing its hosts there. Deployment history is lost."
                 ),
                 label: "Delete site".into(),
                 danger: true,
@@ -1689,9 +2466,12 @@ impl Console {
                 div()
                     .flex()
                     .flex_col()
-                    .child(strong("Delete this site"))
+                    .child(strong(format!(
+                        "Delete this site from {}",
+                        self.detail.node
+                    )))
                     .child(
-                        text_dim("Hosts stop routing immediately. This cannot be undone.")
+                        text_dim("Hosts stop routing there at once. This cannot be undone.")
                             .text_size(px(12.)),
                     ),
             )
@@ -1706,7 +2486,6 @@ fn busy_text(what: &str) -> &'static str {
         "Deploy" => "Starting a build",
         "Switch" => "Switching the active slot",
         "Rollback" => "Rolling back",
-        "Maintenance change" => "Changing maintenance mode",
         _ => "Waiting for the node",
     }
 }
@@ -1714,6 +2493,370 @@ fn busy_text(what: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cite_edge::model::{DeployAction, Source, Target};
+    use serde_json::json;
+
+    fn site(id: &str, name: &str) -> Site {
+        serde_json::from_value(json!({
+            "id": id,
+            "name": name,
+            "hosts": ["a.example.com"],
+            "blue": { "targets": [{ "addr": "10.0.0.1:80", "weight": 100 }] },
+            "green": {},
+            "active": "blue",
+        }))
+        .unwrap()
+    }
+
+    fn peer(node: &str, held: Option<Site>, pages: Option<Vec<MaintenancePage>>) -> Peer {
+        Peer {
+            node: node.into(),
+            site: held,
+            pages,
+        }
+    }
+
+    fn page(id: &str, html: &str) -> MaintenancePage {
+        MaintenancePage {
+            id: id.into(),
+            name: id.into(),
+            html: html.into(),
+            status: 503,
+        }
+    }
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn result(node: &str, outcome: Result<(), &str>) -> NodeResult {
+        NodeResult {
+            node: node.into(),
+            outcome: outcome.map_err(str::to_string),
+        }
+    }
+
+    #[test]
+    fn only_other_online_nodes_are_asked() {
+        let nodes = vec![
+            NodeInfo {
+                name: "edge-fra".into(),
+                online: true,
+            },
+            NodeInfo {
+                name: "edge-nyc".into(),
+                online: true,
+            },
+            NodeInfo {
+                name: "edge-ams".into(),
+                online: false,
+            },
+        ];
+        assert_eq!(peer_names(&nodes, "edge-fra"), names(&["edge-nyc"]));
+        assert!(peer_names(&[], "edge-fra").is_empty());
+    }
+
+    #[test]
+    fn a_peer_holds_the_site_only_when_its_list_names_the_id() {
+        let listed = vec![site("blog", "Blog"), site("shop", "Shop")];
+        let found = peer_from("edge-nyc", "shop", Some(listed.clone()), None);
+        assert_eq!(found.site.map(|s| s.name), Some("Shop".to_string()));
+        assert!(
+            peer_from("edge-nyc", "docs", Some(listed), None)
+                .site
+                .is_none()
+        );
+        // An unreadable list is not the same as a node without the site, but neither makes it a holder.
+        assert!(peer_from("edge-nyc", "shop", None, None).site.is_none());
+    }
+
+    #[test]
+    fn holders_follow_the_node_order_and_always_include_this_node() {
+        let peers = vec![
+            peer("edge-nyc", Some(site("shop", "Shop")), None),
+            peer("edge-ams", None, None),
+            peer("edge-sin", Some(site("shop", "Shop")), None),
+        ];
+        let order = names(&["edge-sin", "edge-fra", "edge-ams", "edge-nyc"]);
+        assert_eq!(
+            holder_nodes("edge-fra", &peers, &order),
+            names(&["edge-sin", "edge-fra", "edge-nyc"])
+        );
+        // Before the others answer, the page's own node is the only holder.
+        assert_eq!(holder_nodes("edge-fra", &[], &order), names(&["edge-fra"]));
+        // A node missing from the configured order is still listed after the rest.
+        assert_eq!(
+            holder_nodes("edge-fra", &peers, &names(&["edge-fra"])),
+            names(&["edge-fra", "edge-nyc", "edge-sin"])
+        );
+    }
+
+    fn with_hosts(hosts: &[&str], repo: Option<&str>) -> Site {
+        let mut s = site("blog", "Blog");
+        s.hosts = names(hosts);
+        s.source = repo.map(|r| Source {
+            repo: r.into(),
+            ..Default::default()
+        });
+        s
+    }
+
+    #[test]
+    fn sites_are_the_same_when_hosts_overlap_or_the_repository_matches() {
+        let mine = with_hosts(&["Blog.Example.com"], Some("Acme/Blog"));
+        let overlap = with_hosts(&["blog.example.com", "x.example.com"], None);
+        assert_eq!(site_relation(&mine, &overlap), Relation::Same);
+        let same_repo = with_hosts(&["other.example.org"], Some("acme/blog"));
+        assert_eq!(site_relation(&mine, &same_repo), Relation::Same);
+        let unrelated = with_hosts(&["api.example.org"], Some("acme/api"));
+        assert_eq!(site_relation(&mine, &unrelated), Relation::Different);
+        // Without hosts in common or two repositories to compare, nothing says they are the same site.
+        let no_source = with_hosts(&["api.example.org"], None);
+        assert_eq!(site_relation(&mine, &no_source), Relation::Different);
+        assert_eq!(
+            site_relation(&with_hosts(&[], None), &with_hosts(&[], None)),
+            Relation::Different
+        );
+    }
+
+    #[test]
+    fn only_holders_with_an_unrelated_site_are_called_out() {
+        let mine = with_hosts(&["blog.example.com"], None);
+        let peers = vec![
+            peer(
+                "edge-nyc",
+                Some(with_hosts(&["blog.example.com"], None)),
+                None,
+            ),
+            peer(
+                "edge-iad",
+                Some(with_hosts(&["api.example.org"], None)),
+                None,
+            ),
+            peer(
+                "edge-ams",
+                Some(with_hosts(&["zzz.example.org"], None)),
+                None,
+            ),
+        ];
+        // edge-ams is not a holder here, so it is not listed.
+        let holders = names(&["edge-fra", "edge-nyc", "edge-iad"]);
+        let found = different_holders(&mine, "edge-fra", &peers, &holders);
+        assert_eq!(
+            found,
+            vec![("edge-iad".to_string(), names(&["api.example.org"]))]
+        );
+        assert_eq!(
+            different_note("edge-iad", &names(&["api.example.org"])),
+            "edge-iad has a site with this id but different hosts (api.example.org)."
+        );
+        assert!(different_note("edge-iad", &[]).contains("(none)"));
+    }
+
+    #[test]
+    fn another_nodes_save_replaces_only_the_shared_fields() {
+        let mut stored = site("shop", "Shop");
+        stored.hosts = vec!["old.example.com".into()];
+        stored.active = Slot::Green;
+        stored.green.targets = vec![Target {
+            addr: "10.9.9.9:80".into(),
+            weight: 50,
+        }];
+        stored.source = Some(Source {
+            repo: "acme/shop-fra".into(),
+            ..Default::default()
+        });
+        stored.maintenance.enabled = true;
+        let mut edited = site("shop", "Storefront");
+        edited.kind = SiteKind::Api;
+        edited.hosts = vec!["shop.example.com".into(), "www.example.com".into()];
+        edited.path_prefixes = vec!["/api".into()];
+        edited.path_regexes = vec!["^/v[0-9]+$".into()];
+        edited.health.path = "/healthz".into();
+        edited.access.cloudflare_only = true;
+        // None of these may reach another node.
+        edited.active = Slot::Blue;
+        edited.blue.targets = vec![Target {
+            addr: "10.1.1.1:80".into(),
+            weight: 100,
+        }];
+        edited.source = Some(Source {
+            repo: "acme/shop-nyc".into(),
+            ..Default::default()
+        });
+        edited.volumes = vec![cite_edge::model::Volume {
+            name: "data".into(),
+            mount_path: "/data".into(),
+        }];
+
+        let body = shared_body(&stored, &edited);
+
+        assert_eq!(body.name, "Storefront");
+        assert_eq!(body.kind, SiteKind::Api);
+        assert_eq!(body.hosts, edited.hosts);
+        assert_eq!(body.path_prefixes, edited.path_prefixes);
+        assert_eq!(body.path_regexes, edited.path_regexes);
+        assert_eq!(body.health, edited.health);
+        assert_eq!(body.access, edited.access);
+        assert_eq!(body.active, Slot::Green);
+        assert_eq!(body.blue, stored.blue);
+        assert_eq!(body.green, stored.green);
+        assert_eq!(body.source, stored.source);
+        assert_eq!(body.volumes, stored.volumes);
+        assert_eq!(body.maintenance, stored.maintenance);
+        assert_eq!(body.history, stored.history);
+    }
+
+    #[test]
+    fn saving_what_is_already_stored_changes_nothing() {
+        let stored = site("shop", "Shop");
+        assert_eq!(shared_body(&stored, &stored), stored);
+    }
+
+    #[test]
+    fn a_save_names_every_node_and_fails_loudly_when_one_failed() {
+        let ok = [result("edge-fra", Ok(())), result("edge-nyc", Ok(()))];
+        assert_eq!(
+            save_message(&ok, None),
+            Ok("Saved on edge-fra, edge-nyc".to_string())
+        );
+        let mixed = [
+            result("edge-fra", Ok(())),
+            result("edge-nyc", Err("refused")),
+        ];
+        assert_eq!(
+            save_message(&mixed, None),
+            Err("Saved on edge-fra. Failed on edge-nyc: refused".to_string())
+        );
+    }
+
+    #[test]
+    fn a_redeploy_is_reported_after_the_save() {
+        let ok = [result("edge-fra", Ok(()))];
+        let started = Ok(started_deployment("d1".into(), Slot::Green));
+        let text = save_message(&ok, Some(&started)).unwrap();
+        assert!(text.starts_with("Saved on edge-fra. Build started on the green slot"));
+        let refused: Result<Deployment, String> = Err("no capacity".into());
+        assert_eq!(
+            save_message(&ok, Some(&refused)),
+            Err("Saved on edge-fra. The redeploy failed: no capacity".to_string())
+        );
+        let failed = Ok(Deployment {
+            id: "d2".into(),
+            at: "2026-01-02T03:04:05Z".into(),
+            slot: Slot::Green,
+            action: DeployAction::Failed,
+            note: "boom".into(),
+        });
+        let text = save_message(&ok, Some(&failed)).unwrap_err();
+        assert!(text.starts_with("Saved on edge-fra. The deploy failed: boom"));
+    }
+
+    #[test]
+    fn each_nodes_maintenance_state_comes_from_its_own_copy() {
+        let mut here = site("shop", "Shop");
+        here.maintenance.enabled = true;
+        here.maintenance.page_id = Some("soon".into());
+        let mut there = site("shop", "Shop");
+        there.maintenance.page_id = Some("sale".into());
+        let peers = vec![
+            peer("edge-nyc", Some(there), None),
+            peer("edge-ams", None, None),
+        ];
+        let holders = names(&["edge-fra", "edge-nyc"]);
+        let rows = maint_rows(&holders, "edge-fra", &here, &peers);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].node, "edge-fra");
+        assert!(rows[0].enabled);
+        assert_eq!(rows[0].page_id.as_deref(), Some("soon"));
+        assert!(!rows[1].enabled);
+        assert_eq!(rows[1].page_id.as_deref(), Some("sale"));
+    }
+
+    #[test]
+    fn the_page_chooser_shows_the_pick_or_the_page_already_served() {
+        let union = union_for(
+            "edge-fra",
+            &[page("soon", "a")],
+            &[peer("edge-nyc", None, Some(vec![page("sale", "b")]))],
+        );
+        let row = |node: &str, page_id: Option<&str>| MaintRow {
+            node: node.into(),
+            enabled: false,
+            page_id: page_id.map(str::to_string),
+        };
+        let rows = [row("edge-fra", None), row("edge-nyc", Some("sale"))];
+        assert_eq!(
+            effective_page(&None, &rows, &union).as_deref(),
+            Some("sale")
+        );
+        assert_eq!(
+            effective_page(&Some(Some("soon".into())), &rows, &union).as_deref(),
+            Some("soon")
+        );
+        // Picking the built-in page wins over a page a node already serves.
+        assert_eq!(effective_page(&Some(None), &rows, &union), None);
+        // A page no node holds any more is never shown as chosen.
+        assert_eq!(
+            effective_page(&Some(Some("gone".into())), &rows, &union),
+            None
+        );
+    }
+
+    #[test]
+    fn turning_off_keeps_the_page_the_node_serves() {
+        assert_eq!(
+            maint_page_for(true, Some("soon"), Some("sale")).as_deref(),
+            Some("soon")
+        );
+        assert_eq!(
+            maint_page_for(false, Some("soon"), Some("sale")).as_deref(),
+            Some("sale")
+        );
+        assert_eq!(
+            maint_page_for(false, Some("soon"), None).as_deref(),
+            Some("soon")
+        );
+        assert_eq!(maint_page_for(true, None, Some("sale")), None);
+    }
+
+    #[test]
+    fn a_node_without_the_chosen_page_is_found_across_all_nodes_pages() {
+        let peers = vec![
+            peer("edge-nyc", None, Some(vec![])),
+            peer("edge-ams", None, None),
+        ];
+        let union = union_for("edge-fra", &[page("soon", "<p>soon</p>")], &peers);
+        assert_eq!(union.pages.len(), 1);
+        assert_eq!(
+            nodes_needing_page(
+                &union,
+                "soon",
+                &names(&["edge-fra", "edge-nyc", "edge-ams"])
+            ),
+            names(&["edge-nyc"])
+        );
+        let entry = &union.pages[0];
+        let created = page_from_union(entry);
+        assert_eq!(created, page("soon", "<p>soon</p>"));
+    }
+
+    #[test]
+    fn the_maintenance_toast_names_the_nodes_and_the_failures() {
+        let results = [
+            result("edge-fra", Ok(())),
+            result("edge-nyc", Ok(())),
+            result("edge-ams", Err("page refused")),
+        ];
+        assert_eq!(
+            maint_message(true, &results),
+            "Maintenance enabled on edge-fra, edge-nyc. Failed on edge-ams: page refused"
+        );
+        assert_eq!(
+            maint_message(false, &results[..1]),
+            "Maintenance disabled on edge-fra"
+        );
+    }
 
     #[test]
     fn open_goes_to_the_first_concrete_host() {

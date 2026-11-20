@@ -106,7 +106,40 @@ pub struct Stack {
     pub kind: String,
 }
 
+/// The four data containers: a site's own database and one-shot job, and the node-wide shared instance and its job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataRole {
+    Db,
+    DbJob,
+    SharedDb,
+    SharedJob,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DataContainer {
+    pub role: DataRole,
+    /// The owning site; none for the shared instance and its job.
+    pub id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DataVolume {
+    Site(String),
+    SharedData,
+    SharedConf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DataNetwork {
+    Site(String),
+    SharedAdmin,
+}
+
+pub const DATA_OFF: &str = "data services are off on this node (CITE_PROXY_DATA=false)";
+
 pub struct Policy {
+    pub(crate) backup_volume: String,
+    pub(crate) data_enabled: bool,
     pub(crate) haproxy: String,
     pub(crate) edge: String,
     pub(crate) github_api_url: Option<String>,
@@ -124,6 +157,13 @@ pub struct Policy {
     manager_image: Regex,
     executor_image: Regex,
     egress_image: Regex,
+    postgres_image: Regex,
+    data_container: Regex,
+    shared_container: Regex,
+    data_volume: Regex,
+    shared_volume: Regex,
+    data_network: Regex,
+    shared_network: Regex,
     pull_repo: Regex,
     pull_tag: Regex,
 }
@@ -137,7 +177,14 @@ impl Policy {
                 "^cite-(?<id>{ID})-(?<slot>blue|green)-(?<kind>{kinds})$"
             ))
         };
+        let pg = crate::spec_data::PG_MAJORS
+            .iter()
+            .map(u8::to_string)
+            .collect::<Vec<_>>()
+            .join("|");
         Policy {
+            backup_volume: cfg.backup_volume.clone(),
+            data_enabled: cfg.data_enabled,
             haproxy: cfg.haproxy_container.clone(),
             edge: cfg.edge_network.clone(),
             github_api_url: cfg.github_api_url.clone(),
@@ -159,11 +206,92 @@ impl Policy {
                 "^{reg}/(cite-executor-node:{VERSION}-node(22|24)|cite-executor-(bun|static|rust):{VERSION})$"
             )),
             egress_image: build(format!("^{reg}/cite-egress:{VERSION}$")),
+            postgres_image: build(format!("^{reg}/cite-postgres:{VERSION}-pg({pg})$")),
+            data_container: build(format!("^cite-(?<id>{ID})-(?<kind>db|dbjob)$")),
+            shared_container: build("^cite-pg-shared(?<kind>|-job)$".to_string()),
+            data_volume: build(format!("^cite-(?<id>{ID})-db-data$")),
+            shared_volume: build("^cite-pg-shared-(?<kind>data|conf)$".to_string()),
+            data_network: build(format!("^cite-(?<id>{ID})-dbnet$")),
+            shared_network: build("^cite-pg-shared-admin$".to_string()),
             pull_repo: build(format!(
-                "^{reg}/(cite-manager|cite-manager-rust|cite-executor-(node|bun|static|rust)|cite-egress)$"
+                "^{reg}/(cite-manager|cite-manager-rust|cite-executor-(node|bun|static|rust)|cite-egress|cite-postgres)$"
             )),
-            pull_tag: build(format!("^{VERSION}(-node(22|24))?$")),
+            pull_tag: build(format!("^{VERSION}(-node(22|24)|-pg({pg}))?$")),
         }
+    }
+
+    pub fn data_container(&self, name: &str) -> Option<DataContainer> {
+        if let Some(caps) = self.data_container.captures(name) {
+            let role = match &caps["kind"] {
+                "db" => DataRole::Db,
+                _ => DataRole::DbJob,
+            };
+            return Some(DataContainer {
+                role,
+                id: Some(caps["id"].to_string()),
+            });
+        }
+        let caps = self.shared_container.captures(name)?;
+        let role = match &caps["kind"] {
+            "" => DataRole::SharedDb,
+            _ => DataRole::SharedJob,
+        };
+        Some(DataContainer { role, id: None })
+    }
+
+    pub fn data_volume(&self, name: &str) -> Option<DataVolume> {
+        if let Some(caps) = self.data_volume.captures(name) {
+            return Some(DataVolume::Site(caps["id"].to_string()));
+        }
+        let caps = self.shared_volume.captures(name)?;
+        Some(match &caps["kind"] {
+            "data" => DataVolume::SharedData,
+            _ => DataVolume::SharedConf,
+        })
+    }
+
+    pub fn data_network(&self, name: &str) -> Option<DataNetwork> {
+        if let Some(caps) = self.data_network.captures(name) {
+            return Some(DataNetwork::Site(caps["id"].to_string()));
+        }
+        self.shared_network
+            .is_match(name)
+            .then_some(DataNetwork::SharedAdmin)
+    }
+
+    /// Every data name is refused while the operator has switched data services off.
+    pub(crate) fn data_gate(&self) -> Result<(), String> {
+        if self.data_enabled {
+            Ok(())
+        } else {
+            Err(DATA_OFF.to_string())
+        }
+    }
+
+    /// True when the name falls in any scheme the proxy serves (stack, site volume or data), used to keep operator names clear of them.
+    pub fn names_cite_object(&self, name: &str) -> bool {
+        name.starts_with("cite-vol-")
+            || self.container.is_match(name)
+            || self.volume.is_match(name)
+            || self.network.is_match(name)
+            || self.site_volume.is_match(name)
+            || self.data_container(name).is_some()
+            || self.data_volume(name).is_some()
+            || self.data_network(name).is_some()
+    }
+
+    fn any_container(&self, name: &str) -> Result<(), String> {
+        if self.data_container(name).is_some() {
+            return self.data_gate();
+        }
+        self.container(name).map(|_| ())
+    }
+
+    fn any_network(&self, name: &str) -> Result<(), String> {
+        if self.data_network(name).is_some() {
+            return self.data_gate();
+        }
+        self.network(name).map(|_| ())
     }
 
     // Names are parsed from the right, so a site id that looks like a slot or role cannot confuse the match.
@@ -199,12 +327,19 @@ impl Policy {
         Ok((caps["id"].to_string(), caps["name"].to_string()))
     }
 
-    // Stack volumes and site volumes are the only volumes the connector may touch.
+    // Stack volumes, site volumes and data volumes are the only volumes the connector may touch.
     fn any_volume(&self, name: &str) -> Result<(), String> {
         if name.starts_with("cite-vol-") && self.site_volume(name).is_ok() {
             return Ok(());
         }
+        if self.data_volume(name).is_some() {
+            return self.data_gate();
+        }
         self.volume(name).map(|_| ())
+    }
+
+    pub fn is_postgres_image(&self, image: &str) -> bool {
+        self.data_enabled && self.postgres_image.is_match(image)
     }
 
     pub fn is_manager_image(&self, image: &str) -> bool {
@@ -220,7 +355,10 @@ impl Policy {
     }
 
     fn is_cite_image(&self, image: &str) -> bool {
-        self.is_manager_image(image) || self.is_executor_image(image) || self.is_egress_image(image)
+        self.is_manager_image(image)
+            || self.is_executor_image(image)
+            || self.is_egress_image(image)
+            || self.is_postgres_image(image)
     }
 
     // The node's egress bridge may be created and inspected, never deleted or attached to by name.
@@ -274,18 +412,27 @@ impl Policy {
             ("GET", ["networks", name]) => {
                 allow_keys(q, &[], &[])?;
                 if !self.is_egress_bridge(name) {
-                    self.network(name)?;
+                    self.any_network(name)?;
                 }
                 Route::NetworkInspect(name.to_string())
             }
             ("DELETE", ["networks", name]) => {
                 allow_keys(q, &[], &[])?;
-                self.network(name)?;
+                self.any_network(name)?;
                 Route::NetworkDelete(name.to_string())
             }
             ("POST", ["networks", name, action @ ("connect" | "disconnect")]) => {
                 allow_keys(q, &[], &[])?;
-                if self.network(name)?.kind != "net" {
+                // A site's dbnet takes the shared instance (the body decides); the admin network takes nothing.
+                let attachable = match self.data_network(name) {
+                    Some(DataNetwork::Site(_)) => {
+                        self.data_gate()?;
+                        true
+                    }
+                    Some(DataNetwork::SharedAdmin) => false,
+                    None => self.network(name)?.kind == "net",
+                };
+                if !attachable {
                     return Err("only per-stack networks can be attached".to_string());
                 }
                 match *action {
@@ -300,23 +447,23 @@ impl Policy {
             ("POST", ["containers", "create"]) => {
                 allow_keys(q, &["name"], &["name"])?;
                 let name = &q["name"];
-                self.container(name)?;
+                self.any_container(name)?;
                 Route::ContainerCreate(name.clone())
             }
             ("GET", ["containers", name, "json"]) => {
                 allow_keys(q, &[], &[])?;
-                self.container(name)?;
+                self.any_container(name)?;
                 Route::ContainerInspect(name.to_string())
             }
             ("GET", ["containers", name, "logs"]) => {
                 check_logs(q)?;
-                self.container(name)?;
+                self.any_container(name)?;
                 Route::ContainerLogs(name.to_string())
             }
             ("DELETE", ["containers", name]) => {
                 allow_keys(q, &["force"], &[])?;
                 bool_value(q, "force")?;
-                self.container(name)?;
+                self.any_container(name)?;
                 Route::ContainerDelete(name.to_string())
             }
             (
@@ -327,7 +474,7 @@ impl Policy {
                     action @ ("start" | "stop" | "restart" | "wait"),
                 ],
             ) => {
-                self.container(name)?;
+                self.any_container(name)?;
                 let name = name.to_string();
                 match *action {
                     "start" => {

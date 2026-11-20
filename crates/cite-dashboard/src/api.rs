@@ -11,7 +11,7 @@ use axum::{Extension, Json, Router};
 use bytes::Bytes;
 use cite_client::{
     ClientError, DEFAULT_FAN_OUT_LIMIT, MAX_NODES, NodeClient, NodeConfig, NodeOutcome,
-    NodeTargets, ReplicationMode, ReplicationPlan, apply_plan, fan_out,
+    NodeTargets, ReplicationMode, ReplicationPlan, TransferPlan, apply_plan, fan_out,
 };
 use cite_edge::auth::{
     Credentials, authenticate, hash_password, validate_password_strength, validate_username,
@@ -26,6 +26,7 @@ use serde_json::{Value, json};
 use crate::error::ApiError;
 use crate::security::{self, PeerIp, SessionCtx};
 use crate::state::{AppState, NodeStatus, PendingSetup, lock, now_unix};
+use crate::transfers::{TransferHub, TransferView};
 use crate::{assets, preview, proxy, qr};
 
 pub const MAX_BODY_BYTES: usize = 1024 * 1024;
@@ -53,6 +54,11 @@ impl<S: Send + Sync, T: DeserializeOwned> FromRequest<S> for ApiJson<T> {
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
+    // Transfer states sit beside the dashboard config; the hub resumes none by itself, it only remembers them.
+    let transfers = TransferHub::load(
+        state.clone(),
+        Some(TransferHub::path_beside(&state.settings.config_path)),
+    );
     let api = Router::new()
         .route("/api/v1/setup", get(setup_status).post(setup_begin))
         .route("/api/v1/setup/confirm", post(setup_confirm))
@@ -65,7 +71,17 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/nodes/{node}", delete(nodes_remove))
         .route("/api/v1/nodes/{node}/{*rest}", any(proxy::proxy))
         .route("/api/v1/deployments", post(deployments))
+        .route(
+            "/api/v1/transfers",
+            get(transfers_list).post(transfers_create),
+        )
+        .route("/api/v1/transfers/{id}", get(transfers_get))
+        .route("/api/v1/transfers/{id}/resume", post(transfers_resume))
+        .route("/api/v1/transfers/{id}/cancel", post(transfers_cancel))
+        .route("/api/v1/transfers/{id}/cutover", post(transfers_cutover))
+        .route("/api/v1/transfers/{id}/rollback", post(transfers_rollback))
         .route("/api/v1/preview", post(preview::create))
+        .layer(Extension(transfers))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             security::api_guard,
@@ -544,4 +560,60 @@ async fn deployments(
         .join("; ");
     let payload = json!({ "error": summary, "results": results });
     Ok((StatusCode::CONFLICT, Json(payload)).into_response())
+}
+
+// Node-to-node database transfers. The server moves the data between the two nodes itself; the browser only starts,
+// watches and steers a transfer, so no dump, chunk or manifest ever reaches it.
+
+async fn transfers_list(Extension(hub): Extension<Arc<TransferHub>>) -> Json<Vec<TransferView>> {
+    Json(hub.list())
+}
+
+async fn transfers_create(
+    Extension(hub): Extension<Arc<TransferHub>>,
+    ApiJson(plan): ApiJson<TransferPlan>,
+) -> Result<(StatusCode, Json<TransferView>), ApiError> {
+    hub.create(plan)
+        .await
+        .map(|view| (StatusCode::ACCEPTED, Json(view)))
+}
+
+async fn transfers_get(
+    Extension(hub): Extension<Arc<TransferHub>>,
+    Path(id): Path<String>,
+) -> Result<Json<TransferView>, ApiError> {
+    hub.get(&id)
+        .map(Json)
+        .ok_or_else(|| ApiError::not_found("transfer not found"))
+}
+
+async fn transfers_resume(
+    Extension(hub): Extension<Arc<TransferHub>>,
+    Path(id): Path<String>,
+) -> Result<(StatusCode, Json<TransferView>), ApiError> {
+    hub.resume(&id)
+        .map(|view| (StatusCode::ACCEPTED, Json(view)))
+}
+
+async fn transfers_cancel(
+    Extension(hub): Extension<Arc<TransferHub>>,
+    Path(id): Path<String>,
+) -> Result<Json<TransferView>, ApiError> {
+    hub.cancel(&id).map(Json)
+}
+
+async fn transfers_cutover(
+    Extension(hub): Extension<Arc<TransferHub>>,
+    Path(id): Path<String>,
+) -> Result<(StatusCode, Json<TransferView>), ApiError> {
+    hub.cutover(&id)
+        .map(|view| (StatusCode::ACCEPTED, Json(view)))
+}
+
+async fn transfers_rollback(
+    Extension(hub): Extension<Arc<TransferHub>>,
+    Path(id): Path<String>,
+) -> Result<(StatusCode, Json<TransferView>), ApiError> {
+    hub.rollback(&id)
+        .map(|view| (StatusCode::ACCEPTED, Json(view)))
 }

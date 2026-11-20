@@ -15,6 +15,8 @@ use crate::build::{BuiltRelease, release_manifest};
 use crate::{ManagerError, Result};
 
 const HEARTBEAT_STALE: Duration = Duration::from_secs(6);
+/// How long promote waits for a fresh executor heartbeat before calling the executor unresponsive.
+const EXECUTOR_START_WAIT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromoteOutcome {
@@ -62,14 +64,26 @@ pub fn executor_responsive(cfg: &ManagerConfig) -> Result<bool> {
     Ok(age < time::Duration::seconds(HEARTBEAT_STALE.as_secs() as i64))
 }
 
+/// The executor can start after the manager, and a fast first build reaches promote before its first heartbeat.
+async fn wait_executor_responsive(cfg: &ManagerConfig, wait: Duration) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        if executor_responsive(cfg)? {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(ManagerError::new("executor_unresponsive"));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 /// The caller must have already validated the build; a failed build never reaches promote.
 pub async fn promote(ctx: PromoteContext<'_>) -> Result<PromoteOutcome> {
     let cfg = ctx.cfg;
     let built = ctx.built;
 
-    if !executor_responsive(cfg)? {
-        return Err(ManagerError::new("executor_unresponsive"));
-    }
+    wait_executor_responsive(cfg, EXECUTOR_START_WAIT).await?;
 
     let slot = free_slot(cfg)?;
     let warm_grace_s = cfg.warm_grace.as_secs();
@@ -479,6 +493,71 @@ mod tests {
         assert!(!slot.join("release.json").exists());
         assert!(!slot.join("app").exists());
         assert!(!slot_is_sealed(&slot));
+    }
+
+    #[tokio::test]
+    async fn promote_waits_for_an_executor_that_has_not_reported_yet() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = cfg_in(tmp.path());
+        let status_path = cfg.status_path();
+        // The executor starts after the manager and writes its first heartbeat a moment later.
+        let late = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            write_status(&status_path, &ExecutorStatus::initial("0.1.0")).unwrap();
+        });
+
+        let src = tmp.path().join("packed");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("index.html"), b"<html>v</html>").unwrap();
+        let tar_path = tmp.path().join("app.tar");
+        let mut tar = std::fs::File::create(&tar_path).unwrap();
+        let report = pack_dir(&src, &mut tar, &PackLimits::default()).unwrap();
+        tar.flush().unwrap();
+        let built = BuiltRelease {
+            release_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".into(),
+            sha: "a".repeat(40),
+            message: "hi".into(),
+            author: "dev".into(),
+            rendering: Rendering::Static,
+            runtime: RuntimeKind::Node,
+            node_major: "22".into(),
+            start_argv: Vec::new(),
+            spa_fallback: None,
+            bytes: report.bytes,
+            file_count: report.file_count,
+            tree_sha256: "0".repeat(64),
+            health: Health {
+                path: "/".into(),
+                expect: HealthExpect::Non2xxOk,
+                timeout_s: 5,
+                consecutive: 1,
+            },
+            tar_path,
+            job_dir: tmp.path().join("job"),
+        };
+        // The deliberate hash mismatch stops promote right after it has got past the executor check.
+        let err = promote(PromoteContext {
+            cfg: &cfg,
+            built: &built,
+            generation: 1,
+        })
+        .await
+        .unwrap_err();
+        late.await.unwrap();
+        assert!(
+            err.to_string().contains("tree_sha256 mismatch"),
+            "promote gave up on a booting executor: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_executor_that_never_reports_is_unresponsive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = cfg_in(tmp.path());
+        let err = wait_executor_responsive(&cfg, Duration::from_millis(300))
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "executor_unresponsive");
     }
 
     #[test]

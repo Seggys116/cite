@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::{Arc, Mutex as StdMutex, MutexGuard};
+use std::sync::{Arc, Mutex as StdMutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use axum::Router;
@@ -37,6 +37,8 @@ mod alerts;
 mod analytics_api;
 mod archives;
 mod certificates;
+mod data_api;
+mod data_transfer_api;
 mod doppler_api;
 mod export;
 mod handlers;
@@ -77,6 +79,8 @@ pub struct Inner {
     certs: Arc<CertStore>,
     alerts: Arc<crate::alerts::Alerts>,
     doppler: Arc<crate::dopplersync::DopplerSync>,
+    // Set once at start-up, and only when the node has an orchestrator and a backup directory.
+    data: OnceLock<Arc<crate::data::DataService>>,
     limiter: StdMutex<LoginLimiter>,
     token_limiter: StdMutex<LoginLimiter>,
     started: Instant,
@@ -115,12 +119,18 @@ impl Inner {
             certs,
             alerts,
             doppler,
+            data: OnceLock::new(),
             limiter: StdMutex::new(LoginLimiter::new()),
             token_limiter: StdMutex::new(LoginLimiter::new()),
             started: Instant::now(),
             #[cfg(test)]
             rotations_waiting: std::sync::atomic::AtomicUsize::new(0),
         })
+    }
+
+    /// Installs the data service; a second call is ignored.
+    pub fn set_data(&self, data: Arc<crate::data::DataService>) {
+        let _ = self.data.set(data);
     }
 
     // Runs to completion even when the caller goes away, so a half-applied change is never left behind.
@@ -158,6 +168,8 @@ pub struct ApiError {
     status: StatusCode,
     message: String,
     retry_after: Option<u64>,
+    // A named list that rides along with the message, such as the conflicts of a link request.
+    detail: Option<(&'static str, serde_json::Value)>,
 }
 
 impl ApiError {
@@ -166,6 +178,15 @@ impl ApiError {
             status,
             message: message.into(),
             retry_after: None,
+            detail: None,
+        }
+    }
+
+    /// A 409 whose body also carries `conflicts`.
+    pub fn conflicts(message: impl Into<String>, conflicts: serde_json::Value) -> Self {
+        Self {
+            detail: Some(("conflicts", conflicts)),
+            ..Self::new(StatusCode::CONFLICT, message)
         }
     }
 
@@ -203,6 +224,9 @@ impl IntoResponse for ApiError {
         let mut body = serde_json::json!({ "error": self.message });
         if let (Some(secs), Some(obj)) = (self.retry_after, body.as_object_mut()) {
             obj.insert("retry_after".into(), secs.into());
+        }
+        if let (Some((name, value)), Some(obj)) = (self.detail.clone(), body.as_object_mut()) {
+            obj.insert(name.into(), value);
         }
         let mut res = (self.status, axum::Json(body)).into_response();
         if let Some(secs) = self.retry_after
@@ -529,6 +553,8 @@ pub fn router(state: AppState) -> Router {
         .merge(alerts::routes())
         .merge(doppler_api::routes())
         .merge(volumes::routes())
+        .merge(data_api::routes())
+        .merge(data_transfer_api::routes())
         .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
     Router::new()
         .merge(public)
@@ -711,6 +737,7 @@ pub async fn run(cfg: ConnectorConfig) -> Result<()> {
     );
     crate::alerts::spawn_watcher(Arc::clone(&state.alerts), Arc::clone(&state.deployer));
     state.doppler.spawn();
+    start_data_service(&state).await;
     certificates::spawn_renewals(Arc::clone(&state));
     tokio::select! {
         () = serve(listener, state, acceptor) => {}
@@ -724,6 +751,36 @@ pub async fn run(cfg: ConnectorConfig) -> Result<()> {
         Err(e) => tracing::warn!(error = %e, "analytics checkpoint task failed"),
     }
     Ok(())
+}
+
+// Data services need Docker and the backup volume; without either the routes answer 404 and nothing runs.
+async fn start_data_service(state: &AppState) {
+    let (Some(orchestrator), Some(cfg)) = (
+        state.orchestrator.clone(),
+        crate::data::service::DataConfig::from_connector(&state.cfg),
+    ) else {
+        return;
+    };
+    let data = match crate::data::DataService::new(
+        Arc::clone(&state.deployer),
+        Arc::clone(&state.store),
+        orchestrator,
+        Arc::clone(&state.alerts),
+        cfg,
+    ) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::error!(error = %e, "data services are off: the backup volume could not be opened");
+            return;
+        }
+    };
+    state.deployer.set_data_service(&data);
+    state.set_data(Arc::clone(&data));
+    data.recover().await;
+    // Docker may have recreated a tenant network (new subnet) while the connector was down.
+    data.reconcile().await;
+    data.spawn_scheduler();
+    tracing::info!("data services are on");
 }
 
 // Opening may migrate the schema or import an old snapshot, so it stays off the async workers.

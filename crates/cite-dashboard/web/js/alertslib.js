@@ -21,6 +21,7 @@ export const ALERT_EVENTS = [
   { value: 'deploy_succeeded', label: 'A deploy succeeds' },
   { value: 'cert_expiring', label: 'A certificate is about to expire' },
   { value: 'node_error', label: 'The node reports an error' },
+  { value: 'backup_failed', label: 'A backup fails' },
 ];
 
 const EVENT_VALUES = new Set(ALERT_EVENTS.map((e) => e.value));

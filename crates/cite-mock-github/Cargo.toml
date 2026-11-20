@@ -25,3 +25,4 @@ tokio = { workspace = true }
 
 [dev-dependencies]
 reqwest = { workspace = true }
+cite-tls = { workspace = true }

@@ -23,7 +23,7 @@ export async function startDeploy({ node, siteId, info, ref, note, targets }) {
 export async function deployWithToasts(args, { onAfter } = {}) {
   try {
     const res = await startDeploy(args);
-    toast(res.async ? 'Deploy started. Follow it in the Status panel.' : 'Deployed.', 'success');
+    toast(res.async ? `Deploy started on ${args.node}. Follow it in the Status panel.` : `Deployed on ${args.node}.`, 'success');
     if (onAfter) onAfter(res);
     return true;
   } catch (ex) {
@@ -33,7 +33,8 @@ export async function deployWithToasts(args, { onAfter } = {}) {
   }
 }
 
-export function askRebuild(labels) {
+// Redeploying only ever touches the node whose page this is, so the dialog names it
+export function askRebuild(labels, node) {
   return new Promise((resolve) => {
     let handle = null;
     const finish = (value) => {
@@ -41,12 +42,12 @@ export function askRebuild(labels) {
       if (handle) handle.close();
     };
     const later = button('Later', { onClick: () => finish(false) });
-    const now = button('Redeploy now', { kind: 'primary', iconName: 'rocket', onClick: () => finish(true) });
+    const now = button(node ? `Redeploy on ${node}` : 'Redeploy now', { kind: 'primary', iconName: 'rocket', onClick: () => finish(true) });
     handle = openModal({
       title: 'This change needs a rebuild',
       content: h('div', { class: 'stack-sm' },
-        h('p', {}, `${labels.join(', ')} ${labels.length === 1 ? 'was' : 'were'} saved. ${labels.length === 1 ? 'It takes' : 'They take'} effect when the site is built again.`),
-        h('p', { class: 'muted' }, 'Redeploying builds the latest commit into the idle slot and switches traffic only if the build succeeds. The live site keeps serving until then.')),
+        h('p', {}, `${labels.join(', ')} ${labels.length === 1 ? 'was' : 'were'} saved. ${labels.length === 1 ? 'It takes' : 'They take'} effect when the site is built again${node ? ` on ${node}` : ''}.`),
+        h('p', { class: 'muted' }, 'The live site keeps serving until the new build passes.')),
       actions: [later, now],
       onClose: () => resolve(false),
     });

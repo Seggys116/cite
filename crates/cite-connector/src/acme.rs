@@ -19,6 +19,7 @@ use zeroize::Zeroizing;
 
 use crate::certs::{self, Generated};
 use crate::cfapi::{CfToken, Cloudflare, Endpoints, Http, Reply, Zone, remote_text};
+use crate::seal::{self, Keyring, OpenMode};
 use crate::{ConnectorError, Result};
 
 pub const MAX_PER_HOUR: usize = 10;
@@ -112,11 +113,16 @@ impl AccountKey {
         Ok(Self { pair, rng, x, y })
     }
 
+    // The file is sealed under the node key when the node has one (found next to the file, like the other loaders do), and a plaintext file from an earlier release is sealed on first load.
     pub fn load_or_create(path: &Path) -> Result<Self> {
-        match cite_core::atomic::read_limited(path, MAX_ACCOUNT_KEY_BYTES) {
-            Ok(bytes) => {
-                let bytes = Zeroizing::new(bytes);
-                let text = std::str::from_utf8(&bytes)
+        let data_dir = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let keyring = Keyring::discover(data_dir, OpenMode::Migrating)?;
+        match seal::read_path(keyring.as_ref(), path, MAX_ACCOUNT_KEY_BYTES) {
+            Ok(Some(read)) => {
+                let text = std::str::from_utf8(&read.plaintext)
                     .map_err(|_| internal("the ACME account key file is not text"))?;
                 let block = pem::parse(text)
                     .map_err(|_| internal("the ACME account key file is not PEM"))?;
@@ -124,16 +130,20 @@ impl AccountKey {
                     return Err(internal("the ACME account key file holds no PRIVATE KEY"));
                 }
                 let der = Zeroizing::new(block.into_contents());
-                Self::from_pkcs8(&der)
+                let key = Self::from_pkcs8(&der)?;
+                if let Some(keyring) = &keyring
+                    && let Err(e) = seal::migrate_path(keyring, path, &read)
+                {
+                    tracing::error!(error = %e, "the ACME account key could not be sealed and was left as it is");
+                }
+                Ok(key)
             }
-            Err(cite_core::Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
-                Self::create(path)
-            }
+            Ok(None) => Self::create(path, keyring.as_ref()),
             Err(e) => Err(internal(format!("cannot read the ACME account key: {e}"))),
         }
     }
 
-    fn create(path: &Path) -> Result<Self> {
+    fn create(path: &Path, keyring: Option<&Keyring>) -> Result<Self> {
         let rng = SystemRandom::new();
         let doc = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng)
             .map_err(|_| internal("cannot generate the ACME account key"))?;
@@ -141,7 +151,7 @@ impl AccountKey {
         let block = pem::Pem::new(KEY_TAG, der.to_vec());
         let text = Zeroizing::new(pem::encode(&block));
         drop(Zeroizing::new(block.into_contents()));
-        cite_core::atomic::write_atomic(path, text.as_bytes(), KEY_MODE)
+        seal::write_path(keyring, path, text.as_bytes(), KEY_MODE)
             .map_err(|e| internal(format!("cannot store the ACME account key: {e}")))?;
         Self::from_pkcs8(&der)
     }
@@ -812,7 +822,7 @@ pub(crate) mod mock {
     use base64::Engine;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use rcgen::{
-        BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair,
+        BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, Issuer, KeyPair,
         PKCS_ECDSA_P256_SHA256, PublicKeyData, SignatureAlgorithm,
     };
     use ring::signature::{ECDSA_P256_SHA256_FIXED, UnparsedPublicKey};
@@ -863,8 +873,7 @@ pub(crate) mod mock {
     }
 
     struct Ca {
-        cert: rcgen::Certificate,
-        key: KeyPair,
+        issuer: Issuer<'static, KeyPair>,
         pem: String,
     }
 
@@ -876,9 +885,12 @@ pub(crate) mod mock {
             let mut dn = DistinguishedName::new();
             dn.push(DnType::CommonName, CA_NAME);
             params.distinguished_name = dn;
-            let cert = params.self_signed(&key).expect("ca certificate");
+            let cert = params.clone().self_signed(&key).expect("ca certificate");
             let pem = cert.pem();
-            Self { cert, key, pem }
+            Self {
+                issuer: Issuer::new(params, key),
+                pem,
+            }
         }
 
         fn sign(&self, csr_der: &[u8], days: i64) -> Result<(String, Seen), String> {
@@ -910,7 +922,7 @@ pub(crate) mod mock {
             params.not_before = now - time::Duration::days(1);
             params.not_after = now + time::Duration::days(days);
             let leaf = params
-                .signed_by(&ForeignKey(point.clone()), &self.cert, &self.key)
+                .signed_by(&ForeignKey(point.clone()), &self.issuer)
                 .map_err(|e| e.to_string())?;
             Ok((
                 leaf.pem(),
@@ -1779,6 +1791,80 @@ mod tests {
 
         std::fs::write(&path, "not a key").unwrap();
         assert!(AccountKey::load_or_create(&path).is_err());
+    }
+
+    fn write_node_key(dir: &std::path::Path) -> crate::seal::NodeKey {
+        let key = crate::seal::NodeKey::generate().unwrap();
+        let path = dir.join("secrets.key");
+        std::fs::write(&path, key.text().as_bytes()).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        key
+    }
+
+    #[test]
+    fn a_new_account_key_is_sealed_when_the_node_has_a_key_and_plain_otherwise() {
+        let plain_dir = tempfile::tempdir().unwrap();
+        let plain_path = plain_dir.path().join(ACCOUNT_KEY_FILE);
+        AccountKey::load_or_create(&plain_path).unwrap();
+        let text = std::fs::read_to_string(&plain_path).unwrap();
+        assert!(text.contains("BEGIN PRIVATE KEY"));
+        assert!(!plain_dir.path().join("secrets.key").exists());
+
+        let dir = tempfile::tempdir().unwrap();
+        let node = write_node_key(dir.path());
+        let path = dir.path().join(ACCOUNT_KEY_FILE);
+        let first = AccountKey::load_or_create(&path).unwrap();
+        let raw = std::fs::read(&path).unwrap();
+        assert_eq!(seal::envelope_kid(&raw), Some(node.kid()));
+        assert!(!String::from_utf8_lossy(&raw).contains("PRIVATE KEY"));
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let again = AccountKey::load_or_create(&path).unwrap();
+        assert_eq!(first.thumbprint(), again.thumbprint());
+        let signature = again.sign(b"payload").unwrap();
+        assert_eq!(signature.len(), 64);
+    }
+
+    #[test]
+    fn a_plaintext_account_key_is_sealed_once_keeping_a_pre_seal_copy_until_the_next_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(ACCOUNT_KEY_FILE);
+        let first = AccountKey::load_or_create(&path).unwrap();
+        let plain = std::fs::read(&path).unwrap();
+        let node = write_node_key(dir.path());
+
+        let migrated = AccountKey::load_or_create(&path).unwrap();
+        assert_eq!(first.thumbprint(), migrated.thumbprint());
+        let raw = std::fs::read(&path).unwrap();
+        assert_eq!(seal::envelope_kid(&raw), Some(node.kid()));
+        let copy = dir.path().join("acme-account.pem.pre-seal");
+        assert_eq!(std::fs::read(&copy).unwrap(), plain);
+
+        let again = AccountKey::load_or_create(&path).unwrap();
+        assert_eq!(first.thumbprint(), again.thumbprint());
+        assert!(!copy.exists(), "the next load removes the copy");
+    }
+
+    #[test]
+    fn a_sealed_account_key_without_its_key_is_refused_and_never_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(ACCOUNT_KEY_FILE);
+        let stranger = Keyring::from_keys(
+            crate::seal::NodeKey::generate().unwrap(),
+            crate::seal::KeySource::Env,
+            Vec::new(),
+            OpenMode::Migrating,
+        );
+        let sealed = stranger
+            .seal(
+                ACCOUNT_KEY_FILE,
+                b"-----BEGIN PRIVATE KEY-----\n-----END PRIVATE KEY-----\n",
+            )
+            .unwrap();
+        std::fs::write(&path, &sealed).unwrap();
+        assert!(AccountKey::load_or_create(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), sealed);
+        assert!(!dir.path().join("secrets.key").exists());
     }
 
     #[test]
