@@ -7,7 +7,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
-use cite_core::atomic::write_atomic_in;
 use cite_core::confined::{FileName, TrustedDir};
 use cite_edge::alerts::{
     AlertEvent, AlertPayload, AlertSettings, EMAIL_TARGET, EmailSettings, SettingsView, Target,
@@ -26,6 +25,7 @@ use zeroize::Zeroizing;
 
 use crate::certs::{CertStore, Source};
 use crate::deploy::Deployer;
+use crate::seal::{self, Keyring, OpenMode};
 use crate::store::{now_unix, unix_to_rfc3339};
 use crate::{ConnectorError, Result};
 
@@ -236,6 +236,8 @@ impl Raised {
 
 pub struct Alerts {
     dir: PathBuf,
+    // The node key, when the node has one: alerts.json is then sealed with it.
+    keyring: Option<Keyring>,
     settings: Mutex<Arc<AlertSettings>>,
     // Set when alerts.json exists but could not be read: nothing is written over it.
     broken: bool,
@@ -264,27 +266,35 @@ fn file_name() -> Result<FileName> {
     FileName::new(FILE).map_err(|e| internal("alert file name", e))
 }
 
-fn load(dir: &Path) -> std::result::Result<AlertSettings, ()> {
+fn load(dir: &Path, keyring: Option<&Keyring>) -> std::result::Result<AlertSettings, ()> {
     let root = match TrustedDir::open(dir) {
         Ok(root) => root,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(AlertSettings::default()),
         Err(_) => return Err(()),
     };
     let name = file_name().map_err(|_| ())?;
-    let bytes = match root.read_limited(&name, MAX_FILE_BYTES) {
-        Ok(b) => Zeroizing::new(b),
-        Err(cite_core::Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(AlertSettings::default());
+    let read = match seal::read_file(keyring, &root, &name, MAX_FILE_BYTES) {
+        Ok(Some(read)) => read,
+        Ok(None) => return Ok(AlertSettings::default()),
+        Err(e) => {
+            tracing::error!(error = %e, "alerts.json could not be opened");
+            return Err(());
         }
-        Err(_) => return Err(()),
     };
-    serde_json::from_slice(&bytes).map_err(|_| ())
+    let settings: AlertSettings = serde_json::from_slice(&read.plaintext).map_err(|_| ())?;
+    // A plaintext file from an earlier release, or one under a previous key, moves to the current key; alerts work either way.
+    if let Some(keyring) = keyring
+        && let Err(e) = seal::migrate_file(keyring, &root, &name, &read)
+    {
+        tracing::error!(error = %e, "alerts.json could not be sealed and was left as it is");
+    }
+    Ok(settings)
 }
 
-fn persist(dir: &Path, settings: &AlertSettings) -> Result<()> {
+fn persist(dir: &Path, settings: &AlertSettings, keyring: Option<&Keyring>) -> Result<()> {
     let bytes = Zeroizing::new(serde_json::to_vec(settings)?);
     let root = TrustedDir::open(dir).map_err(|e| internal("cannot open the data directory", e))?;
-    write_atomic_in(&root, &file_name()?, &bytes, 0o600)
+    seal::write_file(keyring, &root, &file_name()?, &bytes, 0o600)
         .map_err(|e| internal("cannot write the alert settings", e))
 }
 
@@ -298,7 +308,18 @@ impl Alerts {
     }
 
     fn assemble(dir: &Path, net: Net, clock: Arc<dyn Clock>, backoff: Duration) -> Arc<Alerts> {
-        let (settings, broken) = match load(dir) {
+        // A key that cannot be resolved (sealed data without its key, a malformed key) leaves the file unread and untouched.
+        let (keyring, loaded) = match Keyring::discover(dir, OpenMode::Migrating) {
+            Ok(keyring) => {
+                let loaded = load(dir, keyring.as_ref());
+                (keyring, loaded)
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "the secrets key for alerts.json is not usable");
+                (None, Err(()))
+            }
+        };
+        let (settings, broken) = match loaded {
             Ok(s) => (s, false),
             Err(()) => {
                 tracing::error!(
@@ -309,6 +330,7 @@ impl Alerts {
         };
         Arc::new(Alerts {
             dir: dir.to_path_buf(),
+            keyring,
             settings: Mutex::new(Arc::new(settings)),
             broken,
             write: tokio::sync::Mutex::new(()),
@@ -371,9 +393,12 @@ impl Alerts {
         next.normalize();
         next.validate().map_err(ConnectorError::BadRequest)?;
         let dir = self.dir.clone();
-        let next = tokio::task::spawn_blocking(move || persist(&dir, &next).map(|()| next))
-            .await
-            .map_err(|e| internal("alert settings task failed", e))??;
+        let keyring = self.keyring.clone();
+        let next = tokio::task::spawn_blocking(move || {
+            persist(&dir, &next, keyring.as_ref()).map(|()| next)
+        })
+        .await
+        .map_err(|e| internal("alert settings task failed", e))??;
         let view = next.view();
         *lock(&self.settings) = Arc::new(next);
         Ok(view)
@@ -513,7 +538,7 @@ impl Alerts {
             .destination(&hook.url)
             .map_err(Failure::permanent)?;
         let ip = self.net.pin(&target).await?;
-        let mut builder = reqwest::Client::builder()
+        let mut builder = cite_tls::client_builder()
             .redirect(reqwest::redirect::Policy::none())
             .no_proxy()
             .timeout(SEND_TIMEOUT);
@@ -1137,3 +1162,151 @@ impl StatusSource for DeployerSource {
 
 #[cfg(test)]
 mod tests;
+
+// alerts.json under the node key: sealing on write, migration of plaintext, and refusal without the key.
+#[cfg(test)]
+mod sealing_tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use cite_edge::alerts::WebhookKind;
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::seal::{KeySource, NodeKey};
+
+    const URL: &str = "https://hooks.example.com/services/T0/B0/xyz";
+
+    fn incoming(url: &str) -> AlertSettings {
+        AlertSettings {
+            enabled: true,
+            webhooks: vec![Webhook {
+                id: "ops".into(),
+                name: "Ops".into(),
+                kind: WebhookKind::Slack,
+                url: url.into(),
+                events: vec![AlertEvent::BuildFailed],
+            }],
+            email: Some(EmailSettings {
+                host: "smtp.example.com".into(),
+                username: "user".into(),
+                password: "hunter2".into(),
+                from: "a@example.com".into(),
+                to: vec!["b@example.com".into()],
+                ..EmailSettings::default()
+            }),
+            cooldown_secs: 60,
+        }
+    }
+
+    // The managed key file is how the server and its loaders share the node key.
+    fn node_key(dir: &Path) -> NodeKey {
+        let key = NodeKey::generate().expect("key");
+        let path = dir.join("secrets.key");
+        std::fs::write(&path, key.text().as_bytes()).expect("write key");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("mode");
+        key
+    }
+
+    fn file(dir: &TempDir) -> PathBuf {
+        dir.path().join(FILE)
+    }
+
+    #[tokio::test]
+    async fn with_a_node_key_settings_are_written_sealed_and_read_back() {
+        let dir = TempDir::new().expect("tempdir");
+        let key = node_key(dir.path());
+        let alerts = Alerts::new(dir.path());
+        alerts.update(incoming(URL)).await.expect("update");
+
+        let raw = std::fs::read(file(&dir)).expect("read");
+        assert_eq!(seal::envelope_kid(&raw), Some(key.kid()));
+        let text = String::from_utf8_lossy(&raw);
+        assert!(!text.contains("xyz") && !text.contains("hunter2"), "{text}");
+        let mode = std::fs::metadata(file(&dir))
+            .expect("meta")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+
+        let reloaded = Alerts::new(dir.path());
+        let settings = reloaded.settings();
+        assert_eq!(settings.webhooks[0].url, URL);
+        assert_eq!(settings.email.as_ref().expect("email").password, "hunter2");
+    }
+
+    #[tokio::test]
+    async fn without_a_node_key_settings_stay_plaintext_as_before() {
+        let dir = TempDir::new().expect("tempdir");
+        let alerts = Alerts::new(dir.path());
+        alerts.update(incoming(URL)).await.expect("update");
+        let text = std::fs::read_to_string(file(&dir)).expect("read");
+        assert!(text.contains("hunter2"));
+        assert!(
+            !dir.path().join("secrets.key").exists(),
+            "a loader never creates the key"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_plaintext_file_is_sealed_once_keeping_a_pre_seal_copy_until_the_next_load() {
+        let dir = TempDir::new().expect("tempdir");
+        let key = node_key(dir.path());
+        let original = serde_json::to_vec(&incoming(URL)).expect("json");
+        std::fs::write(file(&dir), &original).expect("seed");
+
+        let alerts = Alerts::new(dir.path());
+        assert_eq!(alerts.settings().webhooks[0].url, URL);
+        let raw = std::fs::read(file(&dir)).expect("read");
+        assert_eq!(seal::envelope_kid(&raw), Some(key.kid()));
+        let copy = dir.path().join("alerts.json.pre-seal");
+        assert_eq!(std::fs::read(&copy).expect("copy"), original);
+
+        let again = Alerts::new(dir.path());
+        assert_eq!(again.settings().webhooks[0].url, URL);
+        assert!(!copy.exists(), "the next load removes the copy");
+    }
+
+    #[tokio::test]
+    async fn a_file_under_a_previous_key_is_resealed_with_the_current_one() {
+        let dir = TempDir::new().expect("tempdir");
+        let old = NodeKey::generate().expect("old key");
+        let old_ring =
+            Keyring::from_keys(old.clone(), KeySource::Env, Vec::new(), OpenMode::Migrating);
+        let original = serde_json::to_vec(&incoming(URL)).expect("json");
+        std::fs::write(file(&dir), old_ring.seal(FILE, &original).expect("seal")).expect("seed");
+        let current = node_key(dir.path());
+        std::fs::write(
+            dir.path().join("secrets.key.previous"),
+            old.text().as_bytes(),
+        )
+        .expect("previous");
+
+        let alerts = Alerts::new(dir.path());
+        assert_eq!(alerts.settings().webhooks[0].url, URL);
+        let raw = std::fs::read(file(&dir)).expect("read");
+        assert_eq!(seal::envelope_kid(&raw), Some(current.kid()));
+    }
+
+    #[tokio::test]
+    async fn a_sealed_file_without_its_key_is_left_alone_and_alerts_stay_off() {
+        let dir = TempDir::new().expect("tempdir");
+        let stranger = Keyring::from_keys(
+            NodeKey::generate().expect("key"),
+            KeySource::Env,
+            Vec::new(),
+            OpenMode::Migrating,
+        );
+        let sealed = stranger
+            .seal(FILE, &serde_json::to_vec(&incoming(URL)).expect("json"))
+            .expect("seal");
+        std::fs::write(file(&dir), &sealed).expect("seed");
+
+        let alerts = Alerts::new(dir.path());
+        assert!(!alerts.settings().enabled);
+        let err = alerts.update(incoming(URL)).await.unwrap_err();
+        assert!(matches!(err, ConnectorError::Internal(_)));
+        assert_eq!(std::fs::read(file(&dir)).expect("read"), sealed);
+        assert!(!dir.path().join("secrets.key").exists());
+    }
+}

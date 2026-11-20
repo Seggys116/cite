@@ -101,14 +101,12 @@ export function alertsPanel(node) {
             sync();
           },
         });
-        webhooksBox.append(h('div', {
-          class: 'stack-sm', role: 'group', 'aria-label': `Webhook ${i + 1}`, style: { border: '1px solid var(--border)', 'border-radius': '8px', padding: 'var(--s3)' },
-        },
+        webhooksBox.append(h('div', { class: 'stack-sm alert-hook', role: 'group', 'aria-label': `Webhook ${i + 1}` },
           h('div', { class: 'inline-form' }, textInput(`Webhook ${i + 1} name`, w.name, (v) => {
             w.name = v;
             sync();
           }, { placeholder: 'Name, for example Ops chat', maxlength: '64' }), kind),
-          field('Webhook URL', url, 'Must start with https://. Treat it like a password: anyone with the URL can post to it.'),
+          field('Webhook URL', url, 'Must start with https://. Anyone with the URL can post to it.'),
           w.storedUrl ? h('span', { class: 'hint' }, ['URL ', pill(secretBadge(true), 'ok'), ' ', h('span', { class: 'mono' }, maskUrl(w.storedUrl))]) : null,
           eventChecks(`Webhook ${i + 1} events`, w.events, (value, on) => {
             w.events = toggleEvent(w.events, value, on);
@@ -145,7 +143,7 @@ export function alertsPanel(node) {
       });
       emailBox.append(h('label', { class: 'check-row' }, enable, h('span', {}, 'Send alerts by email')));
       if (!e.enabled) {
-        if (savedEmail) emailBox.append(h('p', { class: 'hint' }, 'Saving with this off removes the stored email settings, including the saved password.'));
+        if (savedEmail) emailBox.append(h('p', { class: 'hint' }, 'Saving removes the stored email settings and password.'));
         return;
       }
       const tls = h('select', { class: 'select', 'aria-label': 'Email encryption' }, TLS_MODES.map((t) => h('option', { value: t.value }, t.label)));
@@ -159,7 +157,7 @@ export function alertsPanel(node) {
         sync();
       }, e.passwordSet ? 'Saved (leave empty to keep it)' : 'Password');
       const recipients = h('textarea', {
-        class: 'textarea', rows: '3', 'aria-label': 'Recipients, one per line', autocomplete: 'off', spellcheck: 'false', placeholder: 'ops@example.com',
+        class: 'textarea', rows: '3', 'aria-label': 'Recipients, one per line', autocomplete: 'off', spellcheck: 'false', placeholder: 'ops@example.com', title: `One address per line, up to ${MAX_RECIPIENTS}.`,
       });
       recipients.value = e.to;
       recipients.addEventListener('input', () => {
@@ -174,9 +172,9 @@ export function alertsPanel(node) {
         h('div', { class: 'inline-form' },
           field('User name', textInput('Email user name', e.username, (v) => { e.username = v; sync(); }, { autocomplete: 'username' })),
           field('Password', password, null)),
-        h('p', { class: 'hint' }, ['Password ', pill(secretBadge(e.passwordSet), e.passwordSet ? 'ok' : 'muted'), ' It is write-only: it is never shown again after saving.']),
+        h('p', { class: 'hint' }, ['Password ', pill(secretBadge(e.passwordSet), e.passwordSet ? 'ok' : 'muted')]),
         field('From address', textInput('Email from address', e.from, (v) => { e.from = v; sync(); }, { type: 'email', placeholder: 'cite@example.com' })),
-        field('Recipients', recipients, `One address per line, up to ${MAX_RECIPIENTS}.`),
+        field('Recipients', recipients),
         eventChecks('Email events', e.events, (value, on) => {
           e.events = toggleEvent(e.events, value, on);
           sync();
@@ -195,7 +193,7 @@ export function alertsPanel(node) {
     const cooldown = textInput('Cooldown in seconds', form.cooldown, (v) => {
       form.cooldown = v;
       sync();
-    }, { inputmode: 'numeric', maxlength: '5' });
+    }, { inputmode: 'numeric', maxlength: '5', title: 'The same alert is not repeated more often than this. 0 sends every one.' });
 
     save.addEventListener('click', async () => {
       errorBox.hidden = true;
@@ -207,7 +205,7 @@ export function alertsPanel(node) {
       }
       try {
         await withBusy(save, () => n.put('/alerts', body));
-        toast('Alerts saved', 'success');
+        toast(`Alerts saved on ${node}`, 'success');
         again();
       } catch (ex) {
         errorBox.textContent = formatError(ex);
@@ -220,19 +218,17 @@ export function alertsPanel(node) {
     return h('div', { class: 'stack' },
       card({
         title: 'Alerts',
-        subtitle: 'Tell someone when a site goes down, a build fails or a certificate is about to expire.',
         actions: [dirtyPill],
         body: h('div', { class: 'form' },
           h('div', { class: 'section-row' }, h('span', { class: 'field-label' }, 'Send alerts'), enableSwitch),
-          field('Cooldown (seconds)', cooldown, 'The same alert is not repeated more often than this. 0 sends every one.')),
+          field('Cooldown (seconds)', cooldown)),
       }),
       card({
         title: 'Webhooks',
-        subtitle: `Up to ${MAX_WEBHOOKS}. Discord and Slack get a message in their own format; generic webhooks get JSON.`,
         actions: [addWebhook],
         body: webhooksBox,
       }),
-      card({ title: 'Email', subtitle: 'Sent through your own mail server.', body: emailBox }),
+      card({ title: 'Email', body: emailBox }),
       errorBox,
       h('div', { class: 'form-actions' }, save));
   }, { skeleton: () => skeletonBlock(200) });

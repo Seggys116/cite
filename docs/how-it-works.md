@@ -52,4 +52,17 @@ docker compose exec manager cite restart-child
 docker compose exec manager cite restart-executor   # exits → Compose relaunches
 ```
 
+## Data in node mode
+
+On a node with the orchestrator a site can have a managed Postgres. Blue and green do not each get a database: both executors join the site's internal `dbnet` network and use the same one, so a switch or rollback never changes which data the site sees. The manager joins `dbnet` only for a build whose variables link to Postgres, which is how a build runs migrations; that build runs while the old slot still serves, so a migration has to work for the old code as well (add first, remove later). The connector checks that the database is up before it touches any container, and keeps the running slot when it is not. Backups, restores and user changes run as one-shot job containers. See [Site data services](data.md).
+
+```mermaid
+flowchart LR
+  B["blue executor"] --- N["dbnet (internal)"]
+  G["green executor"] --- N
+  M["manager (build with a Postgres link only)"] -.- N
+  J["one-shot job (backup, restore, users)"] -.- N
+  N --- D[("Postgres: dedicated, or the node's shared instance")]
+```
+
 HTTPS is terminated **in front** of the executor — see [https.md](https.md).

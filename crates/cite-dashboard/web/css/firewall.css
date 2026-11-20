@@ -1,0 +1,56 @@
+/* firewall styles: uses the tokens defined in app.css only */
+
+/* header line: "All nodes" plus one chip per node */
+.fw-scope { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.fw-node-chips { display: inline-flex; flex-wrap: wrap; gap: 4px; }
+
+/* rules table */
+.fw-nodes { display: flex; flex-wrap: wrap; gap: 4px; }
+.fw-node {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 2px 8px; border-radius: var(--r-pill, 999px);
+  background: var(--chip-fill); color: var(--text); font-size: 12px; white-space: nowrap;
+}
+.fw-differs { margin-left: 4px; font-weight: 400; }
+
+.t td.fw-matches-cell { min-width: 200px; max-width: 420px; }
+.fw-matches { display: flex; flex-wrap: wrap; gap: 4px; }
+.fw-chip {
+  max-width: 100%; white-space: normal; height: auto;
+  overflow-wrap: anywhere; word-break: break-all; text-align: left;
+  /* A chip that wraps onto several lines would look like a bubble at pill radius */
+  border-radius: var(--r-well, 12px);
+}
+
+/* redirects: a row whose on/off state is not the same on every node that holds it */
+.fw-mixed { margin: 0; }
+.fw-mixed[hidden] { display: none; }
+
+/* presets */
+.preset { position: relative; }
+.fw-count { cursor: help; }
+.fw-count:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+.fw-pop {
+  position: absolute; left: 8px; right: 8px; bottom: 48px; z-index: 5;
+  max-height: 260px; overflow: auto;
+  padding: 10px 12px; border-radius: var(--r-well, var(--r3));
+  background: var(--surface-2); color: var(--text);
+  border: 1px solid var(--border); box-shadow: var(--shadow-2, none);
+}
+.fw-pop[hidden] { display: none; }
+
+.fw-rule-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 10px; }
+.fw-rule-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.fw-patterns { display: flex; flex-direction: column; gap: 2px; margin-top: 4px; }
+.fw-pattern { font-size: 12px; color: var(--text-dim); overflow-wrap: anywhere; word-break: break-all; }
+
+.fw-what { font-size: 12px; }
+.fw-what summary { cursor: pointer; color: var(--text-dim); padding: 2px 0; }
+.fw-what summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.fw-what[open] summary { margin-bottom: 8px; }
+
+/* the popover duplicates the details list, so on touch screens only the details list is offered */
+@media (hover: none) {
+  .fw-pop { display: none; }
+}

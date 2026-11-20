@@ -139,6 +139,11 @@ impl TrustedDir {
         self.open_at(name, OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL, mode)
     }
 
+    /// `create_new`, opened for reading as well, for writers that verify what they wrote.
+    pub fn create_new_rw(&self, name: &FileName, mode: u32) -> io::Result<File> {
+        self.open_at(name, OFlags::RDWR | OFlags::CREATE | OFlags::EXCL, mode)
+    }
+
     /// Takes an exclusive advisory lock that is held until the returned file is dropped.
     pub fn lock_file(&self, name: &FileName, mode: u32) -> io::Result<File> {
         let file = self.open_at(name, OFlags::WRONLY | OFlags::CREATE, mode)?;

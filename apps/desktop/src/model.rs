@@ -755,6 +755,7 @@ pub fn health_problem(d: &SiteDraft) -> Option<String> {
         volumes: Vec::new(),
         outbound: true,
         outbound_rules: Default::default(),
+        data: Default::default(),
     };
     cite_edge::validate::validate_site(&probe)
         .err()
@@ -973,6 +974,7 @@ pub fn build_site(draft: &SiteDraft) -> Result<Site, String> {
         volumes: Vec::new(),
         outbound: true,
         outbound_rules: Default::default(),
+        data: Default::default(),
     };
     fill_site(&mut site, draft)?;
     cite_edge::validate::validate_site_strict(&site).map_err(|e| e.to_string())?;

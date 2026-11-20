@@ -69,7 +69,7 @@ export function openZoneSecretPanel({ entries, onDone }) {
     wide: true,
     dismissable: false,
     content: h('div', { class: 'stack' },
-      h('p', { class: 'notice warn', role: 'alert' }, 'This is the only time the secret is shown. Copy it now. This dialog closes only with the button below, and closing it removes the secret from the page.'),
+      h('p', { class: 'notice warn', role: 'alert' }, 'Copy it now: the secret is shown once and removed from the page when this dialog closes.'),
       rows,
       h('div', { class: 'stack-sm' },
         h('b', {}, `Add it in Cloudflare as the header ${ZONE_HEADER}`),

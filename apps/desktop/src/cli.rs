@@ -1,6 +1,6 @@
 use crate::app::{Options, View};
 
-pub const USAGE: &str = "usage: cite-desktop [--demo] [--view <name>] [--node <name>] [--scroll end]\n\nviews: overview, nodes, sites, site-detail, site-new, traffic, request-detail, bots, explore, export, firewall, maintenance, settings";
+pub const USAGE: &str = "usage: cite-desktop [--demo] [--view <name>] [--node <name>] [--scroll end]\n\nviews: overview, nodes, sites, site-detail, site-new, topology, databases, traffic, request-detail, bots, explore, export, firewall, maintenance, settings";
 
 // Flags are parsed by hand: the surface is three options and no extra crate is justified.
 pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
@@ -77,6 +77,13 @@ mod tests {
             assert_eq!(o.view.as_ref(), Some(&view));
             assert_eq!(view.section(), "Traffic");
         }
+    }
+
+    #[test]
+    fn the_topology_view_can_be_opened_directly() {
+        let o = run(&["--demo", "--view", "topology"]).expect("parse");
+        assert_eq!(o.view, Some(View::Topology));
+        assert!(USAGE.contains("topology"));
     }
 
     #[test]

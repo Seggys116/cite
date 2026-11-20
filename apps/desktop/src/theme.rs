@@ -1,28 +1,36 @@
 use gpui::{Rgba, rgb};
 
-pub const BG: u32 = 0x0b0b0c;
-pub const SIDEBAR: u32 = 0x0e0e10;
-pub const TOPBAR: u32 = 0x1b1b1f;
+// The ink palette: neutral greys with one accent, depth from layered shadows and hairlines.
+pub const BG: u32 = 0x0b0c0e;
+pub const SIDEBAR: u32 = 0x0e0f12;
+pub const TOPBAR: u32 = 0x101114;
 // The window behind the inset panels; Term paints its chrome in the top bar colour.
 pub const WINDOW: u32 = TOPBAR;
-pub const INPUT: u32 = 0x111113;
-pub const SURFACE: u32 = 0x141418;
-pub const SURFACE_HI: u32 = 0x1e1e23;
-pub const BORDER: u32 = 0x2a2a2e;
-pub const DIVIDER: u32 = 0x1c1c20;
-pub const TEXT: u32 = 0xdcdcdc;
-pub const DIM: u32 = 0x8a8a8c;
-pub const ACCENT: u32 = 0xce422b;
-pub const YELLOW: u32 = 0xd7ba7d;
-pub const BLUE: u32 = 0x61afef;
-pub const GREEN: u32 = 0x8cd973;
+pub const INPUT: u32 = 0x131417;
+pub const SURFACE: u32 = 0x141518;
+pub const SURFACE_HI: u32 = 0x202126;
+pub const BORDER: u32 = 0x2e2f36;
+pub const DIVIDER: u32 = 0x1d1e22;
+pub const TEXT: u32 = 0xf2f2f3;
+pub const DIM: u32 = 0xaaabb2;
+// The quietest text that still reads at 4.5:1 on SURFACE and SURFACE_HI.
+pub const FAINT: u32 = 0x888991;
+pub const ACCENT: u32 = 0xee6a52;
+// Label colour on an ACCENT fill.
+pub const ON_ACCENT: u32 = 0x0b0c0e;
+pub const YELLOW: u32 = 0xe3b95c;
+pub const BLUE: u32 = 0x7fb0ff;
+pub const GREEN: u32 = 0x6fd08c;
 pub const TOOL: u32 = 0xc678dd;
-pub const RED: u32 = 0xf26b78;
+pub const RED: u32 = 0xff8a80;
 
 // Metrics shared by the chrome: card radius and the row and pill corner radii.
-pub const CARD_RADIUS: f32 = 10.0;
-pub const ROW_RADIUS: f32 = 8.0;
-pub const CHIP_RADIUS: f32 = 7.0;
+pub const CARD_RADIUS: f32 = 18.0;
+pub const ROW_RADIUS: f32 = 12.0;
+pub const CHIP_RADIUS: f32 = 12.0;
+// Pills and pill controls are fully rounded.
+pub const PILL_RADIUS: f32 = 999.0;
+// The panels sit WINDOW_INSET inside the window frame, so this stays equal to CARD_RADIUS.
 pub const PANEL_RADIUS: f32 = CARD_RADIUS;
 
 // The one spacing scale: every gap and padding in the shared helpers comes from here.
@@ -156,6 +164,64 @@ mod tests {
         assert_eq!(layout::page_padding(200.0), space::LG);
         assert!((layout::page_padding(600.0) - 24.0).abs() < 0.01);
         assert_eq!(layout::page_padding(4000.0), 40.0);
+    }
+
+    // WCAG relative luminance and contrast ratio.
+    fn luminance(color: Rgba) -> f32 {
+        let lin = |v: f32| {
+            if v <= 0.03928 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * lin(color.r) + 0.7152 * lin(color.g) + 0.0722 * lin(color.b)
+    }
+
+    fn contrast(fg: Rgba, bg: Rgba) -> f32 {
+        let (a, b) = (luminance(fg), luminance(bg));
+        (a.max(b) + 0.05) / (a.min(b) + 0.05)
+    }
+
+    // Straight alpha blend in sRGB, which is how the renderer composites a tint.
+    fn over(fg: Rgba, bg: Rgba) -> Rgba {
+        let mix = |f: f32, b: f32| b + (f - b) * fg.a;
+        Rgba {
+            r: mix(fg.r, bg.r),
+            g: mix(fg.g, bg.g),
+            b: mix(fg.b, bg.b),
+            a: 1.0,
+        }
+    }
+
+    #[test]
+    fn text_colours_reach_aa_on_every_surface_they_sit_on() {
+        let surfaces = [BG, SIDEBAR, TOPBAR, INPUT, SURFACE, SURFACE_HI];
+        for surface in surfaces {
+            for text in [TEXT, DIM, FAINT] {
+                let ratio = contrast(c(text), c(surface));
+                assert!(
+                    ratio >= 4.5,
+                    "{text:06x} on {surface:06x} is only {ratio:.2}:1"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn labels_on_accent_and_tinted_pills_reach_aa() {
+        assert!(contrast(c(ON_ACCENT), c(ACCENT)) >= 4.5);
+        for hex in [GREEN, YELLOW, RED, BLUE, TOOL] {
+            let bg = over(tint(hex, 0.12), c(SURFACE));
+            let ratio = contrast(c(hex), bg);
+            assert!(ratio >= 4.5, "{hex:06x} pill is only {ratio:.2}:1");
+        }
+    }
+
+    #[test]
+    fn pills_are_fully_rounded_and_the_panel_matches_the_card() {
+        const { assert!(PILL_RADIUS >= 500.0) };
+        assert_eq!(PANEL_RADIUS, CARD_RADIUS);
     }
 
     #[test]

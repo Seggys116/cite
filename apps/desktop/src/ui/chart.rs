@@ -7,7 +7,8 @@ use gpui::{
 };
 
 use crate::model::{fmt_num, nice_max, scale_points};
-use crate::theme::{BORDER, DIM, SURFACE_HI, TEXT, c, chip_stroke, tint};
+use crate::theme::{BORDER, DIM, SURFACE_HI, TEXT, c, tint};
+use crate::ui::widgets::ClipText;
 
 // Width of the left gutter that holds the value labels of a gridded chart.
 pub const Y_GUTTER: f32 = 44.0;
@@ -293,15 +294,14 @@ pub fn hbar(label: &str, value: u64, max: u64, color: u32, text: String) -> Div 
             div()
                 .flex()
                 .flex_col()
-                .w(px(70.))
+                // Room for labels such as "up to 10.0 KB"; it still shrinks on narrow cards.
+                .w(px(96.))
                 .flex_shrink()
                 .min_w(px(36.))
                 .overflow_hidden()
-                .text_ellipsis()
-                .whitespace_nowrap()
                 .text_size(px(12.))
                 .text_color(c(DIM))
-                .child(label.to_string()),
+                .child(ClipText::new(label.to_string())),
         )
         .child(
             div()
@@ -333,29 +333,51 @@ pub fn hbar(label: &str, value: u64, max: u64, color: u32, text: String) -> Div 
         )
 }
 
-struct Tip(SharedString);
+// What a tooltip shows: plain or monospace text, or a list of titled rows (see widgets::pop_list).
+#[derive(Clone)]
+pub(crate) enum TipBody {
+    Text { text: SharedString, mono: bool },
+    Rows(Vec<(String, Option<String>, String)>),
+}
+
+struct Tip(TipBody);
 
 impl Render for Tip {
     fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
-        div()
+        let shell = div()
             .flex()
             .flex_col()
             .max_w(px(520.))
-            .px(px(8.))
-            .py(px(5.))
-            .rounded(px(6.))
+            .px(px(10.))
+            .py(px(8.))
+            .rounded(px(crate::theme::ROW_RADIUS))
             .border_1()
-            .border_color(chip_stroke())
+            .border_color(c(BORDER))
             .bg(c(SURFACE_HI))
+            .shadow(crate::ui::widgets::float_shadow())
             .text_color(c(TEXT))
-            .text_size(px(12.))
-            .font_family(crate::theme::MONO)
-            .child(self.0.clone())
+            .text_size(px(12.));
+        match &self.0 {
+            TipBody::Text { text, mono } => {
+                let body = shell.child(text.clone());
+                if *mono {
+                    body.font_family(crate::theme::MONO)
+                } else {
+                    body
+                }
+            }
+            TipBody::Rows(rows) => shell.child(crate::ui::widgets::pop_list(rows.clone())),
+        }
     }
 }
 
 fn tip_view(text: SharedString, cx: &mut App) -> AnyView {
-    cx.new(|_| Tip(text)).into()
+    tip_body_view(TipBody::Text { text, mono: true }, cx)
+}
+
+// The view a tooltip builder returns; widgets::tip, tip_mono and tip_rows go through it.
+pub(crate) fn tip_body_view(body: TipBody, cx: &mut App) -> AnyView {
+    cx.new(|_| Tip(body)).into()
 }
 
 // Single-line text that ends in an ellipsis when it does not fit and shows the whole value on hover.
@@ -378,10 +400,8 @@ pub fn clip_tip_full(
         .id(key)
         .min_w_0()
         .overflow_hidden()
-        .text_ellipsis()
-        .whitespace_nowrap()
         .tooltip(move |_, cx| tip_view(tip.clone(), cx))
-        .child(text)
+        .child(ClipText::new(text))
 }
 
 // Lets a table keep its column widths on narrow windows by scrolling sideways instead of overlapping.

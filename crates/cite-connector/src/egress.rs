@@ -14,6 +14,27 @@ const BRIDGE_KEY: &str = "CITE_STACK_EGRESS_BRIDGE";
 pub const NODE_IPS_KEY: &str = "CITE_NODE_PUBLIC_IPS";
 const DENY_CIDRS_ENV: &str = "CITE_EGRESS_DENY_CIDRS";
 const ALLOW_CIDRS_ENV: &str = "CITE_EGRESS_ALLOW_CIDRS";
+const ALLOW_PORTS_ENV: &str = "CITE_EGRESS_ALLOW_PORTS";
+
+/// A TCP forward in a site's egress proxy: clients of the proxy connect to `listen` and reach `host:port`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Forward {
+    pub listen: u16,
+    /// A host name or an IP literal; an IPv6 literal is bracketed when written to the proxy env.
+    pub host: String,
+    pub port: u16,
+}
+
+impl Forward {
+    fn env_entry(&self) -> String {
+        let host = if self.host.contains(':') && !self.host.starts_with('[') {
+            format!("[{}]", self.host)
+        } else {
+            self.host.clone()
+        };
+        format!("{}={host}:{}", self.listen, self.port)
+    }
+}
 
 /// Node setting, key in the egress proxy and the rule each entry must pass.
 type NodeKey = (&'static str, &'static str, fn(&str) -> bool);
@@ -229,8 +250,33 @@ impl Egress {
             .collect()
     }
 
-    /// The egress proxy env for one site: the node's entries, then the site's rules.
-    pub fn proxy_env(&self, rules: &OutboundRules) -> Vec<String> {
+    /// Whether the node's CITE_STACK_EGRESS_ALLOW_PORTS (when set) lets traffic to `port` through.
+    /// No setting means every port is open at node level, as in the egress proxy.
+    pub fn node_ports_allow(&self, port: u16) -> bool {
+        let Some(list) = self
+            .node_env
+            .iter()
+            .find_map(|e| e.strip_prefix(ALLOW_PORTS_ENV)?.strip_prefix('='))
+        else {
+            return true;
+        };
+        list.split(',').any(|entry| {
+            let (lo, hi) = entry.split_once('-').unwrap_or((entry, entry));
+            matches!(
+                (lo.parse::<u16>(), hi.parse::<u16>()),
+                (Ok(lo), Ok(hi)) if (lo..=hi).contains(&port)
+            )
+        })
+    }
+
+    /// The egress proxy env for one site: the node's entries, then the site's rules, then the
+    /// forwards and auto-allowed names of its data attachments (each only when non-empty).
+    pub fn proxy_env(
+        &self,
+        rules: &OutboundRules,
+        forwards: &[Forward],
+        auto_allow: &[String],
+    ) -> Vec<String> {
         let mut env = self.node_env.clone();
         env.push(format!("CITE_EGRESS_MODE={}", rules.mode.as_str()));
         env.push(format!("CITE_EGRESS_BLOCK_MAIL={}", rules.block_mail));
@@ -242,6 +288,13 @@ impl Egress {
             if !joined.is_empty() {
                 env.push(format!("{key}={joined}"));
             }
+        }
+        if !forwards.is_empty() {
+            let joined: Vec<String> = forwards.iter().map(Forward::env_entry).collect();
+            env.push(format!("CITE_EGRESS_FORWARDS={}", joined.join(",")));
+        }
+        if !auto_allow.is_empty() {
+            env.push(format!("CITE_EGRESS_AUTO_ALLOW={}", auto_allow.join(",")));
         }
         env
     }
@@ -375,7 +428,7 @@ mod tests {
     fn the_proxy_env_puts_node_entries_first_then_the_site_rules() {
         let e = lookup(&[("CITE_STACK_EGRESS_DENY_CIDRS", "203.0.112.0/24")]).unwrap();
         assert_eq!(
-            e.proxy_env(&OutboundRules::default()),
+            e.proxy_env(&OutboundRules::default(), &[], &[]),
             vec![
                 "CITE_EGRESS_DENY_CIDRS=203.0.112.0/24",
                 "CITE_EGRESS_MODE=public",
@@ -393,7 +446,7 @@ mod tests {
             block_mail: false,
         };
         assert_eq!(
-            e.proxy_env(&rules)[1..],
+            e.proxy_env(&rules, &[], &[])[1..],
             [
                 "CITE_EGRESS_MODE=allowlist",
                 "CITE_EGRESS_BLOCK_MAIL=false",
@@ -401,5 +454,84 @@ mod tests {
                 "CITE_EGRESS_DENY=10.0.0.66",
             ]
         );
+    }
+
+    #[test]
+    fn forwards_and_auto_allow_follow_the_site_rules_and_only_when_present() {
+        let e = lookup(&[("CITE_STACK_EGRESS_DENY_CIDRS", "203.0.112.0/24")]).unwrap();
+        let rules = OutboundRules {
+            mode: OutboundMode::Allowlist,
+            allow: vec!["api.github.com".into()],
+            deny: vec!["10.0.0.66".into()],
+            block_mail: true,
+        };
+        let forwards = [
+            Forward {
+                listen: 15432,
+                host: "db.example.com".into(),
+                port: 5432,
+            },
+            Forward {
+                listen: 15433,
+                host: "2606:4700::1".into(),
+                port: 6543,
+            },
+            Forward {
+                listen: 15434,
+                host: "[2606:4700::2]".into(),
+                port: 5432,
+            },
+        ];
+        let auto = vec!["db.example.com".to_string(), "s3.example.com".to_string()];
+        let env = e.proxy_env(&rules, &forwards, &auto);
+        assert_eq!(
+            env,
+            vec![
+                "CITE_EGRESS_DENY_CIDRS=203.0.112.0/24",
+                "CITE_EGRESS_MODE=allowlist",
+                "CITE_EGRESS_BLOCK_MAIL=true",
+                "CITE_EGRESS_ALLOW=api.github.com",
+                "CITE_EGRESS_DENY=10.0.0.66",
+                "CITE_EGRESS_FORWARDS=15432=db.example.com:5432,15433=[2606:4700::1]:6543,15434=[2606:4700::2]:5432",
+                "CITE_EGRESS_AUTO_ALLOW=db.example.com,s3.example.com",
+            ]
+        );
+        let only_forwards = e.proxy_env(&OutboundRules::default(), &forwards[..1], &[]);
+        assert_eq!(
+            only_forwards.last().map(String::as_str),
+            Some("CITE_EGRESS_FORWARDS=15432=db.example.com:5432")
+        );
+        assert!(
+            !only_forwards
+                .iter()
+                .any(|v| v.starts_with("CITE_EGRESS_AUTO_ALLOW")),
+            "{only_forwards:?}"
+        );
+        let only_auto = e.proxy_env(&OutboundRules::default(), &[], &auto[..1]);
+        assert_eq!(
+            only_auto.last().map(String::as_str),
+            Some("CITE_EGRESS_AUTO_ALLOW=db.example.com")
+        );
+        assert!(
+            !only_auto
+                .iter()
+                .any(|v| v.starts_with("CITE_EGRESS_FORWARDS")),
+            "{only_auto:?}"
+        );
+    }
+
+    #[test]
+    fn the_node_port_list_decides_whether_a_port_is_allowed() {
+        assert!(Egress::default().node_ports_allow(5432));
+        let narrow = lookup(&[("CITE_STACK_EGRESS_ALLOW_PORTS", "80,443,8000-8100")]).unwrap();
+        for port in [80, 443, 8000, 8050, 8100] {
+            assert!(narrow.node_ports_allow(port), "{port}");
+        }
+        for port in [5432, 79, 7999, 8101, 22] {
+            assert!(!narrow.node_ports_allow(port), "{port}");
+        }
+        let with_db = lookup(&[("CITE_STACK_EGRESS_ALLOW_PORTS", "443,5432")]).unwrap();
+        assert!(with_db.node_ports_allow(5432));
+        assert!(!with_db.node_ports_allow(5433));
     }
 }

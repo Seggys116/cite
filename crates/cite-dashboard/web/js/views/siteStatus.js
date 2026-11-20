@@ -42,7 +42,7 @@ export function statusPanel({ node, site, onStatus, onRedeploy }) {
     h('div', { class: 'pill-row' }, chip, detail, pending, checked), banner, slots, note);
   const el = card({
     title: 'Status',
-    subtitle: 'What the node is doing with this site right now.',
+    subtitle: `What ${node} is doing with this site right now.`,
     actions: button('Refresh', { size: 'sm', iconName: 'refresh', onClick: () => poller.now() }),
     body,
   });

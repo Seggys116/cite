@@ -7,6 +7,7 @@ use qrcode::QrCode;
 use qrcode::render::unicode::Dense1x2;
 
 use crate::config::ConnectorConfig;
+use crate::seal::{Keyring, OpenMode};
 use crate::store::Store;
 use crate::tls::{self, TlsOutcome};
 use crate::{ConnectorError, Result};
@@ -193,7 +194,17 @@ pub fn format_json(p: &Provisioned) -> Result<String> {
     .map_err(|e| ConnectorError::Internal(format!("JSON encoding failed: {e}")))
 }
 
+// Creates the node key when the node has none, so the credentials and TLS keys written next are sealed from the start.
+// It refuses, as the server does, when sealed files exist without their key.
+async fn ensure_node_key(cfg: &ConnectorConfig) -> Result<()> {
+    let owned = cfg.clone();
+    tokio::task::spawn_blocking(move || Keyring::load(&owned, OpenMode::Migrating).map(|_| ()))
+        .await
+        .map_err(|e| ConnectorError::Internal(format!("key task failed: {e}")))?
+}
+
 pub async fn run_init(cfg: &ConnectorConfig, opts: InitOptions) -> Result<()> {
+    ensure_node_key(cfg).await?;
     let store = Store::open_read_only(cfg).await?;
     if opts.renew_tls {
         if !cfg.tls {
@@ -231,6 +242,7 @@ pub async fn run_reset(
     username: Option<String>,
     non_interactive: bool,
 ) -> Result<()> {
+    ensure_node_key(cfg).await?;
     let store = Store::open_read_only(cfg).await?;
     let existing = store.credentials().map(|c| c.username);
     let username = resolve_username(username, non_interactive, existing.as_deref())?;
@@ -465,6 +477,84 @@ mod tests {
         let debug = format!("{p:?}");
         assert!(!debug.contains(&p.password));
         assert!(!debug.contains(&p.totp_secret));
+    }
+
+    fn quiet_init() -> InitOptions {
+        InitOptions {
+            username: Some("admin".into()),
+            non_interactive: true,
+            json: true,
+            ..InitOptions::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn init_creates_the_node_key_and_seals_what_it_writes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut cfg = test_config(dir.path());
+        cfg.tls = true;
+        run_init(&cfg, quiet_init()).await.expect("init");
+
+        let key = dir.path().join("secrets.key");
+        let mode = std::fs::metadata(&key).expect("key").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let kid = Keyring::load(&cfg, OpenMode::ReadOnly)
+            .expect("load")
+            .expect("key")
+            .kid();
+        for file in ["credentials.json", "tls/ca.key", "tls/server.key"] {
+            let raw = std::fs::read(dir.path().join(file)).expect("read");
+            assert_eq!(crate::seal::envelope_kid(&raw), Some(kid), "{file}");
+        }
+        let store = Store::open(&cfg)
+            .await
+            .expect("the server starts on what init wrote");
+        assert!(store.credentials().is_some());
+        crate::tls::load_acceptor(&cfg.tls_dir).expect("and loads the sealed TLS key");
+    }
+
+    #[tokio::test]
+    async fn init_keeps_an_existing_node_key() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = test_config(dir.path());
+        let before = Keyring::load(&cfg, OpenMode::Migrating)
+            .expect("load")
+            .expect("created")
+            .kid_hex();
+        run_init(&cfg, quiet_init()).await.expect("init");
+        let after = Keyring::load(&cfg, OpenMode::ReadOnly)
+            .expect("load")
+            .expect("key")
+            .kid_hex();
+        assert_eq!(before, after);
+    }
+
+    #[tokio::test]
+    async fn init_refuses_sealed_files_whose_key_is_gone_and_makes_no_key() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = test_config(dir.path());
+        let stranger = Keyring::from_keys(
+            crate::seal::NodeKey::from_bytes(&[8; 32]),
+            crate::seal::KeySource::Env,
+            Vec::new(),
+            OpenMode::Migrating,
+        );
+        std::fs::write(
+            dir.path().join("credentials.json"),
+            stranger.seal("credentials.json", b"{}").expect("seal"),
+        )
+        .expect("seed");
+        for result in [
+            run_init(&cfg, quiet_init()).await,
+            run_reset(&cfg, Some("admin".into()), true).await,
+        ] {
+            let err = result.expect_err("must refuse").to_string();
+            assert!(
+                err.contains(&stranger.kid_hex()) && err.contains("did not start"),
+                "{err}"
+            );
+        }
+        assert!(!dir.path().join("secrets.key").exists());
     }
 
     #[test]

@@ -264,30 +264,16 @@ pub fn deploy_outcome(d: &Deployment) -> Result<String, String> {
     }
 }
 
-// The message after Save, with or without the redeploy that follows it.
-pub fn save_outcome(deploy: Option<&Result<Deployment, String>>) -> Result<String, String> {
-    match deploy {
-        None => Ok("Saved".to_string()),
-        Some(Ok(d)) if was_started(d) => Ok(format!(
-            "Saved. A build started on the {} slot; the status panel shows how it goes.",
-            d.slot.as_str()
-        )),
-        Some(Ok(d)) => match deploy_outcome(d) {
-            Ok(_) => Ok(format!(
-                "Saved and redeployed. The {} slot is now active.",
-                d.slot.as_str()
-            )),
-            Err(e) => Err(format!("Saved, but the redeploy failed. {e}")),
-        },
-        Some(Err(e)) => Err(format!("Saved, but the redeploy failed: {e}")),
-    }
-}
-
 // One line saying what to try for the failures that have a known fix.
 pub fn failure_hint(note: &str) -> Option<&'static str> {
     let lower = note.to_ascii_lowercase();
-    if lower.contains("out of memory") || lower.contains("oom") || lower.contains("heap out of memory") {
-        Some("The build ran out of memory. Raise Build memory in the Build tab (Next.js builds often need 4096 MiB or more), save and redeploy.")
+    if lower.contains("out of memory")
+        || lower.contains("oom")
+        || lower.contains("heap out of memory")
+    {
+        Some(
+            "The build ran out of memory. Raise Build memory in the Build tab (Next.js builds often need 4096 MiB or more), save and redeploy.",
+        )
     } else {
         None
     }
@@ -342,6 +328,7 @@ mod tests {
             volumes: Vec::new(),
             outbound: true,
             outbound_rules: Default::default(),
+            data: Default::default(),
         }
     }
 
@@ -593,7 +580,7 @@ mod tests {
     }
 
     #[test]
-    fn deploy_and_save_outcomes_keep_the_nodes_words() {
+    fn deploy_outcomes_keep_the_nodes_words() {
         let ok = dep(
             DeployAction::Promote,
             Slot::Green,
@@ -616,21 +603,6 @@ mod tests {
         );
         let quiet = dep(DeployAction::Failed, Slot::Blue, "", "2025-01-01T00:00:00Z");
         assert!(deploy_outcome(&quiet).unwrap_err().contains("untouched"));
-
-        assert_eq!(save_outcome(None).unwrap(), "Saved");
-        let promoted: Result<Deployment, String> = Ok(ok);
-        assert!(
-            save_outcome(Some(&promoted))
-                .unwrap()
-                .starts_with("Saved and redeployed")
-        );
-        let failed: Result<Deployment, String> = Ok(bad);
-        let msg = save_outcome(Some(&failed)).unwrap_err();
-        assert!(msg.starts_with("Saved, but the redeploy failed.") && msg.contains("120s"));
-        let refused: Result<Deployment, String> =
-            Err("409: deploy failed health checks: the green slot of docs never came up".into());
-        let msg = save_outcome(Some(&refused)).unwrap_err();
-        assert!(msg.contains("never came up") && msg.starts_with("Saved, but"));
     }
 
     #[test]

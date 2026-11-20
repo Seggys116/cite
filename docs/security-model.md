@@ -11,6 +11,7 @@ This page covers node mode: who can reach what, which secrets exist and where th
 | HAProxy admin socket `/run/cite/admin.sock` and master CLI `/run/cite/master.sock` | Processes that can open files in the `cite_run` volume: HAProxy and the connector only; no network listener | File ownership (uid 10001, directory mode 0750, socket mode 0600). See below. |
 | Docker API through `cite-dockerproxy` | The connector, on the internal `docker_api` network | Deny-by-default filter on method, path, query and body |
 | Site executors, port 8080 | HAProxy, over the stack's own internal network (or every container on `cite_edge` when per-stack networks are off) | Network isolation only |
+| Site databases, port 5432 | The site's own containers, over its internal `cite-<id>-dbnet` network | No published port. In shared mode `pg_hba.conf` also limits each tenant's logins to its own database and subnet. See [Site data services](#site-data-services). |
 
 ### Connector API
 
@@ -46,20 +47,39 @@ The browser signs in to the dashboard with its own username, password and TOTP c
 
 Until an account exists the dashboard prints a one-time setup token to its log on every start, and the setup form needs it, so nobody who can merely reach the port can claim the console. It is published on `127.0.0.1` by default. The session cookie is `__Host-cite_session` with `Path=/` and no `Domain` when it is Secure (TLS, or `CITE_DASHBOARD_COOKIE_SECURE=true`), and a request carrying two cookies with that name counts as signed out. Dashboard sign-ins are rate limited per client address, with a dashboard-wide lockout that only attempts naming the real account count toward. Running `init --force` or a connector credential reset takes effect in the running process, which signs everyone out. [Dashboard](dashboard.md#signing-in) has the details. The [desktop app](desktop.md) keeps the same kind of token for each node in the operating system keychain instead.
 
+### Console write targets
+
+- Under All nodes, the node picker for firewall, redirect, maintenance and site-settings writes starts with nothing ticked, and the single-node screens ask for a node before they load. Offline nodes cannot be picked.
+- A write to several nodes is sent to each node separately, and the result is reported per node. One node failing does not undo the others.
+- The console is not a replication layer. Each node keeps its own copy of rules, pages and sites and keeps serving if the console is offline.
+- Mock mode in the dashboard (`?mock=1`) is honoured only on `localhost`, `127.0.0.1`, `[::1]` and `*.localhost`, so a crafted link on a real host cannot show fake data.
+- Environment variable values are write-only. No connector route returns one, and the consoles list names only.
+
 ## Secrets at rest
 
 All state is in the `cite_conf` volume, described in [Running a node](node.md#what-is-stored).
 
 | Secret | File | Form |
 |---|---|---|
-| Login password | `credentials.json` | Argon2id hash |
-| TOTP secret | `credentials.json` | Plain base32 key, needed to verify codes |
-| API tokens | `tokens.json` | Argon2id hashes |
-| GitHub tokens | `secrets.json` | Plain text, up to 512 entries of 16 KiB |
-| TLS CA and server keys | `tls/` | PEM files |
-| Site certificate private keys | `certs/` | PEM files, one per certificate, mode 0600 |
+| Login password | `credentials.json` | Argon2id hash, in a sealed file |
+| TOTP secret | `credentials.json` | Base32 key (needed to verify codes), in a sealed file |
+| API tokens | `tokens.json` | Argon2id hashes, not sealed |
+| GitHub tokens, site variables, Doppler values, database and S3 credentials, generated secrets | `secrets.json` | Sealed. Up to 4096 entries of 32 KiB |
+| Alert webhook URLs and SMTP password | `alerts.json` | Sealed |
+| Zone-lock secrets | `zone-secrets.json` | Sealed. The same secrets are written in plain text to `haproxy/haproxy.cfg`, which HAProxy reads |
+| ACME account key | `acme-account.pem` | Sealed |
+| TLS CA and server keys | `tls/ca.key`, `tls/server.key` | Sealed |
+| Database backups | `/backups` (the `cite-backups` volume) | Sealed per file, see [Site data services](#site-data-services) |
+| Site certificate private keys | `certs/` | PEM files, one per certificate, mode 0600, not sealed |
 
 Files are written atomically with mode 0600.
+
+**Sealing.** The connector seals the files marked above with ChaCha20-Poly1305 under a 32-byte node key. A sealed file names the key by its id, and the logical file name is part of what the seal authenticates, so one sealed file cannot be swapped for another. The key comes from, in this order: `CITE_SECRETS_KEY`, `CITE_SECRETS_KEY_FILE`, or the managed file `/conf/secrets.key` (mode 0600), which the connector or `init` creates the first time it starts with write access. A connector that finds sealed files and no key, or the wrong key, refuses to start and says which key id it needs. It never makes a new key over sealed data.
+
+- Files written by an earlier release are sealed on the first start. The plaintext original is kept once as `<name>.pre-seal` (mode 0600) and deleted by the next start that finds the file already sealed. A volume backup taken before the upgrade, and these copies until they are gone, still hold the secrets in plain text.
+- The managed key sits on the same `cite_conf` volume as the files it seals. It protects a copy of one file, a stolen `cite-backups` volume and S3 copies of backups, but not the theft of the whole `cite_conf` volume. To keep the key off that volume, mount a key file into the connector from somewhere else and set `CITE_SECRETS_KEY_FILE` to its path.
+- Back up the key away from the node: `cite-connector secrets export-key > file`. `secrets status` shows the key id, where it comes from and the state of each file. `secrets rotate-key` replaces a managed key; the old one stays as `secrets.key.previous` until the next start has sealed everything under the new key. With a key from the environment or a file, set the new key and move the old one to `CITE_SECRETS_KEY_PREVIOUS` or `CITE_SECRETS_KEY_PREVIOUS_FILE` until the connector logs that it is no longer needed.
+- Not sealed: `tokens.json` (hashes only), `certs/` and `haproxy/` (HAProxy reads them), `edge.json`, and `secrets.key` itself.
 
 HAProxy and the connector both run as uid 10001, so file modes alone would not keep HAProxy out of the connector's files. The separation comes from the mounts: HAProxy mounts only the `haproxy` and `certs` subpaths of `cite_conf`, read-only, so `credentials.json`, `tokens.json`, `secrets.json` and the TLS keys under `/conf/tls` are not visible inside the HAProxy container. The two containers also do not share a process namespace, so a compromised HAProxy cannot read the connector's memory or `/proc` entries, or signal it. Site certificates for HAProxy in `/conf/certs` are visible to HAProxy by design.
 
@@ -161,6 +181,40 @@ Residual risks:
 - Containers share the host kernel. A kernel or runtime escape from a site stack is out of scope, as it is in single-site mode.
 
 If you do not need GitHub builds on the node, leave the overlay off and give sites upstream addresses. The connector then has no Docker access at all.
+
+## Site data services
+
+Databases add containers, a volume of backups and credentials. This section covers what the proxy lets the connector do for them and where the isolation between sites comes from. The feature is described in [Site data services](data.md).
+
+**Proxy rules for the data roles.** The proxy rebuilds every data create body and compares it whole, like the stack roles; the details are in [Orchestrator](orchestrator.md#site-data-services). The connector can create the Postgres servers, jobs, volumes and networks named `cite-<id>-db`, `cite-<id>-dbjob`, `cite-<id>-db-data`, `cite-<id>-dbnet`, `cite-pg-shared`, `cite-pg-shared-job`, `cite-pg-shared-data`, `cite-pg-shared-conf` and `cite-pg-shared-admin`. It cannot give them a host mount, a published port, extra capabilities, another user or image, or a mount of the backup volume other than the subpath `staging/<site>` (or `staging/_shared`). A job of a site must carry that site's own role tag, and only a backup job may join a site's `-xnet` or `-egress` network. No pattern a data name matches can also match a stack, so the data rules cannot be used to create a stack role with other contents. `CITE_PROXY_DATA=false` switches all of it off.
+
+**The proxy does not know tenants.** In shared mode the proxy lets `cite-pg-shared` join any site's `cite-<id>-dbnet`, because it cannot tell which site a tenant is. Which sites may reach which database is decided by the connector and enforced by Postgres, so a compromised connector can attach the shared server to any `dbnet` and can also read every credential it holds. The proxy's rules limit what a connector can build, not whom it can connect.
+
+**Isolation in a shared instance.**
+
+- Each database allows connections only to its own login group: `CONNECT` is revoked from `PUBLIC` on every database, the `postgres` and `template1` databases included, and `CREATE` is revoked from `PUBLIC` on the `public` schema.
+- The connector generates `pg_hba.conf`. It lets the `postgres` superuser in only to the `postgres` database from the admin network, lets each database's `_job` login in to that database from the admin network, lets `+t<tag>_<db>_login` reach `t<tag>_<db>` only from that site's `dbnet` subnet with `scram-sha-256`, and ends with a rule that rejects everything else. The connector rewrites it at startup and whenever a `dbnet`, the admin network or the shared container is recreated, as well as when a tenant changes. The file lives on `cite-pg-shared-conf`, which the server mounts read-only, and is written only by the `hba` job. If the server rejects a generated file, the job restores the previous one and fails.
+- A dedicated server keeps the image's default rules (`scram-sha-256` for every host connection) and is on one network only, the site's own `dbnet`.
+- The superuser never enters a tenant database, because everything inside one (functions, views, `ALTER DATABASE ... SET`) is controlled by tenant code. Superuser sessions open only the `postgres` maintenance database, with `search_path` pinned to `pg_catalog,pg_temp` and qualified names. Work inside a tenant database, including backup, restore, row counts, regrant and dropping a user's objects, runs as that database's job login `<tag>_job`: not a superuser, `BYPASSRLS`, a member of the owner group, `NOLOGIN` outside jobs, and given a fresh password for each job by the superuser. On a dedicated server `CONNECT` grants keep it to its own database. A restore therefore runs without superuser rights, so extensions only a superuser can create cannot be restored; trusted ones can.
+- Tenant roles have no superuser, create-database, create-role, replication or row-security bypass rights, and the privilege levels are fixed groups.
+- A freeze also locks every tenant login (`NOLOGIN`), so connections fail and no session can switch the read-only setting off. The locks are recorded in role comments (`cite:locked`, and `cite:frozen` on the `_login` group) that only a superuser can set; do not edit them.
+- The superuser password of a dedicated or shared server exists only in the connector's secret store and in the environment of the server container and of the jobs.
+
+**Passwords are not revealed.** No route returns a password, and external database URLs and S3 keys are write-only. A link delivers a credential where it is used, and a reveal action would be the one read path an attacker with a stolen token wants. Data access stays possible through backup download, which is audited. The connector redacts stored data secrets from the logs and job output it returns, and audit entries carry names and ids only.
+
+**Backups.** Dumps are sealed before they are kept, on the node and in S3. Plaintext exists only in the staging directory of a running job, and the connector deletes it when the job ends, also on failure. Downloading a backup returns the decrypted dump, so anyone with a token for the node can read a site's data that way. Backup targets are node-level and separate from a site's S3 attachments, so credentials an app holds cannot delete backups. An S3 copy cannot be restored without the node key, so back the key up as described under [Secrets at rest](#secrets-at-rest).
+
+**External databases and S3.** The connector never talks to an external database from its own network: a runtime connection goes through a fixed-destination TCP forward of the site's egress proxy, which applies the same resolve and address checks as `CONNECT`. `CITE_EGRESS_AUTO_ALLOW` names the hosts of the site's attachments so allowlist mode does not need a second entry, and it does not open private addresses; a name that resolves to an internal address is refused unless the site or the node allows it explicitly. Backup targets are the one place the connector itself connects to S3: https only, the address is checked and pinned, redirects and proxies are off, and `CITE_DATA_S3_ALLOW_PRIVATE=true` opens only RFC 1918, IPv6 ULA and 100.64.0.0/10 addresses (and http to those); loopback, link-local and other reserved addresses stay refused. Site S3 attachments always need https. The target test reports fixed categories, never the server's text.
+
+**Transfers.** A transfer moves a dump and a manifest through the process that runs it, over the nodes' TLS APIs. The manifest carries the generated secrets in plain text for that one hop; they are held in memory there, wiped afterwards, and kept on the target only in the sealed store. The manifest also comes from another node, so a link in it may only read from a user or secret the import itself creates, or equal a link the target has; anything else is refused with 409. Neither a transfer nor a conversion deletes the source database.
+
+Residual risks:
+
+- Tenants of the shared instance share one Postgres process, memory, disk and connection slots. A Postgres vulnerability or a noisy tenant can affect all of them; use dedicated mode where that matters.
+- Credentials are in the environment of the containers that use them (`DATABASE_URL` in the executor, the superuser password in the server and jobs), so anyone who can inspect containers through the Docker API reads them.
+- A build that runs migrations holds the owner credentials, including the install scripts of the site's dependencies.
+- There is no TLS between a site and its managed database; the traffic stays on an internal bridge of the host.
+- The managed node key lives on the `cite_conf` volume; see [Secrets at rest](#secrets-at-rest).
 
 ## Out of scope
 

@@ -1029,7 +1029,7 @@ async fn starttls_then_auth_plain_delivers() {
     crate::tls::install_provider();
     let certified = rcgen::generate_simple_self_signed(vec!["smtp.test".to_string()]).unwrap();
     let key =
-        rustls::pki_types::PrivateKeyDer::try_from(certified.key_pair.serialize_der()).unwrap();
+        rustls::pki_types::PrivateKeyDer::try_from(certified.signing_key.serialize_der()).unwrap();
     let server = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(vec![certified.cert.der().clone()], key)

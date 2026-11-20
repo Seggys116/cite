@@ -88,13 +88,13 @@ impl Drop for Hold {
 }
 
 fn saturating_add(counter: &AtomicU64) {
-    let _ = counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+    let _ = counter.try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
         Some(current.saturating_add(1))
     });
 }
 
 fn saturating_sub(counter: &AtomicU64) {
-    let _ = counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+    let _ = counter.try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
         Some(current.saturating_sub(1))
     });
 }
@@ -529,6 +529,10 @@ pub fn set_forwarded_headers_for(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("localhost")
         .to_string();
+    // An HTTP/1.0 client such as HAProxy's health check may omit Host, but runtimes like Bun build req.url from it.
+    if !headers.contains_key(header::HOST) {
+        headers.insert(header::HOST, HeaderValue::from_static("localhost"));
+    }
 
     if !trusted_peer {
         for name in CLIENT_IDENTITY_HEADERS {
@@ -759,6 +763,21 @@ mod tests {
             "203.0.113.9".parse::<IpAddr>().unwrap()
         );
         assert!(is_trusted_ip(&trusted, mapped_peer));
+    }
+
+    #[test]
+    fn a_request_without_host_reaches_the_app_with_one() {
+        // HAProxy's `option httpchk GET /` sends HTTP/1.0 with no Host, and Bun's `new URL(req.url)` throws without one.
+        let peer = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 5), 1234));
+        let mut headers = HeaderMap::new();
+        set_forwarded_headers_for(&mut headers, peer, &[], &[]);
+        assert_eq!(headers.get(header::HOST).unwrap(), "localhost");
+        assert_eq!(headers.get("x-forwarded-host").unwrap(), "localhost");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, HeaderValue::from_static("example.com"));
+        set_forwarded_headers_for(&mut headers, peer, &[], &[]);
+        assert_eq!(headers.get(header::HOST).unwrap(), "example.com");
     }
 
     #[test]

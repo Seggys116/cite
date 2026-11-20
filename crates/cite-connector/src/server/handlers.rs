@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fmt::Display;
 
 use axum::extract::{Path, Request, State};
-use axum::http::header;
+use axum::http::{HeaderMap, header};
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 use cite_edge::cloudflare::{CLOUDFLARE_RANGES_UPDATED, effective_ranges};
@@ -35,6 +35,52 @@ const ORCHESTRATOR_PING_TIMEOUT: std::time::Duration = std::time::Duration::from
 pub(super) fn json_ok<T: Serialize + ?Sized>(value: &T) -> ApiResult<Response> {
     let body = serde_json::to_vec(value)?;
     Ok(([(header::CONTENT_TYPE, "application/json")], body).into_response())
+}
+
+/// Clients of this release send their version in this header; older ones send nothing.
+pub(super) const CLIENT_HEADER: &str = "x-cite-client";
+
+/// Leading numeric `major.minor.patch` of a version text (an optional `name/` prefix, a `v` and any
+/// `-pre` or `+build` suffix are ignored); None when it does not start with a number.
+fn parse_client_version(raw: &str) -> Option<(u64, u64, u64)> {
+    let raw = raw.trim();
+    let raw = raw.rsplit('/').next().unwrap_or(raw);
+    let raw = raw.strip_prefix('v').unwrap_or(raw);
+    let core = raw.split(['-', '+']).next().unwrap_or("");
+    let mut parts = core.split('.');
+    let mut next = |required: bool| -> Option<u64> {
+        match parts.next() {
+            Some(p) if !p.is_empty() && p.len() <= 9 && p.bytes().all(|b| b.is_ascii_digit()) => {
+                p.parse().ok()
+            }
+            None if !required => Some(0),
+            _ => None,
+        }
+    };
+    let version = (next(true)?, next(false)?, next(false)?);
+    parts.next().is_none().then_some(version)
+}
+
+/// Whether the caller understands `Site.data`: it sent `X-Cite-Client` with this release's version or newer.
+pub(super) fn client_sees_data(headers: &HeaderMap) -> bool {
+    let current = parse_client_version(env!("CARGO_PKG_VERSION"));
+    let sent = headers
+        .get(CLIENT_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(parse_client_version);
+    match (sent, current) {
+        (Some(sent), Some(current)) => sent >= current,
+        _ => false,
+    }
+}
+
+/// A site as JSON; `data` is left out for clients that would fail to read it (Site is strict on their side).
+pub(super) fn site_value(site: &Site, with_data: bool) -> ApiResult<Value> {
+    let mut value = serde_json::to_value(site)?;
+    if !with_data && let Some(obj) = value.as_object_mut() {
+        obj.remove("data");
+    }
+    Ok(value)
 }
 
 fn ok_flag() -> Response {
@@ -257,7 +303,7 @@ pub(super) async fn node(State(st): State<AppState>) -> ApiResult<Response> {
             "configured": st.cfg.doppler_token.is_some(),
             "source": st.cfg.doppler_token.as_ref().map_or("none", |t| t.source().as_str()),
         },
-        "capabilities": site_ops::capabilities(st.orchestrator.is_some()),
+        "capabilities": site_ops::capabilities(st.orchestrator.is_some(), st.data.get().is_some()),
         "executor_egress": st.orchestrator.as_ref().is_some_and(|o| o.executor_egress()),
         "egress_mode": st.orchestrator.as_ref().map(|o| o.egress_mode().as_str()),
         "analytics": analytics,
@@ -424,14 +470,24 @@ pub(super) fn find_site(st: &AppState, id: &str) -> ApiResult<Site> {
         .ok_or_else(|| missing(format!("site {id}")))
 }
 
-pub(super) async fn list_sites(State(st): State<AppState>) -> ApiResult<Response> {
+pub(super) async fn list_sites(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
     let cfg = st.store.config();
-    json_ok(&cfg.sites)
+    let with_data = client_sees_data(&headers);
+    let sites = cfg
+        .sites
+        .iter()
+        .map(|s| site_value(s, with_data))
+        .collect::<ApiResult<Vec<Value>>>()?;
+    json_ok(&sites)
 }
 
 pub(super) async fn create_site(
     State(st): State<AppState>,
     Extension(p): Extension<Principal>,
+    headers: HeaderMap,
     JsonBody(mut body): JsonBody<Value>,
 ) -> ApiResult<Response> {
     let obj = body
@@ -444,6 +500,8 @@ pub(super) async fn create_site(
         Some(_) => return Err(ApiError::bad("github_token must be a non-empty string")),
     };
     obj.remove("history");
+    // Databases, storage and links come only from the data routes, never from a site payload.
+    obj.remove("data");
     let site: Site =
         serde_json::from_value(body).map_err(|e| ApiError::bad(format!("invalid site: {e}")))?;
     validate_site_strict(&site)?;
@@ -451,12 +509,13 @@ pub(super) async fn create_site(
         return Err(ConnectorError::Conflict(format!("site {} already exists", site.id)).into());
     }
     let created = st.deployer.create_site(&p.actor(), site, token).await?;
-    json_ok(&created)
+    json_ok(&site_value(&created, client_sees_data(&headers))?)
 }
 
 pub(super) async fn get_site(
     State(st): State<AppState>,
     Path(id): Path<String>,
+    headers: HeaderMap,
 ) -> ApiResult<Response> {
     check_id(&id)?;
     let site = find_site(&st, &id)?;
@@ -468,7 +527,7 @@ pub(super) async fn get_site(
             json!({ "blue": [], "green": [] })
         }
     };
-    let mut value = serde_json::to_value(&site)?;
+    let mut value = site_value(&site, client_sees_data(&headers))?;
     if let Some(obj) = value.as_object_mut() {
         obj.insert("live".into(), live);
     }
@@ -479,6 +538,7 @@ pub(super) async fn put_site(
     State(st): State<AppState>,
     Extension(p): Extension<Principal>,
     Path(id): Path<String>,
+    headers: HeaderMap,
     JsonBody(site): JsonBody<Site>,
 ) -> ApiResult<Response> {
     check_id(&id)?;
@@ -487,8 +547,10 @@ pub(super) async fn put_site(
     }
     validate_site_strict(&site)?;
     find_site(&st, &id)?;
+    // `data` in the body is ignored: the deployer merges the stored data back, so an old client that
+    // never saw the field cannot drop it by writing the site.
     let updated = st.deployer.update_site(&p.actor(), site).await?;
-    json_ok(&updated)
+    json_ok(&site_value(&updated, client_sees_data(&headers))?)
 }
 
 pub(super) async fn delete_site(
@@ -498,24 +560,41 @@ pub(super) async fn delete_site(
     Params(q): Params,
 ) -> ApiResult<Response> {
     check_id(&id)?;
-    if let Some(unknown) = q.keys().find(|k| k.as_str() != "purge_volumes") {
+    if let Some(unknown) = q
+        .keys()
+        .find(|k| !matches!(k.as_str(), "purge_volumes" | "purge_data"))
+    {
         return Err(ApiError::bad(format!(
             "unknown query parameter {unknown:?}"
         )));
     }
-    let purge_volumes = match q.get("purge_volumes").map(String::as_str) {
-        None | Some("false") => false,
-        Some("true") => true,
-        Some(_) => return Err(ApiError::bad("purge_volumes must be true or false")),
+    let flag = |name: &str| -> ApiResult<bool> {
+        match q.get(name).map(String::as_str) {
+            None | Some("false") => Ok(false),
+            Some("true") => Ok(true),
+            Some(_) => Err(ApiError::bad(format!("{name} must be true or false"))),
+        }
     };
+    let purge_volumes = flag("purge_volumes")?;
+    let purge_data = flag("purge_data")?;
     find_site(&st, &id)?;
-    st.deployer
-        .delete_site_with(&p.actor(), &id, purge_volumes)
+    let deleted = st
+        .deployer
+        .delete_site_full(&p.actor(), &id, purge_volumes, purge_data)
         .await?;
     if purge_volumes {
         st.store
             .audit(&p.actor(), "site.volumes.purge", &format!("site={id}"))
             .await;
+    }
+    if purge_data {
+        st.store
+            .audit(&p.actor(), "site.data.purge", &format!("site={id}"))
+            .await;
+        // S3 copies are never deleted by a purge; the count tells the operator what is still there.
+        return Ok(
+            Json(json!({ "ok": true, "s3_objects_left": deleted.s3_objects_left })).into_response(),
+        );
     }
     Ok(ok_flag())
 }
@@ -618,6 +697,7 @@ pub(super) async fn site_maintenance(
     State(st): State<AppState>,
     Extension(p): Extension<Principal>,
     Path(id): Path<String>,
+    headers: HeaderMap,
     JsonBody(req): JsonBody<MaintenanceReq>,
 ) -> ApiResult<Response> {
     check_id(&id)?;
@@ -629,7 +709,7 @@ pub(super) async fn site_maintenance(
         .deployer
         .set_maintenance(&p.actor(), &id, req.enabled, req.page_id)
         .await?;
-    json_ok(&site)
+    json_ok(&site_value(&site, client_sees_data(&headers))?)
 }
 
 pub(super) async fn list_pages(State(st): State<AppState>) -> ApiResult<Response> {
@@ -1144,5 +1224,80 @@ pub(super) fn parse_method(raw: &str) -> ApiResult<String> {
         Ok(raw.to_ascii_uppercase())
     } else {
         Err(ApiError::bad("method must be an HTTP method token"))
+    }
+}
+
+#[cfg(test)]
+mod compat_tests {
+    use super::*;
+
+    fn headers(version: Option<&str>) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        if let Some(v) = version {
+            map.insert(CLIENT_HEADER, v.parse().expect("header value"));
+        }
+        map
+    }
+
+    #[test]
+    fn client_versions_parse_their_numeric_core_only() {
+        assert_eq!(parse_client_version("0.5.0"), Some((0, 5, 0)));
+        assert_eq!(parse_client_version(" v1.2.3 "), Some((1, 2, 3)));
+        assert_eq!(parse_client_version("1.2"), Some((1, 2, 0)));
+        assert_eq!(parse_client_version("7"), Some((7, 0, 0)));
+        assert_eq!(parse_client_version("2.0.1-rc.2+build5"), Some((2, 0, 1)));
+        assert_eq!(parse_client_version("cite-desktop/0.5.0"), Some((0, 5, 0)));
+        for bad in [
+            "",
+            "x",
+            "1.x",
+            "1..2",
+            "1.2.3.4",
+            "-1.0.0",
+            "1.2.3a",
+            "9999999999.0.0",
+        ] {
+            assert_eq!(parse_client_version(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn only_this_release_or_newer_sees_site_data() {
+        let current = env!("CARGO_PKG_VERSION");
+        assert!(!client_sees_data(&headers(None)));
+        assert!(!client_sees_data(&headers(Some("0.0.1"))));
+        assert!(!client_sees_data(&headers(Some("nonsense"))));
+        assert!(client_sees_data(&headers(Some(current))));
+        assert!(client_sees_data(&headers(Some("99.0.0"))));
+        // One patch below this release is older.
+        let (major, minor, patch) = parse_client_version(current).expect("package version");
+        if patch > 0 {
+            let older = format!("{major}.{minor}.{}", patch - 1);
+            assert!(!client_sees_data(&headers(Some(&older))));
+        }
+    }
+
+    #[test]
+    fn data_is_dropped_from_the_json_for_older_clients_and_nothing_else() {
+        let site: Site = serde_json::from_value(json!({
+            "id": "shop", "name": "Shop", "hosts": ["shop.example.com"],
+            "blue": {}, "green": {}, "active": "blue",
+            "source": { "repo": "octo/site" },
+            "data": { "postgres": {
+                "mode": "dedicated", "major": 18,
+                "databases": [{ "name": "app", "users": [{ "name": "app", "level": "readwrite" }] }],
+            } },
+        }))
+        .expect("site");
+        let full = site_value(&site, true).expect("json");
+        let older = site_value(&site, false).expect("json");
+        assert!(full.get("data").is_some());
+        assert!(older.get("data").is_none());
+        let mut without = full.clone();
+        without.as_object_mut().unwrap().remove("data");
+        assert_eq!(without, older);
+        // What an older client writes back deserializes into a site with no data.
+        let back: Site = serde_json::from_value(older).expect("old client site");
+        assert!(back.data.is_empty());
     }
 }

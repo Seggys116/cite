@@ -37,9 +37,31 @@ Running `init --force` against a live dashboard replaces the account for the run
 
 A node is a connector. Add one with a name, its connector URL (for example `https://edge.example.com:8443`), a connector API token and, for a node that uses the CA from `init`, the contents of its `ca.pem`. Create the token with `POST /api/v1/tokens` on the connector, using a session from `POST /api/v1/auth/login`. The token is shown once.
 
-The Nodes view lists the connectors this console manages. A node switcher in the header scopes every other view to one node or to All nodes. Removing a node removes it from the console only; the node keeps serving.
+The Nodes view lists the connectors this console manages. Removing a node removes it from the console only; the node keeps serving.
 
 The connector's certificate comes from a self-signed authority created by `init`. The `init` output prints the CA certificate path and its SHA-256 fingerprint; compare the fingerprint before you trust the CA.
+
+### Choosing nodes
+
+The switcher in the header picks one node or All nodes. It sets which nodes a page reads. It never chooses where a write goes.
+
+| Screen | Reads | Writes |
+|---|---|---|
+| Sites | Every node in the switcher scope | None. Create site has its own placement step. |
+| Firewall, Redirects | Every node in the switcher scope | The node picker. |
+| Maintenance | Every node, whatever the switcher says | Per-node switches, confirmed bulk actions, and the node picker for Delete page. |
+| Topology | Every node, whatever the switcher says | None. |
+| Site page | The node in its address, `#/sites/{node}/{site}` | That node. Saving settings asks which nodes when several hold the site. |
+| Traffic, Settings (all tabs except Dashboard) | The node chosen on the page's node bar | That node. |
+
+The node picker opens before a write that can reach several nodes.
+
+- Under All nodes nothing is ticked. With one node selected in the switcher, that node is ticked.
+- Offline nodes are listed but cannot be ticked.
+- The confirm button names the target, for example "Apply for edge-nyc" or "Apply for 2 nodes", and stays disabled until a node is ticked.
+- One toast reports each node, for example "Added on edge-fra. Failed on edge-nyc: reason".
+
+A node bar has one button per node, and an offline node is disabled. Under All nodes the page shows "Choose a node to continue" and requests nothing until a node is picked. The pick is kept per page while the switcher stays put, and moving the switcher resets it.
 
 ## Views
 
@@ -47,17 +69,63 @@ The connector's certificate comes from a self-signed authority created by `init`
 |---|---|
 | Overview | Health and traffic across every connected node, and recent deployments from all of them. |
 | Nodes | Add and remove connectors. |
-| Sites | A table of sites with node, kind (site or API), hosts, active slot, health and state. Create site opens the wizard described below. |
-| Site page | Routing (hosts and paths), access (Cloudflare proxy only and HTTPS mode), health check settings, a live view of targets in each slot, deploy history, Deploy new version, Switch active slot, Roll back, a maintenance toggle with page choice, and Delete site. |
-| Traffic | Requests over time, status classes, methods, latency (average, p50, p95, p99), response sizes, content types, top paths, client IPs, user agents, hosts and blocking rules, and a live request list that refreshes every 3 seconds. A time window selector offers 15 minutes, 1 hour, 24 hours, 7 days and 30 days, and a site selector narrows every panel to one site. The request list filters by status, method, path, client IP and blocked only, and a request can be turned into a rule that blocks its path or its address. |
-| Firewall | An ordered list of rules. A rule blocks (deny, drop silently or tarpit), redirects, or changes headers and handles CORS, and has a scope of one site or all. Each row shows its effect, label, matchers and hits over 24 hours and can be switched on or off. Presets sit below the list. See Firewall rules below. |
-| Redirects | A table of redirect rules with one Save changes button that sends every change at once. Reached from Firewall. See Redirects below. |
-| Maintenance | Custom maintenance pages: a name, a status code and the HTML (up to 15000 bytes). A page that a site uses cannot be deleted. |
-| Settings | Data retention, connection limits, certificates, Cloudflare ranges, API tokens, the audit log (most recent 200 entries), the rendered `haproxy.cfg` with process and backend status, and dashboard appearance and session. |
+| Sites | One row per site across nodes. See Sites below. Create site opens the wizard described below. |
+| Topology | Hosts, nodes and sites with live load. See Topology below. |
+| Databases | For the node on the node bar: the shared Postgres instance, its tenants and backups, S3 backup targets, data left behind by deleted sites and transfers between nodes. See Data and databases below. |
+| Site page | Settings (hosts, paths, access, health check), a live view of targets in each slot, deploy history, Deploy new version, Switch active slot, Roll back, maintenance with one switch per node, and Delete site. The nodes that hold the site are shown beside its title. |
+| Traffic | For the node on the node bar: requests over time, status classes, methods, latency (average, p50, p95, p99), response sizes, content types, top paths, client IPs, user agents, hosts and blocking rules, and a live request list that refreshes every 3 seconds. A time window selector offers 15 minutes, 1 hour, 24 hours, 7 days and 30 days, and a site selector narrows every panel to one site. The request list filters by status, method, path, client IP and blocked only, and a request can be turned into a rule that blocks its path or its address. |
+| Firewall | An ordered list of rules from every node in scope, merged by id. A rule blocks (deny, drop silently or tarpit), redirects, or changes headers and handles CORS, and has a scope of one site or all. Each row shows its effect, matchers and hits over 24 hours and can be switched on or off. Presets sit below the list. See Firewall rules below. |
+| Redirects | A table of redirect rules with one Save changes button. Reached from Firewall. See Redirects below. |
+| Maintenance | One page library across nodes and a site by node matrix. See Maintenance below. |
+| Settings | For the node on the node bar: data retention, connection limits, certificates, Cloudflare ranges, API tokens, alerts, the audit log (most recent 200 entries) and the rendered `haproxy.cfg` with process and backend status. The Dashboard tab holds appearance and session and has no node bar. |
 
 Connection limit changes apply on the next HAProxy reload. The retention form edits the settings described in [Analytics and retention](analytics.md): recent events, minute history, how long hourly history is kept (forever by default) and whether old data is archived before it is deleted, audit days, the persist interval and the two privacy flags. See Retention, backup, cut and restore below.
 
 A command palette offers shortcuts to views, Create site, Add firewall rule, Add node, switching nodes, toggling the light or dark theme, reloading the view and signing out.
+
+The console uses a neutral paper and ink palette with one accent colour, pill-shaped buttons and sentence-case text. It follows the OS light or dark setting unless Settings, Dashboard, Appearance sets Light or Dark.
+
+## Sites
+
+The Sites view has one row per site id across the nodes in the switcher scope.
+
+| Column | Shows |
+|---|---|
+| Site | Name, id, and an API pill for an API site. |
+| Hosts | Hosts, with path prefixes and `~` regexes under them. |
+| Nodes | A chip per node that holds the site, with a health dot. A chip opens the site on that node. |
+| Load | A one-hour sparkline summed over the nodes, and requests per second over 15 minutes. |
+| State | One pill for the worst state on any node: Needs attention, Deploy failed, Maintenance or Serving. |
+
+- The rate comes from one `/analytics/facets` call per node. The sparkline is fetched per site when its row scrolls into view.
+- Needs attention means a target in the active slot fails its health check. Deploy failed means the latest deployment failed and no later one succeeded.
+- The scope control offers All nodes, one button per node (with more than one node) and Needs attention with a count.
+- The filter box matches name, id or host.
+- A row opens the site on the scoped node, or on the first node that holds it.
+- A node that does not answer is named in a notice, and its sites are not listed.
+
+## Topology
+
+Topology (`#/topology`) shows how requests reach each site in three columns: entries, nodes and sites.
+
+- An entry is a host plus its path prefixes or regexes. A single-endpoint Rust API appears as a site with its path regex.
+- Each link carries requests per second over 15 minutes, drawn as line width. The busiest link is highlighted. A link with no traffic now (a failover or idle route, or a route through an offline node) is dashed.
+- An offline node stays on the chart.
+- Click a node to dim every route that does not pass through it. Click it again or press Escape to clear.
+- Click a site or an entry to open the site.
+- It always covers every node and refreshes every 10 seconds while the tab is visible.
+
+## Maintenance
+
+The Maintenance view keeps one page library across nodes and a site by node matrix. Each node stores its own copy of every page, so a node keeps serving when the console is offline.
+
+- **Pages.** One card per page id with a chip per node that holds it, and a `differs` pill when copies differ. A node that could not be read is never reported as missing a page.
+- **Bring nodes in line.** Lists what it will do per node, then on confirmation creates missing pages and replaces differing copies with the version most nodes hold (a tie goes to the first node listed). Nothing is written when the page loads.
+- **Saving a page.** Creating a page asks first. Editing one lists the change per node first when it reaches several nodes or replaces a differing copy. Only nodes that answered are written, and the rest are named in the result.
+- **Delete page.** Opens the node picker, limited to nodes that hold the page. A page a site uses cannot be deleted.
+- **Sites by node.** One row per site, a page choice, and one switch per node that holds the site. A dash means the node does not hold the site, is offline or could not be read.
+- **Drain and Restore.** Per node, after confirmation. Drain puts the node's sites that are live into maintenance, and Restore takes the ones in maintenance out.
+- **Page on the node.** A node cannot serve a page it does not hold, so turning maintenance on first creates the page on that node.
 
 ## Bot analytics and export
 
@@ -85,7 +153,7 @@ Export opens a dialog with the following choices.
 | Filters | Request and bot exports only: status range, bot class, minimum bot score, host, path prefix, client IP and method. |
 | Row limit | Defaults to 100000. Leave it empty for no limit. |
 
-The dialog checks every field first and then sends a one-row probe to the node, so an invalid request or an expired session is reported in the dialog instead of as a failed download. The file itself is then fetched by a same-origin download that carries your session cookie, so the browser streams it straight to disk and the console never holds the export in memory. The dashboard server relays the node's response without buffering it, keeps only the CSV or NDJSON content type, rebuilds the file name from safe characters and adds `nosniff` and `no-store`. An export comes from the one node selected in the header; it is not merged across nodes.
+The dialog checks every field first and then sends a one-row probe to the node, so an invalid request or an expired session is reported in the dialog instead of as a failed download. The file itself is then fetched by a same-origin download that carries your session cookie, so the browser streams it straight to disk and the console never holds the export in memory. The dashboard server relays the node's response without buffering it, keeps only the CSV or NDJSON content type, rebuilds the file name from safe characters and adds `nosniff` and `no-store`. An export comes from the node chosen on the Traffic node bar; it is never merged across nodes.
 
 ## Retention, backup, cut and restore
 
@@ -145,7 +213,7 @@ On a site with a `source`, the overview tab lists the repository, branch, runtim
 
 ## The site page
 
-A site page has these tabs: Overview, Deployments, Build, Logs, Settings, Maintenance and Danger zone. Build and Logs are for sites the node builds from a repository, and each appears only when the node lists the matching capability in `GET /node` (`source-build`, `site-logs`). Other controls are gated the same way (`site-status`, `site-github-token`, `site-build-env`, `site-runtime-env`, `deploy-async`, `cert-generate`, `cert-origin-ca`, `cert-acme`, `alerts`, `forges`). A node that lists nothing, such as an older connector, simply shows fewer controls. The full guide is [Site status, logs and build settings](site-status.md).
+A site page has these tabs: Overview, Deployments, Build, Logs, Data, Settings, Maintenance and Danger zone. Build and Logs are for sites the node builds from a repository, and each appears only when the node lists the matching capability in `GET /node` (`source-build`, `site-logs`). Data appears for a site that runs a server when the node lists `data-postgres`, `data-external` or `data-s3` (see [Data and databases](#data-and-databases)). Other controls are gated the same way (`site-status`, `site-github-token`, `site-build-env`, `site-runtime-env`, `deploy-async`, `cert-generate`, `cert-origin-ca`, `cert-acme`, `alerts`, `forges`). A node that lists nothing, such as an older connector, simply shows fewer controls. The full guide is [Site status, logs and build settings](site-status.md).
 
 **Status panel.** On Overview and Build. A chip shows the phase: fetching, building, packing, promoting, idle, failed, or unhealthy (idle, but the live slot is not passing its health check). While the manager works the chip pulses and the panel refreshes every 2 seconds; otherwise every 10 seconds. A failed or unhealthy site shows a red banner with the node's reason and a Copy reason button, and a Redeploy button. A "Changes not built yet" badge shows when the node reports `settings_current: false`. A table lists each slot with its container, health, phase, commit, last build time and restarts, with out-of-memory and exit codes when present. Polling runs only while the panel is on the page and the browser tab is visible, and an overlapping request is never started.
 
@@ -153,7 +221,7 @@ A site page has these tabs: Overview, Deployments, Build, Logs, Settings, Mainte
 
 **Build settings (Build tab).** Every field the node accepts in `source`: repository (pasted addresses are normalised), branch, runtime, Node version, poll interval, root directory, package manager, install command, build command, output directory, rendering, start command, SPA fallback file, framework and prune. There is no per-site forge field: the forge is set for the whole node by the operator (`CITE_STACK_FORGE`), and the node refuses a site that names one. A field left empty is Auto and shows what the manager detected, for example "Auto (detected: pnpm)". Each field is checked with the node's rules as you type (relative paths without `..`, one-line commands up to 1024 bytes, a start command without shell characters that does not begin with a package manager, shell or env, and not with static rendering). Unsaved changes are flagged and Save stays off until the form is valid. After a save that changes how the site is built (anything but the poll interval) the console asks every time: "This change needs a rebuild", with Redeploy now and Later.
 
-**Environment variables.** Build and runtime variables list names only. A value can be typed for a new variable or to replace one, is kept in the page until you save, and is dropped when the node has it, when you discard, and when you leave the page. Names are capital letters, digits and underscores; the names the node reserves (`PATH`, `HOME`, `NODE_OPTIONS`, `LD_*`, `GIT_*`, `NPM_CONFIG_*`, `XDG_*`, `CITE_*`, proxy settings and a few more) are refused, a value is one line up to 4096 bytes, a site holds at most 64 and a change is at most 12 KiB. Saved variables apply on the next build.
+**Environment variables.** Values are write-only: no route returns one, so build and runtime variables list names only and the value box is labelled "Value (write-only)". A value can be typed for a new variable or to replace one, is kept in the page until you save, and is dropped when the node has it, when you discard, and when you leave the page. Names are capital letters, digits and underscores; the names the node reserves (`PATH`, `HOME`, `NODE_OPTIONS`, `LD_*`, `GIT_*`, `NPM_CONFIG_*`, `XDG_*`, `CITE_*`, proxy settings and a few more) are refused, a value is one line up to 4096 bytes, a site holds at most 128 and a change is at most 24 KiB. Saved variables apply on the next build.
 
 **GitHub token.** The card says whether the site uses its own token, the node token or none, and whether the git host accepted it. A token is typed into a write-only box, sent once and the box is emptied at once; the node tests it before storing it. "Use the node token" removes the site token.
 
@@ -161,13 +229,19 @@ A site page has these tabs: Overview, Deployments, Build, Logs, Settings, Mainte
 
 **Settings.** Everything the node accepts in `PUT /sites/{id}` besides the source: name, kind, hosts, path prefixes and regexes, the health check (path, interval 100 to 60000 ms, timeout 100 to 10000 ms and not above the interval, rise and fall 1 to 10), and the Access card. Each field shows its own error, an "Unsaved changes" badge appears, and Save stays off until the form is valid and changed. The create wizard uses the same field components as the Build tab.
 
-**Sites list.** A site that failed its last deploy, or whose live targets fail their health check, shows "Needs attention" and the reason under its name (the full text is the tooltip). Details are fetched once per site and reused while you filter.
+**Nodes that hold the site.** The same site id can exist on several nodes, and each node stores its own copy. The nodes that hold it appear as chips beside the title. The current node is marked and the others link to their own page for the site.
+
+- Save on Settings (the Site card, Access and Health check) asks which nodes when more than one holds the site. The current node is ticked and no other.
+- A node whose site has the same id but different hosts and a different repository is named in the dialog as a different site. Check it before ticking it.
+- Each node keeps its own upstream targets, active slot and source. Only name, kind, hosts, paths, health check and access are written.
+- Deploy, Switch active slot, Roll back, Redeploy and Delete site act on the node of the page only.
+- Maintenance has one switch per node that holds the site, and a page choice. Turning it on creates the page on a node that lacks it first. Turn on everywhere and Turn off everywhere confirm first and skip a node that holds a different site with the same id.
 
 Alerts are under Settings, Alerts, shown only for a node with the `alerts` capability.
 
 ## Access
 
-The Access card appears in the create form and on the Routing tab of a site. It stores `access` on the site as `{"cloudflare_only": bool, "tls": "full" | "flexible"}`. The console leaves `access` out of the request while it holds the default (off, Full) and the site has none, so a node that predates the field never receives it.
+The Access card appears in the create form and on the Settings tab of a site. It stores `access` on the site as `{"cloudflare_only": bool, "tls": "full" | "flexible"}`. The console leaves `access` out of the request while it holds the default (off, Full) and the site has none, so a node that predates the field never receives it.
 
 | Setting | Meaning |
 |---|---|
@@ -177,7 +251,7 @@ The Access card appears in the create form and on the Routing tab of a site. It 
 
 Choosing Flexible SSL without the proxy option shows a note on the card and does not block saving: without that option anyone can reach the server directly over plain http, with no encryption.
 
-Settings, Cloudflare shows the active list for the selected node, with its source, date and count. The override box takes one CIDR range per line, IPv4 or IPv6. A bare address counts as a single host (`/32` or `/128`). The console applies the node's width rules before saving: IPv4 ranges must be `/12` or narrower, IPv6 ranges `/28` or narrower, `/0` is refused as trusting every address, and an IPv6 range that overlaps `::ffff:0:0/96`, `::/96`, `2002::/16` or `64:ff9b::/96` is refused because it would also match IPv4 clients (an IPv4-mapped address such as `::ffff:198.51.100.0/120` is read as the IPv4 range). Octets and prefix lengths with leading zeros (`010.0.0.1`, `/08`) are refused, as the node refuses them. Lines that are not addresses or ranges are refused, and up to 256 ranges are allowed. Save ranges writes `cloudflare_ranges` through `PUT /settings`; an empty box, or Use built-in list, saves an empty list so the node falls back to its built-in one. A wrong custom list locks real visitors out of sites that only accept Cloudflare traffic, so use it only when Cloudflare publishes ranges the node does not know yet.
+Settings, Cloudflare shows the active list for the node on the node bar, with its source, date and count. The override box takes one CIDR range per line, IPv4 or IPv6. A bare address counts as a single host (`/32` or `/128`). The console applies the node's width rules before saving: IPv4 ranges must be `/12` or narrower, IPv6 ranges `/28` or narrower, `/0` is refused as trusting every address, and an IPv6 range that overlaps `::ffff:0:0/96`, `::/96`, `2002::/16` or `64:ff9b::/96` is refused because it would also match IPv4 clients (an IPv4-mapped address such as `::ffff:198.51.100.0/120` is read as the IPv4 range). Octets and prefix lengths with leading zeros (`010.0.0.1`, `/08`) are refused, as the node refuses them. Lines that are not addresses or ranges are refused, and up to 256 ranges are allowed. Save ranges writes `cloudflare_ranges` through `PUT /settings`; an empty box, or Use built-in list, saves an empty list so the node falls back to its built-in one. A wrong custom list locks real visitors out of sites that only accept Cloudflare traffic, so use it only when Cloudflare publishes ranges the node does not know yet.
 
 ### Bot policy and zone lock
 
@@ -192,7 +266,7 @@ With Allow, the card says "No bot blocking is active for this site" instead of p
 
 The node generates the zone secret and returns it only from `POST /sites/{id}/zone-secret`. After you save a site whose zone lock was off and is now on (in the create form, once per node the site was created on, even when other nodes failed: the error then lists the failed nodes and says the secret for the others is shown in the dialog), the console calls that route and shows the secret in a dialog: the header name, the secret with a copy button, the secret's fingerprint and date, and numbered Cloudflare steps (Rules, Transform Rules, Modify Request Header, Set static header). The dialog warns that the secret is not shown again. It has no close icon and ignores Escape and clicks outside; it closes only with the I have saved it button, which asks for confirmation first if Copy was never pressed. Closing it empties the text and drops the copies held by the page. The secret is not written to storage, the address or any log.
 
-On the Routing tab of a site with the lock on, the card shows when the secret was created and its fingerprint (`GET /sites/{id}/zone-secret`, which never returns the secret) and a Rotate secret button. When the node reports `readable: false` (it could not read its secret store at start), the line says the lock state is unknown and to fix the file or rotate after restoring it, instead of claiming no secret exists. Rotating asks for confirmation, because the old secret stops working at once. The dashboard proxy passes only `GET` and `POST` on `sites/{id}/zone-secret`, checks the site id, and marks both answers `Cache-Control: no-store`.
+On the Settings tab of a site with the lock on, the card shows when the secret was created and its fingerprint (`GET /sites/{id}/zone-secret`, which never returns the secret) and a Rotate secret button. When the node reports `readable: false` (it could not read its secret store at start), the line says the lock state is unknown and to fix the file or rotate after restoring it, instead of claiming no secret exists. Rotating asks for confirmation, because the old secret stops working at once. The dashboard proxy passes only `GET` and `POST` on `sites/{id}/zone-secret`, checks the site id, and marks both answers `Cache-Control: no-store`.
 
 ## Firewall rules
 
@@ -209,11 +283,24 @@ Each condition row has a type and a value: Path starts with, Path matches regex,
 
 A secret header value is typed into a password box, is not shown again after saving, and the builder opens with the box empty and a note that the stored value is kept; leave it empty to keep it or type a new value to replace it. Switching a rule on or off from the list keeps a stored secret as well. A secret value is never shown in the list or in the sentence, where it appears as `header X-Key = (secret)` and "a secret value".
 
-The rule list shows an Effect column: Deny, Drop silently or Tarpit for blocks, the status and target for redirects, and the number of header changes or the CORS origin for the rest. The three redirect presets (`redirect-to-www`, `redirect-to-apex`, `force-https`) appear with the other presets. They have no site, so Apply asks for confirmation first and says they act on every site on the node. See [Firewall and maintenance](firewall.md) for the rules the node enforces.
+The rule list shows an Effect column: Deny, Drop silently or Tarpit for blocks, the status and target for redirects, and the number of header changes or the CORS origin for the rest. The three redirect presets (`redirect-to-www`, `redirect-to-apex`, `force-https`) appear with the other presets. They have no site, so the node picker for Apply says they act on every site on the node. See [Firewall and maintenance](firewall.md) for the rules the node enforces.
+
+### Rules across nodes
+
+- The page reads rules from every node in scope. The header names the scope, and a node that cannot be read is listed in a notice and left out.
+- Identical rules (same id and same content, ignoring on or off) become one row. Under All nodes a Nodes column shows a chip per holder with an on or off dot.
+- A rule with the same id but different content on another node is a separate row with a `differs` pill. It is never merged.
+- Hits over 24 hours are summed over the nodes that hold the row.
+- The switch is on only when every holder has the rule on. A rule held by one node changes that node. A rule held by several opens the node picker, limited to its holders.
+- Add rule, Save rule, Delete rule and Apply on a preset open the node picker. Add rule offers online nodes, and for a rule scoped to a site only nodes that hold that site. Save rule offers only nodes that hold the rule. Apply offers online nodes.
+- Saving a rule keeps each node's own on or off state.
+- Match text wraps in full instead of ending in an ellipsis.
+
+Each preset shows an "N rules" pill. Hover or focus it to list every rule the preset adds with its action and patterns, so Sensitive files lists its six rules. Each preset card also has a collapsible "What it blocks" list with the same content, which is the only form on touch screens.
 
 ## Redirects
 
-Firewall, Manage redirects (or `#/redirects`) opens a table of the node's redirect rules. Each row has an on switch, From (Path starts with a prefix, or Path matches regex), To (a template with the same placeholder chips as the builder), a status of 301, 302, 307 or 308, and delete. Rules with other conditions, or the quick rows below, show what they match in place of the From box.
+Firewall, Manage redirects (or `#/redirects`) opens a table of the redirect rules, read from every node in scope and merged by id. When copies of a redirect differ between nodes, a notice says so and the first copy is shown. Each row has an on switch, From (Path starts with a prefix, or Path matches regex), To (a template with the same placeholder chips as the builder), a status of 301, 302, 307 or 308, and delete. Rules with other conditions, or the quick rows below, show what they match in place of the From box.
 
 | Button | Adds |
 |---|---|
@@ -221,13 +308,19 @@ Firewall, Manage redirects (or `#/redirects`) opens a table of the node's redire
 | Add www redirect | A row sending to `{scheme}://{www_host}{path}{query}`. |
 | Add https redirect | A row for plain http requests sending to `https://{host}{path}{query}`. |
 
-Every row is checked as you type: the path must start with `/` for a prefix, the regex must compile, the target must be a valid template, no two rows may start from the same path, and the same loop checks as the builder apply. Save changes stays disabled until every row is valid and something changed, and the summary beside it counts rows to save and delete. Save changes sends one `POST /firewall/bulk` request with `{"replace": [rules], "delete": [ids]}` containing only the rows that changed, and the node applies them as one configuration change and answers `{created, replaced, deleted}`. New rows get the next free id `redirect-<n>` and the same text as their label, and an edited row keeps its id, label, name and site. If the node refuses a rule, its message appears under the row that sent it and nothing is saved; a message that names no row is shown below the table. Discard changes reloads the list.
+Every row is checked as you type: the path must start with `/` for a prefix, the regex must compile, the target must be a valid template, no two rows may start from the same path, and the same loop checks as the builder apply. Save changes stays disabled until every row is valid and something changed, and the summary beside it counts rows to save and delete. Save changes opens the node picker (confirm button "Save redirects for ..."), then sends one `POST /firewall/bulk` request per picked node with `{"replace": [rules], "delete": [ids]}` containing only the rows that changed. Each node applies its request as one configuration change and answers `{created, replaced, deleted}`.
+
+- The body for a node is built from that node's own stored rules. A node keeps its own on or off state unless you used that row's switch. A row that is on at some nodes and off at others carries a "differs by node" pill until then.
+- A delete is sent only to nodes that hold the rule.
+- New rows get the next free id `redirect-<n>` and the same text as their label, and an edited row keeps its id, label, name and site.
+- If a node refuses a rule, its message appears under the row that sent it, prefixed with the node name. A message that names no row is shown below the table. Other nodes are not rolled back.
+- Discard changes reloads the list.
 
 The dashboard proxy passes only `POST` on exactly `firewall/bulk` (any other method or extra path segment is refused), needs the session's CSRF token, and refuses bodies over 512 KiB; every other firewall route keeps the usual limit.
 
 ## Certificates
 
-Settings, Certificates lists the TLS certificates stored on the selected node and manages them through the connector's `/certificates` routes. Each row shows the name and subject, the names the certificate is valid for as chips, the issuer, the expiry date with the days left, the key type, a short SHA-256 fingerprint and the site hosts the certificate covers. The expiry gets a warning chip under 30 days and a danger chip under 7 days or once expired. The private key is never returned by the node, so it is never shown.
+Settings, Certificates lists the TLS certificates stored on the node on the node bar and manages them through the connector's `/certificates` routes. Each row shows the name and subject, the names the certificate is valid for as chips, the issuer, the expiry date with the days left, the key type, a short SHA-256 fingerprint and the site hosts the certificate covers. The expiry gets a warning chip under 30 days and a danger chip under 7 days or once expired. The private key is never returned by the node, so it is never shown.
 
 | Action | What it does |
 |---|---|
@@ -240,6 +333,48 @@ Certificate files placed in the node's certificate directory by hand are listed 
 The key and chain are held only in the dialog's text boxes and the one request. The boxes are cleared when the upload succeeds or the dialog closes, the key box is also cleared when an upload fails, they have autocomplete and spellcheck off, and nothing is logged or kept in local storage, session storage or the URL. The dashboard proxy passes `GET` and `POST /certificates`, `GET`, `PUT` and `DELETE /certificates/{id}` and `GET /cloudflare/ranges` and nothing else under those prefixes, requires an id of exactly 26 uppercase letters or digits (a ULID), needs the session's CSRF token for writes and refuses certificate bodies over 144 KiB.
 
 A note above the table lists site hosts that no certificate covers. Visitors to those hosts over HTTPS get a certificate warning, unless the site uses Flexible SSL behind Cloudflare. When the node's `https_port` is empty, HTTPS is off and certificates are stored but not served. The tab then shows a port field (443 by default) that saves `https_port` with `PUT /settings`. A node that answers 404 for the certificate routes predates them, and the tab shows a note that it needs a connector update.
+
+## Data and databases
+
+What these controls do is described in [Site data services](data.md). The console shows them only for a node that lists the matching `data-*` capabilities; an older connector shows no Data tab and no Databases view. Passwords, external database URLs and S3 keys are write-only everywhere: no view shows one, and the inputs that take them are emptied after use.
+
+### The Data tab
+
+The Data tab of a site page reads `GET /sites/{id}/data` through the node bar's node and shows these cards. A node without data services shows "Data services are not enabled on this node".
+
+| Card | What it does |
+|---|---|
+| Postgres | Turns Postgres on with a mode (dedicated or shared, shown with the trade-off table) and a Postgres major, and shows its health, resources and backup policy. An option creates the default `app` database with its users and links. Edit resources applies to dedicated. Turn off removes the database but keeps its data unless you also delete it. After a conversion, a notice offers Delete the old database. Shared mode needs the shared instance enabled on the Databases view first. |
+| Databases and users | Databases with their users: level (owner, read and write, read only), connection limit, timeouts, whether the user is disabled, when the password was last rotated and which links use it. Add a database or user, edit, disable, rotate a password, delete. |
+| Environment links | Each variable with its target (runtime or build) and source. Add a link, apply a preset (Generic, Prisma, Drizzle, Auth.js, Better Auth), or delete one. A conflict with a manual variable offers a replace, and a variable that Doppler also sets is marked as shadowed. Values are never shown. |
+| Generated secrets | Create, rotate (with a warning that an auth secret signs everyone out) and delete random values. |
+| External Postgres | Attach a database by URL (write-only). Shows the host, database, SSL mode, the forward port and warnings such as `verify-full` through the egress forward, and the note that external databases are backed up by hand only. |
+| S3 storage | Attach a bucket with write-only keys. |
+| Backups | Versions of each database with trigger, label, pin, size, checksum, status and where the copies are held. Back up now (optionally also to S3), label, pin, download, restore (it asks for the site id and says a backup is taken first), push to S3 and delete from the node, S3 or both. The schedule (every 1, 2, 3, 4, 6, 8, 12 or 24 hours at a minute, UTC), the retention numbers of each tier, the S3 target and Prune backups now with its preview are on this card. A note says an S3 copy needs the node key. |
+| Convert | Starts a conversion between dedicated and shared with a freeze choice, follows it, compares the tables, and offers Cut over and Abort. |
+| Move database to another node | See below. |
+
+Changes that start work return at once and the card follows the job. A banner says when a redeploy is needed for running containers to see a change.
+
+### Moving a database to another node
+
+The card picks a target node (online and managed by this console), a database, how the site behaves during the final copy (maintenance page, or read only) and two options: replace a database of the same name on the target, and replace manual variables of the same name when the links are created. The dashboard server runs the transfer, so the dump never passes through the browser; the console starts, watches, resumes, cancels, cuts over and rolls back through `/api/v1/transfers`. A row shows the phase (waiting, freezing the source, dumping, copying, restoring, verifying, cutting over, done, failed, rolled back), progress in bytes, and the tables whose row counts differ between the two sides. Cut over is available once the counts match and is refused when they differ; Roll back and Cancel are available while the transfer has not finished, and Resume continues a failed or interrupted one. The target site must exist with Postgres enabled. Transfers that were started elsewhere, for example from the desktop app, appear as open sessions to finish where they were started.
+
+The server keeps the transfers in `transfers.json` next to its configuration (mode 0600, no secrets), runs at most two at once, and marks one that was running when it stopped as failed so it can be resumed. See [Site data services](data.md#moving-a-database-to-another-node) for what each step does.
+
+### The Databases view
+
+`#/databases`, for the node on the node bar. It needs a node that lists `data-shared` or `data-postgres`.
+
+| Card | What it does |
+|---|---|
+| Encryption key and backup volume | The node key id and where it comes from, and whether the backup volume is usable. |
+| Shared instance | Enable, edit (memory, CPUs, connections and, at creation, the Postgres major), restart and delete the node's shared Postgres. Changing the limits recreates the container. |
+| Tenants | The sites on the shared instance with the size of each database. |
+| Instance backups | Back up every tenant database in one archive, download it and delete it. |
+| Transfers between nodes | Open and recent transfers of all sites, with the same actions as the Data tab. |
+| Backup targets | S3 buckets that hold backup copies: add, edit, test and delete. They are separate from the buckets sites use. |
+| Left behind by deleted sites | Data kept when a site was deleted without `purge_data`, with a Purge action. A new site with the same id picks it up again. |
 
 ## How the console talks to connectors
 
@@ -257,7 +392,11 @@ Beyond the generic prefixes, these routes are exact (method, route) pairs, need 
 | `certificates/acme`, `certificates/acme/{job}` | GET | |
 | `alerts` | GET, PUT | PUT 64 KiB |
 | `alerts/test` | POST | 1 KiB |
+| `sites/{id}/data/...` | the site data routes of [Connector API](node-api.md#site-data-services), each an exact method and shape with validated ids and names | 64 KiB |
+| `data/...` | node level: `data`, `data/jobs/{job}`, `data/targets...`, `data/shared...` (with backups and their download), `data/orphans...` | 64 KiB |
+| `/api/v1/transfers` (the server's own route) | GET list, POST create | usual |
+| `/api/v1/transfers/{id}` and its `resume`, `cancel`, `cutover` and `rollback` | GET, and POST for the four actions | usual |
 
-The site id and the ACME job id are checked, the answers for status, logs, token, certificate issuing and alerts are sent with `Cache-Control: no-store`, and the long timeout used for deploys also applies to the token and ACME writes. `PATCH` is refused everywhere except the two environment routes.
+The site id and the ACME job id are checked, the answers for status, logs, token, certificate issuing and alerts are sent with `Cache-Control: no-store`, and the long timeout used for deploys also applies to the token and ACME writes. `PATCH` is refused everywhere except the two environment routes and the data routes that take it (a database user and a backup's label and pin). Backup downloads are relayed as streams. The transfer routes of a connector (`exports`, `imports` and their chunks and manifest) are not proxied at all: the dashboard server drives them itself, so a browser never carries a chunk or sees a manifest.
 
 Connectors still enforce their own rules: the source allowlist, TLS and token check apply to the dashboard server as they would to any client. See [Security model](security-model.md).

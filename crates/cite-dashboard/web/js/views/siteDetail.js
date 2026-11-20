@@ -1,5 +1,6 @@
 import { h, s, clear } from '../dom.js';
 import { nodeApi } from '../api.js';
+import { state } from '../state.js';
 import {
   pageHeader, button, loadInto, card, pill, dataTable, emptyState, field, toggle, chipInput, routeTabs,
   confirmDialog, toast, withBusy, formatError, kvList, skeletonBlock, fmtDate, relTime,
@@ -11,18 +12,28 @@ import {
   PATH_TYPES, pathFieldsFromRows, pathRowsFromSite,
 } from '../conditionlib.js';
 import { pagePreview } from './maintenance.js';
+import { pickTargets } from './targetDialog.js';
+import { applyToNodes, resultKind, resultMessage } from '../targetlib.js';
+import {
+  nodesNeedingPage, rowPage, siteMatrix, unionPages,
+} from '../pageslib.js';
+import {
+  differentHolders, holderNodes, maintenanceMessage, nodeSaveBody, peerNames,
+} from '../sitenodeslib.js';
 import { gitRefProblem } from '../siteCheck.js';
-import { accessForSave, accessOf, zoneLockTurnedOn } from '../accesslib.js';
+import { accessOf, rotationFailureLines, zoneLockTurnedOn } from '../accesslib.js';
 import { accessCard } from './accessCard.js';
 import { rotateAndShow } from './zoneSecret.js';
 import { nodeInfoCached, siteFeatures, showsBuildSettings } from '../caplib.js';
 import { canRollback, deployRefFor, deployFailureText, historyRows } from '../historylib.js';
 import {
-  healthFromFields, healthProblems, hostProblem, nameProblem, routingProblem, siteBody, KINDS,
+  healthFromFields, healthProblems, hostProblem, nameProblem, routingProblem, KINDS,
 } from '../sitelib.js';
 import { makeDirty, dirtyText } from '../dirtylib.js';
 import { statusPanel } from './siteStatus.js';
 import { logsPanel } from './siteLogs.js';
+import { dataPanel } from './siteData.js';
+import { showsDataTab } from '../datalib.js';
 import { buildSettingsCard, envCard, tokenCard } from './siteBuild.js';
 import { deployWithToasts } from './deployFlow.js';
 
@@ -31,6 +42,7 @@ const ALL_TABS = [
   { id: 'deployments', label: 'Deployments', icon: 'rocket' },
   { id: 'build', label: 'Build', icon: 'wrench', needs: 'build' },
   { id: 'logs', label: 'Logs', icon: 'layers', needs: 'logs' },
+  { id: 'data', label: 'Data', icon: 'layers', needs: 'data' },
   { id: 'routing', label: 'Settings', icon: 'globe' },
   { id: 'maintenance', label: 'Maintenance', icon: 'wrench' },
   { id: 'danger', label: 'Danger zone', icon: 'alert' },
@@ -42,6 +54,7 @@ function tabsFor(site, info) {
   return ALL_TABS.filter((t) => {
     if (t.needs === 'build') return showsBuildSettings(info, site);
     if (t.needs === 'logs') return Boolean(site.source) && features.logs;
+    if (t.needs === 'data') return showsDataTab(info, site);
     return true;
   });
 }
@@ -67,8 +80,8 @@ function flowDiagram(site) {
     const active = site.active === name;
     const g = s('g', { class: `slot slot-${name}${active ? ' active' : ''}` },
       s('rect', { x: 520, y, width: 180, height: 100, rx: 10 }),
-      s('text', { class: 'slot-title', x: 536, y: y + 26 }, name.toUpperCase()),
-      s('text', { class: 'slot-state', x: 684, y: y + 26, 'text-anchor': 'end' }, active ? 'ACTIVE' : 'IDLE'));
+      s('text', { class: 'slot-title', x: 536, y: y + 26 }, name.charAt(0).toUpperCase() + name.slice(1)),
+      s('text', { class: 'slot-state', x: 684, y: y + 26, 'text-anchor': 'end' }, active ? 'Active' : 'Idle'));
     const shown = targets.length > 3 ? targets.slice(0, 2) : targets;
     shown.forEach((t, i) => {
       const found = (live[name] || []).find((l) => l.addr === t.addr);
@@ -135,12 +148,12 @@ function deploymentsPanel(ctx, site, reload) {
   const editor = targetEditor({ targets: (site[idle] && site[idle].targets) || [] });
   const gitRef = h('input', {
     class: 'input mono', type: 'text', value: (site.source && site.source.branch) || 'main', placeholder: 'main, v1.4.0 or a commit sha',
-    autocomplete: 'off', spellcheck: 'false', 'aria-label': 'Git ref',
+    autocomplete: 'off', spellcheck: 'false', 'aria-label': 'Git ref', title: 'A branch, tag or commit sha from the source repository',
   });
   const note = h('input', { class: 'input', type: 'text', placeholder: 'What changed in this version', 'aria-label': 'Deployment note' });
   const progress = h('div', { class: 'progress-box', hidden: true, role: 'status' });
   const err = h('p', { class: 'form-error', role: 'alert', hidden: true });
-  const deployBtn = button(`Deploy to ${idle}`, { kind: 'primary', iconName: 'rocket' });
+  const deployBtn = button(`Deploy to ${idle}`, { kind: 'primary', iconName: 'rocket', title: `Deploy to the ${idle} slot on ${node}` });
 
   // A node that cannot deploy in the background holds the request until health checks pass, so show elapsed time while it runs
   const showProgress = () => {
@@ -148,7 +161,7 @@ function deploymentsPanel(ctx, site, reload) {
     const elapsed = h('b', { class: 'mono' }, '0s');
     clear(progress);
     progress.append(h('div', { class: 'progress' }, h('i', {})),
-      h('p', {}, fromGit ? `Building the ${idle} slot from ${gitRef.value.trim()} and waiting for every health check to pass. ` : `Writing targets to the ${idle} slot and waiting for every health check to pass (up to 60 s). `, elapsed));
+      h('p', {}, fromGit ? `Building the ${idle} slot on ${node} from ${gitRef.value.trim()} and waiting for every health check to pass. ` : `Writing targets to the ${idle} slot on ${node} and waiting for every health check to pass (up to 60 s). `, elapsed));
     progress.hidden = false;
     const timer = setInterval(() => { elapsed.textContent = Math.round((Date.now() - started) / 1000) + 's'; }, 500);
     return () => {
@@ -192,11 +205,11 @@ function deploymentsPanel(ctx, site, reload) {
   });
 
   const rollbackNow = async () => {
-    const ok = await confirmDialog({ title: 'Roll back', message: `Return traffic to the previous version? The ${other(site.active)} slot becomes active again.`, confirmLabel: 'Roll back', danger: true });
+    const ok = await confirmDialog({ title: `Roll back on ${node}`, message: `Return traffic on ${node} to the previous version. The ${other(site.active)} slot becomes active again.`, confirmLabel: 'Roll back', danger: true });
     if (!ok) return;
     try {
       await nodeApi(node).post(`/sites/${encodeURIComponent(site.id)}/rollback`);
-      toast('Rolled back', 'success');
+      toast(`Rolled back on ${node}`, 'success');
       reload();
     } catch (ex) {
       toast(formatError(ex), 'error', 15000);
@@ -218,11 +231,9 @@ function deploymentsPanel(ctx, site, reload) {
   return h('div', { class: 'stack' },
     card({
       title: 'Deploy new version',
-      subtitle: fromGit
-        ? `The ref is built into the idle ${idle} slot, health checked, then traffic flips over.`
-        : `Targets are written to the idle ${idle} slot, health checked, then traffic flips over.`,
+      subtitle: `Goes to the idle ${idle} slot on ${node} only, then traffic flips once it is healthy.`,
       body: h('div', { class: 'form' }, fromGit
-        ? field('Git ref', gitRef, 'A branch, tag or commit sha from the source repository.')
+        ? field('Git ref', gitRef)
         : field('Targets for the new version', editor.el, null, { group: true }), field('Note', note), progress, err, h('div', { class: 'form-actions' }, deployBtn)),
     }),
     card({
@@ -254,7 +265,7 @@ function routingPanel(ctx, site, reload) {
   // check() is called by child controls while they are being built, so its handle is declared before them
   let queued = 0;
   const name = h('input', { class: 'input', type: 'text', value: site.name, 'aria-label': 'Site name' });
-  const kind = h('select', { class: 'select', 'aria-label': 'Kind', value: site.kind || 'site' },
+  const kind = h('select', { class: 'select', 'aria-label': 'Kind', title: 'APIs usually route by path prefix, sites by domain', value: site.kind || 'site' },
     KINDS.map((k) => h('option', { value: k }, k === 'api' ? 'API' : 'Site')));
   let hostList = [...(site.hosts || [])];
   const hosts = chipInput({
@@ -325,33 +336,45 @@ function routingPanel(ctx, site, reload) {
     const bad = routingProblem({ ...c, pathRows });
     if (bad) return fail(bad.message);
     err.hidden = true;
-    const next = siteBody(site, {
+    // Only what this form edits is shared; each node keeps its own targets, live slot and source (see nodeSaveBody)
+    const shared = {
       name: c.name.trim(),
       kind: c.kind,
       hosts: c.hosts,
       ...pathFieldsFromRows(pathRows),
       health: c.health,
-    });
-    delete next.access;
-    const accessValue = accessForSave(access.get(), site.access);
-    if (accessValue) next.access = accessValue;
-    try {
-      await withBusy(save, () => nodeApi(ctx.node).put(`/sites/${encodeURIComponent(site.id)}`, next));
-      dirty.reset();
-      toast('Settings saved', 'success');
-      // The node makes the secret when the lock goes on, and only a rotate call hands it back
-      if (zoneLockTurnedOn(accessOf(site), access.get())) {
-        const failures = await rotateAndShow([ctx.node], site.id, reload);
-        if (failures.length) {
-          toast(formatError(failures[0].error), 'error');
-          reload();
-        }
-        return;
-      }
-      reload();
-    } catch (ex) {
-      fail(formatError(ex));
+      access: access.get(),
+    };
+    const url = `/sites/${encodeURIComponent(site.id)}`;
+    const { holders, different } = await ctx.crossReady;
+    let targets = [ctx.node];
+    if (holders.length > 1) {
+      const warnings = different.map((d) => `${d.node} has a site with this id but different hosts (${d.hosts.join(', ') || 'none'}). Check before saving there.`);
+      targets = await pickTargets({
+        title: 'Save changes', message: [`${site.name} is on ${holders.length} nodes. Pick where to save these settings.`, ...warnings].join(' '), verb: 'Save', scope: ctx.node, only: holders,
+      });
+      if (!targets || !targets.length) return;
     }
+    const results = await withBusy(save, () => applyToNodes(targets, async (target) => {
+      const stored = target === ctx.node ? site : await nodeApi(target).get(url);
+      await nodeApi(target).put(url, nodeSaveBody(stored, shared));
+      return { turnedOn: zoneLockTurnedOn(accessOf(stored), shared.access) };
+    }));
+    const message = resultMessage('Saved', results, formatError);
+    if (!results.some((r) => r.ok)) return fail(message);
+    toast(message, resultKind(results));
+    // The page shows this node's copy, so it is only redrawn when this node took the change; otherwise the typed values stay for another try
+    const savedHere = results.some((r) => r.ok && r.node === ctx.node);
+    if (savedHere) dirty.reset();
+    const done = savedHere ? reload : null;
+    // The node makes the secret when the lock goes on, and only a rotate call hands it back
+    const rotate = results.filter((r) => r.ok && r.value.turnedOn).map((r) => r.node);
+    if (rotate.length) {
+      const failures = await rotateAndShow(rotate, site.id, done);
+      rotationFailureLines(failures, formatError).forEach((line) => toast(line, 'error'));
+      return;
+    }
+    if (done) done();
   });
   const withError = (label, control, key, hint) => {
     const f = field(label, control, hint);
@@ -363,15 +386,15 @@ function routingPanel(ctx, site, reload) {
       title: 'Site',
       actions: badge,
       body: h('div', { class: 'form' },
-        h('div', { class: 'two-col' }, withError('Name', name, 'name'), field('Kind', kind, 'APIs usually route by path prefix; sites by domain.')),
+        h('div', { class: 'two-col' }, withError('Name', name, 'name'), field('Kind', kind)),
         field('Hosts', hosts.el, null, { group: true }),
-        field('Only for these paths (optional)', paths.el, 'Leave empty to serve every path. A request matching any path is routed here.', { group: true })),
+        field('Only for these paths (optional)', paths.el, 'Empty serves every path.', { group: true })),
     }),
     access.el,
     card({
       title: 'Health check',
       body: h('div', { class: 'form' },
-        withError('Path', path, 'path', 'Requested on every target to decide whether it is ready.'),
+        withError('Path', path, 'path', 'Requested on every target.'),
         h('div', { class: 'four-col' },
           withError('Interval (ms)', interval, 'interval_ms', '100 to 60000.'), withError('Timeout (ms)', timeout, 'timeout_ms', '100 to 10000, not above the interval.'),
           withError('Rise', rise, 'rise', 'Passes to be healthy, 1 to 10.'), withError('Fall', fall, 'fall', 'Failures to be down, 1 to 10.'))),
@@ -380,35 +403,165 @@ function routingPanel(ctx, site, reload) {
     h('div', { class: 'form-actions' }, dirtyHint, save));
 }
 
-function maintenancePanel(ctx, site, pages, reload) {
-  const m = site.maintenance || { enabled: false, page_id: null };
-  const select = h('select', { class: 'select', 'aria-label': 'Maintenance page', value: m.page_id || '' },
-    h('option', { value: '' }, 'Built-in default page'), pages.map((p) => h('option', { value: p.id }, `${p.name} (${p.status})`)));
+// One switch per node that holds the site. Each switch writes only its own node, and the page is created there first when that node lacks it.
+// onCurrent(enabled, pageId) tells the page when this node's own state changed.
+function maintenancePanel(ctx, site, pages, onCurrent) {
+  const { node, cross } = ctx;
+  const maintenanceUrl = `/sites/${encodeURIComponent(site.id)}/maintenance`;
+  // node -> { enabled, pageId }
+  const cells = new Map();
+  const painters = new Map();
+  let union = { pages: [], nodes: [], unreadable: [] };
+  let holders = [node];
+  let chosen = null;
+
+  const note = h('p', { class: 'muted', role: 'status' }, 'Checking the other nodes');
+  note.hidden = cross.ready;
+  const list = h('div', { class: 'maint-list' });
+  const select = h('select', { class: 'select', 'aria-label': 'Maintenance page', title: 'Shown to visitors on every node you turn on' });
   const preview = h('div', { class: 'preview-slot' });
-  const drawPreview = () => {
-    clear(preview);
-    const page = pages.find((p) => p.id === select.value);
-    preview.append(page ? pagePreview(page) : h('p', { class: 'muted' }, 'The edge serves its built-in 503 page.'));
-  };
-  select.addEventListener('change', drawPreview);
-  drawPreview();
-  const sw = toggle({ checked: Boolean(m.enabled), label: 'Maintenance mode' });
-  const apply = button('Apply', { kind: 'primary', iconName: 'check' });
-  apply.addEventListener('click', async () => {
-    try {
-      await withBusy(apply, () => nodeApi(ctx.node).post(`/sites/${encodeURIComponent(site.id)}/maintenance`, { enabled: sw.isChecked(), page_id: select.value || undefined }));
-      toast(sw.isChecked() ? 'Maintenance mode enabled' : 'Maintenance mode disabled', 'success');
-      reload();
-    } catch (ex) {
-      toast(formatError(ex), 'error');
+  const everyOn = button('Turn on everywhere', { size: 'sm', onClick: (e) => everywhere(true, e.currentTarget) });
+  const everyOff = button('Turn off everywhere', { size: 'sm', onClick: (e) => everywhere(false, e.currentTarget) });
+
+  function rebuild() {
+    const perNode = [{ node, online: true, sites: [site], pages }, ...cross.peers.map((p) => ({ node: p.node, online: true, sites: p.sites, pages: p.pages }))];
+    union = unionPages(perNode.map((n) => ({ node: n.node, pages: n.pages })));
+    const row = siteMatrix(perNode.map((n) => ({ node: n.node, online: n.online, sites: n.sites }))).rows.find((r) => r.id === site.id);
+    holders = cross.holders;
+    for (const name of holders) {
+      if (cells.has(name)) continue;
+      const cell = row && row.cells[name];
+      cells.set(name, cell && cell.present ? { enabled: cell.enabled, pageId: cell.pageId } : { enabled: false, pageId: null });
     }
+  }
+
+  function drawSelect() {
+    const keep = chosen !== null ? chosen : (rowPage({ cells: Object.fromEntries(cells) }) || '');
+    select.replaceChildren(h('option', { value: '' }, 'Built-in default page'), ...union.pages.map((p) => h('option', { value: p.id }, `${p.name} (${p.status})`)));
+    select.value = union.pages.some((p) => p.id === keep) ? keep : '';
+  }
+
+  function drawPreview() {
+    clear(preview);
+    const page = union.pages.find((p) => p.id === select.value);
+    preview.append(page ? pagePreview(page) : h('p', { class: 'muted' }, 'The edge serves its built-in 503 page.'));
+  }
+
+  const unrelated = (name) => cross.different.find((d) => d.node === name);
+  // "Everywhere" never reaches a node whose copy of this id is an unrelated site; its own switch still works
+  const sharing = () => holders.filter((n) => !unrelated(n));
+
+  function syncButtons() {
+    const group = sharing();
+    const on = group.filter((n) => cells.get(n).enabled).length;
+    everyOn.hidden = group.length < 2 || on === group.length;
+    everyOff.hidden = group.length < 2 || on === 0;
+  }
+
+  function paint(name) {
+    const p = painters.get(name);
+    if (!p) return;
+    const { enabled } = cells.get(name);
+    p.sw.setChecked(enabled);
+    p.state.textContent = enabled ? 'Maintenance' : 'Live';
+    p.state.classList.toggle('on', enabled);
+  }
+
+  function setCell(name, enabled, pageId) {
+    cells.set(name, { enabled, pageId });
+    paint(name);
+    syncButtons();
+    if (name === node) onCurrent(enabled, pageId);
+  }
+
+  // The node refuses a page it does not hold, so the page is created there first
+  async function ensurePage(name, pageId) {
+    if (!pageId || !nodesNeedingPage(union, pageId, [name]).length) return;
+    const entry = union.pages.find((p) => p.id === pageId);
+    await nodeApi(name).post('/pages', {
+      id: entry.id, name: entry.name, html: entry.html, status: entry.status,
+    });
+    entry.nodes.push(name);
+    entry.missing = entry.missing.filter((n) => n !== name);
+  }
+
+  async function turn(name, enabled) {
+    const pageId = select.value;
+    if (enabled) await ensurePage(name, pageId);
+    const used = enabled ? pageId : (cells.get(name).pageId || pageId);
+    await nodeApi(name).post(maintenanceUrl, { enabled, page_id: used || undefined });
+    setCell(name, enabled, used || null);
+  }
+
+  // Throws on failure so the switch snaps back
+  async function flip(name, next, sw) {
+    sw.disabled = true;
+    try {
+      await turn(name, next);
+    } catch (ex) {
+      toast(`Could not turn maintenance ${next ? 'on' : 'off'} on ${name}: ${formatError(ex)}`, 'error');
+      throw ex;
+    } finally {
+      sw.disabled = false;
+      if (document.activeElement === document.body) sw.focus();
+    }
+    toast(`Maintenance ${next ? 'enabled' : 'disabled'} on ${name}`, 'success');
+  }
+
+  async function everywhere(enabled, btn) {
+    const names = sharing().filter((n) => cells.get(n).enabled !== enabled);
+    if (!names.length) return;
+    const skipped = holders.filter((n) => unrelated(n));
+    const ok = await confirmDialog({
+      title: enabled ? 'Turn on everywhere' : 'Turn off everywhere',
+      message: `${enabled ? 'Puts' : 'Takes'} ${site.name} ${enabled ? 'into' : 'out of'} maintenance on ${names.join(', ')}.`
+        + (skipped.length ? ` Skips ${skipped.join(', ')}, which has a site with this id but different hosts; use its own switch.` : ''),
+      confirmLabel: enabled ? 'Turn on everywhere' : 'Turn off everywhere',
+      danger: enabled,
+    });
+    if (!ok) return;
+    const results = await withBusy(btn, () => applyToNodes(names, (name) => turn(name, enabled)));
+    toast(maintenanceMessage(enabled, results, formatError), resultKind(results));
+  }
+
+  function drawList() {
+    painters.clear();
+    list.replaceChildren(...holders.map((name) => {
+      const state0 = h('span', { class: 'maint-state' }, '');
+      const sw = toggle({ checked: false, label: `Maintenance on ${name}`, onChange: (next) => flip(name, next, sw) });
+      painters.set(name, { sw, state: state0 });
+      paint(name);
+      const diff = unrelated(name);
+      return h('div', { class: 'maint-row' }, sw, state0, h('span', { class: 'mono maint-node' }, name),
+        diff ? h('span', { class: 'maint-different', title: 'A site with this id but different hosts' }, `Different site (${diff.hosts.join(', ') || 'no hosts'})`) : null);
+    }));
+  }
+
+  function refresh() {
+    rebuild();
+    drawSelect();
+    drawPreview();
+    drawList();
+    syncButtons();
+  }
+
+  select.addEventListener('change', () => {
+    chosen = select.value;
+    drawPreview();
   });
+  refresh();
+  if (!cross.ready) {
+    ctx.crossReady.then(() => {
+      note.hidden = true;
+      refresh();
+    });
+  }
+
   return card({
-    title: 'Maintenance mode',
-    subtitle: 'Visitors see the chosen page with its status code while upstreams stay untouched.',
-    body: h('div', { class: 'form' },
-      h('div', { class: 'switch-row' }, sw, h('div', {}, h('b', {}, 'Serve the maintenance page'), h('p', { class: 'muted' }, m.enabled ? 'Currently enabled' : 'Currently disabled'))),
-      field('Page', select), preview, h('div', { class: 'form-actions' }, apply)),
+    title: 'Maintenance',
+    subtitle: 'Each switch changes only its own node.',
+    actions: h('div', { class: 'maint-actions' }, everyOn, everyOff),
+    body: h('div', { class: 'form' }, note, list, field('Page', select), preview),
   });
 }
 
@@ -417,11 +570,11 @@ function dangerPanel(ctx, site) {
     kind: 'danger',
     iconName: 'trash',
     onClick: async () => {
-      const ok = await confirmDialog({ title: 'Delete site', message: `This removes ${site.name} from ${ctx.node} and stops routing its hosts. Deployment history is lost.`, confirmLabel: 'Delete site', danger: true, requireText: site.id });
+      const ok = await confirmDialog({ title: `Delete site from ${ctx.node}`, message: `This removes ${site.name} from ${ctx.node} only and stops routing its hosts there. Deployment history is lost.`, confirmLabel: 'Delete site', danger: true, requireText: site.id });
       if (!ok) return;
       try {
         await nodeApi(ctx.node).del(`/sites/${encodeURIComponent(site.id)}`);
-        toast(`Site ${site.name} deleted`, 'success');
+        toast(`Site ${site.name} deleted from ${ctx.node}`, 'success');
         location.hash = '#/sites';
       } catch (ex) {
         toast(formatError(ex), 'error');
@@ -431,8 +584,18 @@ function dangerPanel(ctx, site) {
   return card({
     title: 'Danger zone',
     cls: 'danger',
-    body: h('div', { class: 'danger-row' }, h('div', {}, h('b', {}, 'Delete this site'), h('p', { class: 'muted' }, 'Hosts stop routing immediately. This cannot be undone.')), del),
+    body: h('div', { class: 'danger-row' }, h('div', {}, h('b', {}, `Delete this site from ${ctx.node}`), h('p', { class: 'muted' }, 'Hosts stop routing immediately. This cannot be undone.')), del),
   });
+}
+
+// The site and page lists of every other online node. Each entry is null where that node did not answer, and this never rejects.
+function loadPeers(current) {
+  const list = (res) => (res.status === 'fulfilled' && Array.isArray(res.value) ? res.value : null);
+  return Promise.all(peerNames(state.nodes, current).map(async (name) => {
+    const c = nodeApi(name);
+    const [sites, pages] = await Promise.allSettled([c.get('/sites'), c.get('/pages')]);
+    return { node: name, sites: list(sites), pages: list(pages) };
+  }));
 }
 
 // Route shape: #/sites/{node}/{site}/{tab}
@@ -443,17 +606,29 @@ export function siteDetailView(ctx) {
   ctx.root.append(body);
   const n = nodeApi(node);
   loadInto(body, async () => {
+    // The other nodes are read alongside the page but never awaited here: a slow or dead node must not hold the page back
+    const peers = loadPeers(node);
     const [site, pages, info] = await Promise.all([
       n.get('/sites/' + encodeURIComponent(id)),
       n.get('/pages').catch(() => []),
       nodeInfoCached(node, () => n.get('/node')).catch(() => null),
     ]);
-    return { site, pages, info };
-  }, ({ site, pages, info }, reload) => {
+    return { site, pages, info, peers };
+  }, ({ site, pages, info, peers }, reload) => {
     ctx.setCrumbs([{ label: 'Sites', href: '#/sites' }, { label: site.name }]);
     const TABS = tabsFor(site, info);
     const tab = TABS.some((t) => t.id === tabParam) ? tabParam : 'overview';
-    const c = { node, info };
+    // holders is just this node until the others have answered
+    // different: holders whose copy has this id but unrelated hosts and source, so a shared edit must not touch them unless ticked on purpose
+    const cross = { peers: [], holders: [node], different: [], ready: false };
+    const crossReady = peers.then((list) => {
+      cross.peers = list;
+      cross.holders = holderNodes(site.id, node, list, state.nodes.map((x) => x.name));
+      cross.different = differentHolders(site, node, list, cross.holders);
+      cross.ready = true;
+      return cross;
+    });
+    const c = { node, info, cross, crossReady };
     const features = siteFeatures(info);
     const canStatus = Boolean(site.source) && features.status;
     let buildCard = null;
@@ -473,11 +648,11 @@ export function siteDetailView(ctx) {
       kind: 'primary',
       iconName: 'swap',
       onClick: async () => {
-        const ok = await confirmDialog({ title: 'Switch active slot', message: `Send all traffic for ${site.name} to the ${other(site.active)} slot now?`, confirmLabel: 'Switch' });
+        const ok = await confirmDialog({ title: `Switch active slot on ${node}`, message: `Send all traffic for ${site.name} on ${node} to the ${other(site.active)} slot now?`, confirmLabel: 'Switch' });
         if (!ok) return;
         try {
           await n.post(`/sites/${encodeURIComponent(site.id)}/switch`, { slot: other(site.active) });
-          toast(`${other(site.active)} is now active`, 'success');
+          toast(`${other(site.active)} is now active on ${node}`, 'success');
           reload();
         } catch (ex) {
           toast(formatError(ex), 'error');
@@ -488,7 +663,7 @@ export function siteDetailView(ctx) {
       switch (tab) {
         case 'deployments': return deploymentsPanel(c, site, reload);
         case 'routing': return routingPanel(c, site, reload);
-        case 'maintenance': return maintenancePanel(c, site, pages, reload);
+        case 'maintenance': return maintenancePanel(c, site, pages, setServing);
         case 'danger': return dangerPanel(c, site);
         case 'build': {
           const status = canStatus ? makeStatus() : null;
@@ -498,21 +673,43 @@ export function siteDetailView(ctx) {
             features.buildEnv ? envCard({
               node, siteId: site.id, which: 'build-env', title: 'Build environment variables',
               subtitle: 'Visible to the install and build commands.',
-              note: 'Values are write-only: only the names are shown after saving. Anything a static build bakes into its output is public.',
+              note: 'Anything a static build bakes into its output is public.',
+              showLinks: features.dataLinks,
             }).el : null,
             features.runtimeEnv ? envCard({
               node, siteId: site.id, which: 'runtime-env', title: 'Runtime environment variables',
               subtitle: 'Given to the running site when it renders on the server.',
-              note: 'Values are write-only: only the names are shown after saving.',
+              showLinks: features.dataLinks,
             }).el : null,
             features.token ? tokenCard({ node, siteId: site.id, onChanged: () => statusRef && statusRef.refresh() }).el : null);
         }
         case 'logs': return logsPanel({ node, site }).el;
+        case 'data': return dataPanel({ node, site, info, reload });
         default: return overviewPanel(site, { status: canStatus ? makeStatus() : null, node, editSource: showsBuildSettings(info, site) });
       }
     };
+    const servingPill = () => (site.maintenance && site.maintenance.enabled ? pill('Maintenance', 'warn', 'wrench') : pill('Serving', 'ok'));
+    let serving = servingPill();
+    // The Maintenance tab changes this node's state without reloading the page, so the header follows it
+    function setServing(enabled, pageId) {
+      site.maintenance = { enabled, page_id: pageId || null };
+      const next = servingPill();
+      serving.replaceWith(next);
+      serving = next;
+    }
+    // The nodes that hold this site; this one is marked and the others open their own page for it
+    const holderChips = h('span', { class: 'node-chips site-holders', role: 'group', 'aria-label': 'Nodes that hold this site' });
+    const drawHolders = () => {
+      holderChips.replaceChildren(...cross.holders.map((name) => {
+        if (name === node) return h('span', { class: 'node-chip site-holder current', 'aria-current': 'true', title: 'This page shows this node' }, name);
+        const differs = cross.different.some((d) => d.node === name);
+        return h('a', { class: 'node-chip site-holder' + (differs ? ' differs' : ''), href: siteHref(name, site.id, tab), title: differs ? `Open on ${name}: a different site with the same id` : `Open on ${name}` }, name);
+      }));
+    };
+    drawHolders();
+    crossReady.then(drawHolders);
     const pills = h('div', { class: 'pill-row' }, pill(site.kind === 'api' ? 'API' : 'Site', 'muted'), slotPill(site.active),
-      site.maintenance && site.maintenance.enabled ? pill('Maintenance', 'warn', 'wrench') : pill('Serving', 'ok'), h('span', { class: 'mono muted' }, `${site.id} on ${node}`));
+      serving, h('span', { class: 'mono muted' }, site.id), holderChips);
     return h('div', { class: 'stack' },
       pageHeader({ title: site.name, subtitle: pills, actions: [h('a', { class: 'btn', href: '#/sites' }, 'Back'), swap] }),
       routeTabs(TABS, tab, (t) => siteHref(node, id, t)),

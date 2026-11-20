@@ -46,6 +46,7 @@ fn manager_spec() -> (String, Value) {
         volumes: Vec::new(),
         outbound: true,
         outbound_rules: Default::default(),
+        data: Default::default(),
     };
     let env = StackEnv {
         registry: common::REGISTRY,
@@ -495,6 +496,81 @@ async fn only_haproxy_is_attached_to_a_managed_stack_network() {
     assert_eq!(ok.status, 200);
     let w = docker.world.lock().unwrap();
     assert!(w.networks["cite-shop-blue-net"].1.contains(common::HAPROXY));
+}
+
+#[tokio::test]
+async fn only_the_shared_instance_is_attached_to_a_managed_dbnet() {
+    let (addr, docker) = proxy_and_docker().await;
+    docker.world.lock().unwrap().networks.insert(
+        "cite-shop-dbnet".to_string(),
+        (managed_labels(), Default::default()),
+    );
+    let target = "/v1.45/networks/cite-shop-dbnet/connect";
+    for body in [
+        json!({ "Container": common::HAPROXY }),
+        json!({ "Container": "cite-shop-db" }),
+        json!({ "Container": "cite-other-db" }),
+        json!({ "Container": "cite-pg-shared", "EndpointConfig": {} }),
+        json!({ "Container": "cite-pg-shared-job" }),
+    ] {
+        assert!(
+            denied_body(&call_json(addr, "POST", target, &body).await),
+            "{body}"
+        );
+    }
+    assert_eq!(
+        docker.seen().iter().filter(|s| s.method == "POST").count(),
+        0
+    );
+    let ok = call_json(
+        addr,
+        "POST",
+        target,
+        &json!({ "Container": "cite-pg-shared" }),
+    )
+    .await;
+    assert_eq!(ok.status, 200);
+    assert!(
+        docker.world.lock().unwrap().networks["cite-shop-dbnet"]
+            .1
+            .contains("cite-pg-shared")
+    );
+    // The admin network is never an attach target, whatever the body says.
+    docker.world.lock().unwrap().networks.insert(
+        "cite-pg-shared-admin".to_string(),
+        (managed_labels(), Default::default()),
+    );
+    assert!(denied_body(
+        &call_json(
+            addr,
+            "POST",
+            "/v1.45/networks/cite-pg-shared-admin/connect",
+            &json!({ "Container": "cite-pg-shared" }),
+        )
+        .await
+    ));
+}
+
+#[tokio::test]
+async fn a_foreign_dbnet_cannot_take_the_shared_instance() {
+    let (addr, docker) = proxy_and_docker().await;
+    docker.world.lock().unwrap().networks.insert(
+        "cite-shop-dbnet".to_string(),
+        (json!({}), Default::default()),
+    );
+    let reply = call_json(
+        addr,
+        "POST",
+        "/v1.45/networks/cite-shop-dbnet/connect",
+        &json!({ "Container": "cite-pg-shared" }),
+    )
+    .await;
+    assert!(denied_body(&reply) || reply.status >= 400);
+    assert!(
+        !docker.world.lock().unwrap().networks["cite-shop-dbnet"]
+            .1
+            .contains("cite-pg-shared")
+    );
 }
 
 #[tokio::test]

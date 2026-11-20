@@ -68,10 +68,3 @@ export function selectNode(name) {
   storage.set('node', name);
   bus.dispatchEvent(new Event('node'));
 }
-
-// The node a single-node screen should operate on; null when none are configured
-export function currentNode() {
-  if (state.node !== 'all') return state.node;
-  const first = state.nodes.find((n) => n.online) || state.nodes[0];
-  return first ? first.name : null;
-}

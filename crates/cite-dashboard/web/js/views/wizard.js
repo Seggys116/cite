@@ -18,14 +18,19 @@ export function wizard({ steps, finishLabel = 'Finish', onFinish, onCancel }) {
   const cancelBtn = onCancel ? button('Cancel', { onClick: onCancel }) : null;
   const form = h('form', { class: 'wizard', novalidate: true }, list, heading, body, status, h('div', { class: 'form-actions' }, cancelBtn, backBtn, nextBtn));
 
+  const nextLabel = nextBtn.querySelector('span');
   const problem = () => steps[current].problem();
 
+  // Runs on every keystroke of the current step, so it validates that step once and writes only what changed;
+  // an unchanged message is left alone so the live region does not announce it again
   function refresh() {
     const bad = problem();
     nextBtn.disabled = Boolean(bad) || busy;
     backBtn.disabled = current === 0 || busy;
-    status.textContent = bad || '';
-    nextBtn.querySelector('span').textContent = isLast(current, steps.length) ? finishLabel : 'Next';
+    const message = bad || '';
+    if (status.textContent !== message) status.textContent = message;
+    const label = isLast(current, steps.length) ? finishLabel : 'Next';
+    if (nextLabel.textContent !== label) nextLabel.textContent = label;
   }
 
   function drawProgress() {

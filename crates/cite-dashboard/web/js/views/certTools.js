@@ -29,11 +29,7 @@ function tokenInput(label) {
 }
 
 function permissionList(items) {
-  return h('ul', { class: 'stack-sm', style: { 'padding-left': '20px' } }, items.map((p) => h('li', {}, h('code', { class: 'mono' }, p))));
-}
-
-function stepList(items) {
-  return h('ol', { class: 'stack-sm', style: { 'padding-left': '20px' } }, items.map((t) => h('li', {}, t)));
+  return h('ul', { class: 'stack-sm list-indent' }, items.map((p) => h('li', {}, h('code', { class: 'mono' }, p))));
 }
 
 // Checkboxes for the node's known hosts plus a free box for anything else
@@ -48,7 +44,7 @@ function hostPicker(choices) {
     boxes.map(({ c, input }) => h('label', { class: 'check-row' }, input, h('span', { class: 'mono' }, c.host),
       c.uncovered ? pill('no certificate yet', 'warn') : null))) : h('p', { class: 'muted' }, 'No site hosts found on this node. Type the host names below.');
   const element = h('div', { class: 'field' }, h('span', { class: 'field-label' }, 'Hosts to cover'), list, extra,
-    h('span', { class: 'hint' }, 'Wildcards like *.example.com are allowed. Add any host names that are not listed.'));
+    h('span', { class: 'hint' }, 'Wildcards such as *.example.com are allowed.'));
   return {
     element,
     text: () => boxes.filter(({ input }) => input.checked).map(({ c }) => c.host).concat(extra.value).join('\n'),
@@ -57,7 +53,8 @@ function hostPicker(choices) {
 
 function nameField() {
   const input = h('input', { class: 'input', type: 'text', maxlength: '64', autocomplete: 'off', spellcheck: 'false', 'aria-label': 'Certificate name (optional)', placeholder: 'chosen for you if left blank' });
-  return { input, element: field('Name (optional)', input, 'Shown in the certificate list.') };
+  input.title = 'Shown in the certificate list.';
+  return { input, element: field('Name (optional)', input) };
 }
 
 function selfSignedForm(ctx) {
@@ -74,7 +71,7 @@ function selfSignedForm(ctx) {
       fail(problem);
       return;
     }
-    status.textContent = 'Creating the certificate on the node...';
+    status.textContent = `Creating the certificate on ${ctx.node}...`;
     try {
       const saved = await withBusy(submit, () => ctx.n.post('/certificates/generate', generateBody(values)));
       status.textContent = '';
@@ -85,10 +82,9 @@ function selfSignedForm(ctx) {
     }
   });
   const element = h('div', { class: 'form' },
-    h('p', {}, 'The node makes a certificate and a private key for you. Nothing is sent to any other service.'),
-    h('p', { class: 'notice', role: 'note' }, 'Use this when Cloudflare sits in front of the site with SSL mode Full (not Full strict). Cloudflare accepts it. Visitors who reach the node directly, without Cloudflare, will see a browser warning because no one trusts a certificate you made yourself.'),
+    h('p', { class: 'notice', role: 'note' }, 'Works with Cloudflare SSL mode Full. Browsers that reach the node directly will show a warning.'),
     hosts.element, name.element,
-    field('Valid for (days)', days, `Up to ${MAX_SELF_SIGNED_DAYS} days. It is not renewed automatically.`),
+    field('Valid for (days)', days, `Up to ${MAX_SELF_SIGNED_DAYS}. Not renewed automatically.`),
     errorBox, status,
     h('div', { class: 'form-actions' }, ctx.cancelButton(), submit));
   return { element, wipe: () => {} };
@@ -98,6 +94,7 @@ function originCaForm(ctx) {
   const hosts = hostPicker(ctx.choices);
   const name = nameField();
   const token = tokenInput('Cloudflare API token');
+  token.title = 'Sent to the node for this request and not shown again.';
   const validity = h('select', { class: 'select', 'aria-label': 'How long the certificate is valid' },
     ORIGIN_CA_VALIDITY.map((v) => h('option', { value: String(v.days) }, v.label)));
   validity.value = String(DEFAULT_ORIGIN_CA_DAYS);
@@ -119,7 +116,7 @@ function originCaForm(ctx) {
     }
     const body = originCaBody(values);
     wipe();
-    status.textContent = 'Asking Cloudflare for an Origin CA certificate...';
+    status.textContent = `Asking Cloudflare for an Origin CA certificate for ${ctx.node}...`;
     try {
       const saved = await withBusy(submit, () => ctx.n.post('/certificates/origin-ca', body));
       body.cloudflare_token = '';
@@ -132,21 +129,15 @@ function originCaForm(ctx) {
     }
   });
   const element = h('div', { class: 'form' },
-    h('p', {}, 'Cloudflare signs a certificate that only Cloudflare trusts. It works with SSL mode Full (strict), lasts up to 15 years and needs no renewal.'),
-    h('p', { class: 'notice', role: 'note' }, 'Use this when every visitor goes through Cloudflare. Browsers that reach the node directly will not trust it.'),
-    h('p', { class: 'field-label' }, 'Before you start'),
-    stepList([
-      'In the Cloudflare dashboard open My Profile, then API Tokens, then Create Token, and choose Create Custom Token.',
-      'Give it these permissions:',
-      'Limit it to the zones you are covering, create it and copy the token. Cloudflare shows it only once.',
-    ]),
+    h('p', { class: 'notice', role: 'note' }, 'Browsers that reach the node directly will not trust it.'),
+    h('p', {}, 'Create a Cloudflare API token with these permissions, limited to the zones you cover:'),
     permissionList(ORIGIN_CA_PERMISSIONS),
     hosts.element, name.element,
-    field('Cloudflare API token', token, 'Sent to the node over the dashboard connection and used for this request. It is not shown again.'),
+    field('Cloudflare API token', token),
     field('Valid for', validity),
     h('div', { class: 'stack-sm' },
       h('label', { class: 'check-row' }, remember, h('span', {}, 'Remember this token on the node')),
-      h('span', { class: 'hint' }, 'Off by default. If you turn it on the node keeps the token in its own configuration so it can request the next certificate without asking you. Anyone with access to the node can read it. Leave it off if you would rather paste it again.')),
+      h('span', { class: 'hint' }, 'Anyone with access to the node can read a stored token.')),
     errorBox, status,
     h('div', { class: 'form-actions' }, ctx.cancelButton(), submit));
   return { element, wipe };
@@ -175,7 +166,7 @@ function jobProgress(ctx, jobId, startedAt) {
     }
     render();
     if (state.phase === 'issued') {
-      toast('Certificate issued', 'success');
+      toast(`Certificate issued on ${ctx.node}`, 'success');
       ctx.changed();
     }
     if (shouldPoll(state)) timer = setTimeout(tick, JOB_POLL_MS);
@@ -200,6 +191,8 @@ function acmeForm(ctx) {
   const name = nameField();
   const email = h('input', { class: 'input', type: 'email', autocomplete: 'email', spellcheck: 'false', 'aria-label': 'Email address for expiry notices' });
   const token = tokenInput('Cloudflare API token');
+  token.title = 'Used to prove you own the domain with a temporary DNS record.';
+  email.title = 'Let\'s Encrypt writes here if a certificate is about to expire without renewing.';
   const staging = h('input', { type: 'checkbox', 'aria-label': 'Test certificates (not trusted)' });
   const agree = h('input', { type: 'checkbox', 'aria-label': 'I agree to the Let\'s Encrypt terms' });
   const { errorBox, status, fail } = errorBoxes();
@@ -240,7 +233,7 @@ function acmeForm(ctx) {
     }
     const body = acmeBody(values);
     wipe();
-    status.textContent = 'Sending the request to the node...';
+    status.textContent = `Sending the request to ${ctx.node}...`;
     try {
       const accepted = await withBusy(submit, () => ctx.n.post('/certificates/acme', body));
       body.cloudflare_token = '';
@@ -255,23 +248,16 @@ function acmeForm(ctx) {
   });
 
   const element = h('div', { class: 'form' },
-    h('p', {}, 'Let\'s Encrypt issues free certificates that every browser trusts, so the site works with or without Cloudflare. They last 90 days and the node renews them on its own.'),
-    h('p', { class: 'field-label' }, 'Before you start'),
-    stepList([
-      'In the Cloudflare dashboard open My Profile, then API Tokens, then Create Token, and choose Create Custom Token.',
-      'Give it these permissions, limited to the zones you are covering:',
-    ]),
+    h('p', {}, 'Create a Cloudflare API token with these permissions, limited to the zones you cover:'),
     permissionList(ACME_PERMISSIONS),
     hosts.element, name.element,
-    field('Email address', email, 'Let\'s Encrypt writes here if a certificate is about to expire without renewing.'),
-    field('Cloudflare API token', token, 'Used to prove you own the domain by adding a temporary DNS record.'),
-    h('p', { class: 'notice warn', role: 'note' }, 'Renewal happens every 60 days or so without you, so the node must keep this token. It is stored on the node, in its own configuration, until you delete the certificate. Anyone with access to the node can read it.'),
+    field('Email address', email),
+    field('Cloudflare API token', token),
+    h('p', { class: 'notice warn', role: 'note' }, 'The node stores this token to renew the certificate, and anyone with access to the node can read it.'),
     h('div', { class: 'stack-sm' },
       h('label', { class: 'check-row' }, agree, h('span', {}, 'I agree to the Let\'s Encrypt terms, and that the token is stored on this node for renewal')),
       h('a', { href: TERMS_URL, target: '_blank', rel: 'noopener noreferrer' }, 'Read the Let\'s Encrypt subscriber agreement')),
-    h('div', { class: 'stack-sm' },
-      h('label', { class: 'check-row' }, staging, h('span', {}, 'Use test certificates (not trusted)')),
-      h('span', { class: 'hint' }, 'Good for a dry run: it has much higher rate limits, but browsers will warn about the result.')),
+    h('label', { class: 'check-row', title: 'Much higher rate limits, but browsers will warn about the result.' }, staging, h('span', {}, 'Use test certificates (not trusted)')),
     errorBox, status,
     h('div', { class: 'form-actions' }, ctx.cancelButton(), submit),
     progress, managed);
@@ -281,15 +267,15 @@ function acmeForm(ctx) {
 const TOOLS = [
   {
     id: 'generate', title: 'Create a certificate for me', build: selfSignedForm,
-    blurb: 'Quickest option. The node makes a self-signed certificate. Fine behind Cloudflare with SSL mode Full.',
+    blurb: 'Self-signed, for Cloudflare SSL mode Full.',
   },
   {
     id: 'origin', title: 'Cloudflare Origin CA', build: originCaForm,
-    blurb: 'A long-lived certificate signed by Cloudflare. Best when all traffic goes through Cloudflare.',
+    blurb: 'Signed by Cloudflare, lasts up to 15 years.',
   },
   {
     id: 'acme', title: 'Let\'s Encrypt', build: acmeForm,
-    blurb: 'A free certificate every browser trusts, renewed automatically.',
+    blurb: 'Free, trusted by every browser, renewed automatically.',
   },
 ];
 
@@ -322,20 +308,21 @@ export function certToolsCard(node, onChanged) {
     result.textContent = '';
     const ctx = {
       n,
+      node,
       choices,
       changed,
       cancelButton: () => button('Cancel', { onClick: close }),
       finish: (saved, message) => {
         const warning = saved && typeof saved.warning === 'string' ? saved.warning : '';
-        toast(message, 'success');
+        toast(`${message} on ${node}`, 'success');
         if (warning) toast(warning, 'info', 10000);
         close();
-        result.textContent = `${message}${saved && saved.name ? ': ' + saved.name : ''}.${warning ? ' Node warning: ' + warning : ''}`;
+        result.textContent = `${message} on ${node}${saved && saved.name ? ': ' + saved.name : ''}.${warning ? ' Node warning: ' + warning : ''}`;
         changed();
       },
     };
     active = tool.build(ctx);
-    clear(stage).append(h('h4', {}, tool.title), active.element);
+    clear(stage).append(h('h4', {}, `${tool.title} on ${node}`), active.element);
   }
 
   function showMenu() {
@@ -349,7 +336,6 @@ export function certToolsCard(node, onChanged) {
   showMenu();
   return card({
     title: 'Get a certificate',
-    subtitle: 'Let the node create or request one instead of uploading files. New certificates appear in the list above.',
     body: h('div', { class: 'stack-sm' }, stage, result),
   });
 }

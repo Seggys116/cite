@@ -164,7 +164,7 @@ pub struct Http {
 
 impl Http {
     pub fn new(ep: Arc<Endpoints>) -> Result<Self> {
-        let client = reqwest::Client::builder()
+        let client = cite_tls::client_builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(TIMEOUT)
             .connect_timeout(TIMEOUT)

@@ -714,7 +714,7 @@ mod tests {
 
     async fn client() -> (MockGithub, reqwest::Client) {
         let mock = MockGithub::spawn().await.expect("spawn");
-        let client = reqwest::Client::new();
+        let client = cite_tls::client_builder().build().expect("client");
         (mock, client)
     }
 

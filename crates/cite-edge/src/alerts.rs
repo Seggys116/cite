@@ -25,16 +25,18 @@ pub enum AlertEvent {
     DeploySucceeded,
     CertExpiring,
     NodeError,
+    BackupFailed,
 }
 
 impl AlertEvent {
-    pub const ALL: [AlertEvent; 6] = [
+    pub const ALL: [AlertEvent; 7] = [
         AlertEvent::SiteUnhealthy,
         AlertEvent::SiteRecovered,
         AlertEvent::BuildFailed,
         AlertEvent::DeploySucceeded,
         AlertEvent::CertExpiring,
         AlertEvent::NodeError,
+        AlertEvent::BackupFailed,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -45,6 +47,7 @@ impl AlertEvent {
             AlertEvent::DeploySucceeded => "deploy_succeeded",
             AlertEvent::CertExpiring => "cert_expiring",
             AlertEvent::NodeError => "node_error",
+            AlertEvent::BackupFailed => "backup_failed",
         }
     }
 }
@@ -968,6 +971,23 @@ mod tests {
             serde_json::to_string(&AlertEvent::SiteUnhealthy).unwrap(),
             "\"site_unhealthy\""
         );
+    }
+
+    #[test]
+    fn backup_failed_is_a_known_event_with_a_stable_name() {
+        assert_eq!(AlertEvent::ALL.len(), 7);
+        assert!(AlertEvent::ALL.contains(&AlertEvent::BackupFailed));
+        assert_eq!(AlertEvent::BackupFailed.as_str(), "backup_failed");
+        assert_eq!(
+            serde_json::to_string(&AlertEvent::BackupFailed).unwrap(),
+            "\"backup_failed\""
+        );
+        let back: AlertEvent = serde_json::from_str("\"backup_failed\"").unwrap();
+        assert_eq!(back, AlertEvent::BackupFailed);
+        for event in AlertEvent::ALL {
+            let json = serde_json::to_string(&event).unwrap();
+            assert_eq!(json, format!("\"{}\"", event.as_str()));
+        }
     }
 
     fn payload() -> AlertPayload {

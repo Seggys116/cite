@@ -4,6 +4,8 @@ pub mod analytics;
 pub mod auth;
 pub mod bot;
 pub mod cloudflare;
+pub mod datamodel;
+pub mod datawire;
 mod effects;
 pub mod logparse;
 pub mod migrate;

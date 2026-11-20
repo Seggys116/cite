@@ -19,6 +19,12 @@ const BUILD_DENIED_PREFIXES = ['CITE_', 'LD_', 'DYLD_', 'GIT_', 'XDG_'];
 // Names the executor sets for the app itself, refused for runtime variables only
 const RUNTIME_DENIED = ['PORT', 'NODE_ENV', 'HOST', 'HOSTNAME', 'NITRO_HOST'];
 
+// Values are write-only by design: the node keeps them and no route returns one
+export const ENV_NAMES_NOTE = 'The list shows variable names only.';
+export const ENV_VALUE_LABEL = 'Value (write-only)';
+export const ENV_VALUE_HINT = 'The node stores it and never sends it back. To change it, set a new value.';
+export const WRITE_ONLY_HINT = 'Write-only: the node stores it and does not send it back';
+
 export function envNameProblem(name, kind = 'build') {
   const n = String(name ?? '');
   if (!NAME_RE.test(n)) return 'Use capital letters, digits and underscores, not starting with a digit, up to 64 characters.';

@@ -4,11 +4,22 @@ import {
   button, card, confirmDialog, segmented, toast, toggle, withBusy, formatError,
 } from '../ui.js';
 import {
-  BOT_POLICIES, BOT_SPOOF_NOTE, CLOUDFLARE_ONLY_HELP, CLOUDFLARE_ONLY_LABEL, FLEXIBLE_WARNING, TLS_FLEXIBLE_LABEL, TLS_FULL_LABEL,
-  ZONE_LOCK_HELP, ZONE_LOCK_LABEL, ZONE_LOCK_NEEDS_CLOUDFLARE, ZONE_LOCK_TOGGLE,
-  accessOf, botStatusLine, botWarning, flexibleWithoutCloudflare, rangesLine, tlsHelp, userAgentRulesFor, userAgentRulesLine, zoneLockOpenByDefault,
+  BOT_POLICIES, CLOUDFLARE_ONLY_LABEL, TLS_FLEXIBLE_LABEL, TLS_FULL_LABEL,
+  ZONE_LOCK_LABEL, ZONE_LOCK_NEEDS_CLOUDFLARE, ZONE_LOCK_TOGGLE,
+  accessOf, botStatusLine, flexibleWithoutCloudflare, rangesLine, userAgentRulesFor, userAgentRulesLine, zoneLockOpenByDefault,
 } from '../accesslib.js';
 import { rotateAndShow, zoneStatusText } from './zoneSecret.js';
+
+// One sentence each; the longer wording in accesslib.js stays for its own tests and other screens
+const CLOUDFLARE_ONLY_HINT = 'Refuses requests that do not come from Cloudflare. Only for sites proxied by it (orange cloud).';
+const FLEXIBLE_WARNING = 'Without the Cloudflare-only option, anyone can reach your server directly over unencrypted http.';
+const SEO_WARNING = 'This blocks search engine crawlers and link previews, so the site can drop out of search results.';
+const BOT_NOTE = 'Bots are told apart by user agent, which can be faked, so this stops honest tools only.';
+const ZONE_LOCK_HINT = 'Adds a secret header that you set once in a Cloudflare Transform Rule.';
+const TLS_HINTS = {
+  full: 'The node answers HTTPS with its own certificate (Settings, Certificates).',
+  flexible: 'Cloudflare serves HTTPS and reaches your server over plain http, so the node needs no certificate.',
+};
 
 // Who may reach the site and how Cloudflare speaks to the node; shared by the create form and the routing tab.
 // On a saved site (site given) it also reports the zone secret and offers to rotate it.
@@ -80,12 +91,12 @@ export function accessCard({ node, site, siteId = site && site.id, onChange }) {
     botLine.textContent = botStatusLine(value.bots);
     botLine.classList.toggle('warn-text', value.bots === 'allow');
     drawRules();
-    help.textContent = tlsHelp(value.tls);
+    help.textContent = TLS_HINTS[value.tls];
     warn.hidden = !flexibleWithoutCloudflare(value);
-    seo.textContent = botWarning(value.bots);
+    seo.textContent = value.bots === 'block_all' ? SEO_WARNING : '';
     seo.hidden = !seo.textContent;
     lockBox.disabled = !value.cloudflare_only;
-    lockHint.textContent = value.cloudflare_only ? ZONE_LOCK_HELP : ZONE_LOCK_NEEDS_CLOUDFLARE;
+    lockHint.textContent = value.cloudflare_only ? ZONE_LOCK_HINT : ZONE_LOCK_NEEDS_CLOUDFLARE;
     if (onChange) onChange({ ...value });
   }
 
@@ -119,7 +130,7 @@ export function accessCard({ node, site, siteId = site && site.id, onChange }) {
   rotate.addEventListener('click', async () => {
     const ok = await confirmDialog({
       title: 'Rotate zone secret',
-      message: 'The current secret stops working at once. Requests through Cloudflare are refused until you set the new secret in your Transform Rule. Rotate it?',
+      message: `The current secret stops working at once, so requests through Cloudflare are refused until the new one is in your Transform Rule. This changes ${node} only.`,
       confirmLabel: 'Rotate secret',
       danger: true,
     });
@@ -144,15 +155,15 @@ export function accessCard({ node, site, siteId = site && site.id, onChange }) {
   sync();
   const el = card({
     title: 'Access',
-    subtitle: 'Limit who can reach this site and choose how Cloudflare connects to the node.',
+    subtitle: 'Who can reach this site and how Cloudflare connects.',
     body: h('div', { class: 'form' },
       h('div', { class: 'switch-row' }, only,
-        h('div', {}, h('b', {}, CLOUDFLARE_ONLY_LABEL), h('p', { class: 'muted' }, CLOUDFLARE_ONLY_HELP), ranges)),
+        h('div', {}, h('b', {}, CLOUDFLARE_ONLY_LABEL), h('p', { class: 'muted' }, CLOUDFLARE_ONLY_HINT), ranges)),
       h('div', { class: 'field' }, h('span', { class: 'field-label' }, 'HTTPS'), mode, help),
       warn,
       h('div', {}, advancedToggle),
       advanced,
-      h('div', { class: 'field' }, h('span', { class: 'field-label' }, 'Bot policy'), bots, botLine, h('span', { class: 'hint' }, BOT_SPOOF_NOTE), seo, ruleLine, ruleList)),
+      h('div', { class: 'field' }, h('span', { class: 'field-label' }, 'Bot policy'), bots, botLine, h('span', { class: 'hint' }, BOT_NOTE), seo, ruleLine, ruleList)),
   });
   return { el, get: () => ({ ...value }) };
 }

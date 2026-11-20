@@ -43,10 +43,46 @@ impl Default for Timeouts {
     }
 }
 
+/// The connection limit and the DNS cache, shared by the HTTP listener and every TCP forward so
+/// the forwards cannot exceed the process-wide limit and every connection is judged against fresh lookups.
+#[derive(Clone)]
+pub struct Shared {
+    pub(crate) slots: Arc<Semaphore>,
+    pub(crate) resolver: Arc<Resolver>,
+}
+
+impl Shared {
+    pub fn new() -> Shared {
+        Shared::with_limit(MAX_CONNS)
+    }
+
+    pub(crate) fn with_limit(limit: usize) -> Shared {
+        Shared {
+            slots: Arc::new(Semaphore::new(limit)),
+            resolver: Arc::new(Resolver::default()),
+        }
+    }
+}
+
+impl Default for Shared {
+    fn default() -> Self {
+        Shared::new()
+    }
+}
+
 /// Accepts connections until the listener fails; past MAX_CONNS a client gets a 503 at once.
 pub async fn serve(listener: TcpListener, policy: Arc<Policy>, timeouts: Timeouts) {
-    let slots = Arc::new(Semaphore::new(MAX_CONNS));
-    let resolver = Arc::new(Resolver::default());
+    serve_with(listener, policy, timeouts, Shared::new()).await;
+}
+
+/// Like `serve`, with the connection limit and resolver supplied by the caller so forwards can share them.
+pub async fn serve_with(
+    listener: TcpListener,
+    policy: Arc<Policy>,
+    timeouts: Timeouts,
+    shared: Shared,
+) {
+    let Shared { slots, resolver } = shared;
     let mut last_full_warn: Option<Instant> = None;
     loop {
         let (stream, _) = match listener.accept().await {
@@ -275,14 +311,14 @@ async fn handle(mut stream: TcpStream, policy: &Policy, resolver: &Resolver, tim
     }
 }
 
-enum Failure {
+pub(crate) enum Failure {
     Denied(Reason),
     Unreachable,
 }
 
 /// Recent lookups, shared by every connection; the policy judges the addresses again on every use.
 #[derive(Default)]
-struct Resolver {
+pub(crate) struct Resolver {
     cache: Mutex<HashMap<String, (Instant, Vec<IpAddr>)>>,
 }
 
@@ -344,7 +380,7 @@ async fn connect_to(addr: SocketAddr) -> io::Result<TcpStream> {
 }
 
 // Resolves once, judges every address, then connects only to an address that passed: no second lookup to rebind.
-async fn open(
+pub(crate) async fn open(
     policy: &Policy,
     resolver: &Resolver,
     host: &Host,
@@ -879,7 +915,7 @@ where
 }
 
 // Both directions run at once; the tunnel ends when both close, a write stalls, or nothing moves for `idle`.
-async fn relay(mut client: TcpStream, mut upstream: TcpStream, idle: Duration) {
+pub(crate) async fn relay(mut client: TcpStream, mut upstream: TcpStream, idle: Duration) {
     let start = Instant::now();
     let last = AtomicU64::new(0);
     let (cr, cw) = client.split();

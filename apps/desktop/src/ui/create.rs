@@ -103,7 +103,8 @@ impl Console {
         self.create.tokens.clear();
         self.create.error = None;
         self.create.busy = false;
-        self.create.picked = self.active_name().into_iter().collect();
+        // Under "All nodes" nothing is ticked for the person: they pick where the site runs on the last step
+        self.create.picked = self.selected.clone().into_iter().collect();
         self.load_node_tokens(cx);
     }
 
@@ -296,11 +297,7 @@ impl Console {
 
     // Regex validity is recomputed on every render so feedback is immediate.
     pub fn render_create(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let header = page_header(
-            "Create site",
-            "Choose where the site comes from and which domains reach it",
-            Vec::new(),
-        );
+        let header = page_header("Create site", "Source, domains and nodes", Vec::new());
         if self.handles.is_empty() {
             return div()
                 .flex()
@@ -538,14 +535,14 @@ impl Console {
         let github = pick(
             "github",
             "Build from a GitHub repository",
-            "Recommended. The node pulls the code, builds it and redeploys when the branch changes; it runs the servers for you.",
+            "Recommended. The node builds it and redeploys when the branch changes.",
             SourceKind::Github,
             cx,
         );
         let servers = pick(
             "servers",
             "Serve servers I already run",
-            "Route traffic to existing host:port addresses you manage yourself.",
+            "Route traffic to host:port addresses you manage.",
             SourceKind::Servers,
             cx,
         );
@@ -634,12 +631,9 @@ impl Console {
                 .into_any_element(),
         ]);
         let hint = if replicate {
-            format!(
-                "Create the same site on all {} connected nodes.",
-                self.handles.len()
-            )
+            format!("On all {} connected nodes.", self.handles.len())
         } else {
-            "Create the site only on the nodes switched on below.".to_string()
+            "Only on the nodes switched on below.".to_string()
         };
         let mut rows = Vec::new();
         for name in self.node_names() {

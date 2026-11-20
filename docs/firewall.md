@@ -271,6 +271,8 @@ The path presets use the `(?i)` flag so they match in any case. That needs a HAP
 
 Presets are ordinary rules once added. Edit, disable or delete them like any other.
 
+The dashboard and the desktop app list the rules a preset adds on its card, and Apply asks which nodes to add it to. Each node stores its own rules, so the same preset applied to two nodes creates the same rule ids on both. The consoles merge rules with the same id and content into one row, and show a rule whose content differs between nodes as a separate row.
+
 ### Upgrading from an earlier release
 
 Rules saved by an earlier release are checked against the [regex subset](#regex-subset) when the node starts, and nothing is silently deleted:
@@ -303,6 +305,8 @@ Maintenance mode is per site. While it is on, every request that matches the sit
 The 15000 byte limit comes from HAProxy, which loads a page into one buffer (`tune.bufsize`, 16384 bytes by default) and refuses a larger file at the config check. The limit leaves room for headers. Raising `tune.bufsize` would lift it but costs memory on every connection, so it is not changed. Keep CSS inline, use small data URIs, and link large assets from elsewhere.
 
 Turning maintenance off without naming a page keeps the earlier page choice, so turning it on again restores it.
+
+A node refuses a `page_id` it does not hold, because each node stores its own pages. The dashboard and the desktop app show one page library across nodes. They create a missing page on a node before turning maintenance on there, and replace a differing copy only after you confirm. A node keeps serving its own pages when the console is offline. See [Dashboard](dashboard.md#maintenance).
 
 ## Maps and reloads
 

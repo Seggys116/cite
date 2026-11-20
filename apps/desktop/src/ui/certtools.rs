@@ -11,12 +11,13 @@ use crate::certissue::{
     managed_text, normalize_host, origin_days_label, poll_step, step_note, toggle_host,
 };
 use crate::certs::ensure_same_node;
-use crate::scope::{Sequence, foreign_notice};
+use crate::scope::Sequence;
 use crate::theme::{BORDER, ROW_RADIUS, Tone, c};
 use crate::ui::input::TextInput;
+use crate::ui::nodescope::{failed_on, on_node};
 use crate::ui::widgets::{
     BtnKind, Col, btn, btn_off, card, checkbox, field, id, mono, notice, pill, seg_item, seg_row,
-    strong, table, text_dim,
+    strong, table, text_dim, tip,
 };
 
 const LOST_CONTACT: &str = "Lost contact with the node while waiting. The request may still finish; open Settings again to check.";
@@ -90,6 +91,15 @@ fn op_error(err: &ClientError) -> String {
     }
 }
 
+// The one line shown under a mode's title; the full explanation is the title's tooltip.
+fn short_blurb(mode: Mode) -> &'static str {
+    match mode {
+        Mode::Generate => "Self-signed, so browsers warn unless Cloudflare is in front.",
+        Mode::OriginCa => "Only for sites behind the Cloudflare proxy; needs an API token.",
+        Mode::Acme => "Free, trusted by browsers and renewed automatically.",
+    }
+}
+
 fn managed_tone(status: &str, failed: bool) -> Tone {
     if failed {
         return Tone::Bad;
@@ -144,7 +154,7 @@ impl Console {
     }
 
     fn load_acme(&mut self, cx: &mut Context<Self>) {
-        let Some(h) = self.active_handle() else {
+        let Some(h) = self.settings_handle() else {
             return;
         };
         self.certtools.requested = true;
@@ -155,7 +165,7 @@ impl Console {
             cx,
             async move { h.tools_acme_listing(hint.as_deref()).await },
             move |this, res, cx| {
-                if this.active_name().as_deref() != Some(node.as_str())
+                if this.settings_node().as_deref() != Some(node.as_str())
                     || !this.certtools.list_seq.accept(seq)
                 {
                     return;
@@ -277,7 +287,10 @@ impl Console {
     }
 
     fn finish_job(&mut self, text: String, tone: Tone, issued: bool, cx: &mut Context<Self>) {
-        self.certtools.job = None;
+        let text = match self.certtools.job.take() {
+            Some(job) => format!("{}: {text}", job.node),
+            None => text,
+        };
         if self.view != View::Settings {
             self.say(text.clone(), tone);
         }
@@ -305,7 +318,7 @@ impl Console {
             .collect();
         self.certtools.note = None;
         self.certtools.panel = Some(Panel {
-            node: self.active_name().unwrap_or_default(),
+            node: self.settings_node().unwrap_or_default(),
             mode,
             stage: Stage::Hosts,
             hosts,
@@ -349,10 +362,11 @@ impl Console {
         if self.certtools.busy {
             return;
         }
-        let (Some(panel), Some(h)) = (self.certtools.panel.clone(), self.active_handle()) else {
+        let (Some(panel), Some(h)) = (self.certtools.panel.clone(), self.settings_handle()) else {
             return;
         };
-        if let Err(msg) = ensure_same_node(&panel.node, self.active_name().as_deref()) {
+        let node = h.name().to_string();
+        if let Err(msg) = ensure_same_node(&panel.node, Some(&node)) {
             self.certtools_close(cx);
             self.ct_note(msg, Tone::Bad);
             return;
@@ -382,22 +396,29 @@ impl Console {
         let (mode, hosts) = (panel.mode, panel.hosts);
         self.certtools.busy = true;
         self.certtools.note = None;
-        self.fetch_origin(
+        let target = node.clone();
+        self.fetch_on(
             cx,
+            &target,
+            Self::settings_node,
             async move { h.tools_issue(request).await },
-            move |this, res, here, origin, cx| {
+            move |this, res, here, cx| {
                 this.certtools.busy = false;
                 match (res, here) {
-                    (Ok(reply), true) => this.issue_done(mode, reply, hosts, cx),
-                    (Err(e), true) => this.ct_note(op_error(&e), Tone::Bad),
+                    (Ok(reply), true) => this.issue_done(mode, reply, hosts, &node, cx),
+                    (Err(e), true) => {
+                        this.ct_note(failed_on(mode.noun(), &node, &op_error(&e)), Tone::Bad)
+                    }
                     (Ok(_), false) => {
                         this.certtools.requested = false;
-                        this.say(foreign_notice(mode.noun(), origin, "done"), Tone::Ok);
+                        this.say(
+                            on_node(&format!("{} finished", mode.noun()), &node),
+                            Tone::Ok,
+                        );
                     }
-                    (Err(e), false) => this.say(
-                        foreign_notice(mode.noun(), origin, &op_error(&e)),
-                        Tone::Bad,
-                    ),
+                    (Err(e), false) => {
+                        this.say(failed_on(mode.noun(), &node, &op_error(&e)), Tone::Bad)
+                    }
                 }
                 cx.notify();
             },
@@ -409,12 +430,13 @@ impl Console {
         mode: Mode,
         reply: IssueReply,
         hosts: Vec<String>,
+        node: &str,
         cx: &mut Context<Self>,
     ) {
         self.certtools_close(cx);
         match reply {
             IssueReply::Saved(outcome) => {
-                let done = issued_text(mode, &outcome);
+                let done = on_node(&issued_text(mode, &outcome), node);
                 match outcome.warning {
                     Some(warning) => self.ct_note(format!("{done} {warning}"), Tone::Warn),
                     None => self.ct_note(done, Tone::Ok),
@@ -423,14 +445,16 @@ impl Console {
             }
             IssueReply::Job(job_id) => {
                 self.certtools.job = Some(Job {
-                    node: self.active_name().unwrap_or_default(),
+                    node: node.to_string(),
                     id: job_id,
                     hosts,
                     polls: 0,
                     errors: 0,
                 });
                 self.ct_note(
-                    "Request sent. Let's Encrypt usually needs a minute or two to check the domain.",
+                    format!(
+                        "Request sent from {node}. Let's Encrypt usually needs a minute or two."
+                    ),
                     Tone::Info,
                 );
                 self.start_polling(cx);
@@ -445,7 +469,7 @@ impl Console {
             .ready()
             .map(|l| l.uncovered_hosts.clone())
             .unwrap_or_default();
-        let node = self.active_name().unwrap_or_default();
+        let node = self.settings_node().unwrap_or_default();
         let mut site_hosts: Vec<String> = Vec::new();
         if let Load::Ready(data) = &self.sites.data {
             for row in data.rows.iter().filter(|r| r.node == node) {
@@ -457,14 +481,13 @@ impl Console {
 
     pub(crate) fn certtools_card(&mut self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let inputs = self.ct_inputs(cx);
-        if !self.certtools.requested && self.active_handle().is_some() {
+        if !self.certtools.requested && self.settings_handle().is_some() {
             self.load_acme(cx);
         }
-        let subtitle = "Create, request or issue a certificate for the hosts a node serves";
         if self.certtools.unsupported {
             return card(
                 Some("Get a certificate"),
-                Some(subtitle),
+                None,
                 div()
                     .flex()
                     .items_center()
@@ -509,7 +532,7 @@ impl Console {
                 .unwrap_or("Working...");
             body = body.child(notice(label, Tone::Info));
         }
-        let here = self.active_name().unwrap_or_default();
+        let here = self.settings_node().unwrap_or_default();
         if let Some(job) = s.job.as_ref().filter(|j| j.node == here) {
             let text = format!(
                 "Waiting for Let's Encrypt to issue the certificate for {} ({} checks so far)...",
@@ -530,7 +553,7 @@ impl Console {
         if let Some(listing) = &s.listing {
             body = body.child(self.acme_table(listing));
         }
-        card(Some("Get a certificate"), Some(subtitle), body).into_any_element()
+        card(Some("Get a certificate"), None, body).into_any_element()
     }
 
     fn acme_table(&self, listing: &AcmeListing) -> AnyElement {
@@ -613,8 +636,12 @@ impl Console {
             .rounded(px(ROW_RADIUS))
             .border_1()
             .border_color(c(BORDER))
-            .child(strong(mode.title()))
-            .child(text_dim(mode.blurb()).text_size(px(12.)))
+            .child(tip(
+                strong(mode.title()),
+                id("ct-tip", mode.title()),
+                mode.blurb(),
+            ))
+            .child(text_dim(short_blurb(mode)).text_size(px(12.)))
             .child(text_dim(panel.stage.label()).text_size(px(11.)));
         shell = match panel.stage {
             Stage::Hosts => shell.child(self.ct_hosts_step(panel, inputs, cx)),
@@ -670,10 +697,7 @@ impl Console {
                 }))
                 .into_any_element()
         };
-        let count = format!(
-            "{} of up to {MAX_HOSTS} hosts selected. Hosts without a certificate are ticked for you.",
-            panel.hosts.len()
-        );
+        let count = format!("{} of up to {MAX_HOSTS} hosts selected.", panel.hosts.len());
         div()
             .flex()
             .flex_col()
@@ -686,7 +710,7 @@ impl Console {
                     .gap(px(10.))
                     .child(div().flex().flex_col().flex_1().min_w_0().max_w(px(420.)).child(field(
                         "Add a host",
-                        Some("A name like shop.example.com, or *.example.com for every subdomain."),
+                        Some("Such as shop.example.com, or *.example.com for every subdomain."),
                         inputs.host.clone(),
                     )))
                     .child(
@@ -783,9 +807,9 @@ impl Console {
         }
         if mode.needs_token() {
             let hint = if mode == Mode::Acme {
-                "Needs permission to edit DNS records for the domain. It is hidden here, sent once and cleared afterwards."
+                "Needs permission to edit the domain's DNS records. Sent once, then cleared."
             } else {
-                "A token that can create Origin CA certificates. It is hidden here, sent once and cleared afterwards."
+                "Needs permission to create Origin CA certificates. Sent once, then cleared."
             };
             form = form.child(field(
                 "Cloudflare API token",
@@ -860,6 +884,18 @@ mod tests {
         assert_eq!(managed_tone("issued", true), Tone::Bad);
         assert_eq!(managed_tone("failed", false), Tone::Bad);
         assert_eq!(managed_tone("renewing", false), Tone::Info);
+    }
+
+    #[test]
+    fn every_mode_summarises_itself_in_one_sentence() {
+        for mode in Mode::ALL {
+            let line = short_blurb(mode);
+            assert!(
+                line.ends_with('.') && line.matches('.').count() == 1,
+                "{line}"
+            );
+            assert!(line.len() < mode.blurb().len(), "{line}");
+        }
     }
 
     #[test]

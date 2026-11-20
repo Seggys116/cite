@@ -3,7 +3,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use cite_core::parse_poll_interval;
-use cite_edge::model::{Site, Slot, Source, Target, VOLUME_PREFIX, volume_docker_name};
+use cite_edge::model::{
+    LinkTarget, Site, Slot, Source, Target, VOLUME_PREFIX, dbnet_name, volume_docker_name,
+};
 use cite_edge::status::{BuildEnvPatch, LogLine, ManagerReport};
 use cite_edge::validate::{
     is_valid_id, is_valid_volume_name, validate_outbound_rules, validate_volumes,
@@ -13,10 +15,14 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
+use zeroize::Zeroizing;
 
 use crate::config::{ConnectorConfig, NodeToken};
+use crate::data::env::{DataBindings, DbRoute};
 use crate::egress::{EGRESS_PROXY_PORT, Egress, EgressMode};
 use crate::error::{ConnectorError, Result};
+
+pub mod data;
 
 // Volume subpath mounts need Engine API 1.45 (Docker Engine 26).
 const API: &str = "/v1.45";
@@ -201,11 +207,15 @@ pub fn setting_env(source: &Source) -> Vec<String> {
 }
 
 /// Per-deploy values that ride on one ensure call; none of them is ever a label.
-#[derive(Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default)]
 pub struct StackOpts {
     pub deploy_id: Option<String>,
     pub build_env: Option<BTreeMap<String, String>>,
     pub runtime_env: Option<BTreeMap<String, String>>,
+    /// Credentials of the site's data links; rendered over the env maps above (links win).
+    pub data: Option<DataBindings>,
+    /// Superuser password of the site's dedicated database, used only to (re)create its container.
+    pub db_password: Option<Zeroizing<String>>,
 }
 
 // Env values are secrets, so only their names are ever printed.
@@ -218,6 +228,11 @@ impl std::fmt::Debug for StackOpts {
             .field("deploy_id", &self.deploy_id)
             .field("build_env", &names(&self.build_env))
             .field("runtime_env", &names(&self.runtime_env))
+            .field("data", &self.data)
+            .field(
+                "db_password",
+                &self.db_password.as_ref().map(|_| "<redacted>"),
+            )
             .finish()
     }
 }
@@ -497,6 +512,8 @@ pub struct Orchestrator {
     reconciled: AtomicBool,
     // Mirrors the proxy's egress settings, so an outbound site is refused before anything is removed.
     egress: Egress,
+    // The named volume data jobs mount a staging subpath of (CITE_DATA_BACKUP_VOLUME).
+    backup_volume: String,
 }
 
 // Everything besides the site itself that shapes a stack; `isolate` gives each stack its own network.
@@ -606,6 +623,8 @@ struct Inspected {
     site_mounts: Vec<(String, String)>,
     // Sorted names of the networks the container is attached to.
     networks: Vec<String>,
+    // Config.Cmd when the engine reported one.
+    cmd: Option<Vec<String>>,
 }
 
 // Static runtimes ignore the setting: they have no server process that could make a request.
@@ -650,6 +669,12 @@ fn site_mounts_of(host: &Value) -> Vec<(String, String)> {
 impl Inspected {
     // The image adds its own env vars, so every requested entry must be present rather than the sets being equal.
     fn matches(&self, spec: &Value) -> bool {
+        self.same_config(spec)
+            && self.networks == endpoint_names(&spec["NetworkingConfig"]["EndpointsConfig"])
+    }
+
+    // Everything `matches` compares except the attached networks, for containers other parties attach to.
+    fn same_config(&self, spec: &Value) -> bool {
         let image = spec["Image"].as_str().unwrap_or_default();
         let env_ok = spec["Env"]
             .as_array()
@@ -676,7 +701,6 @@ impl Inspected {
             && limit_ok("Memory", self.memory)
             && limit_ok("NanoCpus", self.nano_cpus)
             && self.site_mounts == site_mounts_of(&spec["HostConfig"])
-            && self.networks == endpoint_names(&spec["NetworkingConfig"]["EndpointsConfig"])
     }
 }
 
@@ -703,6 +727,10 @@ pub struct SlotInspect {
     pub executor_outbound: bool,
     /// True when the executor is attached to its stack's filtered xnet.
     pub executor_filtered: bool,
+    /// True when the executor is attached to the site's database network.
+    pub executor_dbnet: bool,
+    /// True when the manager is attached to the site's database network (build-target links).
+    pub manager_dbnet: bool,
     /// None while the stack has no egress proxy, else whether it runs the node's current settings and the given site rules.
     pub egress_proxy: Option<EgressProxyState>,
 }
@@ -801,7 +829,8 @@ impl Orchestrator {
                     Ok(o.with_default_token(cfg.github_token.clone())
                         .with_limits(Limits::from_env()?)
                         .with_forge(Forge::from_env()?)
-                        .with_egress(Egress::from_env()?))
+                        .with_egress(Egress::from_env()?)
+                        .with_backup_volume(&cfg.backup_volume))
                 })
                 .map(Some),
         }
@@ -828,7 +857,7 @@ impl Orchestrator {
                 "registry {registry:?} is not valid"
             )));
         }
-        let http = reqwest::Client::builder()
+        let http = cite_tls::client_builder()
             .no_proxy()
             .connect_timeout(Duration::from_secs(3))
             .build()
@@ -846,7 +875,17 @@ impl Orchestrator {
             forge: Forge::default(),
             reconciled: AtomicBool::new(false),
             egress: Egress::default(),
+            backup_volume: data::DEFAULT_BACKUP_VOLUME.to_string(),
         })
+    }
+
+    pub fn with_backup_volume(mut self, name: &str) -> Orchestrator {
+        self.backup_volume = name.to_string();
+        self
+    }
+
+    pub fn backup_volume(&self) -> &str {
+        &self.backup_volume
     }
 
     pub fn with_forge(mut self, forge: Forge) -> Orchestrator {
@@ -965,6 +1004,10 @@ impl Orchestrator {
         )?;
         self.preflight(site, &plan, opts, true)?;
         self.ensure_reconciled().await;
+        // The database is healthy before any container of the slot changes, so a failure leaves the running slot alone.
+        if site.data.postgres.is_some() {
+            self.prepare_database(site, opts).await?;
+        }
         let names = &plan.names;
         for image in [&plan.manager_image, &plan.executor_image]
             .into_iter()
@@ -1051,6 +1094,9 @@ impl Orchestrator {
         )?;
         self.preflight(site, &plan, opts, false)?;
         self.ensure_reconciled().await;
+        if crate::data::env::build_needs_dbnet(&site.data) {
+            self.prepare_database(site, opts).await?;
+        }
         let names = &plan.names;
         self.ensure_image(&plan.manager_image).await?;
         for volume in names.volumes() {
@@ -1107,6 +1153,13 @@ impl Orchestrator {
             || executor
                 .as_ref()
                 .is_some_and(|e| e.networks.contains(&names.egress));
+        let dbnet = dbnet_name(site_id);
+        let exec_dbnet = executor
+            .as_ref()
+            .is_some_and(|e| e.networks.contains(&dbnet));
+        let manager_dbnet = manager
+            .as_ref()
+            .is_some_and(|m| m.networks.contains(&dbnet));
         let (exec_memory, exec_cpus, exec_volumes) = executor.map_or((0, 0, Vec::new()), |e| {
             (e.memory, e.nano_cpus, e.site_mounts)
         });
@@ -1127,6 +1180,8 @@ impl Orchestrator {
                 executor_present: exec_present,
                 executor_outbound: exec_outbound,
                 executor_filtered: exec_filtered,
+                executor_dbnet: exec_dbnet,
+                manager_dbnet,
                 egress_proxy,
             });
         };
@@ -1153,6 +1208,8 @@ impl Orchestrator {
             executor_present: exec_present,
             executor_outbound: exec_outbound,
             executor_filtered: exec_filtered,
+            executor_dbnet: exec_dbnet,
+            manager_dbnet,
             egress_proxy,
         })
     }
@@ -1167,7 +1224,11 @@ impl Orchestrator {
             }
             Outbound::Filtered => {
                 let image = format!("{}/{EGRESS_IMAGE}:{}", self.registry, self.stack_version);
-                let mut want = self.egress.proxy_env(&site.outbound_rules);
+                let mut want = self.egress.proxy_env(
+                    &site.outbound_rules,
+                    &crate::data::env::egress_forwards(&site.data),
+                    &crate::data::env::auto_allow_hosts(&site.data),
+                );
                 let mut have = proxy.map(|p| p.env.clone()).unwrap_or_default();
                 want.sort();
                 have.sort();
@@ -1203,10 +1264,16 @@ impl Orchestrator {
             .collect();
         volumes.sort();
         let executor_current = !inspected.executor_present
-            || (volumes == inspected.executor_volumes && self.outbound_current(site, inspected));
+            || (volumes == inspected.executor_volumes
+                && self.outbound_current(site, inspected)
+                && inspected.executor_dbnet == site.data.postgres.is_some());
+        // Env values are not readable here, so a rotated password is reported by the data routes, not by this check.
+        let manager_dbnet_current =
+            inspected.manager_dbnet == crate::data::env::build_needs_dbnet(&site.data);
         inspected.state != "missing"
             && want == have
             && executor_current
+            && manager_dbnet_current
             && inspected.manager_memory == limits.manager_memory
             && inspected.manager_nano_cpus == limits.manager_nano_cpus
             && inspected.executor_memory == limits.executor_memory
@@ -1931,6 +1998,12 @@ impl Orchestrator {
                 .to_string(),
             site_mounts: site_mounts_of(&v["HostConfig"]),
             networks: endpoint_names(&v["NetworkSettings"]["Networks"]),
+            cmd: v["Config"]["Cmd"].as_array().map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            }),
         }))
     }
 
@@ -2022,17 +2095,47 @@ impl Orchestrator {
             };
             checked.map_err(|e| e.0)
         };
-        env_check(&opts.build_env, false).map_err(|why| refuse("manager", why))?;
+        // Both checks run on the maps a container would really get: stored values plus the rendered links.
+        let route = outbound_route(site, self.egress.mode);
+        let (build_env, runtime_env) = merged_env(&plan.names, opts, route)?;
+        if !site.data.links.is_empty() && opts.data.is_none() {
+            return Err(refuse(
+                "manager",
+                "the site has data links but no data credentials were supplied".to_string(),
+            ));
+        }
+        env_check(&build_env, false).map_err(|why| refuse("manager", why))?;
         let max_memory = self.limits.max_memory.unwrap_or(CEILING_MEMORY);
         let max_cpus = self.limits.max_nano_cpus.unwrap_or((MAX_CPUS * 1e9) as i64);
         let mut specs = vec![("manager", &plan.manager)];
         if executor {
-            env_check(&opts.runtime_env, true).map_err(|why| refuse("executor", why))?;
+            env_check(&runtime_env, true).map_err(|why| refuse("executor", why))?;
             if wants_outbound(site) && self.egress.mode == EgressMode::Off {
                 return Err(refuse(
                     "executor",
                     "outbound network access is off on this node (CITE_STACK_EGRESS_MODE=off); turn outbound off for this site".to_string(),
                 ));
+            }
+            // External databases and S3 endpoints are reached over the site's outbound access.
+            let external = !site.data.external_postgres.is_empty() || !site.data.s3.is_empty();
+            if external && !wants_outbound(site) {
+                return Err(refuse(
+                    "executor",
+                    "the site links an external database or S3 endpoint but outbound network access is off for it".to_string(),
+                ));
+            }
+            if route == Outbound::Filtered {
+                for forward in crate::data::env::egress_forwards(&site.data) {
+                    if !self.egress.node_ports_allow(forward.port) {
+                        return Err(refuse(
+                            "egress proxy",
+                            format!(
+                                "port {} of an external database is not in CITE_STACK_EGRESS_ALLOW_PORTS",
+                                forward.port
+                            ),
+                        ));
+                    }
+                }
             }
             specs.push(("executor", &plan.executor));
         }
@@ -2577,6 +2680,49 @@ fn plan_stack(
     )
 }
 
+// The stored env maps with the data links rendered over them. Links win, so a manual or Doppler value of
+// the same name never reaches a container; creating such a link was refused earlier unless it overrode it.
+// A runtime link reaches an external database through the stack's egress proxy only in filtered mode.
+type EnvMap = Option<BTreeMap<String, String>>;
+
+fn merged_env(names: &StackNames, opts: &StackOpts, route: Outbound) -> Result<(EnvMap, EnvMap)> {
+    let Some(bindings) = opts.data.as_ref() else {
+        return Ok((opts.build_env.clone(), opts.runtime_env.clone()));
+    };
+    let runtime_route = match route {
+        Outbound::Filtered => DbRoute::ViaEgressProxy {
+            proxy_host: names.egress_proxy.clone(),
+        },
+        Outbound::None | Outbound::Open => DbRoute::Direct,
+    };
+    let render = |target: LinkTarget, route: &DbRoute| {
+        crate::data::env::render(bindings, target, route).map_err(|e| {
+            ConnectorError::BadRequest(format!(
+                "the data links of {} cannot be rendered: {e}",
+                names.id
+            ))
+        })
+    };
+    let overlay = |base: &Option<BTreeMap<String, String>>, links: BTreeMap<String, String>| {
+        if links.is_empty() {
+            base.clone()
+        } else {
+            let mut merged = base.clone().unwrap_or_default();
+            merged.extend(links);
+            Some(merged)
+        }
+    };
+    let build = overlay(
+        &opts.build_env,
+        render(LinkTarget::Build, &DbRoute::Direct)?,
+    );
+    let runtime = overlay(
+        &opts.runtime_env,
+        render(LinkTarget::Runtime, &runtime_route)?,
+    );
+    Ok((build, runtime))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn plan_stack_with(
     site: &Site,
@@ -2610,6 +2756,8 @@ fn plan_stack_with(
         format!("CITE_REPO={}", source.repo),
         format!("CITE_BRANCH={branch}"),
         format!("CITE_POLL_INTERVAL={poll}"),
+        // The node manager image is shared by node, bun and static sites, so it cannot set this itself.
+        format!("CITE_RUNTIME={runtime}"),
     ];
     if with_node {
         manager_env.push(format!("CITE_NODE={node_major}"));
@@ -2649,7 +2797,9 @@ fn plan_stack_with(
         }
         manager_env.push(format!("{DEPLOY_ID_KEY}={id}"));
     }
-    if let Some(map) = opts.build_env.as_ref() {
+    let route = outbound_route(site, env.egress.mode);
+    let (build_env, runtime_env) = merged_env(&names, opts, route)?;
+    if let Some(map) = build_env.as_ref() {
         manager_env.push(format!("{BUILD_ENV_KEY}={}", serde_json::to_string(map)?));
     }
 
@@ -2665,10 +2815,9 @@ fn plan_stack_with(
         executor_env.push("CITE_NODE_BIN=/nodejs/bin/node".to_string());
         executor_env.push(format!("CITE_NODE={node_major}"));
     }
-    if let Some(map) = opts.runtime_env.as_ref() {
+    if let Some(map) = runtime_env.as_ref() {
         executor_env.push(format!("{RUNTIME_ENV_KEY}={}", serde_json::to_string(map)?));
     }
-    let route = outbound_route(site, env.egress.mode);
     let (egress_image, egress_proxy) = if route == Outbound::Filtered {
         // Stored rules are loaded leniently, so they are checked again before they reach the proxy.
         validate_outbound_rules(site).map_err(|e| ConnectorError::BadRequest(e.0))?;
@@ -2679,7 +2828,11 @@ fn plan_stack_with(
         executor_env.push("NO_PROXY=localhost,127.0.0.1".to_string());
         executor_env.push("NODE_USE_ENV_PROXY=1".to_string());
         let image = format!("{registry}/{EGRESS_IMAGE}:{version}");
-        let proxy_env = env.egress.proxy_env(&site.outbound_rules);
+        let proxy_env = env.egress.proxy_env(
+            &site.outbound_rules,
+            &crate::data::env::egress_forwards(&site.data),
+            &crate::data::env::auto_allow_hosts(&site.data),
+        );
         let spec = egress_proxy_spec(&names, &image, &proxy_env, &env.egress.bridge);
         (Some(image), Some(spec))
     } else {
@@ -2708,8 +2861,13 @@ fn plan_stack_with(
         .iter()
         .map(|v| volume_mount(&v.docker_name(&site.id), &v.mount_path, None, false))
         .collect();
+    // The executor joins the site's database network whenever it has managed Postgres; the manager only
+    // when a build-target link reads from it (migrations at build time).
+    let dbnet = dbnet_name(&site.id);
+    let executor_dbnet = site.data.postgres.is_some().then_some(dbnet.as_str());
+    let manager_dbnet = crate::data::env::build_needs_dbnet(&site.data).then_some(dbnet.as_str());
     Ok(Plan {
-        manager: manager_spec(&names, &manager_image, &manager_env, &limits),
+        manager: manager_spec(&names, &manager_image, &manager_env, &limits, manager_dbnet),
         executor: executor_spec(
             &names,
             &executor_image,
@@ -2717,10 +2875,13 @@ fn plan_stack_with(
             &executor_network,
             &limits,
             &site_mounts,
-            match route {
-                Outbound::None => None,
-                Outbound::Open => Some(names.egress.as_str()),
-                Outbound::Filtered => Some(names.xnet.as_str()),
+            ExecutorNets {
+                egress: match route {
+                    Outbound::None => None,
+                    Outbound::Open => Some(names.egress.as_str()),
+                    Outbound::Filtered => Some(names.xnet.as_str()),
+                },
+                dbnet: executor_dbnet,
             },
         ),
         init: init_spec(&names, &manager_image, &site_volumes),
@@ -2771,8 +2932,19 @@ fn volume_mount(volume: &str, target: &str, subpath: Option<&str>, read_only: bo
 }
 
 // Mirrors the manager service in docker-compose.yml, on the per-stack egress network only.
-fn manager_spec(names: &StackNames, image: &str, env: &[String], limits: &Limits) -> Value {
+fn manager_spec(
+    names: &StackNames,
+    image: &str,
+    env: &[String],
+    limits: &Limits,
+    dbnet: Option<&str>,
+) -> Value {
     let data = names.data.as_str();
+    let mut endpoints = serde_json::Map::new();
+    endpoints.insert(names.egress.clone(), json!({}));
+    if let Some(dbnet) = dbnet {
+        endpoints.insert(dbnet.to_string(), json!({}));
+    }
     json!({
         "Image": image,
         "Env": env,
@@ -2804,8 +2976,14 @@ fn manager_spec(names: &StackNames, image: &str, env: &[String], limits: &Limits
             "RestartPolicy": { "Name": "unless-stopped" },
             "LogConfig": log_config(),
         },
-        "NetworkingConfig": { "EndpointsConfig": { names.egress.as_str(): {} } },
+        "NetworkingConfig": { "EndpointsConfig": endpoints },
     })
+}
+
+// The optional extra networks of the executor: the outbound bridge and the database network.
+struct ExecutorNets<'a> {
+    egress: Option<&'a str>,
+    dbnet: Option<&'a str>,
 }
 
 // Mirrors the executor service in docker-compose.yml; reachable only through an internal network.
@@ -2816,8 +2994,9 @@ fn executor_spec(
     network: &str,
     limits: &Limits,
     site_mounts: &[Value],
-    egress: Option<&str>,
+    nets: ExecutorNets<'_>,
 ) -> Value {
+    let ExecutorNets { egress, dbnet } = nets;
     let data = names.data.as_str();
     // The egress bridge only adds a default route; HAProxy still resolves the alias on the internal network alone.
     let mut endpoints = serde_json::Map::new();
@@ -2827,6 +3006,10 @@ fn executor_spec(
     );
     if let Some(egress) = egress {
         endpoints.insert(egress.to_string(), json!({}));
+    }
+    // The database network has no gateway and no alias: the executor only dials out to the database.
+    if let Some(dbnet) = dbnet {
+        endpoints.insert(dbnet.to_string(), json!({}));
     }
     let mut mounts = vec![
         volume_mount(data, "/var/lib/cite/releases", Some("releases"), true),
@@ -3075,6 +3258,12 @@ pub(crate) mod tests {
         pull_error: Option<String>,
         init_exit: i64,
         haproxy_missing: bool,
+        // Health the database servers report; None means healthy.
+        db_health: Option<String>,
+        // Exit code of a data job; a hanging one stays running until it is stopped.
+        job_exit: i64,
+        job_hang: bool,
+        job_logs: Vec<u8>,
     }
 
     pub(crate) const HAPROXY: &str = "cite-node-haproxy";
@@ -3161,6 +3350,16 @@ pub(crate) mod tests {
             ("GET", "/volumes") => {
                 let filters = query_param(query, "filters").unwrap_or_default();
                 let wanted: Value = serde_json::from_str(&filters).unwrap_or_default();
+                // Mirrors the Docker proxy, which refuses listings filtered by anything but labels.
+                if wanted
+                    .as_object()
+                    .is_some_and(|o| o.keys().any(|k| k != "label"))
+                {
+                    return (
+                        403,
+                        "{\"message\":\"filters may only carry a label filter\"}".to_string(),
+                    );
+                }
                 let wanted: Vec<(String, String)> = wanted["label"]
                     .as_array()
                     .map(|a| {
@@ -3201,10 +3400,20 @@ pub(crate) mod tests {
                             .iter()
                             .map(|m| (format!("id-{m}"), json!({ "Name": m })))
                             .collect();
+                        let index = f
+                            .networks
+                            .keys()
+                            .position(|k| k == &p["/networks/".len()..]);
+                        let subnet = format!("172.30.{}.0/24", index.unwrap_or(0));
                         (
                             200,
-                            json!({ "Labels": n.labels, "Internal": n.internal, "Containers": members })
-                                .to_string(),
+                            json!({
+                                "Labels": n.labels,
+                                "Internal": n.internal,
+                                "Containers": members,
+                                "IPAM": { "Config": [{ "Subnet": subnet }] },
+                            })
+                            .to_string(),
                         )
                     }
                     None => not_found(),
@@ -3243,11 +3452,19 @@ pub(crate) mod tests {
                     return (409, json!({ "message": "name in use" }).to_string());
                 }
                 let spec: Value = serde_json::from_slice(body).unwrap_or_default();
+                let is_db = name.ends_with("-db") || name == "cite-pg-shared";
+                let state = if is_db {
+                    let health = f.db_health.clone().unwrap_or_else(|| "healthy".into());
+                    json!({ "Health": { "Status": health } })
+                } else {
+                    Value::Null
+                };
                 f.containers.insert(
                     name,
                     Ctr {
                         spec,
                         running: false,
+                        state,
                         ..Default::default()
                     },
                 );
@@ -3308,6 +3525,7 @@ pub(crate) mod tests {
                                     "Image": c.spec["Image"],
                                     "Env": c.spec["Env"],
                                     "Labels": c.spec["Labels"],
+                                    "Cmd": c.spec["Cmd"],
                                 },
                                 "HostConfig": {
                                     "NetworkMode": c.spec["HostConfig"]["NetworkMode"],
@@ -3330,13 +3548,27 @@ pub(crate) mod tests {
                     return not_found();
                 };
                 let init_exit = f.init_exit;
+                let (job_exit, job_hang, job_logs) = (f.job_exit, f.job_hang, f.job_logs.clone());
                 let Some(c) = f.containers.get_mut(&name) else {
                     return not_found();
                 };
                 match action.as_str() {
                     "start" if c.running => (304, String::new()),
+                    "start" if name.ends_with("-dbjob") || name == "cite-pg-shared-job" => {
+                        // A job runs and ends at once unless the test keeps it running.
+                        c.running = job_hang;
+                        if !job_hang {
+                            c.state = json!({ "Status": "exited", "ExitCode": job_exit });
+                            c.logs = job_logs;
+                        }
+                        (204, String::new())
+                    }
                     "start" => {
                         c.running = !name.ends_with("-init");
+                        (204, String::new())
+                    }
+                    "restart" => {
+                        c.running = true;
                         (204, String::new())
                     }
                     "stop" if !c.running => (304, String::new()),
@@ -3380,6 +3612,18 @@ pub(crate) mod tests {
 
     pub(crate) fn drop_container(fake: &Arc<Mutex<Fake>>, name: &str) {
         fake.lock().unwrap().containers.remove(name);
+    }
+
+    pub(crate) fn has_container(fake: &Arc<Mutex<Fake>>, name: &str) -> bool {
+        fake.lock().unwrap().containers.contains_key(name)
+    }
+
+    pub(crate) fn has_volume(fake: &Arc<Mutex<Fake>>, name: &str) -> bool {
+        fake.lock().unwrap().volumes.contains_key(name)
+    }
+
+    pub(crate) fn has_network(fake: &Arc<Mutex<Fake>>, name: &str) -> bool {
+        fake.lock().unwrap().networks.contains_key(name)
     }
 
     // The Env array a created container was given, as text, for checking where a token ended up.
@@ -3494,6 +3738,7 @@ pub(crate) mod tests {
             volumes: Vec::new(),
             outbound: true,
             outbound_rules: Default::default(),
+            data: Default::default(),
         }
     }
 
@@ -3926,6 +4171,7 @@ pub(crate) mod tests {
         assert!(env.contains(&"CITE_BRANCH=release/1"));
         assert!(env.contains(&"CITE_POLL_INTERVAL=10m"));
         assert!(env.contains(&"CITE_NODE=24"));
+        assert!(env.contains(&"CITE_RUNTIME=node"));
         assert_eq!(
             p.manager["Image"],
             json!("r.io/o/cite-manager:1.0.0-node24")
@@ -3937,6 +4183,35 @@ pub(crate) mod tests {
         let rust = plan(Some("rust"), None).unwrap();
         let env = rust.manager["Env"].to_string();
         assert!(!env.contains("CITE_NODE="));
+    }
+
+    #[test]
+    fn manager_gets_the_runtime_of_every_row() {
+        for row in &RUNTIMES {
+            let p = plan(Some(row.runtime), None).unwrap();
+            let want = format!("CITE_RUNTIME={}", row.runtime);
+            let env = env_of(&p.manager);
+            assert_eq!(
+                env.iter().filter(|e| **e == want).count(),
+                1,
+                "{}",
+                row.runtime
+            );
+            assert_eq!(
+                env.iter()
+                    .filter(|e| e.starts_with("CITE_RUNTIME="))
+                    .count(),
+                1
+            );
+        }
+        let bun = plan(Some("bun"), None).unwrap();
+        assert!(env_of(&bun.manager).contains(&"CITE_RUNTIME=bun".to_string()));
+        assert!(
+            bun.manager["Image"]
+                .as_str()
+                .unwrap()
+                .contains("cite-manager:")
+        );
     }
 
     #[test]
@@ -4947,6 +5222,7 @@ pub(crate) mod tests {
             deploy_id: Some("D1".into()),
             build_env: Some([("API_KEY".to_string(), "build-secret-77".to_string())].into()),
             runtime_env: Some([("DB_PASS".to_string(), "run-secret-88".to_string())].into()),
+            ..StackOpts::default()
         };
         let shown = format!("{opts:?}");
         assert!(shown.contains("API_KEY") && shown.contains("DB_PASS") && shown.contains("D1"));
@@ -4963,6 +5239,7 @@ pub(crate) mod tests {
                 "CITE_REPO=acme/shop".to_string(),
                 "CITE_BRANCH=main".to_string(),
                 "CITE_POLL_INTERVAL=5m".to_string(),
+                "CITE_RUNTIME=node".to_string(),
                 "CITE_NODE=22".to_string(),
                 format!("CITE_GITHUB_TOKEN={TOKEN}"),
                 format!("CITE_DATA_DIR={dir}"),
@@ -5017,6 +5294,7 @@ pub(crate) mod tests {
             deploy_id: Some("01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string()),
             build_env: Some(BTreeMap::from([("API_KEY".into(), "buildsecret".into())])),
             runtime_env: Some(BTreeMap::from([("DB_URL".into(), "runtimesecret".into())])),
+            ..StackOpts::default()
         };
         let p = plan_stack_with(
             &site("shop", None),
@@ -5094,6 +5372,7 @@ pub(crate) mod tests {
             deploy_id: Some("d1".to_string()),
             build_env: Some(BTreeMap::new()),
             runtime_env: Some(BTreeMap::from([("A".into(), "1".into())])),
+            ..StackOpts::default()
         };
         orch.ensure_stack_with(&s, Slot::Blue, None, TOKEN, &opts)
             .await
@@ -6136,5 +6415,1066 @@ pub(crate) mod tests {
         let f = fake.lock().unwrap();
         assert!(!f.containers.contains_key("cite-shop-blue-egress-proxy"));
         assert!(!f.networks.contains_key("cite-egress"));
+    }
+
+    // ---- site data services ----
+
+    const PW43: &str = "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789_-abcde";
+    const LOGIN: &str = "t0000000000_app_app_a";
+    const IMAGE: &str = "ghcr.io/seggys116/cite-postgres:0.2.0-pg18";
+
+    fn data_site(id: &str, mode: &str) -> Site {
+        let mut s = site(id, None);
+        s.data = serde_json::from_value(json!({
+            "postgres": {
+                "mode": mode,
+                "major": 18,
+                "databases": [{ "name": "app", "users": [
+                    { "name": "app", "level": "readwrite" },
+                    { "name": "migrate", "level": "owner" },
+                ] }],
+            },
+            "links": [
+                { "var": "DATABASE_URL", "target": "runtime",
+                  "source": { "kind": "postgres", "database": "app", "user": "app", "field": "url" } },
+                { "var": "MIGRATION_DATABASE_URL", "target": "build",
+                  "source": { "kind": "postgres", "database": "app", "user": "migrate", "field": "url" } },
+            ],
+        }))
+        .unwrap();
+        s
+    }
+
+    fn external_site() -> Site {
+        let mut s = site("shop", None);
+        s.data = serde_json::from_value(json!({
+            "external_postgres": [{
+                "name": "billing", "host": "db.example.net", "port": 5432,
+                "database": "b", "sslmode": "require",
+            }],
+            "links": [
+                { "var": "BILLING_URL", "target": "runtime",
+                  "source": { "kind": "external", "name": "billing", "field": "url" } },
+                { "var": "BILLING_BUILD_URL", "target": "build",
+                  "source": { "kind": "external", "name": "billing", "field": "url" } },
+            ],
+        }))
+        .unwrap();
+        s
+    }
+
+    fn data_bindings(s: &Site, host: &str) -> DataBindings {
+        use crate::data::env::{ExtCreds, PgCreds};
+        let mut b = DataBindings {
+            links: s.data.links.clone(),
+            site_url: format!("https://{}.example.com", s.id),
+            build_needs_dbnet: crate::data::env::build_needs_dbnet(&s.data),
+            ..DataBindings::default()
+        };
+        for (user, login) in [("app", LOGIN), ("migrate", "t0000000000_app_migrate_a")] {
+            b.pg.insert(
+                ("app".into(), user.into()),
+                PgCreds {
+                    host: host.to_string(),
+                    port: 5432,
+                    database: "app".into(),
+                    user: login.into(),
+                    password: Zeroizing::new(format!("pw-{user}-secret")),
+                    sslmode: "disable",
+                },
+            );
+        }
+        if !s.data.external_postgres.is_empty() {
+            b.ext.insert(
+                "billing".into(),
+                ExtCreds {
+                    name: "billing".into(),
+                    url: Zeroizing::new(
+                        "postgres://u:p%40ss@db.example.net:5432/b?sslmode=require".into(),
+                    ),
+                    forward_port: 15432,
+                },
+            );
+        }
+        b
+    }
+
+    fn data_opts(s: &Site) -> StackOpts {
+        StackOpts {
+            data: Some(data_bindings(s, &format!("cite-{}-db", s.id))),
+            db_password: Some(Zeroizing::new(PW43.to_string())),
+            ..StackOpts::default()
+        }
+    }
+
+    fn env_entry(spec: &Value, key: &str) -> Option<String> {
+        env_of(spec)
+            .into_iter()
+            .find_map(|e| e.strip_prefix(&format!("{key}=")).map(str::to_string))
+    }
+
+    fn env_map_of(spec: &Value, key: &str) -> BTreeMap<String, String> {
+        serde_json::from_str(&env_entry(spec, key).expect("env entry")).unwrap()
+    }
+
+    fn plan_data(s: &Site, opts: &StackOpts, egress: &Egress) -> Result<Plan> {
+        plan_stack_with(
+            s,
+            Slot::Blue,
+            None,
+            TOKEN,
+            &stack_env_with("ghcr.io/seggys116", "0.2.0", true, egress),
+            opts,
+            &Limits::default(),
+            &Forge::default(),
+        )
+    }
+
+    fn shared_cfg() -> crate::data::shared::SharedSettings {
+        serde_json::from_value(json!({
+            "version": 1,
+            "enabled": true,
+            "major": 18,
+            "memory_mb": 1024,
+            "nano_cpus": 2_000_000_000i64,
+            "max_connections": 200,
+        }))
+        .unwrap()
+    }
+
+    fn pg_job(id: &str, op: JobOp, env: &[(&str, &str)]) -> JobSpec {
+        JobSpec {
+            scope: JobScope::Site(id.to_string()),
+            op,
+            net: JobNet::Dbnet,
+            major: 18,
+            env: env
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), Zeroizing::new((*v).to_string())))
+                .collect(),
+            read_only: op == JobOp::Restore,
+        }
+    }
+
+    fn log_index(fake: &Arc<Mutex<Fake>>, entry: &str) -> usize {
+        fake.lock()
+            .unwrap()
+            .log
+            .iter()
+            .position(|l| l == entry)
+            .unwrap_or_else(|| panic!("{entry} was never called"))
+    }
+
+    use data::{JobNet, JobOp, JobScope, JobSpec};
+
+    #[test]
+    fn data_links_are_rendered_over_the_stored_env_and_links_win() {
+        let s = data_site("shop", "dedicated");
+        let mut opts = data_opts(&s);
+        opts.runtime_env = Some(BTreeMap::from([
+            ("DATABASE_URL".to_string(), "manual".to_string()),
+            ("KEEP".to_string(), "1".to_string()),
+        ]));
+        opts.build_env = Some(BTreeMap::from([("BUILD_ONLY".into(), "1".into())]));
+        let p = plan_data(&s, &opts, &FILTERED).unwrap();
+        let runtime = env_map_of(&p.executor, RUNTIME_ENV_KEY);
+        assert_eq!(
+            runtime["DATABASE_URL"],
+            format!("postgres://{LOGIN}:pw-app-secret@cite-shop-db:5432/app?sslmode=disable"),
+            "a link shadows a manual value of the same name"
+        );
+        assert_eq!(runtime["KEEP"], "1");
+        assert!(!runtime.contains_key("MIGRATION_DATABASE_URL"));
+        let build = env_map_of(&p.manager, BUILD_ENV_KEY);
+        assert!(build["MIGRATION_DATABASE_URL"].contains("t0000000000_app_migrate_a"));
+        assert_eq!(build["BUILD_ONLY"], "1");
+        assert!(
+            !build.contains_key("DATABASE_URL"),
+            "the build never gets the runtime link"
+        );
+        // Credentials stay out of labels and out of the other container.
+        for spec in [&p.manager, &p.executor, &p.init] {
+            assert!(!spec["Labels"].to_string().contains("pw-app-secret"));
+        }
+        assert!(!p.manager.to_string().contains("pw-app-secret"));
+        assert!(!p.executor.to_string().contains("pw-migrate-secret"));
+    }
+
+    #[test]
+    fn the_stored_env_is_untouched_without_data_bindings() {
+        let s = data_site("shop", "dedicated");
+        let opts = StackOpts {
+            runtime_env: Some(BTreeMap::from([("A".to_string(), "1".to_string())])),
+            ..StackOpts::default()
+        };
+        let p = plan_data(&s, &opts, &FILTERED).unwrap();
+        assert_eq!(
+            env_map_of(&p.executor, RUNTIME_ENV_KEY),
+            BTreeMap::from([("A".to_string(), "1".to_string())])
+        );
+        assert!(env_entry(&p.manager, BUILD_ENV_KEY).is_none());
+    }
+
+    #[test]
+    fn the_database_network_joins_the_executor_always_and_the_manager_only_for_build_links() {
+        let s = data_site("shop", "dedicated");
+        let p = plan_data(&s, &data_opts(&s), &FILTERED).unwrap();
+        assert_eq!(
+            endpoints_of(&p.executor),
+            vec![
+                "cite-shop-blue-net",
+                "cite-shop-blue-xnet",
+                "cite-shop-dbnet"
+            ]
+        );
+        assert_eq!(
+            p.executor["NetworkingConfig"]["EndpointsConfig"]["cite-shop-dbnet"],
+            json!({}),
+            "no alias and no extra settings"
+        );
+        assert_eq!(
+            endpoints_of(&p.manager),
+            vec!["cite-shop-blue-egress", "cite-shop-dbnet"]
+        );
+        assert_eq!(
+            p.manager["HostConfig"]["NetworkMode"], "cite-shop-blue-egress",
+            "the manager keeps its own network mode"
+        );
+
+        let mut runtime_only = s.clone();
+        runtime_only
+            .data
+            .links
+            .retain(|l| l.target == LinkTarget::Runtime);
+        let p = plan_data(&runtime_only, &data_opts(&runtime_only), &FILTERED).unwrap();
+        assert_eq!(endpoints_of(&p.manager), vec!["cite-shop-blue-egress"]);
+        assert!(endpoints_of(&p.executor).contains(&"cite-shop-dbnet".to_string()));
+
+        let none = plan_data(&site("shop", None), &StackOpts::default(), &FILTERED).unwrap();
+        for spec in [&none.manager, &none.executor] {
+            assert!(!endpoints_of(spec).iter().any(|n| n.ends_with("dbnet")));
+        }
+
+        let external = external_site();
+        let p = plan_data(
+            &external,
+            &StackOpts {
+                data: Some(data_bindings(&external, "unused")),
+                ..StackOpts::default()
+            },
+            &FILTERED,
+        )
+        .unwrap();
+        assert!(
+            !endpoints_of(&p.executor)
+                .iter()
+                .any(|n| n.ends_with("dbnet")),
+            "an external database needs no database network"
+        );
+    }
+
+    #[test]
+    fn external_databases_use_the_forward_when_filtered_and_the_url_as_is_when_open() {
+        let s = external_site();
+        let opts = StackOpts {
+            data: Some(data_bindings(&s, "unused")),
+            ..StackOpts::default()
+        };
+        let p = plan_data(&s, &opts, &FILTERED).unwrap();
+        let runtime = env_map_of(&p.executor, RUNTIME_ENV_KEY);
+        assert_eq!(
+            runtime["BILLING_URL"],
+            "postgres://u:p%40ss@cite-shop-blue-egress-proxy:15432/b?sslmode=require"
+        );
+        let build = env_map_of(&p.manager, BUILD_ENV_KEY);
+        assert_eq!(
+            build["BILLING_BUILD_URL"], "postgres://u:p%40ss@db.example.net:5432/b?sslmode=require",
+            "the manager has direct egress, so the URL is verbatim"
+        );
+        let proxy_env = env_of(p.egress_proxy.as_ref().unwrap());
+        assert!(proxy_env.contains(&"CITE_EGRESS_FORWARDS=15432=db.example.net:5432".to_string()));
+        assert!(proxy_env.contains(&"CITE_EGRESS_AUTO_ALLOW=db.example.net".to_string()));
+
+        let p = plan_data(&s, &opts, &OPEN).unwrap();
+        assert_eq!(
+            env_map_of(&p.executor, RUNTIME_ENV_KEY)["BILLING_URL"],
+            "postgres://u:p%40ss@db.example.net:5432/b?sslmode=require"
+        );
+        assert!(p.egress_proxy.is_none());
+    }
+
+    #[test]
+    fn a_link_that_cannot_be_rendered_fails_the_plan_without_leaking_values() {
+        let s = data_site("shop", "dedicated");
+        let mut opts = data_opts(&s);
+        opts.data.as_mut().unwrap().pg.clear();
+        let err = plan_data(&s, &opts, &FILTERED)
+            .err()
+            .expect("refused")
+            .to_string();
+        assert!(err.contains("DATABASE_URL"), "{err}");
+        assert!(!err.contains("pw-"), "{err}");
+    }
+
+    #[test]
+    fn stack_opts_never_print_credentials() {
+        let s = data_site("shop", "dedicated");
+        let mut opts = data_opts(&s);
+        opts.runtime_env = Some(BTreeMap::from([("RUN".into(), "runsecret77".into())]));
+        let shown = format!("{opts:?}");
+        for secret in [PW43, "pw-app-secret", "pw-migrate-secret", "runsecret77"] {
+            assert!(!shown.contains(secret), "{shown}");
+        }
+        assert!(shown.contains("DATABASE_URL") && shown.contains("RUN"));
+    }
+
+    #[tokio::test]
+    async fn a_deploy_with_links_but_no_bindings_is_refused_before_anything_changes() {
+        let (orch, fake) = start_fake().await;
+        let s = data_site("shop", "dedicated");
+        let err = orch
+            .ensure_stack_with(&s, Slot::Blue, None, TOKEN, &StackOpts::default())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("data links"), "{err}");
+        assert!(fake.lock().unwrap().containers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn external_data_needs_outbound_access_and_an_allowed_port() {
+        let (orch, fake) = start_fake().await;
+        let mut closed = external_site();
+        closed.outbound = false;
+        let opts = StackOpts {
+            data: Some(data_bindings(&closed, "unused")),
+            ..StackOpts::default()
+        };
+        let err = orch
+            .ensure_stack_with(&closed, Slot::Blue, None, TOKEN, &opts)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("outbound network access is off"), "{err}");
+        assert!(fake.lock().unwrap().containers.is_empty());
+
+        let ports = Egress::from_lookup(|k| {
+            (k == "CITE_STACK_EGRESS_ALLOW_PORTS").then(|| "80,443".to_string())
+        })
+        .unwrap();
+        let (orch, fake) = start_fake().await;
+        let orch = orch.with_egress(ports);
+        let open = external_site();
+        let opts = StackOpts {
+            data: Some(data_bindings(&open, "unused")),
+            ..StackOpts::default()
+        };
+        let err = orch
+            .ensure_stack_with(&open, Slot::Blue, None, TOKEN, &opts)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("5432") && err.contains("CITE_STACK_EGRESS_ALLOW_PORTS"),
+            "{err}"
+        );
+        assert!(fake.lock().unwrap().containers.is_empty());
+
+        let (orch, _) = start_fake().await;
+        orch.ensure_stack_with(&open, Slot::Blue, None, TOKEN, &opts)
+            .await
+            .expect("an unrestricted node allows the port");
+    }
+
+    #[tokio::test]
+    async fn a_dedicated_database_is_created_healthy_and_recreated_only_on_drift() {
+        let (orch, fake) = start_fake().await;
+        let s = data_site("shop", "dedicated");
+        orch.ensure_site_database(&s, PW43).await.unwrap();
+        {
+            let f = fake.lock().unwrap();
+            let db = &f.containers["cite-shop-db"];
+            assert!(db.running);
+            assert_eq!(db.spec["Image"], IMAGE);
+            assert_eq!(
+                f.volumes["cite-shop-db-data"],
+                json!({ "cite.managed": "true", "cite.site": "shop", "cite.volume": "db-data" })
+            );
+            let net = &f.networks["cite-shop-dbnet"];
+            assert!(net.internal);
+            assert_eq!(
+                net.labels,
+                json!({ "cite.managed": "true", "cite.site": "shop", "cite.role": "dbnet" })
+            );
+            assert!(f.images.contains(IMAGE));
+            assert!(!f.networks["cite-shop-dbnet"].members.contains(HAPROXY));
+        }
+        orch.ensure_site_database(&s, PW43).await.unwrap();
+        assert_eq!(count(&fake, "CREATE cite-shop-db"), 1);
+
+        let mut bigger = s.clone();
+        bigger.data.postgres.as_mut().unwrap().memory_mb = 1024;
+        orch.ensure_site_database(&bigger, PW43).await.unwrap();
+        assert_eq!(count(&fake, "CREATE cite-shop-db"), 2, "memory drift");
+        bigger.data.postgres.as_mut().unwrap().max_connections = 200;
+        orch.ensure_site_database(&bigger, PW43).await.unwrap();
+        assert_eq!(
+            count(&fake, "CREATE cite-shop-db"),
+            3,
+            "connection cap drift"
+        );
+        assert_eq!(
+            count(&fake, "DELETE /volumes"),
+            0,
+            "recreating the server keeps its data"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_malformed_superuser_password_creates_nothing() {
+        let (orch, fake) = start_fake().await;
+        let s = data_site("shop", "dedicated");
+        let long = "x".repeat(44);
+        for bad in ["", "short", long.as_str()] {
+            let err = orch.ensure_site_database(&s, bad).await.unwrap_err();
+            assert!(matches!(err, ConnectorError::Internal(_)), "{err}");
+            assert!(bad.is_empty() || !err.to_string().contains(bad));
+        }
+        assert!(fake.lock().unwrap().containers.is_empty());
+        orch.ensure_site_database(&site("shop", None), "")
+            .await
+            .expect("a site without managed postgres has nothing to ensure");
+        assert!(fake.lock().unwrap().containers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_unhealthy_database_fails_with_its_state_and_a_timeout_names_the_wait() {
+        let (orch, fake) = start_fake().await;
+        fake.lock().unwrap().db_health = Some("unhealthy".to_string());
+        let s = data_site("shop", "dedicated");
+        let err = orch
+            .ensure_site_database(&s, PW43)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("cite-shop-db") && err.contains("unhealthy"),
+            "{err}"
+        );
+        assert!(!err.contains(PW43));
+
+        // A server that never gets healthy times out; a short bound stands in for the real 120 s.
+        let (orch, fake) = start_fake().await;
+        fake.lock().unwrap().containers.insert(
+            "cite-shop-db".to_string(),
+            Ctr {
+                spec: json!({ "Labels": { "cite.managed": "true" } }),
+                running: true,
+                state: json!({ "Health": { "Status": "starting" } }),
+                ..Ctr::default()
+            },
+        );
+        let err = orch
+            .wait_healthy_for(
+                "cite-shop-db",
+                &[],
+                Duration::from_millis(30),
+                Duration::from_millis(10),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ConnectorError::Unavailable(_)));
+        assert!(err.to_string().contains("not healthy within"), "{err}");
+        let bad = orch
+            .wait_healthy_for(
+                "cite-shop-blue-manager",
+                &[],
+                Duration::ZERO,
+                Duration::ZERO,
+            )
+            .await;
+        assert!(matches!(bad, Err(ConnectorError::BadRequest(_))));
+    }
+
+    #[tokio::test]
+    async fn a_shared_tenant_gets_its_network_and_the_instance_attached_once() {
+        let (orch, fake) = start_fake().await;
+        orch.ensure_shared_instance(&shared_cfg(), PW43)
+            .await
+            .unwrap();
+        {
+            let f = fake.lock().unwrap();
+            let shared = &f.containers["cite-pg-shared"];
+            assert!(shared.running);
+            assert_eq!(shared.spec["HostConfig"]["Memory"], 1024 * MIB);
+            assert_eq!(
+                shared.spec["Labels"],
+                json!({ "cite.managed": "true", "cite.role": "pg-shared" })
+            );
+            assert!(f.networks["cite-pg-shared-admin"].internal);
+            assert!(f.volumes.contains_key("cite-pg-shared-data"));
+            assert!(f.volumes.contains_key("cite-pg-shared-conf"));
+        }
+        let s = data_site("shop", "shared");
+        orch.ensure_site_database(&s, "").await.unwrap();
+        orch.ensure_site_database(&s, "").await.unwrap();
+        {
+            let f = fake.lock().unwrap();
+            assert!(
+                f.networks["cite-shop-dbnet"]
+                    .members
+                    .contains("cite-pg-shared")
+            );
+            assert!(
+                !f.containers.contains_key("cite-shop-db"),
+                "no server per site"
+            );
+        }
+        assert_eq!(count(&fake, "POST /networks/cite-shop-dbnet/connect"), 1);
+        assert!(
+            orch.dbnet_subnet("shop")
+                .await
+                .unwrap()
+                .starts_with("172.30.")
+        );
+        orch.disconnect_shared("shop").await.unwrap();
+        orch.disconnect_shared("shop").await.unwrap();
+        assert_eq!(count(&fake, "POST /networks/cite-shop-dbnet/disconnect"), 1);
+        assert!(
+            fake.lock().unwrap().networks["cite-shop-dbnet"]
+                .members
+                .is_empty()
+        );
+        orch.reconnect_shared(&["shop".to_string(), "ghost".to_string()])
+            .await
+            .expect("a site whose network is gone is skipped");
+        assert!(
+            fake.lock().unwrap().networks["cite-shop-dbnet"]
+                .members
+                .contains("cite-pg-shared")
+        );
+        // Recreating the instance on spec drift keeps it one container.
+        orch.ensure_shared_instance(&shared_cfg(), PW43)
+            .await
+            .unwrap();
+        assert_eq!(count(&fake, "CREATE cite-pg-shared"), 1);
+    }
+
+    #[tokio::test]
+    async fn the_shared_instance_and_its_tenant_links_need_what_they_attach_to() {
+        let (orch, fake) = start_fake().await;
+        assert!(matches!(
+            orch.connect_shared("shop").await,
+            Err(ConnectorError::NotFound(_))
+        ));
+        let s = data_site("shop", "shared");
+        let err = orch.ensure_site_database(&s, "").await.unwrap_err();
+        assert!(err.to_string().contains("does not exist"), "{err}");
+        assert!(
+            orch.dbnet_subnet("shop").await.is_ok(),
+            "the site's network exists even though the instance is missing"
+        );
+        assert!(matches!(
+            orch.dbnet_subnet("ghost").await,
+            Err(ConnectorError::NotFound(_))
+        ));
+        let err = orch
+            .ensure_shared_instance(&shared_cfg(), "short")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ConnectorError::Internal(_)));
+        assert!(
+            !fake
+                .lock()
+                .unwrap()
+                .containers
+                .contains_key("cite-pg-shared")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_job_reports_its_exit_code_and_a_redacted_tail_and_leaves_no_container() {
+        let (orch, fake) = start_fake().await;
+        {
+            let mut f = fake.lock().unwrap();
+            f.job_logs =
+                format!("step one\nconnected with {PW43} ok\nextra-secret-9 leaked\n").into_bytes();
+        }
+        let job = pg_job(
+            "shop",
+            JobOp::Counts,
+            &[
+                ("CITE_JOB_ID", "01ARZ3NDEKTSV4RRFFQ69G5FAV"),
+                ("PGPASSWORD", PW43),
+            ],
+        );
+        let out = orch
+            .run_job(
+                &job,
+                &["extra-secret-9".to_string()],
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.exit_code, 0);
+        assert_eq!(
+            out.log_tail,
+            vec![
+                "step one",
+                "connected with [REDACTED] ok",
+                "[REDACTED] leaked"
+            ],
+            "the job's own password is scrubbed even when the caller did not pass it"
+        );
+        assert!(
+            !fake
+                .lock()
+                .unwrap()
+                .containers
+                .contains_key("cite-shop-dbjob")
+        );
+        assert_eq!(count(&fake, "CREATE cite-shop-dbjob"), 1);
+        assert!(fake.lock().unwrap().images.contains(IMAGE));
+
+        fake.lock().unwrap().job_exit = 3;
+        let failed = orch
+            .run_job(&job, &[], Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(
+            failed.exit_code, 3,
+            "a failing job is an outcome, not an error"
+        );
+        assert!(
+            !fake
+                .lock()
+                .unwrap()
+                .containers
+                .contains_key("cite-shop-dbjob")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_shared_scope_job_runs_in_its_own_container_on_the_admin_network() {
+        let (orch, fake) = start_fake().await;
+        let job = JobSpec {
+            scope: JobScope::Shared,
+            op: JobOp::Sizes,
+            net: JobNet::SharedAdmin,
+            major: 18,
+            env: vec![("PGPASSWORD".to_string(), Zeroizing::new(PW43.to_string()))],
+            read_only: false,
+        };
+        let out = orch
+            .run_job(&job, &[], Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(out.exit_code, 0);
+        assert_eq!(count(&fake, "CREATE cite-pg-shared-job"), 1);
+        assert!(
+            !fake
+                .lock()
+                .unwrap()
+                .containers
+                .contains_key("cite-pg-shared-job")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_hanging_job_is_stopped_at_its_timeout_and_cleaned_up() {
+        let (orch, fake) = start_fake().await;
+        fake.lock().unwrap().job_hang = true;
+        let job = pg_job("shop", JobOp::Backup, &[("PGPASSWORD", PW43)]);
+        let err = orch
+            .run_job(&job, &[], Duration::from_millis(60))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ConnectorError::Unavailable(_)), "{err}");
+        assert!(err.to_string().contains("did not finish"), "{err}");
+        assert!(!err.to_string().contains(PW43));
+        assert_eq!(count(&fake, "POST /containers/cite-shop-dbjob/stop"), 1);
+        assert!(
+            !fake
+                .lock()
+                .unwrap()
+                .containers
+                .contains_key("cite-shop-dbjob")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_leftover_job_container_is_replaced_but_a_foreign_one_is_never_removed() {
+        let (orch, fake) = start_fake().await;
+        let job = pg_job("shop", JobOp::Counts, &[("PGPASSWORD", PW43)]);
+        fake.lock().unwrap().containers.insert(
+            "cite-shop-dbjob".to_string(),
+            Ctr {
+                spec: json!({ "Labels": { "cite.managed": "true" } }),
+                running: true,
+                ..Ctr::default()
+            },
+        );
+        orch.run_job(&job, &[], Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(count(&fake, "CREATE cite-shop-dbjob"), 1);
+
+        fake.lock().unwrap().containers.insert(
+            "cite-shop-dbjob".to_string(),
+            Ctr {
+                spec: json!({ "Labels": {} }),
+                running: true,
+                ..Ctr::default()
+            },
+        );
+        let err = orch
+            .run_job(&job, &[], Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ConnectorError::Conflict(_)), "{err}");
+        assert!(
+            fake.lock()
+                .unwrap()
+                .containers
+                .contains_key("cite-shop-dbjob")
+        );
+        assert_eq!(count(&fake, "CREATE cite-shop-dbjob"), 1);
+    }
+
+    #[tokio::test]
+    async fn a_job_the_proxy_would_refuse_is_refused_without_calling_the_engine() {
+        let (orch, fake) = start_fake().await;
+        let mut wrong_scope = pg_job("shop", JobOp::Hba, &[("PGPASSWORD", PW43)]);
+        wrong_scope.net = JobNet::SharedAdmin;
+        let shared_on_dbnet = JobSpec {
+            scope: JobScope::Shared,
+            op: JobOp::Sizes,
+            net: JobNet::Dbnet,
+            major: 18,
+            env: Vec::new(),
+            read_only: false,
+        };
+        let mut bad_major = pg_job("shop", JobOp::Counts, &[]);
+        bad_major.major = 16;
+        for job in [wrong_scope, shared_on_dbnet, bad_major] {
+            let err = orch
+                .run_job(&job, &[], Duration::from_secs(1))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, ConnectorError::BadRequest(_)), "{err}");
+        }
+        assert!(fake.lock().unwrap().log.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_database_reports_its_health_restarts_and_is_removed_cleanly() {
+        let (orch, fake) = start_fake().await;
+        let before = orch.database_health("cite-shop-db").await.unwrap();
+        assert_eq!(before.state, "missing");
+        assert_eq!(before.health, "none");
+        let s = data_site("shop", "dedicated");
+        orch.ensure_site_database(&s, PW43).await.unwrap();
+        let seen = orch.database_health("cite-shop-db").await.unwrap();
+        assert_eq!(seen.state, "running");
+        assert_eq!(seen.health, "healthy");
+        assert_eq!(seen.image, IMAGE);
+        assert_eq!(
+            orch.volume_size("cite-shop-db-data").await.unwrap(),
+            Some(4096)
+        );
+        assert_eq!(orch.volume_size("cite-gone-db-data").await.unwrap(), None);
+        assert!(orch.volume_size("cite-vol-shop_data").await.is_err());
+
+        orch.restart_database("cite-shop-db").await.unwrap();
+        assert_eq!(count(&fake, "POST /containers/cite-shop-db/restart"), 1);
+        assert!(matches!(
+            orch.restart_database("cite-ghost-db").await,
+            Err(ConnectorError::NotFound(_))
+        ));
+        for bad in ["cite-shop-blue-executor", "cite-shop-dbjob", "x"] {
+            assert!(matches!(
+                orch.restart_database(bad).await,
+                Err(ConnectorError::BadRequest(_))
+            ));
+            assert!(orch.database_health(bad).await.is_err());
+        }
+
+        orch.remove_site_database("shop", false).await.unwrap();
+        {
+            let f = fake.lock().unwrap();
+            assert!(!f.containers.contains_key("cite-shop-db"));
+            assert!(!f.networks.contains_key("cite-shop-dbnet"));
+            assert!(f.volumes.contains_key("cite-shop-db-data"), "data kept");
+        }
+        orch.ensure_site_database(&s, PW43).await.unwrap();
+        orch.remove_site_database("shop", true).await.unwrap();
+        assert!(
+            !fake
+                .lock()
+                .unwrap()
+                .volumes
+                .contains_key("cite-shop-db-data")
+        );
+        orch.remove_site_database("shop", true)
+            .await
+            .expect("removing what is gone is fine");
+    }
+
+    #[tokio::test]
+    async fn removing_a_shared_tenant_detaches_the_instance_and_removing_the_instance_is_clean() {
+        let (orch, fake) = start_fake().await;
+        orch.ensure_shared_instance(&shared_cfg(), PW43)
+            .await
+            .unwrap();
+        orch.ensure_site_database(&data_site("shop", "shared"), "")
+            .await
+            .unwrap();
+        orch.remove_site_database("shop", true).await.unwrap();
+        {
+            let f = fake.lock().unwrap();
+            assert!(!f.networks.contains_key("cite-shop-dbnet"));
+            assert!(
+                f.containers.contains_key("cite-pg-shared"),
+                "the instance stays"
+            );
+            assert!(f.volumes.contains_key("cite-pg-shared-data"));
+        }
+        orch.remove_shared_instance(false).await.unwrap();
+        {
+            let f = fake.lock().unwrap();
+            assert!(!f.containers.contains_key("cite-pg-shared"));
+            assert!(!f.networks.contains_key("cite-pg-shared-admin"));
+            assert!(f.volumes.contains_key("cite-pg-shared-data"), "data kept");
+        }
+        orch.remove_shared_instance(true).await.unwrap();
+        let f = fake.lock().unwrap();
+        assert!(!f.volumes.contains_key("cite-pg-shared-data"));
+        assert!(!f.volumes.contains_key("cite-pg-shared-conf"));
+    }
+
+    #[tokio::test]
+    async fn a_deploy_waits_for_the_database_before_the_executor_and_joins_it_to_the_network() {
+        let (orch, fake) = start_fake().await;
+        let s = data_site("shop", "dedicated");
+        orch.ensure_stack_with(&s, Slot::Blue, None, TOKEN, &data_opts(&s))
+            .await
+            .unwrap();
+        assert!(
+            log_index(&fake, "CREATE cite-shop-db")
+                < log_index(&fake, "CREATE cite-shop-blue-executor"),
+            "the database exists and is healthy before the executor is created"
+        );
+        assert!(
+            log_index(&fake, "CREATE cite-shop-db")
+                < log_index(&fake, "CREATE cite-shop-blue-manager")
+        );
+        let f = fake.lock().unwrap();
+        for name in ["cite-shop-blue-executor", "cite-shop-blue-manager"] {
+            assert!(
+                f.containers[name].spec["NetworkingConfig"]["EndpointsConfig"]
+                    .get("cite-shop-dbnet")
+                    .is_some(),
+                "{name}"
+            );
+        }
+        assert!(!f.networks["cite-shop-dbnet"].members.contains(HAPROXY));
+    }
+
+    #[tokio::test]
+    async fn a_database_that_is_not_ready_aborts_the_deploy_before_any_container_changes() {
+        let (orch, fake) = start_fake().await;
+        let s = data_site("shop", "dedicated");
+        fake.lock().unwrap().db_health = Some("unhealthy".to_string());
+        let err = orch
+            .ensure_stack_with(&s, Slot::Blue, None, TOKEN, &data_opts(&s))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ConnectorError::Unavailable(_)), "{err}");
+        let text = err.to_string();
+        assert!(text.contains("the database of shop is not ready"), "{text}");
+        assert!(text.contains("the running slot was not changed"), "{text}");
+        assert!(!text.contains(PW43));
+        let f = fake.lock().unwrap();
+        assert!(!f.containers.contains_key("cite-shop-blue-executor"));
+        assert!(!f.containers.contains_key("cite-shop-blue-manager"));
+    }
+
+    #[tokio::test]
+    async fn a_dedicated_deploy_without_the_database_password_is_refused() {
+        let (orch, fake) = start_fake().await;
+        let s = data_site("shop", "dedicated");
+        let mut opts = data_opts(&s);
+        opts.db_password = None;
+        let err = orch
+            .ensure_stack_with(&s, Slot::Blue, None, TOKEN, &opts)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no database password"), "{err}");
+        assert!(fake.lock().unwrap().containers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_shared_tenant_deploy_needs_no_superuser_password() {
+        let (orch, fake) = start_fake().await;
+        orch.ensure_shared_instance(&shared_cfg(), PW43)
+            .await
+            .unwrap();
+        let s = data_site("shop", "shared");
+        let mut opts = data_opts(&s);
+        opts.db_password = None;
+        opts.data = Some(data_bindings(&s, "cite-pg-shared"));
+        orch.ensure_stack_with(&s, Slot::Blue, None, TOKEN, &opts)
+            .await
+            .unwrap();
+        let f = fake.lock().unwrap();
+        assert!(
+            f.networks["cite-shop-dbnet"]
+                .members
+                .contains("cite-pg-shared")
+        );
+        assert!(f.containers.contains_key("cite-shop-blue-executor"));
+    }
+
+    #[tokio::test]
+    async fn the_manager_alone_prepares_the_database_only_for_build_links() {
+        let (orch, fake) = start_fake().await;
+        let s = data_site("shop", "dedicated");
+        orch.ensure_manager(&s, Slot::Blue, None, TOKEN, &data_opts(&s))
+            .await
+            .unwrap();
+        {
+            let f = fake.lock().unwrap();
+            assert!(f.containers.contains_key("cite-shop-db"));
+            assert!(
+                f.containers["cite-shop-blue-manager"].spec["NetworkingConfig"]["EndpointsConfig"]
+                    .get("cite-shop-dbnet")
+                    .is_some()
+            );
+            assert!(!f.containers.contains_key("cite-shop-blue-executor"));
+        }
+
+        let (orch, fake) = start_fake().await;
+        let mut runtime_only = s.clone();
+        runtime_only
+            .data
+            .links
+            .retain(|l| l.target == LinkTarget::Runtime);
+        orch.ensure_manager(
+            &runtime_only,
+            Slot::Blue,
+            None,
+            TOKEN,
+            &data_opts(&runtime_only),
+        )
+        .await
+        .unwrap();
+        let f = fake.lock().unwrap();
+        assert!(
+            !f.containers.contains_key("cite-shop-db"),
+            "a build without database links does not touch the database"
+        );
+        assert!(f.containers.contains_key("cite-shop-blue-manager"));
+    }
+
+    #[tokio::test]
+    async fn the_database_network_shows_in_the_settings_check_and_in_env_mentions() {
+        let (orch, _fake) = start_fake().await;
+        let s = data_site("shop", "dedicated");
+        orch.ensure_stack_with(&s, Slot::Blue, None, TOKEN, &data_opts(&s))
+            .await
+            .unwrap();
+        let seen = orch.inspect_slot("shop", Slot::Blue).await.unwrap();
+        assert!(seen.executor_dbnet && seen.manager_dbnet);
+        assert!(orch.settings_current(&s, &seen));
+        let mut plain = s.clone();
+        plain.data = Default::default();
+        assert!(
+            !orch.settings_current(&plain, &seen),
+            "dropping the database leaves the executor stale"
+        );
+        let mut runtime_only = s.clone();
+        runtime_only
+            .data
+            .links
+            .retain(|l| l.target == LinkTarget::Runtime);
+        assert!(
+            !orch.settings_current(&runtime_only, &seen),
+            "the manager no longer needs the network"
+        );
+
+        assert!(
+            orch.env_mentions("shop", &[LOGIN.to_string()])
+                .await
+                .unwrap()
+        );
+        assert!(
+            !orch
+                .env_mentions("shop", &["t0000000000_app_app_b".to_string()])
+                .await
+                .unwrap()
+        );
+        assert!(!orch.env_mentions("shop", &[String::new()]).await.unwrap());
+        orch.stop_stack("shop", Slot::Blue).await.unwrap();
+        assert!(
+            !orch
+                .env_mentions("shop", &[LOGIN.to_string()])
+                .await
+                .unwrap(),
+            "a stopped stack no longer uses the login"
+        );
+    }
+
+    #[tokio::test]
+    async fn forwards_and_auto_allowed_hosts_are_part_of_the_pending_settings_check() {
+        let (orch, fake) = start_fake().await;
+        let s = external_site();
+        let opts = StackOpts {
+            data: Some(data_bindings(&s, "unused")),
+            ..StackOpts::default()
+        };
+        orch.ensure_stack_with(&s, Slot::Blue, None, TOKEN, &opts)
+            .await
+            .unwrap();
+        let proxy_env = container_env(&fake, "cite-shop-blue-egress-proxy");
+        assert!(proxy_env.contains("CITE_EGRESS_FORWARDS=15432=db.example.net:5432"));
+        let seen = orch.inspect_slot("shop", Slot::Blue).await.unwrap();
+        assert!(orch.settings_current(&s, &seen));
+        let mut without = s.clone();
+        without.data = Default::default();
+        assert!(
+            !orch.settings_current(&without, &seen),
+            "removing the attachment changes the proxy env"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_shared_instance_is_prepared_before_its_container_exists() {
+        let (orch, fake) = start_fake().await;
+        let subnet = orch.prepare_shared_instance().await.unwrap();
+        assert!(subnet.starts_with("172.30."), "{subnet}");
+        orch.prepare_shared_instance()
+            .await
+            .expect("preparing twice is fine");
+        let f = fake.lock().unwrap();
+        assert!(f.containers.is_empty());
+        assert!(f.networks["cite-pg-shared-admin"].internal);
+        assert_eq!(
+            f.networks["cite-pg-shared-admin"].labels,
+            json!({ "cite.managed": "true", "cite.role": "pg-shared-admin" })
+        );
+        assert_eq!(
+            f.volumes["cite-pg-shared-conf"],
+            json!({ "cite.managed": "true", "cite.volume": "pg-shared-conf" })
+        );
+        assert!(f.volumes.contains_key("cite-pg-shared-data"));
+    }
+
+    #[test]
+    fn the_backup_volume_defaults_and_follows_the_config() {
+        let orch = Orchestrator::new("tcp://127.0.0.1:1", "cite_edge", "0.2.0", "r.io/o").unwrap();
+        assert_eq!(orch.backup_volume(), "cite-backups");
+        let orch = orch.with_backup_volume("node-backups");
+        assert_eq!(orch.backup_volume(), "node-backups");
     }
 }

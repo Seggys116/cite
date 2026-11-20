@@ -12,6 +12,7 @@ pub enum SiteTab {
     Build,
     Environment,
     Volumes,
+    Data,
     Logs,
     Domains,
     Access,
@@ -19,11 +20,12 @@ pub enum SiteTab {
 }
 
 impl SiteTab {
-    pub const ALL: [SiteTab; 8] = [
+    pub const ALL: [SiteTab; 9] = [
         SiteTab::Overview,
         SiteTab::Build,
         SiteTab::Environment,
         SiteTab::Volumes,
+        SiteTab::Data,
         SiteTab::Logs,
         SiteTab::Domains,
         SiteTab::Access,
@@ -38,6 +40,7 @@ impl SiteTab {
             SiteTab::Build => "Health check",
             SiteTab::Environment => "Environment",
             SiteTab::Volumes => "Volumes",
+            SiteTab::Data => "Data",
             SiteTab::Logs => "Logs",
             SiteTab::Domains => "Domains and routing",
             SiteTab::Access => "Access",
@@ -51,6 +54,7 @@ impl SiteTab {
             SiteTab::Build => "build",
             SiteTab::Environment => "env",
             SiteTab::Volumes => "volumes",
+            SiteTab::Data => "data",
             SiteTab::Logs => "logs",
             SiteTab::Domains => "domains",
             SiteTab::Access => "access",
@@ -73,6 +77,8 @@ pub struct TabOffer {
     pub logs: bool,
     // The site runs as a server and the node offers volumes.
     pub volumes: bool,
+    // The site runs as a server and the node offers a data service (Postgres, external Postgres or S3).
+    pub data: bool,
 }
 
 pub fn visible_tabs(offer: TabOffer) -> Vec<SiteTab> {
@@ -81,6 +87,7 @@ pub fn visible_tabs(offer: TabOffer) -> Vec<SiteTab> {
         .filter(|t| match t {
             SiteTab::Environment => offer.source && offer.env,
             SiteTab::Volumes => offer.source && offer.volumes,
+            SiteTab::Data => offer.source && offer.data,
             SiteTab::Logs => offer.source && offer.logs,
             _ => true,
         })
@@ -152,6 +159,7 @@ mod tests {
             env: true,
             logs: true,
             volumes: true,
+            data: true,
         });
         assert_eq!(all, SiteTab::ALL.to_vec());
         let plain = visible_tabs(TabOffer {
@@ -159,15 +167,17 @@ mod tests {
             env: true,
             logs: true,
             volumes: true,
+            data: true,
         });
         assert!(!plain.contains(&SiteTab::Environment) && !plain.contains(&SiteTab::Logs));
-        assert!(!plain.contains(&SiteTab::Volumes));
+        assert!(!plain.contains(&SiteTab::Volumes) && !plain.contains(&SiteTab::Data));
         assert!(plain.contains(&SiteTab::Build) && plain.contains(&SiteTab::Danger));
         let old = visible_tabs(TabOffer {
             source: true,
             env: false,
             logs: false,
             volumes: false,
+            data: false,
         });
         assert_eq!(old.len(), 5);
         let order = visible_tabs(TabOffer {
@@ -175,14 +185,39 @@ mod tests {
             env: true,
             logs: true,
             volumes: true,
+            data: true,
         });
         let at = |t| order.iter().position(|x| *x == t).unwrap();
         assert!(
             at(SiteTab::Environment) < at(SiteTab::Volumes)
-                && at(SiteTab::Volumes) < at(SiteTab::Logs)
+                && at(SiteTab::Volumes) < at(SiteTab::Data)
+                && at(SiteTab::Data) < at(SiteTab::Logs)
         );
         assert_eq!(SiteTab::Build.label(false), "Health check");
         assert_eq!(SiteTab::Build.label(true), "Build");
+    }
+
+    #[test]
+    fn the_data_tab_appears_only_with_the_data_capabilities_on_a_built_site() {
+        let offer = |source, data| TabOffer {
+            source,
+            env: true,
+            logs: true,
+            volumes: true,
+            data,
+        };
+        assert!(visible_tabs(offer(true, true)).contains(&SiteTab::Data));
+        // The node offers no data service, or the site is not built from a repository.
+        assert!(!visible_tabs(offer(true, false)).contains(&SiteTab::Data));
+        assert!(!visible_tabs(offer(false, true)).contains(&SiteTab::Data));
+        // The offer is derived from the node's capabilities.
+        let caps = |list: &[&str]| list.iter().map(|c| c.to_string()).collect::<Vec<_>>();
+        assert!(!crate::ui::dataview::data_tab_offered(&caps(&["volumes"])));
+        assert!(crate::ui::dataview::data_tab_offered(&caps(&["data-s3"])));
+        assert_eq!(SiteTab::Data.label(true), "Data");
+        assert_eq!(SiteTab::Data.key(), "data");
+        assert!(!SiteTab::Data.has_form());
+        assert_eq!(SiteTab::ALL.len(), 9);
     }
 
     #[test]

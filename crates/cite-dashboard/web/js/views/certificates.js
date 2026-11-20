@@ -1,13 +1,13 @@
 import { h } from '../dom.js';
 import { nodeApi } from '../api.js';
 import {
-  button, card, confirmDialog, dataTable, field, kvList, loadInto, openModal, pill, skeletonBlock, toast, withBusy, formatError, fmtInt,
+  button, card, confirmDialog, dataTable, field, kvList, loadInto, openModal, pill, skeletonBlock, toast, withBusy, formatError,
 } from '../ui.js';
 import { isUnsupported } from '../archivelib.js';
 import { certToolsCard } from './certTools.js';
 import {
-  HTTPS_OFF_NOTE, MANUAL_BADGE, MAX_PEM_BYTES, NAME_RULE, SUPPORT_NOTE, isManualCert, expiryState, hostList, parsePort, parseRanges, rangesSaveNote, rangesToText,
-  shortFingerprint, uncoveredNote, uploadProblem,
+  MANUAL_BADGE, MAX_PEM_BYTES, NAME_RULE, SUPPORT_NOTE, isManualCert, expiryState, hostList, parsePort, parseRanges, rangesSaveNote, rangesToText,
+  shortFingerprint, uploadProblem,
 } from '../certlib.js';
 
 const MAX_SAN_CHIPS = 4;
@@ -100,7 +100,7 @@ export function openCertificateDialog({ node, existing, onDone }) {
       });
       wipe();
       modal.close();
-      toast(replacing ? 'Certificate replaced' : 'Certificate uploaded', 'success');
+      toast(replacing ? `Certificate replaced on ${node}` : `Certificate uploaded to ${node}`, 'success');
       const warning = saved && typeof saved.warning === 'string' ? saved.warning : '';
       if (warning) toast(warning, 'info', 10000);
       if (onDone) onDone({ name: (saved && saved.name) || name, warning });
@@ -112,18 +112,21 @@ export function openCertificateDialog({ node, existing, onDone }) {
     }
   });
 
+  nameIn.title = NAME_RULE;
+  certIn.title = 'The certificate first, then any intermediate certificates.';
+  keyIn.title = 'Unencrypted PEM. It is cleared from this form when the dialog closes.';
   const content = h('div', { class: 'form' },
-    h('p', { class: 'muted' }, 'Paste the PEM text or choose the files. The private key is sent to the node over the dashboard connection and is never shown again.'),
-    field('Name', nameIn, replacing ? 'Change the name or leave it as it is. ' + NAME_RULE : NAME_RULE),
+    h('p', { class: 'muted' }, `The private key is sent to ${node} and never shown again.`),
+    field('Name', nameIn),
     h('div', { class: 'field' },
       h('div', { class: 'section-row' }, h('span', { class: 'field-label' }, 'Certificate chain'), fileButton('Choose certificate file', certIn, fail)),
-      certIn, h('span', { class: 'hint' }, 'The certificate first, then any intermediate certificates.')),
+      certIn),
     h('div', { class: 'field' },
       h('div', { class: 'section-row' }, h('span', { class: 'field-label' }, 'Private key'), fileButton('Choose key file', keyIn, fail)),
-      keyIn, h('span', { class: 'hint' }, 'Unencrypted PEM. It is cleared from this form when the dialog closes.')),
+      keyIn),
     errorBox, status);
   const modal = openModal({
-    title: replacing ? `Replace ${existing.name}` : 'Upload a certificate',
+    title: replacing ? `Replace ${existing.name} on ${node}` : `Upload a certificate to ${node}`,
     content,
     actions: [cancel, submit],
     wide: true,
@@ -133,7 +136,7 @@ export function openCertificateDialog({ node, existing, onDone }) {
 }
 
 // The HTTPS listener is off until a port is set, so this offers to set it with the same whole-settings write the other panels use
-function httpsPortControl(n, again) {
+function httpsPortControl(n, node, again) {
   const input = h('input', { class: 'input mono', type: 'number', min: '1', max: '65535', inputmode: 'numeric', value: '443', 'aria-label': 'HTTPS port' });
   const save = button('Save port', { kind: 'primary', iconName: 'check' });
   const errorBox = h('div', { class: 'form-error', role: 'alert', hidden: true });
@@ -150,7 +153,7 @@ function httpsPortControl(n, again) {
         const current = await n.get('/settings');
         await n.put('/settings', { ...current, https_port: parsed.value });
       });
-      toast('HTTPS port saved', 'success');
+      toast(`HTTPS port saved on ${node}`, 'success');
       again();
     } catch (ex) {
       errorBox.textContent = formatError(ex);
@@ -158,7 +161,7 @@ function httpsPortControl(n, again) {
     }
   });
   return h('div', { class: 'stack-sm' },
-    h('p', { class: 'notice warn', role: 'note' }, HTTPS_OFF_NOTE),
+    h('p', { class: 'notice warn', role: 'note' }, 'HTTPS is off on this node. Set a port to serve certificates.'),
     h('div', { class: 'inline-form' }, input, save),
     errorBox);
 }
@@ -185,21 +188,22 @@ export function certificatesPanel(node) {
   };
 
   const done = (verb) => (info) => {
-    status.textContent = `${verb} ${info.name}.${info.warning ? ' Node warning: ' + info.warning : ''}`;
+    status.textContent = `${verb} ${info.name} on ${node}.${info.warning ? ' Node warning: ' + info.warning : ''}`;
     run();
   };
 
   const remove = async (cert, again) => {
     const ok = await confirmDialog({
-      title: 'Delete certificate',
-      message: `Delete ${cert.name} from ${node}? Hosts that only this certificate covers stop being served over HTTPS until another one covers them. This cannot be undone.`,
+      title: `Delete certificate from ${node}`,
+      message: `Delete ${cert.name} from ${node}? Hosts only it covers lose HTTPS. This cannot be undone.`,
       confirmLabel: 'Delete',
       danger: true,
     });
     if (!ok) return;
     try {
       await n.del('/certificates/' + encodeURIComponent(cert.id));
-      status.textContent = `Deleted ${cert.name}.`;
+      status.textContent = `Deleted ${cert.name} from ${node}.`;
+      toast(`Certificate deleted from ${node}`, 'success');
       again();
     } catch (ex) {
       toast(formatError(ex), 'error');
@@ -217,11 +221,11 @@ export function certificatesPanel(node) {
   run = loadInto(host, load, (list, again) => {
     if (list === null) return h('p', { class: 'notice', role: 'note' }, SUPPORT_NOTE);
     const items = list.items || [];
-    const missing = uncoveredNote(list.uncovered_hosts);
+    const uncovered = (list.uncovered_hosts || []).filter(Boolean);
     const parts = [];
-    if (missing) parts.push(h('p', { class: 'notice warn', role: 'note' }, missing));
-    if (list.dir_ready === false) parts.push(h('p', { class: 'notice warn', role: 'note' }, 'The certificate directory on this node is not ready, so uploaded certificates cannot be served yet.'));
-    if (list.https_port === null || list.https_port === undefined) parts.push(httpsPortControl(n, again));
+    if (uncovered.length) parts.push(h('p', { class: 'notice warn', role: 'note' }, `No certificate for ${uncovered.join(', ')}.`));
+    if (list.dir_ready === false) parts.push(h('p', { class: 'notice warn', role: 'note' }, 'The certificate directory on this node is not ready.'));
+    if (list.https_port === null || list.https_port === undefined) parts.push(httpsPortControl(n, node, again));
     else parts.push(kvList([['HTTPS port', h('span', { class: 'mono' }, String(list.https_port))]]));
     parts.push(items.length ? dataTable({
       columns: [
@@ -239,8 +243,7 @@ export function certificatesPanel(node) {
         { label: 'Actions', render: (c) => rowActions(c, again) },
       ],
       rows: items,
-    }) : h('p', { class: 'muted' }, 'No certificates yet. Upload one to serve HTTPS for your site hosts from this node.'));
-    if (items.length) parts.push(h('p', { class: 'muted' }, `${fmtInt(items.length)} ${items.length === 1 ? 'certificate' : 'certificates'} on this node.`));
+    }) : h('p', { class: 'muted' }, 'No certificates yet.'));
     return h('div', { class: 'stack-sm' }, parts);
   }, { skeleton: () => skeletonBlock(80) });
 
@@ -248,7 +251,6 @@ export function certificatesPanel(node) {
   return h('div', { class: 'stack' },
     card({
       title: 'Certificates',
-      subtitle: 'TLS certificates the node serves for HTTPS. Sites where Cloudflare handles HTTPS do not need one.',
       actions: [uploadBtn],
       body: h('div', { class: 'stack-sm' }, host, status),
     }),
@@ -268,7 +270,7 @@ export function cloudflarePanel(node) {
       throw ex;
     }
   }, (data, again) => {
-    if (data === null) return h('p', { class: 'notice', role: 'note' }, 'This node needs a connector update before it can report or change its Cloudflare ranges.');
+    if (data === null) return h('p', { class: 'notice', role: 'note' }, 'This node needs a connector update to manage Cloudflare ranges.');
     const { info, settings } = data;
     const custom = info.source === 'custom';
     const area = h('textarea', {
@@ -293,7 +295,7 @@ export function cloudflarePanel(node) {
           const current = await n.get('/settings');
           await n.put('/settings', { ...current, cloudflare_ranges: ranges });
         });
-        toast(message, 'success');
+        toast(`${message} on ${node}`, 'success');
         again();
       } catch (ex) {
         errorBox.textContent = formatError(ex);
@@ -317,7 +319,6 @@ export function cloudflarePanel(node) {
     return h('div', { class: 'stack' },
       card({
         title: 'Active ranges',
-        subtitle: 'Sites set to Only allow traffic through the Cloudflare proxy accept requests from these addresses and no others.',
         body: h('div', { class: 'stack-sm' },
           kvList([
             ['Source', pill(custom ? 'Custom list' : 'Built-in list', 'muted')],
@@ -328,9 +329,8 @@ export function cloudflarePanel(node) {
       }),
       card({
         title: 'Override the list',
-        subtitle: 'Use this only if Cloudflare publishes new ranges before the node is updated.',
         body: h('div', { class: 'form' },
-          field('Custom ranges', area, 'One CIDR range per line, IPv4 or IPv6. A wrong list locks real visitors out of sites that only accept Cloudflare traffic.'),
+          field('Custom ranges', area, 'One range per line. A wrong list locks visitors out of Cloudflare-only sites.'),
           result, errorBox,
           h('div', { class: 'form-actions' }, reset, save)),
       }));

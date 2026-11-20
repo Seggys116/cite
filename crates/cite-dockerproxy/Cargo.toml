@@ -28,6 +28,7 @@ http.workspace = true
 http-body.workspace = true
 http-body-util.workspace = true
 bytes.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 cite-connector = { path = "../cite-connector" }

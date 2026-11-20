@@ -720,15 +720,26 @@ fn every_copy_of_the_environment_limits_says_128_keys_and_24_kib() {
 }
 
 #[test]
-fn capabilities_are_the_sixteen_known_names() {
-    assert_eq!(CAPABILITIES.len(), 16);
+fn capabilities_are_the_known_names() {
+    assert_eq!(CAPABILITIES.len(), 23);
+    for name in [
+        "data-postgres",
+        "data-shared",
+        "data-external",
+        "data-s3",
+        "data-backups",
+        "data-links",
+        "data-transfer",
+    ] {
+        assert!(CAPABILITIES.contains(&name), "{name}");
+    }
     assert!(CAPABILITIES.contains(&"site-status") && CAPABILITIES.contains(&"forges"));
     assert!(CAPABILITIES.contains(&"analytics-filters") && CAPABILITIES.contains(&"doppler"));
     assert!(CAPABILITIES.contains(&"volumes") && CAPABILITIES.contains(&"outbound"));
     let mut sorted = CAPABILITIES.to_vec();
     sorted.sort_unstable();
     sorted.dedup();
-    assert_eq!(sorted.len(), 16);
+    assert_eq!(sorted.len(), 23);
 }
 
 fn binding(project: &str, config: &str, build: bool, runtime: bool) -> DopplerBinding {

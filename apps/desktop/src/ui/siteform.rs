@@ -11,7 +11,7 @@ use crate::siteops::{auto_placeholder, detected_value};
 use crate::theme::{Tone, c};
 use crate::ui::input::TextInput;
 use crate::ui::paths::{PathRow, clear_rows, path_editor, read_paths, rows_from};
-use crate::ui::widgets::{BtnKind, btn, field, id, mono, notice, seg_item, seg_row, text_dim};
+use crate::ui::widgets::{BtnKind, btn, field, id, mono, notice, seg_item, seg_row, text_dim, tip};
 use crate::wizard::FieldProblems;
 use cite_edge::status::SiteStatus;
 
@@ -340,7 +340,7 @@ pub fn basics(
     let id_field: AnyElement = if editing {
         field(
             "Id",
-            Some("The id is used in URLs and cannot change."),
+            Some("Used in URLs; cannot change."),
             mono(f.id.read(cx).text().to_string()),
         )
         .into_any_element()
@@ -361,7 +361,7 @@ pub fn basics(
         .gap(px(12.))
         .child(field(
             "Kind",
-            Some("APIs usually route by path prefix; sites by host name."),
+            Some("APIs usually route by path; sites by host name."),
             div().flex().child(kind),
         ))
         .child(
@@ -395,7 +395,7 @@ pub fn domains(
         .gap(px(12.))
         .child(with_problem(
             "Hosts",
-            Some("Requests with these Host headers go to this site. Separate with commas."),
+            Some("Separate with commas."),
             &f.hosts,
             problems.hosts.as_ref(),
             editing,
@@ -415,7 +415,7 @@ pub fn source_fields(
     let repo_text = f.repo.read(cx).text().to_string();
     let mut repo = div().flex().flex_col().gap(px(6.)).child(field(
         "Repository",
-        Some("owner/name, or paste the repository's address (https, ssh, with or without .git)."),
+        Some("owner/name, or the repository's address."),
         f.repo.clone(),
     ));
     if !repo_text.trim().is_empty() {
@@ -469,7 +469,7 @@ pub fn source_fields(
         .child(repo)
         .child(with_problem(
             "Branch",
-            Some("The branch the node builds and watches."),
+            Some("The branch the node builds."),
             &f.branch,
             problems.branch.as_ref(),
             false,
@@ -506,7 +506,11 @@ pub fn source_fields(
         false,
         cx,
     ))
-    .child(text_dim(BUILD_DETECTION_NOTE).text_size(px(12.)))
+    .child(tip(
+        text_dim("Build commands are detected by the node.").text_size(px(12.)),
+        id(home.key, "detection-tip"),
+        BUILD_DETECTION_NOTE,
+    ))
 }
 
 // Targets for a site that serves servers the owner already runs; only the create page shows these.
@@ -537,7 +541,7 @@ pub fn health_fields(f: &SiteFields, problems: &FieldProblems) -> Div {
     };
     let mut col = div().flex().flex_col().gap(px(12.)).child(field(
         "Health check path",
-        Some("Probed on every target to decide readiness. Must start with /."),
+        Some("Must start with /."),
         f.health.clone(),
     ));
     col = col.child(

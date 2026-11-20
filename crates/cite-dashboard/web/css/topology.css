@@ -1,0 +1,47 @@
+/* topology styles: uses the tokens defined in app.css only */
+
+.topo-chart { display: flex; flex-direction: column; gap: 12px; }
+
+/* Narrow screens scroll the chart sideways instead of squeezing it */
+.topo-scroll {
+  overflow-x: auto; padding: 8px; background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--r-card); box-shadow: var(--shadow-1);
+}
+.topo-svg { display: block; width: 100%; min-width: 560px; height: auto; }
+
+.topo-rect { fill: var(--surface-2); stroke: var(--border); stroke-width: 1; }
+.topo-node .topo-rect { stroke-width: 1.5; }
+.topo-box:hover .topo-rect { stroke: var(--text-faint); }
+.topo-box:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.topo-box:focus-visible .topo-rect { stroke: var(--accent); stroke-width: 2; }
+.topo-box.picked .topo-rect { stroke: var(--accent); stroke-width: 2; }
+.topo-node.offline .topo-rect { stroke: var(--bad); stroke-dasharray: 4 3; }
+
+.topo-host, .topo-name { fill: var(--text); font-size: 12px; font-weight: 600; }
+.topo-host, .topo-mono { font-family: var(--mono); }
+.topo-name { font-size: 13px; }
+.topo-sub { fill: var(--text-dim); font-size: 11px; }
+
+.topo-dot.ok { fill: var(--ok); }
+.topo-dot.bad { fill: var(--bad); }
+
+.topo-pill { fill: var(--surface); stroke: var(--text-faint); stroke-width: 1; }
+.topo-pill.ok { stroke: var(--ok); }
+.topo-pill.warn { stroke: var(--warn); }
+.topo-pill.bad { stroke: var(--bad); }
+.topo-pill-text { fill: var(--text); font-size: 10.5px; font-weight: 600; }
+
+.topo-link { fill: none; stroke: var(--text-faint); }
+.topo-link.busiest { stroke: var(--accent); }
+.topo-arrow.faint { fill: var(--text-faint); }
+.topo-arrow.accent { fill: var(--accent); }
+
+/* Picking a node dims everything that is not routed through it */
+.topo-link.dim, .topo-box.dim { opacity: 0.3; }
+
+.topo-legend { display: flex; flex-wrap: wrap; gap: 8px 20px; margin: 0; font-size: 12px; color: var(--text-dim); }
+.topo-legend-item { display: inline-flex; align-items: center; gap: 8px; }
+.topo-swatch { display: inline-block; width: 28px; height: 0; border-top: 3px solid var(--text-faint); }
+.topo-swatch.busiest { border-top: 4px solid var(--accent); }
+.topo-swatch.wide { border-top-width: 5px; }
+.topo-swatch.standby { border-top: 2px dashed var(--text-faint); }

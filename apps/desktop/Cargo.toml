@@ -1,9 +1,9 @@
 [package]
 name = "cite-desktop"
-version = "0.4.1"
+version = "0.5.0"
 edition = "2024"
 license = "MIT"
-rust-version = "1.88"
+rust-version = "1.100"
 description = "Desktop console for Cite nodes"
 
 [workspace]
@@ -12,7 +12,7 @@ description = "Desktop console for Cite nodes"
 gpui = "0.2"
 cite-client = { path = "../../crates/cite-client" }
 cite-edge = { path = "../../crates/cite-edge" }
-keyring = { version = "3", features = ["apple-native", "linux-native-sync-persistent", "windows-native"] }
+keyring = "4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 regex = "1"

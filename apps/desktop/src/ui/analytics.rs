@@ -24,6 +24,7 @@ use crate::theme::{BLUE, DIM, GREEN, MONO, RED, Tone, YELLOW, c, tint};
 use crate::ui::bots::{ExportRun, bot_badge, request_detail};
 use crate::ui::chart::{FIELD_MIN, Line, STAT_MIN, clip_tip, hbar, line_chart, wide, x_axis};
 use crate::ui::input::TextInput;
+use crate::ui::nodescope::{choose_node_notice, failed_on, resolve, unresolved_text};
 use crate::ui::scroll::scroll_area;
 use crate::ui::widgets::{
     BtnKind, Col, btn, btn_off, card, empty_state, field, grid, grid_min, id, mono, notice,
@@ -31,6 +32,20 @@ use crate::ui::widgets::{
 };
 const AUTO_TICKS: u64 = 20;
 const LOG_ROWS_KEPT: usize = 500;
+
+// The request row a Details click meant. The painted index is tried first; the list may have been
+// replaced since, so a row with a different node or time is looked up by those instead.
+fn find_row<'a>(
+    rows: &'a [(String, LogEvent)],
+    hint: usize,
+    node: &str,
+    ts_ms: i64,
+) -> Option<&'a (String, LogEvent)> {
+    let matches = |row: &&(String, LogEvent)| row.0 == node && row.1.ts_ms == ts_ms;
+    rows.get(hint)
+        .filter(matches)
+        .or_else(|| rows.iter().find(matches))
+}
 
 // Keeps the request list bounded: a page that pushes it past the cap replaces the newest rows; returns how many went.
 fn trim_log(rows: &mut Vec<(String, LogEvent)>) -> usize {
@@ -456,16 +471,12 @@ impl Console {
         if matches!(self.analytics.export, ExportRun::Running { .. }) {
             return;
         }
-        let Some(handle) = self
-            .analytics
-            .node
-            .as_deref()
-            .and_then(|n| self.handle_named(n))
-            .or_else(|| self.active_handle())
-        else {
-            self.analytics.export = ExportRun::Failed("No node is connected.".into());
+        let Some(handle) = self.export_node().and_then(|n| self.handle_named(&n)) else {
+            self.analytics.export =
+                ExportRun::Failed(unresolved_text(self.export_node().as_deref()));
             return;
         };
+        let node = handle.name().to_string();
         let now = now_ms();
         let modern = self
             .analytics
@@ -509,19 +520,29 @@ impl Console {
         self.analytics.export = ExportRun::Running {
             since_tick: self.tick,
         };
-        self.fetch(cx, run_export(handle, query, dir, name), |this, res, cx| {
-            this.analytics.export = match res {
-                Ok(report) => {
-                    this.say("Export saved", Tone::Ok);
-                    ExportRun::Done {
-                        path: report.path,
-                        bytes: report.bytes,
+        self.fetch(
+            cx,
+            run_export(handle, query, dir, name),
+            move |this, res, cx| {
+                this.analytics.export = match res {
+                    Ok(report) => {
+                        this.say(format!("Export saved from {node}"), Tone::Ok);
+                        ExportRun::Done {
+                            node,
+                            path: report.path,
+                            bytes: report.bytes,
+                        }
                     }
-                }
-                Err(e) => ExportRun::Failed(e.to_string()),
-            };
-            cx.notify();
-        });
+                    Err(e) => ExportRun::Failed(failed_on("Export", &node, &e.to_string())),
+                };
+                cx.notify();
+            },
+        );
+    }
+
+    // The node an export reads from: the one picked in the filter, else the first online node.
+    fn export_node(&self) -> Option<String> {
+        resolve(None, self.analytics.node.as_deref(), &self.node_infos())
     }
 
     fn persist_presets(&mut self) -> Result<(), String> {
@@ -629,7 +650,7 @@ impl Console {
             Load::Ready(data) => {
                 if data.partial {
                     col = col.child(notice(
-                        "Partial result: the node read only the newest part of this range. Narrow the range or the filter for exact numbers.",
+                        "Partial result: narrow the range or the filter for exact numbers.",
                         Tone::Warn,
                     ));
                 }
@@ -756,12 +777,7 @@ impl Console {
         if let Some(e) = &a.error {
             body = body.child(notice(e, Tone::Bad));
         }
-        card(
-            Some("Filter"),
-            Some("Every set field narrows the numbers below."),
-            body,
-        )
-        .into_any_element()
+        card(Some("Filter"), None, body).into_any_element()
     }
 
     fn site_chips(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -1034,7 +1050,7 @@ impl Console {
         }
         card(
             Some("Saved filters"),
-            Some("Stored on this computer as plain text without secrets. Copy one to share it."),
+            Some("Stored on this computer; copy one to share it."),
             body,
         )
         .into_any_element()
@@ -1120,11 +1136,7 @@ impl Console {
         let row_a = grid(vec![
             half(card(Some("Status classes"), None, status_bars(data))),
             half(card(Some("Methods"), None, method_bars(data))),
-            half(card(
-                Some("Latency"),
-                Some("Total time per request"),
-                latency_bars(data),
-            )),
+            half(card(Some("Latency"), None, latency_bars(data))),
         ]);
         let tops = grid(
             data.tops
@@ -1191,7 +1203,7 @@ impl Console {
                     })),
             );
         }
-        card(Some(title), Some("Click a row to filter by it"), list)
+        card(Some(title), None, list)
     }
 
     fn bots_card(&self, data: &Data, cx: &mut Context<Self>) -> AnyElement {
@@ -1242,7 +1254,7 @@ impl Console {
         card(
             Some("Bots"),
             Some(&format!(
-                "{} of {} requests came from bots ({:.1}%). Click a class to filter.",
+                "{} of {} requests came from bots ({:.1}%).",
                 fmt_int(bots.bot_requests),
                 fmt_int(bots.total_requests),
                 bots.bot_share_pct
@@ -1260,7 +1272,7 @@ impl Console {
             .iter()
             .enumerate()
             .map(|(i, (node, e))| {
-                let picked = (node.clone(), e.clone());
+                let (row_node, row_ts) = (node.clone(), e.ts_ms);
                 let mut cells = vec![
                     mono(format!("{} {}", &iso(e.ts_ms)[5..10], fmt_clock(e.ts_ms)))
                         .text_color(c(DIM))
@@ -1297,8 +1309,13 @@ impl Console {
                         .hover(|s| s.opacity(0.7))
                         .child("Details")
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            let same = this.analytics.log.inspect.as_ref() == Some(&picked);
-                            this.analytics.log.inspect = (!same).then(|| picked.clone());
+                            let log = &mut this.analytics.log;
+                            let Some(picked) = find_row(&log.rows, i, &row_node, row_ts).cloned()
+                            else {
+                                return;
+                            };
+                            let same = log.inspect.as_ref() == Some(&picked);
+                            log.inspect = (!same).then_some(picked);
                             cx.notify();
                         }))
                         .into_any_element(),
@@ -1334,7 +1351,7 @@ impl Console {
         if log.dropped > 0 {
             body = body.child(notice(
                 &format!(
-                    "Only {LOG_ROWS_KEPT} requests are kept in the list: the {} newest were dropped to make room for older pages. Apply the filter again to start from the newest.",
+                    "The list keeps {LOG_ROWS_KEPT} requests, so the {} newest were dropped; apply the filter again to start from the newest.",
                     fmt_int(log.dropped as u64)
                 ),
                 Tone::Info,
@@ -1353,7 +1370,7 @@ impl Console {
                     } else {
                         "No requests match"
                     },
-                    "Requests that match the filter are listed here, newest first.",
+                    "Matching requests appear here, newest first.",
                 )),
             ),
         )));
@@ -1376,7 +1393,7 @@ impl Console {
         };
         card(
             Some("Requests"),
-            Some("Pages of fifty, newest first"),
+            None,
             body.child(div().flex().child(footer)),
         )
         .into_any_element()
@@ -1384,6 +1401,10 @@ impl Console {
 
     fn analytics_export_card(&self, cx: &mut Context<Self>) -> AnyElement {
         let a = &self.analytics;
+        // An export never picks a node for the person: the filter's node bar decides.
+        let Some(node) = self.export_node() else {
+            return card(Some("Export"), None, choose_node_notice()).into_any_element();
+        };
         let gaps = a
             .filter
             .query(now_ms())
@@ -1431,7 +1452,7 @@ impl Console {
         if !gaps.is_empty() {
             body = body.child(notice(
                 &format!(
-                    "The export route cannot apply: {}. The file will hold more than the page shows.",
+                    "The export cannot apply {}, so the file holds more than the page shows.",
                     gaps.join(", ")
                 ),
                 Tone::Warn,
@@ -1443,20 +1464,20 @@ impl Console {
                 let secs = self.tick.saturating_sub(*since_tick) / 2;
                 body = body.child(notice(&format!("Exporting... {secs}s"), Tone::Info));
             }
-            ExportRun::Done { path, bytes } => {
+            ExportRun::Done { node, path, bytes } => {
                 body = body.child(notice(
-                    &format!("Saved {} ({})", path.display(), fmt_bytes(*bytes)),
+                    &format!(
+                        "Saved {} from {node} ({})",
+                        path.display(),
+                        fmt_bytes(*bytes)
+                    ),
                     Tone::Ok,
                 ));
             }
             ExportRun::Failed(msg) => body = body.child(notice(msg, Tone::Bad)),
         }
-        card(
-            Some("Export"),
-            Some("Saved to your Downloads folder from the selected node, or the first one when all nodes are shown."),
-            body,
-        )
-        .into_any_element()
+        let subtitle = format!("Saves from {node}.");
+        card(Some("Export"), Some(subtitle.as_str()), body).into_any_element()
     }
 }
 
@@ -1540,6 +1561,34 @@ mod tests {
                 ("edge".to_string(), event)
             })
             .collect()
+    }
+
+    #[test]
+    fn a_details_click_finds_its_row_even_after_the_list_shifted() {
+        let list = rows(5);
+        let (node, ts) = (list[3].0.clone(), list[3].1.ts_ms);
+        assert_eq!(find_row(&list, 3, &node, ts).map(|r| r.1.ts_ms), Some(ts));
+        // The painted index now holds another request: the row is found by node and time.
+        assert_eq!(find_row(&list, 0, &node, ts).map(|r| r.1.ts_ms), Some(ts));
+        assert_eq!(find_row(&list, 9, &node, ts).map(|r| r.1.ts_ms), Some(ts));
+        assert!(find_row(&list, 3, "other", ts).is_none());
+        assert!(find_row(&list, 3, &node, 999).is_none());
+    }
+
+    #[test]
+    fn an_export_under_all_nodes_waits_for_a_chosen_node() {
+        let nodes: Vec<crate::targets::NodeInfo> = ["edge-fra", "edge-nyc"]
+            .iter()
+            .map(|n| crate::targets::NodeInfo {
+                name: n.to_string(),
+                online: true,
+            })
+            .collect();
+        assert_eq!(resolve(None, None, &nodes), None);
+        assert_eq!(
+            resolve(None, Some("edge-nyc"), &nodes).as_deref(),
+            Some("edge-nyc")
+        );
     }
 
     #[test]

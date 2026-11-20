@@ -3,7 +3,7 @@
 
 services:
   dockerproxy:
-    image: ghcr.io/seggys116/cite-dockerproxy:${CITE_VERSION:-0.4.1}
+    image: ghcr.io/seggys116/cite-dockerproxy:${CITE_VERSION:-0.5.0}
     restart: unless-stopped
     init: true
     user: "10001:10001"
@@ -21,6 +21,9 @@ services:
       CITE_PROXY_HAPROXY_CONTAINER: cite-node-haproxy
       CITE_PROXY_EDGE_NETWORK: cite_edge
       CITE_PROXY_GITHUB_API_URL: ${CITE_GITHUB_API_URL:-}
+      # Site databases: backup jobs mount a subpath of this volume by name (compose creates it; the proxy never does).
+      CITE_PROXY_BACKUP_VOLUME: cite-backups
+      CITE_PROXY_DATA: ${CITE_DATA:-true}
       CITE_STACK_FORGE: ${CITE_STACK_FORGE:-}
       CITE_STACK_FORGE_API_URL: ${CITE_STACK_FORGE_API_URL:-}
       CITE_STACK_MAX_MEM: ${CITE_STACK_MAX_MEM:-16g}
@@ -81,6 +84,16 @@ services:
       CITE_DOPPLER_TOKEN: ${CITE_DOPPLER_TOKEN:-}
       CITE_DOPPLER_TOKEN_FILE: ${CITE_DOPPLER_TOKEN_FILE:-}
       CITE_DOPPLER_POLL_SECS: ${CITE_DOPPLER_POLL_SECS:-300}
+      # Site data services: dumps are staged and kept on the cite-backups volume, which the connector mounts at /backups.
+      CITE_DATA_BACKUP_DIR: /backups
+      CITE_DATA_BACKUP_VOLUME: cite-backups
+      CITE_DATA_S3_ALLOW_PRIVATE: ${CITE_DATA_S3_ALLOW_PRIVATE:-false}
+      CITE_DATA_JOB_TIMEOUT: ${CITE_DATA_JOB_TIMEOUT:-21600}
+      CITE_SECRETS_KEY_FILE: ${CITE_SECRETS_KEY_FILE:-}
+    volumes:
+      - type: volume
+        source: cite_backups
+        target: /backups
     networks:
       - docker_api
 
@@ -88,3 +101,7 @@ networks:
   docker_api:
     driver: bridge
     internal: true
+
+volumes:
+  cite_backups:
+    name: cite-backups

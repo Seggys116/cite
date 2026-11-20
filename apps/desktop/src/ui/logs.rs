@@ -8,7 +8,7 @@ use crate::theme::{BORDER, CARD_RADIUS, DIM, INPUT, Tone, c};
 use crate::ui::detail::Data;
 use crate::ui::input::TextInput;
 use crate::ui::scroll::scroll_area_with;
-use crate::ui::widgets::{BtnKind, btn, id, mono, seg_item, seg_row, text_dim, toggle};
+use crate::ui::widgets::{BtnKind, btn, id, mono, seg_item, seg_row, text_dim, tip, toggle};
 
 // Most rows the viewer paints at once; the buffer behind it keeps more.
 const SHOWN_LOG_ROWS: usize = 400;
@@ -61,10 +61,10 @@ impl LogView {
 
 fn level_tag(level: LogLevel) -> &'static str {
     match level {
-        LogLevel::Error => "ERR",
-        LogLevel::Warn => "WRN",
-        LogLevel::Info => "INF",
-        LogLevel::Debug => "DBG",
+        LogLevel::Error => "Error",
+        LogLevel::Warn => "Warn",
+        LogLevel::Info => "Info",
+        LogLevel::Debug => "Debug",
         LogLevel::Other => "",
     }
 }
@@ -223,7 +223,7 @@ impl Console {
                     .child(
                         mono(level_tag(row.level))
                             .text_color(color)
-                            .w(px(28.))
+                            .w(px(44.))
                             .flex_none(),
                     )
                     .child(mono(row.text.clone()).text_color(color).flex_1().min_w_0()),
@@ -272,7 +272,11 @@ impl Console {
             .flex_wrap()
             .items_center()
             .gap(px(10.))
-            .child(seg_row(sources))
+            .child(tip(
+                seg_row(sources),
+                id("logs", "source-tip"),
+                "Build is the manager that fetches and builds the repository; Runtime is the running site.\nThe last 5000 lines are kept.",
+            ))
             .child(seg_row(slots))
             .child(
                 div()
@@ -313,14 +317,7 @@ impl Console {
             .border_color(c(BORDER))
             .bg(c(INPUT))
             .child(lines);
-        col.child(viewer)
-            .child(
-                text_dim(
-                    "Build is the manager that fetches and builds the repository; Runtime is the running site. The last 5000 lines are kept.",
-                )
-                .text_size(px(11.)),
-            )
-            .into_any_element()
+        col.child(viewer).into_any_element()
     }
 }
 
@@ -333,7 +330,7 @@ mod tests {
         assert_eq!(window_start(0), 0);
         assert_eq!(window_start(SHOWN_LOG_ROWS), 0);
         assert_eq!(window_start(SHOWN_LOG_ROWS + 25), 25);
-        assert_eq!(level_tag(LogLevel::Error), "ERR");
+        assert_eq!(level_tag(LogLevel::Error), "Error");
         assert_eq!(level_tag(LogLevel::Other), "");
         assert_eq!(SOURCES[0].0, "manager");
     }

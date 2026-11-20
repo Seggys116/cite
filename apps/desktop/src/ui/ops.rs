@@ -426,9 +426,10 @@ impl Console {
             return;
         }
         let shown = git_ref.clone();
+        let node = self.detail.node.clone();
         let fut = async move { h.deploy_async(&site, Some(git_ref.as_str()), None).await };
         self.ops_action(cx, "Deploy", fut, move |_| {
-            format!("Deploy of {shown} started")
+            format!("Deploy of {shown} started on {node}")
         });
     }
 
@@ -617,7 +618,7 @@ impl Console {
         Some(
             card(
                 Some("This change needs a rebuild"),
-                Some("The settings are saved, but the running version was built without them."),
+                Some("The running version was built without the saved settings."),
                 div().flex().gap(px(8.)).child(now).child(later),
             )
             .into_any_element(),
@@ -819,14 +820,6 @@ impl Console {
         if let Some(d) = token_detail(status) {
             body = body.child(text_dim(d).text_size(px(12.)));
         }
-        body = body.child(
-            text_dim(if status.node_token_configured {
-                "The node has a GitHub token of its own."
-            } else {
-                "The node has no GitHub token of its own."
-            })
-            .text_size(px(12.)),
-        );
         let label = if status.site_token_set {
             "Change token"
         } else {
@@ -859,7 +852,7 @@ impl Console {
         body = body
             .child(field(
                 "Token for this site",
-                Some("Write-only: it is sent once and never shown again."),
+                Some("Write-only. The node never sends it back."),
                 self.ops.token.clone(),
             ))
             .child(row);
@@ -940,7 +933,7 @@ impl Console {
                     .gap(px(12.))
                     .child(div().flex().flex_col().flex_1().min_w_0().child(field(
                         "Deploy a branch, tag or commit",
-                        Some("Builds this ref into the idle slot without waiting here; watch the status above."),
+                        Some("Builds into the idle slot; watch the status above."),
                         self.ops.git_ref.clone(),
                     )))
                     .child(div().flex().flex_col().pb(px(18.)).child(go)),

@@ -75,9 +75,24 @@ pub struct ConnectorConfig {
     // The node-wide Doppler token, held the same way; sites bound to Doppler without their own token use it.
     pub doppler_token: Option<NodeToken>,
     pub doppler_poll_secs: u64,
+    // Where site data services keep dumps and staging; None means the data services have no storage and stay off.
+    pub backup_dir: Option<PathBuf>,
+    // The Docker volume that backs `backup_dir`, named so a job container can mount a subpath of it.
+    pub backup_volume: String,
+    pub s3_allow_private: bool,
+    pub data_job_timeout_secs: u64,
+    // The node key for secrets at rest and its predecessor during a rotation; see `seal`.
+    pub secrets_key: Option<KeyInput>,
+    pub secrets_key_previous: Option<KeyInput>,
 }
 
 const MAX_NODE_TOKEN_BYTES: usize = 512;
+const MAX_KEY_INPUT_BYTES: u64 = 1024;
+const DEFAULT_BACKUP_VOLUME: &str = "cite-backups";
+const MAX_VOLUME_NAME: usize = 63;
+const DEFAULT_DATA_JOB_TIMEOUT_SECS: u64 = 21_600;
+const MIN_DATA_JOB_TIMEOUT_SECS: u64 = 60;
+const MAX_DATA_JOB_TIMEOUT_SECS: u64 = 86_400;
 const DEFAULT_DOPPLER_POLL_SECS: u64 = 300;
 const MIN_DOPPLER_POLL_SECS: u64 = 60;
 const MAX_DOPPLER_POLL_SECS: u64 = 86_400;
@@ -156,6 +171,142 @@ fn node_token(env: &HashMap<String, String>, var: &str) -> Result<Option<NodeTok
     NodeToken::new(text.trim(), TokenSource::File)
         .map(Some)
         .map_err(|e| config_err(format!("{file_var}: {e}")))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyInputSource {
+    Env,
+    File(PathBuf),
+}
+
+// A node key given by the operator, already checked for shape; it is held only in zeroizing memory.
+#[derive(Clone)]
+pub struct KeyInput {
+    text: zeroize::Zeroizing<String>,
+    source: KeyInputSource,
+}
+
+impl KeyInput {
+    pub fn new(text: &str, source: KeyInputSource) -> Result<Self> {
+        let text = text.trim();
+        crate::seal::NodeKey::parse(text)?;
+        Ok(Self {
+            text: zeroize::Zeroizing::new(text.to_string()),
+            source,
+        })
+    }
+
+    pub fn expose(&self) -> &str {
+        &self.text
+    }
+
+    pub fn source(&self) -> &KeyInputSource {
+        &self.source
+    }
+}
+
+impl std::fmt::Debug for KeyInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let source = match self.source {
+            KeyInputSource::Env => "env",
+            KeyInputSource::File(_) => "file",
+        };
+        write!(f, "KeyInput(<redacted>, {source})")
+    }
+}
+
+// Same precedence as the node tokens: the variable wins over its `_FILE` form, and blank means "not given".
+fn key_input(env: &HashMap<String, String>, var: &str) -> Result<Option<KeyInput>> {
+    if let Some(raw) = get(env, var) {
+        return KeyInput::new(raw, KeyInputSource::Env)
+            .map(Some)
+            .map_err(|e| config_err(format!("{var}: {e}")));
+    }
+    let file_var = format!("{var}_FILE");
+    let Some(path) = get(env, &file_var) else {
+        return Ok(None);
+    };
+    let mut bytes = Vec::new();
+    // one byte past the limit, so an oversized file is refused rather than slurped
+    std::fs::File::open(path)
+        .and_then(|f| {
+            std::io::Read::read_to_end(&mut std::io::Read::take(f, MAX_KEY_INPUT_BYTES), &mut bytes)
+        })
+        .map_err(|e| config_err(format!("cannot read {file_var} {path}: {e}")))?;
+    let text = zeroize::Zeroizing::new(
+        String::from_utf8(bytes)
+            .map_err(|_| config_err(format!("{file_var} is not valid text")))?,
+    );
+    warn_if_group_readable(&file_var, path);
+    KeyInput::new(&text, KeyInputSource::File(PathBuf::from(path)))
+        .map(Some)
+        .map_err(|e| config_err(format!("{file_var}: {e}")))
+}
+
+// A wider mode is a warning, not a refusal: some secret mounts cannot be made 0600.
+fn warn_if_group_readable(var: &str, path: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(meta) = std::fs::metadata(path)
+        && meta.permissions().mode() & 0o077 != 0
+    {
+        tracing::warn!("{var} points at a file readable by other users; restrict it to mode 0600");
+    }
+}
+
+// The node key and its predecessor, read the same way by the config and by components that only know the data directory.
+pub fn key_inputs_from_env(
+    env: &HashMap<String, String>,
+) -> Result<(Option<KeyInput>, Option<KeyInput>)> {
+    Ok((
+        key_input(env, "CITE_SECRETS_KEY")?,
+        key_input(env, "CITE_SECRETS_KEY_PREVIOUS")?,
+    ))
+}
+
+fn parse_backup_dir(raw: &str) -> Result<PathBuf> {
+    let path = PathBuf::from(raw);
+    let ok = path.is_absolute()
+        && path.file_name().is_some()
+        && raw.len() <= MAX_DB_PATH
+        && !raw.chars().any(char::is_control)
+        && !path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir));
+    if ok {
+        Ok(path)
+    } else {
+        Err(config_err(
+            "CITE_DATA_BACKUP_DIR must be an absolute directory path, without '..' or control characters"
+                .into(),
+        ))
+    }
+}
+
+// The docker proxy applies the stricter rule that the name matches no cite container, volume or network pattern.
+fn parse_backup_volume(raw: &str) -> Result<String> {
+    let mut bytes = raw.bytes();
+    let first_ok = bytes
+        .next()
+        .is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit());
+    let rest_ok = bytes
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'.' | b'-'));
+    if first_ok && rest_ok && raw.len() <= MAX_VOLUME_NAME {
+        Ok(raw.to_string())
+    } else {
+        Err(config_err(
+            "CITE_DATA_BACKUP_VOLUME must be a volume name of a-z, 0-9, '_', '.' and '-' (63 characters at most)"
+                .into(),
+        ))
+    }
+}
+
+fn parse_data_job_timeout(raw: &str) -> Result<u64> {
+    match raw.parse::<u64>() {
+        Ok(n) if (MIN_DATA_JOB_TIMEOUT_SECS..=MAX_DATA_JOB_TIMEOUT_SECS).contains(&n) => Ok(n),
+        _ => Err(config_err(format!(
+            "CITE_DATA_JOB_TIMEOUT must be {MIN_DATA_JOB_TIMEOUT_SECS} to {MAX_DATA_JOB_TIMEOUT_SECS} seconds"
+        ))),
+    }
 }
 
 fn parse_doppler_poll(raw: &str) -> Result<u64> {
@@ -480,6 +631,19 @@ impl ConnectorConfig {
             Some(raw) => parse_doppler_poll(raw)?,
             None => DEFAULT_DOPPLER_POLL_SECS,
         };
+        let backup_dir = match get(env, "CITE_DATA_BACKUP_DIR") {
+            Some(raw) => Some(parse_backup_dir(raw)?),
+            None => None,
+        };
+        let backup_volume = match get(env, "CITE_DATA_BACKUP_VOLUME") {
+            Some(raw) => parse_backup_volume(raw)?,
+            None => DEFAULT_BACKUP_VOLUME.to_string(),
+        };
+        let data_job_timeout_secs = match get(env, "CITE_DATA_JOB_TIMEOUT") {
+            Some(raw) => parse_data_job_timeout(raw)?,
+            None => DEFAULT_DATA_JOB_TIMEOUT_SECS,
+        };
+        let (secrets_key, secrets_key_previous) = key_inputs_from_env(env)?;
         Ok(Self {
             listen,
             allow,
@@ -524,6 +688,12 @@ impl ConnectorConfig {
             github_token: node_token(env, "CITE_GITHUB_TOKEN")?,
             doppler_token: node_token(env, "CITE_DOPPLER_TOKEN")?,
             doppler_poll_secs,
+            backup_dir,
+            backup_volume,
+            s3_allow_private: bool_or(env, "CITE_DATA_S3_ALLOW_PRIVATE", false)?,
+            data_job_timeout_secs,
+            secrets_key,
+            secrets_key_previous,
             data_dir,
         })
     }
@@ -984,6 +1154,138 @@ mod tests {
             ConnectorConfig::from_env_map(&e).expect("config").node_name,
             "node"
         );
+    }
+
+    #[test]
+    fn data_service_settings_default_to_off_storage_and_a_six_hour_job_limit() {
+        let cfg = ConnectorConfig::from_env_map(&base()).expect("config");
+        assert_eq!(cfg.backup_dir, None);
+        assert_eq!(cfg.backup_volume, "cite-backups");
+        assert!(!cfg.s3_allow_private);
+        assert_eq!(cfg.data_job_timeout_secs, 21_600);
+        assert!(cfg.secrets_key.is_none() && cfg.secrets_key_previous.is_none());
+    }
+
+    #[test]
+    fn data_service_settings_are_read_and_validated() {
+        let cfg = doppler_cfg(&[
+            ("CITE_DATA_BACKUP_DIR", "/backups"),
+            ("CITE_DATA_BACKUP_VOLUME", "node-backups"),
+            ("CITE_DATA_S3_ALLOW_PRIVATE", "true"),
+            ("CITE_DATA_JOB_TIMEOUT", "3600"),
+        ])
+        .expect("config");
+        assert_eq!(cfg.backup_dir, Some(PathBuf::from("/backups")));
+        assert_eq!(cfg.backup_volume, "node-backups");
+        assert!(cfg.s3_allow_private);
+        assert_eq!(cfg.data_job_timeout_secs, 3600);
+
+        for (key, value) in [
+            ("CITE_DATA_BACKUP_DIR", "relative/dir"),
+            ("CITE_DATA_BACKUP_DIR", "/"),
+            ("CITE_DATA_BACKUP_DIR", "/backups/../etc"),
+            ("CITE_DATA_BACKUP_DIR", "/back\nups"),
+            ("CITE_DATA_BACKUP_VOLUME", "Upper"),
+            ("CITE_DATA_BACKUP_VOLUME", "-leading"),
+            ("CITE_DATA_BACKUP_VOLUME", "has space"),
+            ("CITE_DATA_BACKUP_VOLUME", "a/b"),
+            ("CITE_DATA_S3_ALLOW_PRIVATE", "maybe"),
+            ("CITE_DATA_JOB_TIMEOUT", "59"),
+            ("CITE_DATA_JOB_TIMEOUT", "86401"),
+            ("CITE_DATA_JOB_TIMEOUT", "6h"),
+        ] {
+            let err = doppler_cfg(&[(key, value)]).expect_err(value).to_string();
+            assert!(err.contains(key), "{key}={value}: {err}");
+        }
+        let long = "a".repeat(64);
+        assert!(doppler_cfg(&[("CITE_DATA_BACKUP_VOLUME", long.as_str())]).is_err());
+        assert!(doppler_cfg(&[("CITE_DATA_BACKUP_VOLUME", "cite-backups")]).is_ok());
+    }
+
+    // 32 zero bytes and 32 bytes of 0x01, in the text form of a node key.
+    fn key_a() -> String {
+        format!("cite-key-v1:{}", "A".repeat(43))
+    }
+
+    fn key_b() -> String {
+        format!("cite-key-v1:{}AQE", "AQEB".repeat(10))
+    }
+
+    #[test]
+    fn the_node_key_comes_from_the_environment_then_a_file_and_is_never_printed() {
+        let (a, b) = (key_a(), key_b());
+        let cfg = doppler_cfg(&[("CITE_SECRETS_KEY", &a)]).unwrap();
+        let key = cfg.secrets_key.as_ref().unwrap();
+        assert_eq!(key.expose(), a);
+        assert_eq!(key.source(), &KeyInputSource::Env);
+        assert!(!format!("{cfg:?}").contains("AAAAAAAAAAAAAAAA"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let current = dir.path().join("current.key");
+        let previous = dir.path().join("previous.key");
+        std::fs::write(&current, format!("{a}\n")).unwrap();
+        std::fs::write(&previous, &b).unwrap();
+        let (current_s, previous_s) = (
+            current.display().to_string(),
+            previous.display().to_string(),
+        );
+        let cfg = doppler_cfg(&[
+            ("CITE_SECRETS_KEY_FILE", &current_s),
+            ("CITE_SECRETS_KEY_PREVIOUS_FILE", &previous_s),
+        ])
+        .unwrap();
+        assert_eq!(cfg.secrets_key.as_ref().unwrap().expose(), a);
+        assert_eq!(
+            cfg.secrets_key.as_ref().unwrap().source(),
+            &KeyInputSource::File(current.clone())
+        );
+        assert_eq!(cfg.secrets_key_previous.as_ref().unwrap().expose(), b);
+
+        let both = doppler_cfg(&[
+            ("CITE_SECRETS_KEY", &b),
+            ("CITE_SECRETS_KEY_FILE", &current_s),
+        ])
+        .unwrap();
+        assert_eq!(both.secrets_key.as_ref().unwrap().expose(), b);
+        let blank =
+            doppler_cfg(&[("CITE_SECRETS_KEY", " "), ("CITE_SECRETS_KEY_FILE", "")]).unwrap();
+        assert!(blank.secrets_key.is_none());
+    }
+
+    #[test]
+    fn a_bad_node_key_is_refused_without_printing_it() {
+        let long = format!("{}A", key_a());
+        for bad in [
+            "cite-key-v1:oops",
+            "plain-text-key",
+            "cite-key-v1:",
+            long.as_str(),
+        ] {
+            let secret_part = bad.strip_prefix("cite-key-v1:").unwrap_or(bad);
+            let err = doppler_cfg(&[("CITE_SECRETS_KEY", bad)])
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("CITE_SECRETS_KEY"), "{err}");
+            assert!(
+                secret_part.is_empty() || !err.contains(secret_part),
+                "{err}"
+            );
+            let err = doppler_cfg(&[("CITE_SECRETS_KEY_PREVIOUS", bad)])
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("CITE_SECRETS_KEY_PREVIOUS"), "{err}");
+        }
+        assert!(doppler_cfg(&[("CITE_SECRETS_KEY_FILE", "/nonexistent/cite-key")]).is_err());
+        let dir = tempfile::tempdir().unwrap();
+        let big = dir.path().join("big");
+        std::fs::write(&big, "a".repeat(4096)).unwrap();
+        assert!(doppler_cfg(&[("CITE_SECRETS_KEY_FILE", &big.display().to_string())]).is_err());
+        let wrong = dir.path().join("wrong");
+        std::fs::write(&wrong, "cite-key-v1:short").unwrap();
+        let err = doppler_cfg(&[("CITE_SECRETS_KEY_FILE", &wrong.display().to_string())])
+            .unwrap_err()
+            .to_string();
+        assert!(!err.contains("short"), "{err}");
     }
 
     #[test]

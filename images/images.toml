@@ -2,11 +2,11 @@
 
 [meta]
 registry = "ghcr.io/seggys116"
-rust_image = "docker.io/library/rust:1.98-bookworm"
-rust_digest = "sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e"
-bun_version = "1.4.4"
-bun_linux_x64_sha256 = "bf8ccbfb2b0b80159e0f9a6d15c55317add8077534dbc6130a3edb52fccb395c"
-bun_linux_aarch64_sha256 = "baa6bb36f51d6e58561e02bbea825038a9df454f673d6d776e8bbf86f8c7850e"
+rust_image = "docker.io/library/rust:1.100-bookworm"
+rust_digest = "sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea"
+bun_version = "1.4.5"
+bun_linux_x64_sha256 = "94559b3b528995a49452f9f2404cec74f2efd7d06e0a000a8cd214b02c3666eb"
+bun_linux_aarch64_sha256 = "18656a3bf0ea5641f5796ae4213b75255579a70a0fded2f337933785568cdf84"
 
 [images]
 manager = "cite-manager"
@@ -16,14 +16,30 @@ executor_bun = "cite-executor-bun"
 executor_static = "cite-executor-static"
 executor_rust = "cite-executor-rust"
 egress = "cite-egress"
+postgres = "cite-postgres"
+
+# Managed Postgres: the official alpine image of each major, pinned by multi-arch index digest. The release
+# tag is {VERSION}-pg{major}. Resolve a digest with
+#   docker buildx imagetools inspect docker.io/library/postgres:<major>-alpine
+# and paste the `Digest:` line. The workflows and the connector test refuse an empty or malformed digest.
+[[postgres]]
+major = 17
+image = "docker.io/library/postgres:17-alpine"
+digest = "sha256:526f86d93c6ea08fd3f1fe5605650cacc781b2c6013169a0ad8f42c7d3d84f32"
+
+[[postgres]]
+major = 18
+default = true
+image = "docker.io/library/postgres:18-alpine"
+digest = "sha256:ff64c9e3bdf8e2120107d3559de8db314e8305f7e38c5105903c6295876738ff"
 
 [[node]]
 major = 22
 lts = true
 runtime_image = "docker.io/library/node:22-bookworm-slim"
-runtime_digest = "sha256:5ec23b7c622b00547753bc6ffd78085dd868a68aeb41c8e0a1418f033e13d96d"
+runtime_digest = "sha256:e9f565d32859f0cbfb52125eafe8be39390f24dac302dc3cdf566e8ba3ab21ee"
 executor_base = "gcr.io/distroless/nodejs22-debian13:nonroot"
-executor_digest = "sha256:8ad9cc935b7843c4024b7e1487b5ef472c354ea847b97c667023e2618552607e"
+executor_digest = "sha256:39c66687298417dbf3ff2fb8b6012c20554494e16414ef7afd07b9abbb45b501"
 manager_tag_suffix = "node22"
 executor_tag_suffix = "node22"
 
@@ -31,16 +47,16 @@ executor_tag_suffix = "node22"
 major = 24
 lts = true
 runtime_image = "docker.io/library/node:24-bookworm-slim"
-runtime_digest = "sha256:01d566e8d94d8c619591d78652babfccd3c6992a3dffa9ed5ab39e11cf6c70e9"
+runtime_digest = "sha256:dc26ae92c9fb15cf6b1d63e20f0944b2efe0f115b20e00be48fb23fceb061c54"
 executor_base = "gcr.io/distroless/nodejs24-debian13:nonroot"
-executor_digest = "sha256:b8cec4b2f2126ff7bd034ec9ac207ffb3272667dfdc48376e3b035d3270549ba"
+executor_digest = "sha256:6abfcb367ebc291572c774c1592a986be2ab26a2486f73093401327495a5962a"
 manager_tag_suffix = "node24"
 executor_tag_suffix = "node24"
 
 [bases]
 static_nonroot = "gcr.io/distroless/static:nonroot"
-static_digest = "sha256:25ac8f0c3b2334a9eb05452266bd4697864a8c8ef0ef71e5e6480d7f92868329"
+static_digest = "sha256:aafe993665bf6200db38a02c11a9351e782a84b6a45e7f33b6695638c88e3931"
 bun_distroless = "docker.io/oven/bun:1-distroless"
-bun_digest = "sha256:153a951ae40106e125898103e6e990ee0f38e6aee7f561029e26cf9fbed23470"
-cc_nonroot = "gcr.io/distroless/cc-debian12:nonroot"
-cc_digest = "sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f"
+bun_digest = "sha256:3a210956422ad81cf7532e1fc1f2eb9275d6ef4c2337a9d25d530f798e80726a"
+cc_nonroot = "gcr.io/distroless/cc-debian13:nonroot"
+cc_digest = "sha256:cb87acc574abe719b6e5c547384defa2f7b1f24af9605d3f618cf852495d8be2"

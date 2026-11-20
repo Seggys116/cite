@@ -88,6 +88,8 @@ pub struct Policy {
     mode: Mode,
     site_allow: Rules,
     site_deny: Rules,
+    /// Exact host names of the site's own attachments. They satisfy allowlist mode but never lift the private-address refusal.
+    auto_allow: Vec<HostRule>,
     block_mail: bool,
 }
 
@@ -100,9 +102,31 @@ impl Default for Policy {
             mode: Mode::Public,
             site_allow: Rules::default(),
             site_deny: Rules::default(),
+            auto_allow: Vec::new(),
             block_mail: true,
         }
     }
+}
+
+/// The most host names `CITE_EGRESS_AUTO_ALLOW` may carry (the Docker proxy enforces the same bound).
+const MAX_AUTO_ALLOW: usize = 16;
+
+// Names only, written exactly as parsed: no wildcard, no leading dot, no IP literal.
+fn auto_allow_list(key: &str, raw: &str) -> Result<Vec<HostRule>, String> {
+    let entries = items(key, raw)?;
+    if entries.len() > MAX_AUTO_ALLOW {
+        return Err(format!("{key} has more than {MAX_AUTO_ALLOW} entries"));
+    }
+    entries
+        .iter()
+        .map(|e| match crate::addr::parse_host(e) {
+            Some(Host::Name(n)) if n == *e => Ok(HostRule {
+                name: n,
+                subdomains: false,
+            }),
+            _ => Err(format!("{key} entry {e:?} is not a plain host name")),
+        })
+        .collect()
 }
 
 fn items(key: &str, raw: &str) -> Result<Vec<String>, String> {
@@ -208,7 +232,13 @@ impl Policy {
             }
         };
         let site_allow = mixed_list("CITE_EGRESS_ALLOW", &text("CITE_EGRESS_ALLOW"))?;
-        if mode == Mode::Allowlist && site_allow.cidrs.is_empty() && site_allow.hosts.is_empty() {
+        let auto_allow =
+            auto_allow_list("CITE_EGRESS_AUTO_ALLOW", &text("CITE_EGRESS_AUTO_ALLOW"))?;
+        if mode == Mode::Allowlist
+            && site_allow.cidrs.is_empty()
+            && site_allow.hosts.is_empty()
+            && auto_allow.is_empty()
+        {
             return Err(
                 "CITE_EGRESS_MODE=allowlist needs at least one CITE_EGRESS_ALLOW entry".to_string(),
             );
@@ -220,6 +250,7 @@ impl Policy {
             mode,
             site_allow,
             site_deny: mixed_list("CITE_EGRESS_DENY", &text("CITE_EGRESS_DENY"))?,
+            auto_allow,
             block_mail,
         })
     }
@@ -267,7 +298,10 @@ impl Policy {
         }
         let site_cidr = self.site_allow.cidr_hit(ip);
         let site_host = self.site_allow.host_hit(name, false);
-        if self.mode == Mode::Allowlist && !site_cidr && !site_host {
+        // Satisfies allowlist mode only; the Private arm below deliberately ignores it, so an attachment
+        // name that resolves to an internal address is still refused.
+        let auto_host = name.is_some_and(|h| self.auto_allow.iter().any(|r| r.matches(h, false)));
+        if self.mode == Mode::Allowlist && !site_cidr && !site_host && !auto_host {
             return Err(Reason::NotAllowlisted);
         }
         let cidr_allowed = site_cidr || self.node_allow.iter().any(|c| c.contains(ip));
@@ -530,5 +564,125 @@ mod tests {
             .collect::<Vec<_>>()
             .join(",");
         assert!(Policy::from_lookup(|k| (k == "CITE_EGRESS_ALLOW").then(|| many.clone())).is_err());
+    }
+
+    #[test]
+    fn an_auto_allowed_public_name_passes_allowlist_mode() {
+        let p = policy(&[
+            ("CITE_EGRESS_MODE", "allowlist"),
+            ("CITE_EGRESS_ALLOW", "api.github.com"),
+            ("CITE_EGRESS_AUTO_ALLOW", "db.example.com,s3.example.com"),
+        ]);
+        assert_eq!(
+            p.check_addr(Some("db.example.com"), ip("93.184.215.14")),
+            Ok(())
+        );
+        assert_eq!(
+            p.check_addr(Some("s3.example.com"), ip("2606:4700::1111")),
+            Ok(())
+        );
+        assert_eq!(
+            p.check_addr(Some("other.example.com"), ip("93.184.215.14")),
+            Err(Reason::NotAllowlisted)
+        );
+        assert_eq!(
+            p.check_addr(Some("x.db.example.com"), ip("93.184.215.14")),
+            Err(Reason::NotAllowlisted),
+            "auto-allow is exact, never a suffix"
+        );
+        assert_eq!(
+            p.check_addr(None, ip("93.184.215.14")),
+            Err(Reason::NotAllowlisted),
+            "an address with no name is never auto-allowed"
+        );
+        let alone = policy(&[
+            ("CITE_EGRESS_MODE", "allowlist"),
+            ("CITE_EGRESS_AUTO_ALLOW", "db.example.com"),
+        ]);
+        assert_eq!(
+            alone.check_addr(Some("db.example.com"), ip("93.184.215.14")),
+            Ok(()),
+            "auto-allow alone satisfies the allowlist requirement"
+        );
+    }
+
+    #[test]
+    fn an_auto_allowed_name_never_opens_a_private_address() {
+        for mode in ["public", "allowlist"] {
+            let p = policy(&[
+                ("CITE_EGRESS_MODE", mode),
+                ("CITE_EGRESS_AUTO_ALLOW", "db.example.com"),
+            ]);
+            for bad in [
+                "10.0.0.5",
+                "172.17.0.1",
+                "192.168.1.1",
+                "127.0.0.1",
+                "169.254.169.254",
+                "::1",
+                "fd00::1",
+            ] {
+                assert_eq!(
+                    p.check_addr(Some("db.example.com"), ip(bad)),
+                    Err(Reason::Internal),
+                    "{mode} {bad}"
+                );
+            }
+        }
+        // The same name in CITE_EGRESS_ALLOW keeps its old meaning: it may be private.
+        let allowed = policy(&[("CITE_EGRESS_ALLOW", "db.example.com")]);
+        assert_eq!(
+            allowed.check_addr(Some("db.example.com"), ip("10.0.0.5")),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn denies_still_beat_auto_allow() {
+        let p = policy(&[
+            ("CITE_EGRESS_MODE", "allowlist"),
+            ("CITE_EGRESS_AUTO_ALLOW", "db.example.com"),
+            ("CITE_EGRESS_DENY", "db.example.com"),
+            ("CITE_EGRESS_DENY_CIDRS", "203.0.112.0/24"),
+        ]);
+        assert_eq!(
+            p.check_addr(Some("db.example.com"), ip("93.184.215.14")),
+            Err(Reason::SiteDenied)
+        );
+        let node = policy(&[
+            ("CITE_EGRESS_AUTO_ALLOW", "other.example.com"),
+            ("CITE_EGRESS_DENY_CIDRS", "203.0.112.0/24"),
+        ]);
+        assert_eq!(
+            node.check_addr(Some("other.example.com"), ip("203.0.112.9")),
+            Err(Reason::NodeDenied)
+        );
+    }
+
+    #[test]
+    fn hostile_auto_allow_entries_are_refused() {
+        for bad in [
+            "*.example.com",
+            ".example.com",
+            "Example.com",
+            "10.0.0.1",
+            "[::1]",
+            "a..b",
+            "exa mple.com",
+            "example.com.",
+        ] {
+            assert!(
+                Policy::from_lookup(|k| (k == "CITE_EGRESS_AUTO_ALLOW").then(|| bad.to_string()))
+                    .is_err(),
+                "{bad}"
+            );
+        }
+        let many = (0..17)
+            .map(|i| format!("h{i}.example.com"))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(
+            Policy::from_lookup(|k| (k == "CITE_EGRESS_AUTO_ALLOW").then(|| many.clone())).is_err()
+        );
     }
 }

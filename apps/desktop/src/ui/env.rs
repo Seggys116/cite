@@ -6,7 +6,11 @@ use crate::siteops::{CAP_BUILD_ENV, CAP_RUNTIME_ENV, env_name, env_patch, has_ca
 use crate::theme::{DIVIDER, Tone, c};
 use crate::ui::detail::Data;
 use crate::ui::input::TextInput;
-use crate::ui::widgets::{BtnKind, btn, btn_off, card, id, mono, strong, text_dim};
+use crate::ui::widgets::{BtnKind, btn, btn_off, card, id, mono, pill, strong, text_dim};
+
+// Shown under the editor: a value goes to the node once and cannot be read back, so a change is a new value.
+const VALUE_HINT: &str =
+    "The node stores it and never sends it back. To change it, set a new value.";
 
 pub struct EnvRow {
     pub name: Entity<TextInput>,
@@ -17,7 +21,7 @@ impl EnvRow {
     fn new(cx: &mut Context<Console>) -> Self {
         Self {
             name: new_input(cx, "API_BASE_URL", |i| i.mono()),
-            value: new_input(cx, "Value (never shown again)", |i| i.masked().mono()),
+            value: new_input(cx, "Value", |i| i.masked().mono()),
         }
     }
 }
@@ -138,6 +142,7 @@ impl Console {
         } else {
             "Build variables"
         };
+        let node = self.detail.node.clone();
         let fut = async move { h.env_patch(&site, runtime, &patch).await };
         // The typed rows stay until the node has the values, so a failed save can be retried as typed.
         self.ops_action_then(
@@ -146,9 +151,9 @@ impl Console {
             fut,
             move |_| {
                 if count == 1 {
-                    "1 variable saved. It applies on the next redeploy.".to_string()
+                    format!("1 variable saved on {node}. It applies on the next redeploy.")
                 } else {
-                    format!("{count} variables saved. They apply on the next redeploy.")
+                    format!("{count} variables saved on {node}. They apply on the next redeploy.")
                 }
             },
             move |this, cx| this.ops.env.rows(runtime).reset(cx),
@@ -171,9 +176,10 @@ impl Console {
         } else {
             "Build variable"
         };
+        let node = self.detail.node.clone();
         let fut = async move { h.env_patch(&site, runtime, &patch).await };
         self.ops_action(cx, label, fut, move |_| {
-            format!("{name} removed. It applies on the next redeploy.")
+            format!("{name} removed on {node}. It applies on the next redeploy.")
         });
     }
 
@@ -193,6 +199,8 @@ impl Console {
             ex.build_env.as_ref()
         };
         let key = if runtime { "runtime-env" } else { "build-env" };
+        // Variables a data resource produces: shown read-only, and managed on the Data tab.
+        let linked = self.linked_env(runtime);
         let mut list = div().flex().flex_col();
         match names {
             None => {
@@ -200,7 +208,14 @@ impl Console {
                     .child(text_dim("The node did not list these variables.").text_size(px(12.)))
             }
             Some(n) if n.is_empty() => {
-                list = list.child(text_dim("No variables are set.").text_size(px(12.)))
+                list = list.child(
+                    text_dim(if linked.is_empty() {
+                        "No variables are set."
+                    } else {
+                        "No variables are set by hand."
+                    })
+                    .text_size(px(12.)),
+                )
             }
             Some(n) => {
                 for name in n {
@@ -214,7 +229,6 @@ impl Console {
                             .border_b_1()
                             .border_color(c(DIVIDER))
                             .child(div().flex().flex_col().flex_1().min_w_0().child(mono(name.clone())))
-                            .child(text_dim("value hidden").text_size(px(11.)))
                             .child(btn(id(key, name), "Remove", BtnKind::Danger).on_click(
                                 cx.listener(move |this, _, _, cx| {
                                     let victim = drop_name.clone();
@@ -235,6 +249,37 @@ impl Console {
                     );
                 }
             }
+        }
+        if !linked.is_empty() {
+            list = list.child(
+                text_dim("Linked from a data resource. Change these on the Data tab.")
+                    .text_size(px(11.))
+                    .pt(px(8.)),
+            );
+        }
+        for row in &linked {
+            list = list.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .py(px(6.))
+                    .border_b_1()
+                    .border_color(c(DIVIDER))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w_0()
+                            .child(mono(row.var.clone())),
+                    )
+                    .child(text_dim(row.text.clone()).text_size(px(11.)))
+                    .children(
+                        row.shadows_doppler
+                            .then(|| pill("shadows Doppler", Tone::Warn)),
+                    ),
+            );
         }
         let rows = &self.ops.env.rows_ref(runtime).rows;
         let typed: Vec<String> = rows
@@ -257,7 +302,7 @@ impl Console {
                         .flex()
                         .flex_col()
                         .flex_1()
-                        .child(strong("Value").text_size(px(12.))),
+                        .child(strong("Value (write-only)").text_size(px(12.))),
                 )
                 .child(div().w(px(76.)).flex_none()),
         );
@@ -319,14 +364,11 @@ impl Console {
             },
         ));
         let (title, sub) = if runtime {
-            (
-                "Runtime variables",
-                "Read by the running site. Names are listed; values are write-only and never shown again.",
-            )
+            ("Runtime variables", "Read by the running site. Names only.")
         } else {
             (
                 "Build variables",
-                "Available while the site installs and builds. Names are listed; values are write-only and never shown again.",
+                "Available while the site installs and builds. Names only.",
             )
         };
         let body = div()
@@ -336,10 +378,7 @@ impl Console {
             .child(list)
             .child(editor)
             .child(div().flex().gap(px(8.)).child(add).child(save))
-            .child(
-                text_dim("Upper case letters, digits and _. Changes apply on the next redeploy.")
-                    .text_size(px(11.)),
-            );
+            .child(text_dim(VALUE_HINT).text_size(px(11.)));
         Some(card(Some(title), Some(sub), body).into_any_element())
     }
 
@@ -356,7 +395,7 @@ impl Console {
                     .pt(px(8.))
                     .child(strong("Doppler").text_size(px(16.)))
                     .child(
-                        text_dim("Sync this site's variables from a Doppler config with a service token instead of typing them.")
+                        text_dim("Sync variables from a Doppler config with a service token.")
                             .text_size(px(12.)),
                     )
                     .into_any_element(),

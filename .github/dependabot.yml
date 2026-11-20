@@ -169,6 +169,18 @@ updates:
       docker-minor-patch:
         update-types: ["minor", "patch"]
 
+  - package-ecosystem: docker
+    directory: "/images/postgres"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "chore(deps)"
+    cooldown:
+      default-days: 3
+    groups:
+      docker-minor-patch:
+        update-types: ["minor", "patch"]
+
   - package-ecosystem: docker-compose
     directory: "/"
     schedule:

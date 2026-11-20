@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::fmt;
 
-use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
+use argon2::password_hash::phc::PasswordHash;
+use argon2::password_hash::{PasswordHasher, PasswordVerifier};
 use argon2::{Algorithm, Argon2, Params, Version};
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
@@ -79,18 +80,15 @@ fn to_hex(bytes: &[u8]) -> String {
 
 pub fn hash_password(pw: &str) -> Result<String, AuthError> {
     let salt_bytes = random_bytes::<16>()?;
-    let salt = SaltString::encode_b64(&salt_bytes).map_err(|_| AuthError::Hash)?;
     let hash = hasher()
-        .hash_password(pw.as_bytes(), &salt)
+        .hash_password_with_salt(pw.as_bytes(), &salt_bytes)
         .map_err(|_| AuthError::Hash)?;
     Ok(hash.to_string())
 }
 
 // Spends the same Argon2 cost as a real check, so an unknown user takes as long as a wrong password.
 pub fn dummy_verify() {
-    if let Ok(salt) = SaltString::encode_b64(&[0x5au8; 16]) {
-        let _ = hasher().hash_password(b"cite-dummy-password", &salt);
-    }
+    let _ = hasher().hash_password_with_salt(b"cite-dummy-password", &[0x5au8; 16]);
 }
 
 pub fn verify_password(pw: &str, phc: &str) -> bool {
@@ -551,6 +549,23 @@ mod tests {
         assert!(hash.starts_with("$argon2id$"));
         assert!(verify_password(password(), &hash));
         assert!(!verify_password(wrong_password(), &hash));
+    }
+
+    // Hashes written by argon2 0.5 (releases up to 0.4.1) at the release and test costs must keep verifying,
+    // or upgrading a node would lock every operator out.
+    #[test]
+    fn hashes_from_earlier_releases_still_verify() {
+        let pw = "correct horse battery staple";
+        for phc in [
+            "$argon2id$v=19$m=19456,t=2,p=1$BwcHBwcHBwcHBwcHBwcHBw$eZ8SueF3EIJEgtgpg1rLafWpNVv3dMTwc0KCOxG5CSg",
+            "$argon2id$v=19$m=64,t=1,p=1$BwcHBwcHBwcHBwcHBwcHBw$lqiL4VyWibGbFFOhtqk/XGMMWt8/3hvZrQjOuOga2lQ",
+        ] {
+            assert!(verify_password(pw, phc), "{phc}");
+            assert!(
+                !verify_password("correct horse battery stapler", phc),
+                "{phc}"
+            );
+        }
     }
 
     #[test]

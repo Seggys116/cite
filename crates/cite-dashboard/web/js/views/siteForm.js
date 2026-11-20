@@ -9,6 +9,7 @@ import {
   TOKEN_TOGGLE, tokenPlan, tokenState, cleanToken,
 } from '../siteCheck.js';
 import { nodeInfoCached } from '../caplib.js';
+import { WRITE_ONLY_HINT } from '../envlib.js';
 import { sourceFields } from './sourceFields.js';
 import { createVerdict, rotationFailureLines } from '../accesslib.js';
 import { PATH_TYPES } from '../conditionlib.js';
@@ -78,7 +79,8 @@ export function newSiteView(ctx) {
   }
   const form = emptySiteForm();
   const onlineNames = state.nodes.map((n) => n.name);
-  const preferred = state.node !== 'all' ? [state.node] : onlineNames.slice(0, 1);
+  // Under "All nodes" no node is ticked for the person: they pick where the site runs on the last step
+  const preferred = state.node !== 'all' ? [state.node] : [];
   form.nodes = [...preferred];
 
   // Controls whose state lives in the control itself are made once and moved into each step that shows them
@@ -124,7 +126,7 @@ export function newSiteView(ctx) {
     const plan = currentPlan();
     const box = h('div', { class: 'field' },
       h('span', { class: 'field-label' }, plan.required ? 'GitHub token (required)' : 'GitHub token'), token,
-      h('span', { class: 'hint' }, plan.show ? plan.help : 'Used only for this site. Stored only on the node and never shown again.'));
+      h('span', { class: 'hint' }, plan.show ? plan.help : `Used only for this site. ${WRITE_ONLY_HINT}`));
     box.hidden = !plan.show && !tokenOpen;
     const open = button(TOKEN_TOGGLE, { size: 'sm' });
     open.addEventListener('click', () => {
@@ -178,7 +180,7 @@ export function newSiteView(ctx) {
       field('Domains', hosts.el, 'Requests for these domains go to this site.', { group: true }),
       h('div', { class: 'stack-sm' },
         h('span', { class: 'field-label' }, 'Only for these paths (optional)'),
-        h('p', { class: 'hint' }, 'Leave empty to serve every path on the domains. Add several; a request matching any of them is routed here.'),
+        h('p', { class: 'hint' }, 'Leave empty to serve every path.'),
         conditionList({ rows: form.paths, types: PATH_TYPES, label: 'Path', addLabel: 'Add a path', onChange: () => refresh() }).el));
   }
 

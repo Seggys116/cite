@@ -177,6 +177,16 @@ impl Console {
                     .into_any_element(),
             );
         }
+        // Explore archives and exports write to or read from one node, so those tabs name it.
+        let bar = match active {
+            View::Explore | View::Export => self.scope_bar_for(
+                "explore-node",
+                &self.bots.scope,
+                Self::choose_explore_node,
+                cx,
+            ),
+            _ => None,
+        };
         div()
             .flex()
             .flex_col()
@@ -186,7 +196,15 @@ impl Console {
                 subtitle,
                 vec![seg_row(items).into_any_element()],
             ))
-            .child(div().flex().child(seg_row(tabs)))
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap(px(16.))
+                    .child(seg_row(tabs))
+                    .children(bar),
+            )
             .into_any_element()
     }
 
@@ -412,11 +430,7 @@ fn traffic_body(
     let half = |card: gpui::Div| card.flex_1().min_w_0().into_any_element();
     let row_a = grid(vec![
         half(card(Some("Status classes"), None, status)),
-        half(card(
-            Some("Latency"),
-            Some("Total time per request"),
-            latency,
-        )),
+        half(card(Some("Latency"), None, latency)),
         half(card(Some("Response sizes"), None, size_bars)),
     ]);
     let row_b = grid(vec![

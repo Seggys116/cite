@@ -230,12 +230,48 @@ async fn node_capabilities_follow_what_the_node_can_do() {
     }
     for cap in &caps {
         for needs_stack in [
-            "logs", "token", "env", "build", "doppler", "volumes", "outbound",
+            "logs", "token", "env", "build", "doppler", "volumes", "outbound", "data-",
         ] {
             assert!(!cap.contains(needs_stack), "{cap} needs an orchestrator");
         }
     }
+    // Pin the data capability names exactly; the node here has no orchestrator, so none may be offered.
+    const DATA_CAPABILITIES: [&str; 7] = [
+        "data-postgres",
+        "data-shared",
+        "data-external",
+        "data-s3",
+        "data-backups",
+        "data-links",
+        "data-transfer",
+    ];
+    let declared: Vec<&str> = CAPABILITIES
+        .iter()
+        .copied()
+        .filter(|c| c.starts_with("data-"))
+        .collect();
+    assert_eq!(declared, DATA_CAPABILITIES);
+    assert!(
+        !caps.iter().any(|c| c.starts_with("data-")),
+        "data services need the orchestrator: {caps:?}"
+    );
     assert_eq!(node["github"]["api_host"], "api.github.com");
+}
+
+#[tokio::test]
+async fn data_capabilities_need_the_orchestrator_as_well_as_a_running_data_service() {
+    // A data service without an orchestrator is not a working one: still nothing data-* is offered.
+    let h = super::data_api::start_with_data_service().await;
+    let t = h.token().await;
+    let (status, node) = h.get(&t, "/node").await;
+    assert_eq!(status, 200);
+    let caps = node["capabilities"].as_array().expect("capabilities");
+    assert!(
+        !caps
+            .iter()
+            .any(|c| c.as_str().is_some_and(|c| c.starts_with("data-"))),
+        "{caps:?}"
+    );
 }
 
 #[tokio::test]
@@ -249,6 +285,125 @@ async fn node_reports_the_host_of_a_custom_github_api() {
     assert_eq!(status, 200);
     assert_eq!(node["github"]["api_host"], "ghe.example.com");
     assert!(!node.to_string().contains("api/v3"));
+}
+
+const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+fn data_json() -> Value {
+    json!({
+        "postgres": {
+            "mode": "dedicated",
+            "major": 18,
+            "databases": [{ "name": "app", "users": [{ "name": "app", "level": "readwrite" }] }],
+        },
+    })
+}
+
+async fn seed_data_site(h: &Harness, id: &str) {
+    let mut json = site_json(id, &format!("{id}.example.com"));
+    json["source"] = json!({ "repo": "octo/site" });
+    json["data"] = data_json();
+    let site: Site = serde_json::from_value(json).expect("site");
+    h.state
+        .store
+        .update("test", "seed", move |cfg| {
+            cfg.sites.push(site);
+            Ok(())
+        })
+        .await
+        .expect("seed");
+}
+
+async fn get_as(h: &Harness, t: &str, path: &str, client: Option<&str>) -> (u16, Value) {
+    let mut req = h.http.get(h.url(path)).bearer_auth(t);
+    if let Some(version) = client {
+        req = req.header("x-cite-client", version);
+    }
+    let res = req.send().await.expect("request");
+    let status = res.status().as_u16();
+    (status, res.json().await.unwrap_or(Value::Null))
+}
+
+#[tokio::test]
+async fn site_data_is_sent_only_to_clients_that_announce_this_release_or_newer() {
+    let h = start().await;
+    let t = h.token().await;
+    seed_data_site(&h, "shop").await;
+    let current = format!("v{CLIENT_VERSION}");
+    let named = format!("cite-client/{CLIENT_VERSION}");
+    let pre = format!("{CLIENT_VERSION}-rc.1");
+    let cases: [(Option<&str>, bool); 11] = [
+        (None, false),
+        (Some(""), false),
+        (Some("garbage"), false),
+        (Some("0.0.1"), false),
+        (Some("0.4.0"), false),
+        (Some("1.x"), false),
+        (Some(CLIENT_VERSION), true),
+        (Some(current.as_str()), true),
+        (Some(named.as_str()), true),
+        (Some(pre.as_str()), true),
+        (Some("999.1.0"), true),
+    ];
+    for (client, sees) in cases {
+        let (status, one) = get_as(&h, &t, "/sites/shop", client).await;
+        assert_eq!(status, 200, "{client:?}");
+        assert_eq!(
+            one.get("data").is_some(),
+            sees,
+            "get with {client:?}: {one}"
+        );
+        if sees {
+            assert_eq!(one["data"]["postgres"]["mode"], "dedicated");
+        }
+        let (status, list) = get_as(&h, &t, "/sites", client).await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            list[0].get("data").is_some(),
+            sees,
+            "list with {client:?}: {list}"
+        );
+        // Everything else about the site is the same either way.
+        assert_eq!(one["id"], "shop");
+        assert_eq!(one["source"]["repo"], "octo/site");
+    }
+    // The stored site is never altered by who reads it.
+    let stored = h.state.store.config();
+    assert!(stored.sites[0].data.postgres.is_some());
+}
+
+#[tokio::test]
+async fn a_site_payload_cannot_carry_data_in() {
+    let h = start().await;
+    let t = h.token().await;
+    let mut body = site_json("blog", "blog.example.com");
+    body["data"] = data_json();
+    let (status, created) = h.post(&t, "/sites", body).await;
+    assert_eq!(status, 200, "{created}");
+    assert!(created.get("data").is_none(), "{created}");
+    let stored = h.state.store.config();
+    let blog = stored.sites.iter().find(|s| s.id == "blog").expect("site");
+    assert!(blog.data.is_empty(), "data comes from the data routes only");
+}
+
+#[tokio::test]
+async fn deleting_a_site_takes_the_purge_flags_and_reports_what_s3_keeps() {
+    let h = start().await;
+    let t = h.token().await;
+    h.seed_site("blog").await;
+    h.seed_site("docs").await;
+    for query in ["purge_data=maybe", "purge_volumes=2", "purge=true"] {
+        let (status, _) = h.delete(&t, &format!("/sites/blog?{query}")).await;
+        assert_eq!(status, 400, "{query}");
+    }
+    let (status, plain) = h.delete(&t, "/sites/docs").await;
+    assert_eq!(status, 200);
+    assert_eq!(plain, json!({ "ok": true }));
+    let (status, purged) = h.delete(&t, "/sites/blog?purge_data=true").await;
+    assert_eq!(status, 200, "{purged}");
+    assert_eq!(purged, json!({ "ok": true, "s3_objects_left": 0 }));
+    let audit = format!("{:?}", h.state.store.audit_tail(50).await);
+    assert!(audit.contains("site.data.purge"), "{audit}");
 }
 
 #[tokio::test]

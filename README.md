@@ -29,6 +29,9 @@
 <td width="25%" valign="top"><b>Analytics</b><br><sub>Requests, status classes, latency percentiles, top paths and header-first bot scoring from HAProxy's own logs, kept in an embedded SQLite database with set retention and CSV export.</sub></td>
 <td width="25%" valign="top"><b>Many nodes, one console</b><br><sub>A connector on each node exposes an authenticated API. The dashboard talks to all of them and can replicate a site to every node.</sub></td>
 </tr>
+<tr>
+<td colspan="4" valign="top"><b>Site databases</b><br><sub>With the orchestrator, a site can have its own Postgres or a database on the node's shared instance, or attach an external one. Users have fixed privilege levels and rotate without downtime. Env links put credentials where the build or the app needs them, with presets for Prisma, Drizzle, Auth.js and Better Auth. Encrypted, numbered backups with retention and S3 copies, restore, and staged moves between modes and nodes. See <a href="docs/data.md">Site data services</a>.</sub></td>
+</tr>
 </table>
 
 ## Two modes
@@ -170,7 +173,7 @@ Without it, a site routes to upstream addresses you run yourself. [Running a nod
 
 ## Dashboard and desktop app
 
-The dashboard is a browser console with seven views: Overview, Nodes, Sites, Traffic, Firewall, Maintenance and Settings. A node switcher scopes every view to one node or to all of them. Signing in takes a username, a password and a six-digit authenticator code. A node is added with a name, its connector URL and a connector API token, plus the node's CA certificate when it uses the one from `init`.
+The dashboard is a browser console with nine views: Overview, Nodes, Sites, Topology, Databases, Traffic, Firewall, Maintenance and Settings. Topology draws how hosts reach sites through the nodes, with live load. The node switcher sets which nodes a page reads, and firewall, redirect and maintenance changes go only to nodes you pick. Signing in takes a username, a password and a six-digit authenticator code. A node is added with a name, its connector URL and a connector API token, plus the node's CA certificate when it uses the one from `init`.
 
 ```bash
 docker compose -f docker-compose.dashboard.yml up -d
@@ -181,7 +184,7 @@ Open `http://127.0.0.1:8088` and enter the one-time setup token from the log to 
 
 The console source is in `crates/cite-dashboard/web`. [Dashboard](docs/dashboard.md) describes each view and the API the console uses.
 
-The desktop app in `apps/desktop` is a native client for the same connector API, with the same views. It talks to the connectors directly, so it needs no dashboard container, and it keeps each node's API token in the operating system keychain. Builds for macOS, Linux and Windows are unsigned. See [Desktop app](docs/desktop.md).
+The desktop app in `apps/desktop` is a native client for the same connector API, with the same views plus Analytics. It is dark only for now. It talks to the connectors directly, so it needs no dashboard container, and it keeps each node's API token in the operating system keychain. Builds for macOS, Linux and Windows are unsigned. See [Desktop app](docs/desktop.md).
 
 ## Adding a site
 
@@ -234,11 +237,13 @@ In node mode, the connector API is reached in this order: source address allowli
 
 The orchestrator overlay gives the connector access to the Docker API through `cite-dockerproxy`, a filter that forwards only the calls the orchestrator makes and only when the request body matches the container, volume or network specification it would send. A compromised connector can then manage Cite's own site stacks but cannot ask Docker for a privileged container or a host mount. The proxy itself holds the Docker socket, so its compromise is host root. The [security model](docs/security-model.md) lists this and the other limits.
 
+The connector seals its secret files and its database backups under a node key. Back the key up away from the node (`cite-connector secrets export-key`): without it the sealed files and every backup are unreadable, and the connector refuses to start. Site databases publish no port, no API route returns a password, and the Docker proxy accepts only exact database container specifications. See [Site data services](docs/data.md) and [Upgrading](docs/node.md#upgrading-from-an-older-release).
+
 ## CI and releases
 
 | Workflow | Runs on | What it does |
 |---|---|---|
-| `ci.yml` | Push to `main`, pull request | `cargo fmt`, clippy with warnings denied, the workspace tests, an MSRV check on Rust 1.88, `cargo deny`, and hadolint plus image builds for the single-site images. |
+| `ci.yml` | Push to `main`, pull request | `cargo fmt`, clippy with warnings denied, the workspace tests, an MSRV check on Rust 1.100, `cargo deny`, and hadolint plus image builds for the single-site images. |
 | `node.yml` | Push to `main`, pull request | Syntax and static-safety checks on the dashboard scripts, compose file validation (including a check that only `dockerproxy` mounts the Docker socket), shellcheck and dry runs of `scripts/setup.sh`, builds of the connector, dashboard and dockerproxy images, and `haproxy -c` on a rendered sample config. |
 | `apps.yml` | Push to `main`, pull request | Builds the desktop app for macOS arm64, macOS x64, Linux x64 and Windows x64, and the connector and dashboard binaries for Linux x64 and macOS arm64. Everything is uploaded as workflow artifacts. The Windows build is marked experimental and does not fail the workflow. |
 | `e2e.yml` | Push to `main`, manual | First-deploy, fault and per-runtime end-to-end scripts for single-site mode. |
@@ -250,6 +255,10 @@ Desktop builds are not signed or notarised. On macOS, open the app with right-cl
 
 `scripts/e2e-node.sh` runs the node stack end to end against a throwaway compose project (`cite-e2e`, ports 18080 and 17443). It needs a connector image tagged `ghcr.io/seggys116/cite-connector:e2e`, which you can build with `docker build -f images/connector/Dockerfile --build-arg VERSION=0.2.0 -t ghcr.io/seggys116/cite-connector:e2e .`. No workflow runs it. `E2E_KEEP=1` skips the teardown.
 
+`scripts/e2e-data.sh` runs the site data services end to end (sealed secrets, dedicated and shared Postgres, backup and restore, rotation, external databases, S3, conversion and node-to-node transfer) against two throwaway compose projects. `E2E_SKIP_BUILD=1` reuses images you already built and `E2E_KEEP=1` skips the teardown. The `e2e.yml` workflow runs it on manual dispatch only.
+
+`scripts/e2e-upgrade.sh` starts a node on the previous release (0.4.1 compose files and images), seeds sites, tokens, variables, a volume, a firewall rule and traffic, upgrades it in place the way `setup.sh update` does, and checks that everything survived and kept serving. It also runs on manual dispatch only.
+
 ## Requirements
 
 | Component | Minimum |
@@ -257,7 +266,7 @@ Desktop builds are not signed or notarised. On macOS, open the app with right-cl
 | Docker Engine | 26.0 (named volume subpath mounts, Engine API 1.45) |
 | Docker Compose | v2.26 |
 | Host | Linux for the server side. HAProxy, the connector and the dashboard run in containers. |
-| Desktop app | macOS 13 or newer, Linux, or Windows. Building from source needs Rust 1.88. |
+| Desktop app | macOS 13 or newer, Linux, or Windows. Building from source needs Rust 1.100. |
 | GitHub token | `contents:read` on each repo built (single-site mode, and orchestrated sites) |
 
 ## Local development
@@ -299,6 +308,8 @@ The `cite-edge` run covers log ingest rate, dashboard query latency over 90 days
 | [Multiple sites](docs/multi-site.md) | [Connector API](docs/node-api.md) |
 | [Running real sites](docs/sites.md) | [Security model](docs/security-model.md) |
 | [HTTPS in front](docs/https.md) | [Site status, logs and build settings](docs/site-status.md) |
+| | [Site data services](docs/data.md) |
+| | [Changelog](CHANGELOG.md) |
 
 [SECURITY](SECURITY.md) describes how to report a vulnerability.
 

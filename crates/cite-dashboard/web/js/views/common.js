@@ -1,5 +1,4 @@
 import { h } from '../dom.js';
-import { state } from '../state.js';
 import { emptyState, pill, dot } from '../ui.js';
 
 export function noNodes() {
@@ -9,12 +8,6 @@ export function noNodes() {
     text: 'Connect a Cite node first. Its sites, traffic and firewall then appear here.',
     action: h('a', { class: 'btn btn-primary', href: '#/nodes' }, 'Add a node'),
   });
-}
-
-// A one-line reminder shown on single-node screens while the switcher is on "All nodes"
-export function nodeNotice(name) {
-  if (state.node !== 'all' || !name) return null;
-  return h('p', { class: 'notice' }, 'Showing node ', h('b', {}, name), '. Pick a node in the switcher above to change it.');
 }
 
 export function siteHref(node, id, tab) {

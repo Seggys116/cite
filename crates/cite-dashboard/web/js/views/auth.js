@@ -109,7 +109,6 @@ export function loginScreen({ onSuccess }) {
 
   const form = h('form', { class: 'auth-card', novalidate: true, onSubmit: (e) => { e.preventDefault(); submit(); } },
     h('h1', { class: 'auth-title' }, 'Sign in'),
-    h('p', { class: 'muted' }, 'Use your console account and a current authenticator code.'),
     field('Username', user),
     field('Password', pass),
     field('Authentication code', code.el, null, { group: true }),
@@ -180,8 +179,7 @@ export function onboardingScreen({ onDone }) {
     h('div', { class: 'meter-row' }, meter, meterLabel),
     field('Confirm password', again), err, next);
     clear(host);
-    host.append(h('h1', { class: 'auth-title' }, 'Create the console account'),
-      h('p', { class: 'muted' }, 'This is the first run. The account protects every node you connect.'), steps, form);
+    host.append(h('h1', { class: 'auth-title' }, 'Create the console account'), steps, form);
     setupToken.focus();
   }
 
@@ -206,7 +204,7 @@ export function onboardingScreen({ onDone }) {
     const link = uri.startsWith('otpauth://') ? h('a', { class: 'link', href: uri }, 'Open in authenticator app') : null;
     clear(host);
     host.append(h('h1', { class: 'auth-title' }, 'Scan with your authenticator'),
-      h('p', { class: 'muted' }, 'Scan the code, or enter the secret by hand, then type the 6-digit code it shows.'), steps,
+      h('p', { class: 'muted' }, 'Scan the code or enter the secret, then type the 6-digit code.'), steps,
       h('div', { class: 'scan-grid' },
         h('div', { class: 'qr-box' }, qr || h('p', { class: 'muted' }, 'QR code unavailable. Use the secret.')),
         h('div', { class: 'scan-side' },
@@ -224,7 +222,7 @@ export function onboardingScreen({ onDone }) {
     clear(host);
     host.append(h('div', { class: 'done-art' }, icon('check')),
       h('h1', { class: 'auth-title center' }, 'Console ready'),
-      h('p', { class: 'muted center' }, 'Two-factor sign-in is active. Sign in to add your first node.'),
+      h('p', { class: 'muted center' }, 'Sign in to add your first node.'),
       button('Continue to sign in', { kind: 'primary', onClick: onDone }));
   }
 

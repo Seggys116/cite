@@ -64,8 +64,7 @@ export function botDetail(ev) {
   if (!hasBotData(ev)) return h('p', { class: 'muted' }, 'This request was recorded without bot analysis.');
   return h('div', { class: 'stack-sm' },
     h('div', { class: 'pill-row' }, classBadge(ev.bot_class), h('span', { class: 'muted' }, 'score'), scoreValue(ev.bot_score)),
-    signalChips(ev.bot_signals),
-    h('p', { class: 'hint' }, BOT_METHOD_HELP));
+    signalChips(ev.bot_signals));
 }
 
 function ranked(items, emptyText) {
@@ -108,21 +107,19 @@ export function botsPanel(sm) {
     h('div', { class: 'section-row' }, h('h2', { class: 'section-title' }, 'Bot traffic'), help.btn),
     help.note,
     h('div', { class: 'grid-cards' },
-      card({ title: 'Bot share', subtitle: 'Requests not classed human', body: sm.total_requests ? share : h('p', { class: 'muted' }, 'No requests in this window.') }),
+      card({ title: 'Bot share', body: sm.total_requests ? share : h('p', { class: 'muted' }, 'No requests in this window.') }),
       card({
         title: 'Classes',
-        subtitle: 'Hover a class to see what it means',
         body: h('div', { class: 'stack' },
           hbars(classes.map((c) => ({ label: c.label, value: c.value, cls: 'bc-fill ' + c.cls }))), legend(classes)),
       }),
       card({
         title: 'Score distribution',
-        subtitle: '0 looks human, 100 looks automated',
         body: buckets.some((b) => b.value) ? histogram(buckets) : h('p', { class: 'muted' }, 'No scored requests in this window.'),
       })),
     h('div', { class: 'grid-cards wide' },
-      card({ title: 'Top signals', subtitle: 'Why requests were flagged. Hover a signal for its meaning.', flush: true, body: signalTable(sm.signals) }),
-      card({ title: 'Top bot agents', subtitle: 'User agents behind the flagged requests', flush: true, body: ranked(sm.agents, 'No bot agents seen in this window.') })));
+      card({ title: 'Top signals', flush: true, body: signalTable(sm.signals) }),
+      card({ title: 'Top bot agents', flush: true, body: ranked(sm.agents, 'No bot agents seen in this window.') })));
 }
 
 export function botsSkeleton() {
@@ -161,7 +158,6 @@ export function topExplorer(node, getQuery) {
   limitSel.addEventListener('change', run);
   const el = card({
     title: 'Top explorer',
-    subtitle: 'Rank any recorded field over the selected window',
     actions: [kindSel, limitSel],
     flush: true,
     body: h('div', {}, live, host),
@@ -170,7 +166,7 @@ export function topExplorer(node, getQuery) {
 }
 
 function storageBody({ stats, settings, unsupported }) {
-  if (unsupported) return h('p', { class: 'muted' }, 'This node does not report storage statistics yet. Update the node to see them.');
+  if (unsupported) return h('p', { class: 'muted' }, 'This node does not report storage statistics.');
   const span = stats.oldest_ts_ms && stats.newest_ts_ms
     ? `${fmtDate(stats.oldest_ts_ms)} to ${fmtDate(stats.newest_ts_ms)}`
     : 'No requests stored yet';
@@ -202,7 +198,6 @@ export function storageCard(node) {
   const archives = archivesPanel(node, { onDataChanged: () => run() });
   const el = card({
     title: 'Analytics storage',
-    subtitle: 'What this node keeps on disk for analytics',
     actions: archives.actions,
     body: h('div', { class: 'stack' }, host, archives.el),
   });
@@ -235,7 +230,6 @@ export function openExportDialog({ node, win, sites = [], site = '' }) {
     return el;
   };
 
-  const kindHint = h('span', { class: 'hint' });
   const topField = field('Top list field', selectFor('top', 'Top list field', TOP_KINDS));
   const customRow = h('div', { class: 'two-col' },
     field('From', inputFor('from', { type: 'datetime-local' })),
@@ -261,8 +255,7 @@ export function openExportDialog({ node, win, sites = [], site = '' }) {
     customRow.hidden = form.rangeMode !== 'custom';
     const filtered = form.kind === 'requests' || form.kind === 'bots';
     filters.hidden = !filtered;
-    const info = EXPORT_KINDS.find((k) => k.value === form.kind);
-    kindHint.textContent = info.help + (filtered ? '' : ' Request filters do not apply to this export.');
+    kindSelect.title = EXPORT_KINDS.find((k) => k.value === form.kind).help;
   };
   const rangeSeg = segmented({
     label: 'Time range',
@@ -286,16 +279,17 @@ export function openExportDialog({ node, win, sites = [], site = '' }) {
     errorBox.hidden = !message;
   };
 
+  const kindSelect = selectFor('kind', 'What to export', EXPORT_KINDS, sync);
   const content = h('div', { class: 'form' },
     h('div', { class: 'two-col' },
-      field('What to export', selectFor('kind', 'What to export', EXPORT_KINDS, sync), kindHint),
+      field('What to export', kindSelect),
       field('Format', formatSeg, null, { group: true })),
     topField,
     field('Time range', rangeSeg, null, { group: true }),
     customRow,
     h('div', { class: 'two-col' },
       field('Site', selectFor('site', 'Site', siteOptions)),
-      field('Row limit', inputFor('limit', { type: 'number', min: '1', placeholder: 'No limit', inputmode: 'numeric' }), 'Large exports stream straight to a file; a limit keeps them quick.')),
+      field('Row limit', inputFor('limit', { type: 'number', min: '1', placeholder: 'No limit', inputmode: 'numeric', title: 'A limit keeps large exports quick.' }))),
     filters, errorBox, status);
 
   const cancel = button('Cancel', { onClick: () => modal.close() });
@@ -322,7 +316,7 @@ export function openExportDialog({ node, win, sites = [], site = '' }) {
           startNavigation(downloadHref(node, params));
         }
         status.textContent = '';
-        toast('Export started. Your browser saves the file to its downloads folder.', 'success');
+        toast(`Export from ${node} started`, 'success');
         modal.close();
       } catch (ex) {
         status.textContent = '';
@@ -330,7 +324,7 @@ export function openExportDialog({ node, win, sites = [], site = '' }) {
       }
     }),
   });
-  const modal = openModal({ title: 'Export analytics', wide: true, content, actions: [cancel, go] });
+  const modal = openModal({ title: `Export analytics from ${node}`, wide: true, content, actions: [cancel, go] });
   sync();
   return modal;
 }

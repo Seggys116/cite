@@ -1,17 +1,27 @@
 import { h } from '../dom.js';
 import { nodeApi } from '../api.js';
-import { currentNode, state } from '../state.js';
+import { state } from '../state.js';
 import {
-  pageHeader, button, iconButton, loadInto, card, emptyState, toggle, segmented, toast, withBusy, formatError, skeletonRows,
+  pageHeader, button, iconButton, loadInto, card, emptyState, pill, toggle, segmented, toast, withBusy, formatError, skeletonRows,
 } from '../ui.js';
-import { noNodes, nodeNotice } from './common.js';
+import { noNodes, listOf } from './common.js';
+import {
+  onlineNodes, readNodes, scopeLine, scopeNodes,
+} from './firewall.js';
+import { pickTargets } from './targetDialog.js';
+import { applyToNodes, resultKind, resultMessage } from '../targetlib.js';
+import {
+  bulkBodyFor, enabledDiffers, mergeRules, unreachableNote,
+} from '../firewalllib.js';
 import { PLACEHOLDERS } from '../rulelib.js';
 import {
   STATUS_CHOICES, blankRow, describeFrom, diffRows, presetRow, rowForError, rowsProblems, rulesToRows,
 } from '../redirectlib.js';
 
-function editor(rules, reload, node) {
+// rules is one copy of every rule id across the nodes read; heldByNode maps each reachable node to Map(rule id -> its own stored rule)
+function editor({ rules, heldByNode, down, differing }, reload) {
   const rows = rulesToRows(rules);
+  const note = unreachableNote(down);
   let lastTarget = null;
   const list = h('div', { class: 'redirect-list stack-sm' });
   const save = button('Save changes', { kind: 'primary', iconName: 'check' });
@@ -43,7 +53,20 @@ function editor(rules, reload, node) {
     if (!rows.length) list.append(emptyState({ iconName: 'swap', title: 'No redirects', text: 'Add a redirect, or use one of the quick actions.' }));
     rows.forEach((row, i) => {
       const n = i + 1;
-      const on = toggle({ checked: row.enabled, label: `Enable redirect ${n}`, onChange: (v) => { row.enabled = v; sync(); } });
+      const mixed = h('p', {
+        class: 'fw-mixed', title: 'This redirect is on at some nodes and off at others. Saving keeps each node as it is unless you use the switch.',
+      }, pill('differs by node', 'warn'));
+      mixed.hidden = !row.id || row.enabledTouched || !enabledDiffers(row.id, heldByNode);
+      const on = toggle({
+        checked: row.enabled,
+        label: `Enable redirect ${n}`,
+        onChange: (v) => {
+          row.enabled = v;
+          row.enabledTouched = true;
+          mixed.hidden = true;
+          sync();
+        },
+      });
       let from;
       if (row.simple) {
         const mode = segmented({
@@ -74,7 +97,7 @@ function editor(rules, reload, node) {
       const slot = h('span', { class: 'error-text', role: 'status', 'aria-live': 'polite', hidden: true });
       errorSlots.set(row.key, slot);
       list.append(h('div', { class: 'redirect-row' },
-        on, from, h('span', { class: 'redirect-arrow', 'aria-hidden': 'true' }, 'to'), to, status, remove), slot);
+        on, from, h('span', { class: 'redirect-arrow', 'aria-hidden': 'true' }, 'to'), to, status, remove), mixed, slot);
     });
   }
 
@@ -106,28 +129,48 @@ function editor(rules, reload, node) {
     err.hidden = true;
     nodeErrors.clear();
     const diff = diffRows(rows, rules);
-    try {
-      const res = await withBusy(save, () => nodeApi(node).post('/firewall/bulk', { replace: diff.replace, delete: diff.delete }));
-      toast(`Redirects saved: ${(res && res.created) || 0} added, ${(res && res.replaced) || 0} changed, ${(res && res.deleted) || 0} removed`, 'success');
-      reload();
-    } catch (ex) {
-      const message = formatError(ex);
-      const key = rowForError(message, diff.owners);
-      if (key) nodeErrors.set(key, message);
-      else {
-        err.textContent = message;
-        err.hidden = false;
-      }
-      sync();
+    const only = onlineNodes().filter((name) => heldByNode.has(name));
+    if (!only.length) {
+      err.textContent = 'No node is online to save to.';
+      err.hidden = false;
+      return;
     }
+    const picked = await pickTargets({
+      title: 'Save redirects',
+      message: `${diff.replace.length} to save, ${diff.delete.length} to delete.`,
+      verb: 'Save redirects',
+      scope: state.node,
+      only,
+    });
+    if (!picked) return;
+    // Each node gets its own body: its stored copy and its own on/off state, changed only where the switch was touched
+    const touched = new Set(rows.filter((row) => row.enabledTouched && row.id).map((row) => row.id));
+    const results = await withBusy(save, () => applyToNodes(picked, (name) => nodeApi(name).post('/firewall/bulk', bulkBodyFor(name, diff, touched, heldByNode))));
+    const lines = [];
+    for (const r of results.filter((x) => !x.ok)) {
+      const message = formatError(r.error);
+      const key = rowForError(message, diff.owners);
+      if (key) nodeErrors.set(key, `${r.node}: ${message}`);
+      else lines.push(`${r.node}: ${message}`);
+    }
+    err.textContent = lines.join('. ');
+    err.hidden = lines.length === 0;
+    if (results.some((r) => r.ok)) {
+      toast(resultMessage('Redirects saved', results, formatError), resultKind(results));
+      reload();
+      return;
+    }
+    sync();
   });
 
   draw();
   sync();
   return h('div', { class: 'stack' },
+    note ? h('p', { class: 'notice warn', role: 'status' }, note) : null,
+    differing.length ? h('p', { class: 'notice warn', role: 'status' }, `${differing.join(', ')} differ between nodes; the first copy is shown.`) : null,
     card({
       title: 'Redirects',
-      subtitle: 'Each row sends visitors from one path to another address. Changes are saved together in one step.',
+      subtitle: 'Each row sends visitors from one path to another address. Changes are saved together.',
       actions: [
         button('Add redirect', { iconName: 'plus', onClick: () => add(blankRow()) }),
         button('Add www redirect', { onClick: () => add(presetRow('www')) }),
@@ -143,12 +186,31 @@ function editor(rules, reload, node) {
 
 export function redirectsView(ctx) {
   ctx.setCrumbs([{ label: 'Firewall', href: '#/firewall' }, { label: 'Redirects' }]);
-  const node = currentNode();
   const body = h('div', {});
-  ctx.root.append(...[pageHeader({ title: 'Redirects', subtitle: node ? 'Redirects served by ' + node : 'Send visitors from old addresses to new ones' }), nodeNotice(node), body].filter(Boolean));
-  if (!node || !state.nodes.length) {
+  ctx.root.append(pageHeader({ title: 'Redirects', subtitle: scopeLine() }), body);
+  if (!state.nodes.length) {
     body.appendChild(noNodes());
     return;
   }
-  loadInto(body, () => nodeApi(node).get('/firewall/rules'), (rules, again) => editor(rules, again, node), { skeleton: () => skeletonRows(5) });
+  const names = scopeNodes();
+  loadInto(body, async () => {
+    const results = await readNodes(names, '/firewall/rules');
+    const reached = results.filter((r) => r.ok);
+    if (!reached.length) throw results[0].error;
+    const perNode = reached.map((r) => ({ node: r.node, rules: listOf(r.value) }));
+    const rows = mergeRules(perNode);
+    const seen = new Set();
+    const rules = [];
+    for (const row of rows) {
+      if (seen.has(row.id)) continue;
+      seen.add(row.id);
+      rules.push(row.rule);
+    }
+    return {
+      rules,
+      heldByNode: new Map(perNode.map((p) => [p.node, new Map(p.rules.map((r) => [r.id, r]))])),
+      down: results.filter((r) => !r.ok).map((r) => r.node),
+      differing: [...new Set(rows.filter((r) => r.differs && r.rule.redirect).map((r) => r.rule.name))],
+    };
+  }, (data, again) => editor(data, again), { skeleton: () => skeletonRows(5) });
 }

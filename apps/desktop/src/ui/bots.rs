@@ -17,13 +17,14 @@ use crate::bots::{
 };
 use crate::demo::now_ms;
 use crate::model::{WINDOWS, fmt_bytes, fmt_int, fmt_num, fmt_pct, merge_top};
-use crate::theme::{BORDER, DIM, SURFACE, Tone, c, tint};
+use crate::theme::{DIM, Tone, c, tint};
 use crate::ui::chart::{PANE_MIN, STAT_MIN, clip_tip, wide};
 use crate::ui::input::TextInput;
+use crate::ui::nodescope::{NodeScope, choose_node_notice, failed_on, unresolved_text};
 use crate::ui::traffic::top_table;
 use crate::ui::widgets::{
     BtnKind, Col, btn, card, clip, field, grid_min, id, mono, notice, pill, pill_color, seg_item,
-    seg_row, skeleton, stat, strong, table, text_dim,
+    seg_row, skeleton, stat, strong, table, text_dim, tip,
 };
 
 const TOP_LIMIT: usize = 25;
@@ -44,8 +45,14 @@ pub enum StorageOutcome {
 pub enum ExportRun {
     Idle,
     // Console tick at which the export began; the elapsed-seconds display is derived from it.
-    Running { since_tick: u64 },
-    Done { path: PathBuf, bytes: u64 },
+    Running {
+        since_tick: u64,
+    },
+    Done {
+        node: String,
+        path: PathBuf,
+        bytes: u64,
+    },
     Failed(String),
 }
 
@@ -74,6 +81,8 @@ pub struct State {
     pub top_kind: usize,
     pub top: Load<Vec<TopItem>>,
     pub storage: Load<Vec<NodeStorage>>,
+    // The node the Explore archives and the Export tab write to; the other tabs read every node.
+    pub scope: NodeScope,
     pub export: ExportState,
 }
 
@@ -84,6 +93,7 @@ impl State {
             top_kind: 0,
             top: Load::Idle,
             storage: Load::Idle,
+            scope: NodeScope::default(),
             export: ExportState {
                 kind: ExportKind::Requests,
                 format: ExportFormat::Csv,
@@ -209,6 +219,10 @@ impl Console {
     }
 
     pub fn load_explore(&mut self, cx: &mut Context<Self>) {
+        // Nothing loads until a node is chosen on the Explore tab.
+        if self.explore_node().is_none() {
+            return;
+        }
         self.load_top(cx);
         self.load_storage(cx);
         self.load_archives(cx);
@@ -246,10 +260,12 @@ impl Console {
         if matches!(self.bots.export.run, ExportRun::Running { .. }) {
             return;
         }
-        let Some(handle) = self.active_handle() else {
-            self.bots.export.run = ExportRun::Failed("No node is connected.".into());
+        let Some(handle) = self.explore_handle() else {
+            self.bots.export.run =
+                ExportRun::Failed(unresolved_text(self.explore_node().as_deref()));
             return;
         };
+        let node = handle.name().to_string();
         let now = now_ms();
         let form = self.export_form(cx);
         let query = match build_query(&form, now) {
@@ -269,20 +285,25 @@ impl Console {
         self.bots.export.run = ExportRun::Running {
             since_tick: self.tick,
         };
-        self.fetch(cx, run_export(handle, query, dir, name), |this, res, cx| {
-            let next = match res {
-                Ok(report) => {
-                    this.say("Export saved", Tone::Ok);
-                    ExportRun::Done {
-                        path: report.path,
-                        bytes: report.bytes,
+        self.fetch(
+            cx,
+            run_export(handle, query, dir, name),
+            move |this, res, cx| {
+                let next = match res {
+                    Ok(report) => {
+                        this.say(format!("Export saved from {node}"), Tone::Ok);
+                        ExportRun::Done {
+                            node,
+                            path: report.path,
+                            bytes: report.bytes,
+                        }
                     }
-                }
-                Err(e) => ExportRun::Failed(friendly_error(&e)),
-            };
-            this.bots.export.run = next;
-            cx.notify();
-        });
+                    Err(e) => ExportRun::Failed(failed_on("Export", &node, &friendly_error(&e))),
+                };
+                this.bots.export.run = next;
+                cx.notify();
+            },
+        );
     }
 
     fn scope_subtitle(&self, what: &str) -> String {
@@ -328,6 +349,9 @@ impl Console {
         if self.handles.is_empty() {
             return col.child(self.no_nodes_block(cx)).into_any_element();
         }
+        if self.explore_node().is_none() {
+            return col.child(choose_node_notice()).into_any_element();
+        }
         let mut kinds = Vec::new();
         for (i, kind) in TOP_KINDS.iter().enumerate() {
             kinds.push(
@@ -354,7 +378,7 @@ impl Console {
         };
         col = col.child(card(
             Some("Top explorer"),
-            Some("The most frequent values of one field in this window"),
+            None,
             div()
                 .flex()
                 .flex_col()
@@ -372,8 +396,11 @@ impl Console {
     }
 
     pub fn render_export(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let subtitle = self.scope_subtitle("Download analytics");
-        let mut col = div()
+        let subtitle = match self.explore_node() {
+            Some(n) => format!("Download analytics from {n}"),
+            None => "Download analytics".to_string(),
+        };
+        let col = div()
             .flex()
             .flex_col()
             .gap(px(16.))
@@ -381,7 +408,9 @@ impl Console {
         if self.handles.is_empty() {
             return col.child(self.no_nodes_block(cx)).into_any_element();
         }
-        col = col.children(self.scope_note());
+        if self.explore_node().is_none() {
+            return col.child(choose_node_notice()).into_any_element();
+        }
         col.child(self.export_card(cx)).into_any_element()
     }
 
@@ -463,7 +492,7 @@ impl Console {
         form = form
             .child(field(
                 "Format",
-                Some("CSV opens in a spreadsheet; NDJSON is one JSON object per line."),
+                Some("CSV for spreadsheets, NDJSON for one JSON object per line."),
                 div().flex().child(seg_row(formats)),
             ))
             .child(field(
@@ -571,20 +600,21 @@ impl Console {
             ExportRun::Idle => None,
             ExportRun::Running { since_tick } => {
                 let secs = self.tick.saturating_sub(*since_tick) / TICKS_PER_SECOND;
-                Some(notice(
-                    &format!("Exporting, {secs}s elapsed. Large exports can take several minutes."),
-                    Tone::Info,
-                ))
+                Some(notice(&format!("Exporting, {secs}s elapsed."), Tone::Info))
             }
-            ExportRun::Done { path, bytes } => Some(notice(
-                &format!("Saved {} to {}", fmt_bytes(*bytes), path.display()),
+            ExportRun::Done { node, path, bytes } => Some(notice(
+                &format!(
+                    "Saved {} from {node} to {}",
+                    fmt_bytes(*bytes),
+                    path.display()
+                ),
                 Tone::Ok,
             )),
             ExportRun::Failed(msg) => Some(notice(msg, Tone::Bad)),
         };
         let destination = match downloads_dir() {
             Some(dir) => text_dim(format!(
-                "Saves into {}. An existing file is never replaced.",
+                "Saves into {}; never replaces a file.",
                 dir.display()
             )),
             None => {
@@ -611,29 +641,8 @@ impl Console {
             .child(save)
             .child(destination.text_size(px(12.)));
         form = form.child(footer).children(status);
-        card(
-            Some("Export"),
-            Some("Stream a file from the node to this computer"),
-            form,
-        )
-        .into_any_element()
+        card(Some("Export"), None, form).into_any_element()
     }
-}
-
-fn help_note(title: &str, text: &str) -> AnyElement {
-    div()
-        .flex()
-        .flex_col()
-        .gap(px(4.))
-        .px(px(14.))
-        .py(px(10.))
-        .rounded(px(crate::theme::CARD_RADIUS))
-        .border_1()
-        .border_color(c(BORDER))
-        .bg(c(SURFACE))
-        .child(strong(title.to_string()).text_size(px(12.)))
-        .child(text_dim(text.to_string()).text_size(px(12.)))
-        .into_any_element()
 }
 
 fn bots_body(s: &BotSummary) -> AnyElement {
@@ -677,26 +686,14 @@ fn bots_body(s: &BotSummary) -> AnyElement {
     let row_a = grid_min(
         PANE_MIN,
         vec![
-            half(card(
-                Some("Traffic by class"),
-                Some("Segment width is the share of requests"),
-                class_panel(s),
-            )),
-            half(card(
-                Some("Score distribution"),
-                Some("Requests per bot score band"),
-                score_panel(s),
-            )),
+            half(card(Some("Traffic by class"), None, class_panel(s))),
+            half(card(Some("Score distribution"), None, score_panel(s))),
         ],
     );
     let row_b = grid_min(
         PANE_MIN,
         vec![
-            half(card(
-                Some("Top signals"),
-                Some("What the detector noticed"),
-                signals_table(&s.signals),
-            )),
+            half(card(Some("Top signals"), None, signals_table(&s.signals))),
             half(card(
                 Some("Top bot agents"),
                 None,
@@ -708,7 +705,11 @@ fn bots_body(s: &BotSummary) -> AnyElement {
         .flex()
         .flex_col()
         .gap(px(16.))
-        .child(help_note("How detection works", METHOD_HELP))
+        .child(tip(
+            text_dim("The score from 0 to 100 is a heuristic, not proof."),
+            id("bots-tip", "method"),
+            METHOD_HELP,
+        ))
         .child(stats)
         .child(row_a)
         .child(row_b)
@@ -749,15 +750,11 @@ fn class_panel(s: &BotSummary) -> AnyElement {
                         .rounded_full()
                         .bg(c(slice.color)),
                 )
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .flex_1()
-                        .min_w_0()
-                        .child(strong(slice.label.clone()))
-                        .child(text_dim(class_help(&slice.key)).text_size(px(11.))),
-                )
+                .child(div().flex().flex_1().min_w_0().child(tip(
+                    strong(slice.label.clone()),
+                    id("bots-class", &slice.key),
+                    class_help(&slice.key),
+                )))
                 .child(
                     mono(fmt_int(slice.count))
                         .flex_none()
@@ -827,14 +824,12 @@ fn signals_table(items: &[TopItem]) -> AnyElement {
             vec![
                 div()
                     .flex()
-                    .flex_col()
                     .min_w_0()
-                    .child(mono(signal_label(&t.key)))
-                    .child(
-                        clip(signal_help(&t.key))
-                            .text_size(px(11.))
-                            .text_color(c(DIM)),
-                    )
+                    .child(tip(
+                        mono(signal_label(&t.key)),
+                        id("bots-signal", &t.key),
+                        signal_help(&t.key),
+                    ))
                     .into_any_element(),
                 mono(fmt_int(t.count)).into_any_element(),
             ]
@@ -953,16 +948,10 @@ fn storage_card(nodes: &[NodeStorage]) -> AnyElement {
     ));
     if any_old {
         body = body.child(
-            text_dim("Nodes marked as needing an update predate the storage endpoint and report nothing here.")
-                .text_size(px(12.)),
+            text_dim("Nodes marked as needing an update report nothing here.").text_size(px(12.)),
         );
     }
-    card(
-        Some("Storage"),
-        Some("Analytics database on each node"),
-        body,
-    )
-    .into_any_element()
+    card(Some("Storage"), None, body).into_any_element()
 }
 
 // Class and score together, or a dash for events recorded before bot detection existed.

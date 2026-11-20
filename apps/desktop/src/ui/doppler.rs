@@ -287,7 +287,7 @@ pub fn token_line(source: &str) -> &'static str {
 }
 
 pub const SERVICE_TOKEN_PREFIX: &str = "dp.st.";
-const TOKEN_HELP: &str = "Create a service token in Doppler (Project > Config > Access > Service Tokens), paste it here. It is stored encrypted on the node and only used to fetch this config's variables.";
+const TOKEN_HELP: &str = "Paste a service token (Doppler: Project > Config > Access). It is stored encrypted on the node.";
 const ADVANCED_LABEL: &str = "Advanced: use the node's token and pick a project and config";
 
 // What the card names the project and config when the token alone chose them.
@@ -482,12 +482,7 @@ impl Console {
             }
             res
         };
-        self.doppler_action(
-            "Doppler",
-            fut,
-            "Doppler connected. Variables sync now and on every change.",
-            cx,
-        );
+        self.doppler_action("Doppler", fut, "Doppler connected", cx);
     }
 
     fn doppler_sync(&mut self, cx: &mut Context<Self>) {
@@ -756,7 +751,7 @@ impl Console {
         Some(
             card(
                 Some("Doppler service token"),
-                Some("The node pulls this site's variables from the token's config. When they change in Doppler, it syncs them and redeploys the site automatically."),
+                Some("Changes in Doppler sync to the node and redeploy the site automatically."),
                 body,
             )
             .into_any_element(),

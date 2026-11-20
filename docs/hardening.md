@@ -55,7 +55,7 @@ The proxy cannot discover the node's public address by itself: it is an ordinary
 
 A refusal is a `403 Forbidden` whose body names the reason, for example `destination is a private or internal address`. A plain `http://` request is sent upstream with `Connection: close` and the client connection closes after its response, so one connection carries exactly one request; a request with both `Content-Length` and `Transfer-Encoding`, or with a transfer coding other than `chunked`, gets `400`. The proxy logs the destination host and port and the verdict, never the path or query string. It allows 256 connections at a time and answers `503` past that, gives the DNS lookup and every connect attempt 10 seconds in total, caches lookups for 30 seconds (each use is checked again), waits at most 10 seconds for request headers, and closes a tunnel when nothing moves either way for 120 seconds.
 
-Clients that honour the proxy variables work unchanged: Node `fetch` and `http` (Node 22.21 and newer, and 24, through `NODE_USE_ENV_PROXY=1`), Bun, curl, axios and undici configured to read the environment, Rust `reqwest`, Python `requests`. A client that ignores them cannot reach the internet in filtered mode; configure it to use `http://cite-<id>-<slot>-egress-proxy:3128` (the value of `HTTPS_PROXY`), or use `open` mode on a node whose sites you trust. Databases and other non-HTTP protocols cannot go through the proxy; reach them on a private address you allow (below) only if the client supports an HTTP `CONNECT` proxy, or use `open` mode.
+Clients that honour the proxy variables work unchanged: Node `fetch` and `http` (Node 22.21 and newer, and 24, through `NODE_USE_ENV_PROXY=1`), Bun, curl, axios and undici configured to read the environment, Rust `reqwest`, Python `requests`. A client that ignores them cannot reach the internet in filtered mode; configure it to use `http://cite-<id>-<slot>-egress-proxy:3128` (the value of `HTTPS_PROXY`), or use `open` mode on a node whose sites you trust. Databases and other non-HTTP protocols cannot go through the proxy; reach them on a private address you allow (below) only if the client supports an HTTP `CONNECT` proxy, or use `open` mode. The exception is an external Postgres attached through [site data services](data.md#external-postgres), which gets a fixed TCP forward in the site's egress proxy (see [Site databases](#site-databases)).
 
 Node settings, set on both the Docker proxy and the connector by the orchestrator overlay:
 
@@ -80,6 +80,27 @@ The order of precedence is: node deny lists, then the site's `deny`, then (in al
 ### Open and off
 
 For isolation, turn `outbound` off on sites that do not need it, or set `CITE_STACK_EGRESS_MODE=off` so the Docker proxy refuses executor egress for every site on the node (the connector then refuses outbound sites with a clear error and `GET /api/v1/node` reports `egress_mode: "off"` and `executor_egress: false`). The older `CITE_STACK_EXECUTOR_EGRESS=false` still means `off`. In `open` mode add `DOCKER-USER` rules that drop traffic from the `cite-*-egress` bridges to the host and private ranges you do not want reached, and block the metadata address as described below. Filtered mode does not need those rules for executors, but managers still use their unfiltered egress bridge for builds.
+
+## Site databases
+
+Node mode only; the feature is described in [Site data services](data.md) and the reasoning in the [security model](security-model.md#site-data-services).
+
+| Control | Postgres server | Job container |
+|---|---|---|
+| User | `70:70` | `10001:10001` |
+| `read_only`, `cap_drop: ALL`, `no-new-privileges` | yes | yes |
+| Published ports | none | none |
+| Networks | one internal network (`cite-<id>-dbnet`, or `cite-pg-shared-admin` for the shared server, which also joins each tenant's `dbnet`) | the network of the database it works on; only a backup of an external database uses the site's `-xnet` or `-egress` network |
+| Writable | data volume, a 64 MiB `/tmp`, the socket directory | the `cite-backups` subpath of its site (read-only for a restore), a 64 MiB `/tmp` |
+| Limits | memory, CPU and connections per site or per shared instance, 512 pids | 512 MiB, one CPU, 64 pids |
+| Restart | `unless-stopped` | never |
+
+- **Authentication.** `scram-sha-256` only, role attributes without superuser, create-database, create-role, replication and row-security bypass. In shared mode, `pg_hba.conf` lets each tenant's logins reach only their own database from their own `dbnet` subnet, gives the superuser only the `postgres` database and each database's job login its database, both from the admin network, and rejects the rest. The superuser never opens a tenant database; backup, restore and counts run as a per-database job login that is not a superuser and can log in only during a job.
+- **Egress for databases.** An external Postgres is reached through a TCP forward on ports 15432 to 15439 of the site's egress proxy. The destination is fixed in the proxy's environment, and every connection gets the checks listed under [Filtered mode](#filtered-mode). `CITE_EGRESS_AUTO_ALLOW` lets the attached host names through allowlist mode but never opens a private address; open one with the site's `outbound_rules.allow` or the node's `CITE_STACK_EGRESS_ALLOW_CIDRS`. The forward honours `CITE_STACK_EGRESS_ALLOW_PORTS`: an attachment whose port is not listed is refused.
+- **Disable it.** `CITE_DATA=false` makes the Docker proxy refuse every data container, volume and network.
+- **Keys and backups.** Everything the connector seals, backups included, is bound to the node key. Put it on a mount that is not `cite_conf` (`CITE_SECRETS_KEY_FILE`) when you want it separate from the files it protects, export a copy with `cite-connector secrets export-key` and keep it off the node, and treat the `cite-backups` volume as sensitive: the files in it are encrypted, but its catalogs name your databases.
+- **Disk.** Postgres volumes and backups are not limited per site, like the other volumes. Backups are pruned by the retention policy, and an import needs free space of twice the dump.
+- **Build users.** A build that runs migrations holds the owner credentials, including the install scripts of the site's dependencies. Link a build variable only to the user the build needs.
 
 ## Host firewall
 

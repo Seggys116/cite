@@ -17,7 +17,8 @@ use crate::ui::widgets::{
 
 pub const MAX_ENTRIES: usize = 64;
 const MAX_HOST: usize = 253;
-const SWITCH_HELP: &str = "Lets this site's server code make requests to the public internet. Private, internal and Docker addresses are blocked unless you allow them below. Applies on the next deploy.";
+const SWITCH_HELP: &str =
+    "Lets this site's server code reach the public internet. Applies on the next deploy.";
 
 fn is_allowlist(r: &OutboundRules) -> bool {
     r.mode == OutboundMode::Allowlist
@@ -253,7 +254,7 @@ impl Console {
         let (title, hint) = match (deny, allowlist) {
             (false, false) => (
                 "Always allow",
-                "Reachable even when the address is private, such as a database on your network.",
+                "Reachable even when private, such as a database on your network.",
             ),
             (false, true) => (
                 "Allowed destinations",
@@ -368,7 +369,7 @@ impl Console {
             .child(text_dim(SWITCH_HELP).text_size(px(12.)));
         if blocked {
             body = body.child(notice(
-                "This node blocks all outbound requests from sites, so this switch and the rules below have no effect until the node allows them.",
+                "This node blocks all outbound requests from sites, so these settings have no effect.",
                 Tone::Warn,
             ));
         } else if egress_unfiltered(mode) {

@@ -16,7 +16,7 @@ Example `site-a.env`:
 CITE_REPO=acme/marketing
 CITE_GITHUB_TOKEN=ghp_replace_me
 CITE_BRANCH=main
-CITE_VERSION=0.4.1
+CITE_VERSION=0.5.0
 CITE_NODE=22
 CITE_PORT=8081
 CITE_BIND=127.0.0.1
@@ -36,3 +36,7 @@ app.example.com {
 ```
 
 Or route hostnames with Cloudflare Tunnel / nginx to each executor's `CITE_PORT`. The executor remains plain HTTP; see [https.md](https.md).
+
+## Sites on several nodes
+
+Node mode runs many sites on one node, and the dashboard and desktop app manage several nodes. The same site id can exist on more than one node, and each node keeps its own copy. [Dashboard](dashboard.md#sites) describes the Sites list, which shows one row per site across nodes, and [Topology](dashboard.md#topology), which shows how hosts reach sites through the nodes.

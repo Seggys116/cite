@@ -1,4 +1,4 @@
-import { h } from '../dom.js';
+import { h, debounce } from '../dom.js';
 import { button, iconButton } from '../ui.js';
 import { KEEP_SECRET_NOTE } from '../rulelib.js';
 import {
@@ -63,10 +63,15 @@ export function conditionList({
       const name = `${label} ${i + 1}`;
       const type = h('select', { class: 'select', 'aria-label': `${name} type`, value: row.type }, allowed.map((t) => option(t.id, t.label)));
       const error = h('span', { class: 'error-text', role: 'status', 'aria-live': 'polite', hidden: true });
-      const check = () => {
+      // The message needs no keystroke accuracy, so the regex check behind it waits for a pause; the parent is told at once
+      const show = () => {
         const bad = rowProblem(row);
         error.textContent = bad || '';
         error.hidden = !bad;
+      };
+      const showSoon = debounce(show, 120);
+      const check = () => {
+        showSoon();
         changed();
       };
       let valueEl;
@@ -74,7 +79,7 @@ export function conditionList({
         valueEl = headerEditor(row, check, name);
       } else if (row.type === 'scheme') {
         valueEl = h('select', { class: 'select', 'aria-label': `${name} value`, value: row.value }, option('', 'Choose'), option('http', 'http'), option('https', 'https'));
-        valueEl.addEventListener('change', () => { row.value = valueEl.value; check(); });
+        valueEl.addEventListener('change', () => { row.value = valueEl.value; show(); changed(); });
       } else {
         valueEl = h('input', {
           class: 'input mono', type: 'text', value: row.value, placeholder: typeOf(row.type).placeholder, spellcheck: 'false', autocomplete: 'off', 'aria-label': `${name} value`,
@@ -95,7 +100,8 @@ export function conditionList({
         changed();
       });
       root.append(h('div', { class: 'cond-row' }, h('div', { class: 'cond-fields' }, type, valueEl), remove), error);
-      if (rowProblem(row)) check();
+      // A row that arrives with a problem shows it now, without notifying the parent: it already knows its own rows
+      show();
       if (focusIndex === i) (valueEl.querySelector ? (valueEl.querySelector('input,select') || valueEl) : valueEl).focus();
     });
     const add = button(addLabel, {

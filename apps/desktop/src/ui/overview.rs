@@ -9,6 +9,7 @@ use crate::model::{
     parse_rfc3339_ms, read_info, rel_time,
 };
 use crate::theme::{BORDER, DIM, GREEN, MONO, Tone, c};
+use crate::topology::fmt_rps;
 use crate::ui::chart::{STAT_MIN, clip_tip, spark, wide};
 use crate::ui::sites::{SiteState, site_state};
 use crate::ui::widgets::{
@@ -149,7 +150,7 @@ impl Console {
     pub fn render_overview(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let header = page_header(
             "Overview",
-            "Health and traffic across every connected node",
+            "Health and traffic across your nodes",
             Vec::new(),
         );
         let body: AnyElement = match &self.overview.data {
@@ -293,6 +294,13 @@ fn overview_body(data: &Data, cx: &mut Context<Console>) -> AnyElement {
         .into_any_element()
 }
 
+// Requests per second over the overview window, from the summary the card already loads.
+fn node_rps(snap: &NodeSnapshot) -> Option<f64> {
+    snap.summary
+        .as_ref()
+        .map(|s| s.requests as f64 / (OVERVIEW_WINDOW_MINUTES * 60.0))
+}
+
 // The sparkline shows the last hour of request counts.
 fn node_card(snap: &NodeSnapshot, cx: &mut Context<Console>) -> AnyElement {
     let name = snap.name.clone();
@@ -343,6 +351,10 @@ fn node_card(snap: &NodeSnapshot, cx: &mut Context<Console>) -> AnyElement {
             .as_ref()
             .map(|s| s.points.iter().map(|p| p.requests).collect())
             .unwrap_or_default();
+        let load = match node_rps(snap) {
+            Some(rps) => mono(fmt_rps(rps)),
+            None => mono("-").text_color(c(DIM)),
+        };
         div()
             .flex()
             .flex_col()
@@ -365,6 +377,7 @@ fn node_card(snap: &NodeSnapshot, cx: &mut Context<Console>) -> AnyElement {
                         "Rules",
                         mono(snap.rules.to_string()).into_any_element(),
                     ))
+                    .child(metric("Load", load.into_any_element()))
                     .child(metric("HAProxy", haproxy.into_any_element())),
             )
             .child(spark(points, GREEN))
@@ -402,4 +415,30 @@ fn node_card(snap: &NodeSnapshot, cx: &mut Context<Console>) -> AnyElement {
         .child(body)
         .child(div().flex().child(open))
         .into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cite_edge::analytics::Summary;
+
+    fn snap(summary: Option<Summary>) -> NodeSnapshot {
+        NodeSnapshot {
+            online: true,
+            summary,
+            ..offline("edge-fra", String::new())
+        }
+    }
+
+    #[test]
+    fn a_node_load_is_its_summary_requests_over_the_window() {
+        let summary = Summary {
+            requests: 9_000,
+            ..Summary::default()
+        };
+        assert_eq!(node_rps(&snap(Some(summary))), Some(10.0));
+        assert_eq!(node_rps(&snap(None)), None);
+        let idle = Summary::default();
+        assert_eq!(node_rps(&snap(Some(idle))), Some(0.0));
+    }
 }
