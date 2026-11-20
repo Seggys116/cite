@@ -19,6 +19,11 @@ regex = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 unicode-segmentation = "1"
 
+# gpui 0.2.2 (the latest) reaches xattr 0.2.3 through zed-async-tar, and xattr 0.2.3 uses libc::ENOATTR, which
+# libc 0.2.190 removed on Linux. Hold libc on the last release that has it until gpui moves to xattr 1.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = ">=0.2.189, <0.2.190"
+
 [dev-dependencies]
 gpui = { version = "0.2", features = ["test-support"] }
 tempfile = "3"
